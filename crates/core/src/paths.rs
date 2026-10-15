@@ -1,47 +1,76 @@
-//! Platform directories.
+//! Platform directories. Nothing here creates directories.
 //!
-//! - Windows: `%APPDATA%\AGT`
-//! - macOS:   `~/Library/Application Support/AGT`
-//! - other:   `$XDG_CONFIG_HOME/agt` or `~/.config/agt`
+//! | | config (`config_dir`) | data: logs, models, lock (`data_dir`) |
+//! |---|---|---|
+//! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (local; also the Velopack install root) |
+//! | macOS | `~/Library/Application Support/AGT` | same |
+//! | other | `$XDG_CONFIG_HOME/agt` | `$XDG_DATA_HOME/agt` |
+//!
+//! `AGT_HOME`, if set, replaces both (handy for tests and dev runs).
 
 use std::path::PathBuf;
 
-/// Directory holding `config.toml` and `logs/`. Not created by this function.
-pub fn app_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AGT_HOME") {
-        return PathBuf::from(dir);
-    }
-    base_dir()
+/// Holds `config.toml`. Small, user-edited, fine to roam.
+pub fn config_dir() -> PathBuf {
+    home_override().unwrap_or_else(platform::config_dir)
 }
 
-#[cfg(windows)]
-fn base_dir() -> PathBuf {
-    let appdata = std::env::var_os("APPDATA").expect("%APPDATA% is not set");
-    PathBuf::from(appdata).join("AGT")
-}
-
-#[cfg(target_os = "macos")]
-fn base_dir() -> PathBuf {
-    home().join("Library/Application Support/AGT")
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-fn base_dir() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(x) => PathBuf::from(x).join("agt"),
-        None => home().join(".config/agt"),
-    }
-}
-
-#[cfg(unix)]
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("$HOME is not set"))
+/// Holds logs, the instance lock and (later) models. Machine-local, never roams.
+pub fn data_dir() -> PathBuf {
+    home_override().unwrap_or_else(platform::data_dir)
 }
 
 pub fn config_file() -> PathBuf {
-    app_dir().join("config.toml")
+    config_dir().join("config.toml")
 }
 
 pub fn log_dir() -> PathBuf {
-    app_dir().join("logs")
+    data_dir().join("logs")
+}
+
+fn home_override() -> Option<PathBuf> {
+    std::env::var_os("AGT_HOME").map(PathBuf::from)
+}
+
+fn env_dir(var: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(var).unwrap_or_else(|| panic!("${var} is not set")))
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    pub fn config_dir() -> PathBuf {
+        env_dir("APPDATA").join("AGT")
+    }
+    pub fn data_dir() -> PathBuf {
+        env_dir("LOCALAPPDATA").join("AGT")
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::*;
+    pub fn config_dir() -> PathBuf {
+        env_dir("HOME").join("Library/Application Support/AGT")
+    }
+    pub fn data_dir() -> PathBuf {
+        config_dir()
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    use super::*;
+    fn xdg(var: &str, fallback: &str) -> PathBuf {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env_dir("HOME").join(fallback))
+            .join("agt")
+    }
+    pub fn config_dir() -> PathBuf {
+        xdg("XDG_CONFIG_HOME", ".config")
+    }
+    pub fn data_dir() -> PathBuf {
+        xdg("XDG_DATA_HOME", ".local/share")
+    }
 }
