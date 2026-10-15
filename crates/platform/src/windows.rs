@@ -1,6 +1,6 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, HotkeyEvent, Key, is_modifier};
+use crate::{Error, HoldDetector, HotkeyEvent, Key, Permission, is_modifier};
 use std::{
     cell::RefCell,
     ptr::{null, null_mut},
@@ -106,7 +106,7 @@ pub fn start_hotkey(
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
             HOOK.with(|h| {
                 *h.borrow_mut() = Some(HookState {
-                    vk: key.vk as u32,
+                    vk: key.code as u32,
                     swallow: key.swallowed(),
                     detector: HoldDetector::default(),
                     on_event,
@@ -160,7 +160,7 @@ pub fn foreground_window() -> Option<usize> {
 
 pub fn key_down(key: Key) -> Option<bool> {
     // A swallowed key never updates the system's key state.
-    (!key.swallowed()).then(|| vk_down(key.vk))
+    (!key.swallowed()).then(|| vk_down(key.code))
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -443,3 +443,14 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Re
     }
     Ok(true)
 }
+
+// ---------------------------------------------------------------------------------------
+// Permissions: Windows has no per-app prompts for any of this.
+
+pub fn missing_permissions() -> Vec<Permission> {
+    Vec::new()
+}
+
+pub fn request_permissions(_missing: &[Permission]) {}
+
+pub fn open_permission_settings(_permission: Permission) {}

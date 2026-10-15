@@ -1,9 +1,13 @@
-//! OS integration: the hold-to-talk global hotkey and clipboard paste.
+//! OS integration: the hold-to-talk global hotkey, clipboard paste, and (macOS) the privacy
+//! permissions they need.
 //!
-//! Windows is implemented (low-level keyboard hook, Win32 clipboard, `SendInput`).
-//! macOS (and anything else) currently returns [`Error`]s saying so; Phase 4 fills it in.
+//! - Windows: low-level keyboard hook, Win32 clipboard, `SendInput`.
+//! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone, Input Monitoring and
+//!   Accessibility permissions (see [`missing_permissions`]).
+//! - Anything else returns [`Error`]s saying it's unsupported.
 
 use std::{
+    fmt,
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
@@ -13,9 +17,14 @@ mod windows;
 #[cfg(windows)]
 use windows as imp;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as imp;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use unsupported as imp;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -38,9 +47,9 @@ pub enum HotkeyEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     pub name: &'static str,
-    /// Windows virtual-key code.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    vk: u16,
+    /// Platform key code: Windows virtual-key code, or macOS virtual key code (`kVK_*`).
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    code: u16,
 }
 
 /// Supported hotkeys (names are case-insensitive) and their Windows virtual-key codes.
@@ -53,6 +62,7 @@ pub struct Key {
 /// Deliberately absent: Alt and Win (releasing them alone opens the menu bar / Start menu),
 /// and CapsLock, F1-F12, Insert, Pause (they would have to be swallowed, taking them away
 /// from apps).
+#[cfg(not(target_os = "macos"))]
 pub const KEYS: &[(&str, u16)] = &[
     ("RightCtrl", 0xA3),
     ("LeftCtrl", 0xA2),
@@ -72,11 +82,37 @@ pub const KEYS: &[(&str, u16)] = &[
     ("F24", 0x87),
 ];
 
+/// Supported hotkeys (names are case-insensitive) and their macOS virtual key codes.
+///
+/// - Right Option and Right Command are passed through to apps (holding them alone does
+///   nothing; Option+letter or Command+letter while holding cancels the dictation).
+/// - Fn (the Globe key on newer keyboards) is passed through too: set System Settings >
+///   Keyboard > "Press Globe key to" to "Do Nothing", or releasing it also opens the emoji
+///   picker / switches the input source / starts Apple's dictation.
+/// - F13-F20 are swallowed: apps never see them while AGT runs.
+///
+/// Deliberately absent: the left modifiers and Control/Shift (used in everyday shortcuts and
+/// for typing), CapsLock, and F1-F12 (media and brightness keys).
+#[cfg(target_os = "macos")]
+pub const KEYS: &[(&str, u16)] = &[
+    ("RightOption", 0x3D),
+    ("RightCommand", 0x36),
+    ("Fn", 0x3F),
+    ("F13", 0x69),
+    ("F14", 0x6B),
+    ("F15", 0x71),
+    ("F16", 0x6A),
+    ("F17", 0x40),
+    ("F18", 0x4F),
+    ("F19", 0x50),
+    ("F20", 0x5A),
+];
+
 impl Key {
     pub fn parse(name: &str) -> Result<Self, String> {
         KEYS.iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
-            .map(|&(name, vk)| Key { name, vk })
+            .map(|&(name, code)| Key { name, code })
             .ok_or_else(|| {
                 let names: Vec<_> = KEYS.iter().map(|(n, _)| *n).collect();
                 format!(
@@ -88,16 +124,61 @@ impl Key {
 
     /// Whether the hook swallows this key: it's not a modifier, so passing it through would
     /// act in the focused app.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn swallowed(&self) -> bool {
-        !is_modifier(self.vk as u32)
+        !is_modifier(self.code as u32)
     }
 }
 
-/// Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
+/// Windows: Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
+#[cfg(not(target_os = "macos"))]
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
+}
+
+/// macOS: Command, Shift, CapsLock, Option, Control (left and right) and Fn: the keys that
+/// arrive as `flagsChanged` events.
+#[cfg(target_os = "macos")]
+fn is_modifier(code: u32) -> bool {
+    matches!(code, 0x36..=0x3F)
+}
+
+/// A privacy permission AGT needs (macOS only; on Windows nothing is ever missing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    /// Recording (without it, macOS delivers silence).
+    Microphone,
+    /// Seeing the hotkey (the keyboard event tap).
+    InputMonitoring,
+    /// Sending Cmd+V (and swallowing F13-F20).
+    Accessibility,
+}
+
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Permission::Microphone => "Microphone",
+            Permission::InputMonitoring => "Input Monitoring",
+            Permission::Accessibility => "Accessibility",
+        })
+    }
+}
+
+/// The permissions AGT doesn't have (yet). Cheap: fine to poll every second or so.
+pub fn missing_permissions() -> Vec<Permission> {
+    imp::missing_permissions()
+}
+
+/// Asks the user for `missing` (macOS shows its permission prompts; each one only the first
+/// time it's asked). Returns at once; poll [`missing_permissions`] to see them granted.
+pub fn request_permissions(missing: &[Permission]) {
+    imp::request_permissions(missing)
+}
+
+/// Opens the system settings page where `permission` is granted.
+pub fn open_permission_settings(permission: Permission) {
+    imp::open_permission_settings(permission)
 }
 
 /// Keeps the global hotkey alive; dropping it removes the hook.
@@ -121,10 +202,12 @@ impl HotkeyReset {
     }
 }
 
-/// Starts watching `key` on a dedicated, time-critical-priority thread. `on_event` runs on
-/// that thread and must return quickly (e.g. just send on a channel): a slow handler delays
-/// every keystroke on the system. Ctrl/Shift hotkeys are passed through; F13-F24 are
-/// swallowed.
+/// Starts watching `key` on a dedicated, high-priority thread. `on_event` runs on that thread
+/// and must return quickly (e.g. just send on a channel): a slow handler delays every
+/// keystroke on the system. Modifier hotkeys are passed through; F13-F24 are swallowed.
+///
+/// macOS: if Input Monitoring isn't granted yet, this still succeeds; the thread waits for
+/// the permission and starts watching as soon as it's granted (no restart needed).
 pub fn start_hotkey(
     key: Key,
     on_event: impl Fn(HotkeyEvent) + Send + 'static,
@@ -133,7 +216,7 @@ pub fn start_hotkey(
 }
 
 /// Whether `key` is physically down right now, if that can be known: `None` for swallowed
-/// keys (their state never reaches the system) and on unsupported platforms.
+/// keys on Windows (their state never reaches the system) and on unsupported platforms.
 pub fn key_down(key: Key) -> Option<bool> {
     imp::key_down(key)
 }
@@ -166,9 +249,11 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     imp::set_clipboard_text(text).map(PasteToken)
 }
 
-/// Sends Ctrl+V to the focused window (releasing held Shift/Alt/Win first). Returns once the
-/// keystrokes are queued; the target app reads the clipboard asynchronously, so wait a bit
-/// before restoring it. Fails e.g. when the focused app runs elevated.
+/// Sends Ctrl+V (Windows; releasing held Shift/Alt/Win first) or Cmd+V (macOS; with no other
+/// modifier, whatever is held) to the focused window. Returns once the keystrokes are queued;
+/// the target app reads the clipboard asynchronously, so wait a bit before restoring it.
+/// Fails e.g. when the focused app runs elevated (Windows) or without the Accessibility
+/// permission (macOS).
 pub fn send_paste() -> Result<(), Error> {
     PASTES.fetch_add(1, Ordering::SeqCst);
     imp::send_paste()
@@ -183,10 +268,12 @@ pub fn paste_count() -> u64 {
 }
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
-/// physically held: it injects a Shift-up for held Shift keys and a Ctrl-up that maps to Left
-/// Ctrl. Right Ctrl is never touched.
+/// physically held. Windows: it injects a Shift-up for held Shift keys and a Ctrl-up that maps
+/// to Left Ctrl; Right Ctrl is never touched. macOS: never (the poll reads the hardware state,
+/// which our injected events don't change).
 pub fn paste_may_release(key: Key) -> bool {
-    matches!(key.vk, 0xA0..=0xA2) // LeftShift, RightShift, LeftCtrl
+    // LeftShift, RightShift, LeftCtrl
+    cfg!(not(target_os = "macos")) && matches!(key.code, 0xA0..=0xA2)
 }
 
 /// Identifies the clipboard state [`set_clipboard_text`] created.
@@ -205,7 +292,7 @@ const STALE_GAP_MS: u32 = 1500;
 /// Turns raw key transitions into hold events: ignores auto-repeat, cancels when any other
 /// key is pressed during the hold, and recovers from a missed release. Platform-independent
 /// so it can be unit-tested.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct HoldDetector {
     state: Hold,
@@ -222,10 +309,11 @@ enum Hold {
     Cancelled,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 impl HoldDetector {
     /// `is_hotkey`: whether this transition is for the hotkey; `down`: press (incl. repeat)
-    /// or release; `time_ms`: the event's timestamp (`KBDLLHOOKSTRUCT::time`).
+    /// or release; `time_ms`: the event's timestamp in ms, wrapping (`KBDLLHOOKSTRUCT::time`,
+    /// or the `CGEvent` timestamp).
     pub(crate) fn on_key(
         &mut self,
         is_hotkey: bool,
@@ -277,10 +365,11 @@ impl HoldDetector {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn parse_keys() {
         assert_eq!(Key::parse("rightctrl").unwrap().name, "RightCtrl");
-        assert_eq!(Key::parse(" F13 ").unwrap().vk, 0x7C);
+        assert_eq!(Key::parse(" F13 ").unwrap().code, 0x7C);
         assert!(Key::parse("Hyper").is_err());
         for gone in ["RightAlt", "RightWin", "CapsLock", "F5", "Insert", "Pause"] {
             assert!(Key::parse(gone).is_err(), "{gone} should not be allowed");
@@ -290,6 +379,27 @@ mod tests {
         assert!(!paste_may_release(Key::parse("RightCtrl").unwrap()));
         assert!(paste_may_release(Key::parse("LeftCtrl").unwrap()));
         assert!(paste_may_release(Key::parse("RightShift").unwrap()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_keys() {
+        assert_eq!(Key::parse("rightoption").unwrap().name, "RightOption");
+        assert_eq!(Key::parse(" F13 ").unwrap().code, 0x69);
+        for gone in ["RightCtrl", "LeftOption", "CapsLock", "F5", "F21"] {
+            assert!(Key::parse(gone).is_err(), "{gone} should not be allowed");
+        }
+        for (name, swallowed) in [
+            ("RightOption", false),
+            ("RightCommand", false),
+            ("Fn", false),
+            ("F13", true),
+            ("F20", true),
+        ] {
+            let k = Key::parse(name).unwrap();
+            assert_eq!(k.swallowed(), swallowed, "{name}");
+            assert!(!paste_may_release(k), "{name}");
+        }
     }
 
     #[test]
