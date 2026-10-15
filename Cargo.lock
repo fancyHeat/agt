@@ -97,6 +97,7 @@ version = "0.0.6"
 dependencies = [
  "agt-core",
  "agt-fetch",
+ "libc",
  "serde_json",
  "sha2",
  "tracing",

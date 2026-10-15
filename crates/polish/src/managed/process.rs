@@ -190,13 +190,18 @@ impl Server for LlamaServer {
     }
 
     fn wait(&mut self) -> String {
-        match self.child.wait() {
+        let status = match self.child.wait() {
             Ok(s) => s.to_string(),
             Err(e) => format!("cannot wait for it: {e}"),
-        }
+        };
+        // Its process (group) is gone: nothing may be suspended under its name any more.
+        self.gate.retire();
+        status
     }
 
     fn kill(&mut self) {
+        // A suspended server must run again to exit (and handle SIGTERM).
+        self.gate.retire();
         // Unix: closing the watchdog's stdin makes it stop the server.
         drop(self.watchdog_pipe.take());
         let _ = self.child.kill();
@@ -279,13 +284,16 @@ exit "$status""#;
 
 #[cfg(unix)]
 fn command(exe: &std::path::Path, args: &[String]) -> Command {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(WATCHDOG)
         .arg("agt-llama-server")
         .arg(exe)
         .args(args)
-        .stdin(Stdio::piped());
+        .stdin(Stdio::piped())
+        // Its own process group, so `gate` can stop and continue all of it at once.
+        .process_group(0);
     cmd
 }
 
@@ -384,6 +392,57 @@ mod tests {
 
     /// A child that would run "forever" dies with the watchdog's stdin (AGT's end of the
     /// pipe), and its exit status comes through.
+    #[cfg(unix)]
+    #[test]
+    fn unix_gate_stops_and_continues_the_server() {
+        use std::time::Instant;
+        let pid_file = std::env::temp_dir().join(format!("agt-gate-{}", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let mut child = spawn(command(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), script],
+        ))
+        .unwrap();
+        let pipe = child.stdin.take();
+        let t = Instant::now();
+        let pid = loop {
+            if let Ok(s) = fs::read_to_string(&pid_file)
+                && s.ends_with('\n')
+            {
+                break s.trim().to_owned();
+            }
+            assert!(t.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Whether the server is stopped, once the signal has arrived (it's asynchronous).
+        let stopped = |pid: &str| {
+            let is = || {
+                let out = Command::new("ps")
+                    .args(["-o", "stat=", "-p", pid])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().starts_with('T')
+            };
+            std::thread::sleep(Duration::from_millis(200));
+            is()
+        };
+        let gate = Gate::for_child(&child);
+        drop(gate.enter());
+        assert!(gate.is_suspended());
+        assert!(stopped(&pid), "the server must be stopped");
+        let awake = gate.enter();
+        assert!(!stopped(&pid));
+        drop(awake);
+        assert!(stopped(&pid));
+        // Stopping it for good: resumed, then ended by the watchdog.
+        gate.retire();
+        assert!(!stopped(&pid));
+        drop(pipe);
+        child.wait().unwrap();
+        let _ = fs::remove_file(&pid_file);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_watchdog_stops_the_server_when_agt_goes_away() {

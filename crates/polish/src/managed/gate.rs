@@ -1,17 +1,24 @@
 //! Keeps an idle server from using any CPU.
 //!
-//! On Windows, llama-server's HTTP listener polls every millisecond (cpp-httplib's idle
-//! interval there), which costs ~1% of a core and ~1000 wake-ups a second while nothing
-//! happens, all day. So between requests AGT suspends the whole process
-//! (`NtSuspendProcess`) and resumes it for each request; both take microseconds, and a
-//! suspended process holds its memory but uses no CPU at all. Elsewhere the gate does
-//! nothing (the server already blocks when idle).
+//! An idle llama-server is not idle: on Windows its HTTP listener polls every millisecond
+//! (~1% of a core, ~1000 wake-ups a second); on macOS it wakes ~600 times a second. All day.
+//! So between requests AGT suspends it and resumes it for each request; both take
+//! microseconds, and a suspended process keeps its memory but uses no CPU at all.
+//!
+//! - Windows: `NtSuspendProcess` / `NtResumeProcess` on the server process.
+//! - Unix: `SIGSTOP` / `SIGCONT` to the process group the watchdog leads (watchdog, its
+//!   pipe reader and the server). If AGT dies while they're stopped, the group becomes an
+//!   orphaned process group with stopped members, so the kernel sends it SIGHUP and SIGCONT
+//!   (POSIX), which ends the watchdog and the server; the pipe reader would also wake up.
 
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct Gate {
     #[cfg(windows)]
     process: Option<std::os::windows::io::OwnedHandle>,
+    /// The watchdog's process group.
+    #[cfg(unix)]
+    group: Option<i32>,
     /// Requests in flight, and whether the process is suspended.
     state: Mutex<(u32, bool)>,
 }
@@ -21,11 +28,13 @@ pub(crate) struct Awake(Arc<Gate>);
 
 impl Gate {
     /// A gate that never suspends anything.
-    #[cfg(any(test, not(windows)))]
+    #[cfg(any(test, not(any(windows, unix))))]
     pub fn none() -> Arc<Self> {
         Arc::new(Self {
             #[cfg(windows)]
             process: None,
+            #[cfg(unix)]
+            group: None,
             state: Mutex::new((0, false)),
         })
     }
@@ -44,7 +53,16 @@ impl Gate {
         })
     }
 
-    #[cfg(not(windows))]
+    /// `child` must lead its own process group (`CommandExt::process_group(0)`).
+    #[cfg(unix)]
+    pub fn for_child(child: &std::process::Child) -> Arc<Self> {
+        Arc::new(Self {
+            group: i32::try_from(child.id()).ok(),
+            state: Mutex::new((0, false)),
+        })
+    }
+
+    #[cfg(not(any(windows, unix)))]
     pub fn for_child(_: &std::process::Child) -> Arc<Self> {
         Self::none()
     }
@@ -57,6 +75,12 @@ impl Gate {
         }
         s.0 += 1;
         Awake(self.clone())
+    }
+
+    /// Resumes the server for good (it's being stopped: it must run to exit, and nothing may
+    /// suspend it, or what's left of its process group, again).
+    pub fn retire(self: &Arc<Self>) {
+        std::mem::forget(self.enter());
     }
 
     /// Whether the process is currently suspended (for tests and logs).
@@ -92,7 +116,28 @@ impl Gate {
         status >= 0
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    fn set_suspended(&self, suspend: bool) -> bool {
+        let Some(group) = self.group.filter(|g| *g > 1) else {
+            return false;
+        };
+        let sig = if suspend {
+            libc::SIGSTOP
+        } else {
+            libc::SIGCONT
+        };
+        // SAFETY: plain syscall; a negative pid addresses the process group.
+        let ok = unsafe { libc::kill(-group, sig) } == 0;
+        if !ok {
+            tracing::debug!(
+                "cannot suspend/resume llama-server: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        ok
+    }
+
+    #[cfg(not(any(windows, unix)))]
     fn set_suspended(&self, _: bool) -> bool {
         false
     }
