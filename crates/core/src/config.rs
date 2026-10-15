@@ -18,6 +18,9 @@ log_level = "info"
 # Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (recommended if Right
 # Ctrl is awkward to reach); LeftWin/RightWin only work in a chord with Ctrl or Shift. A
 # chord starts once all its keys are down and ends when any of them is released.
+# With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
+# keys are up: if you already hold the hotkey for the next dictation, the previous text
+# lands when you release it (after 10 s it's pasted anyway).
 key = "RightCtrl"
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150

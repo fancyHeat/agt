@@ -256,11 +256,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed());
                     if let (Some(i), true, Some(mask)) = (chord_key, down, &s.mask)
                         && is_win(kb.vkCode)
-                        && s.detector.is_down(i)
+                        && s.detector.repeat_in_chord(i)
                     {
-                        // Win auto-repeat. If a paste released Win in software since we last
-                        // masked, the system takes this repeat for a fresh Win press, and
-                        // the physical release would then open the Start menu: mask again.
+                        // Win auto-repeat while the chord is held or being released. If a
+                        // paste released Win in software since we last masked, the system
+                        // takes this repeat for a fresh Win press, and the physical release
+                        // would then open the Start menu: mask again. (A lone Win held after
+                        // some unrelated paste is left alone: its tap still opens Start.)
                         let pastes = crate::paste_count();
                         if pastes != s.masked_at_paste {
                             s.masked_at_paste = pastes;

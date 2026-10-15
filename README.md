@@ -37,7 +37,9 @@ clicks.
   its own a tap could no longer open the Start menu, and every key typed while holding it
   would be a Windows shortcut. AGT keeps a Win chord from opening the Start menu on release.
   If a Shift, Left Ctrl or Win hotkey key is still held when the text is ready (you let go of
-  Ctrl but not yet of Win, or are already holding the chord for the next dictation), the
+  Ctrl but not yet of Win, or are already holding the hotkey for the next dictation; this
+  includes the single-key `LeftCtrl`, `LeftShift` and `RightShift` hotkeys, whose text then
+  lands when you release the key, not during the next hold), the
   paste waits until you release it (pastes stay in order; after 10 s it pastes anyway), so it
   never turns into e.g. Win+Ctrl+V (the sound output panel).
 - Pressing any other non-modifier key while holding (Esc, or a shortcut like Right Ctrl+C)

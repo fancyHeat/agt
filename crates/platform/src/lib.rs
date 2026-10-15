@@ -461,9 +461,12 @@ impl HoldDetector {
         }
     }
 
-    /// Whether chord key `i` is believed to be down.
-    pub(crate) fn is_down(&self, i: usize) -> bool {
-        self.down & (1 << i) != 0
+    /// Whether a press of chord key `i` (call before [`Self::on_key`]) is an auto-repeat while
+    /// the chord is held or being released: the key is already down and the chord completed
+    /// (or was disarmed) without all its keys having been released since. False for a key
+    /// held on its own (e.g. a lone Win), the chord never having been complete.
+    pub(crate) fn repeat_in_chord(&self, i: usize) -> bool {
+        self.down & (1 << i) != 0 && self.state != Hold::Idle
     }
 
     /// Forget any hold in progress.
@@ -723,5 +726,32 @@ mod tests {
         assert_eq!(d.on_key(Some(0), true, 700, t), None);
         assert_eq!(d.on_key(Some(1), true, 710, t), None);
         assert_eq!(d.on_key(Some(2), true, 720, t), Some(HotkeyEvent::Down(t)));
+    }
+
+    #[test]
+    fn win_repeat_counts_as_in_chord_only_while_the_chord_is_engaged() {
+        // The Windows hook re-masks Win repeats after a paste only when this says so.
+        let t = Instant::now();
+        let mut d = HoldDetector::new(2);
+        // A lone Win held (e.g. after an unrelated paste): its repeats are not in a chord, so
+        // releasing it still opens the Start menu.
+        assert!(!d.repeat_in_chord(1)); // first press: not even down yet
+        d.on_key(WIN, true, 0, t);
+        assert!(!d.repeat_in_chord(1));
+        d.on_key(WIN, true, 500, t);
+        assert!(!d.repeat_in_chord(1));
+        d.on_key(WIN, false, 600, t);
+        // The chord held: Win repeats are in the chord.
+        d.on_key(CTRL, true, 1000, t);
+        assert!(!d.repeat_in_chord(1)); // the press completing the chord isn't a repeat
+        assert_eq!(d.on_key(WIN, true, 1010, t), Some(HotkeyEvent::Down(t)));
+        assert!(d.repeat_in_chord(1));
+        // Being released: Ctrl let go first, Win lingers and repeats.
+        assert_eq!(d.on_key(CTRL, false, 2000, t), Some(HotkeyEvent::Up(t)));
+        assert!(d.repeat_in_chord(1));
+        // Everything released: a new lone Win hold is not in a chord again.
+        d.on_key(WIN, false, 2100, t);
+        d.on_key(WIN, true, 3000, t);
+        assert!(!d.repeat_in_chord(1));
     }
 }
