@@ -276,7 +276,28 @@ fn foreground() -> (usize, bool) {
     (hwnd as usize, pid == std::process::id())
 }
 
-#[cfg(not(windows))]
+/// macOS: the frontmost app's pid, and whether it's this process.
+#[cfg(target_os = "macos")]
+fn foreground() -> (usize, bool) {
+    use objc2::{
+        msg_send,
+        runtime::{AnyClass, AnyObject},
+    };
+    let Some(cls) = AnyClass::get(c"NSWorkspace") else {
+        return (0, false);
+    };
+    let pid: i32 = unsafe {
+        let ws: *mut AnyObject = msg_send![cls, sharedWorkspace];
+        let app: *mut AnyObject = msg_send![ws, frontmostApplication];
+        if app.is_null() {
+            return (0, false);
+        }
+        msg_send![app, processIdentifier]
+    };
+    (pid as usize, pid as u32 == std::process::id())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn foreground() -> (usize, bool) {
     (0, false)
 }
@@ -345,6 +366,7 @@ fn capture_overlay(path: &Path) {
 
 #[cfg(not(windows))]
 fn capture_overlay(_: &Path) {
+    // macOS: window capture needs the Screen Recording permission, even for our own window.
     eprintln!("capture is only implemented on Windows");
 }
 
@@ -375,5 +397,9 @@ fn cpu_time() -> Duration {
 
 #[cfg(not(windows))]
 fn cpu_time() -> Duration {
-    Duration::ZERO
+    // getrusage: user + system time of the whole process.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    tv(u.ru_utime) + tv(u.ru_stime)
 }
