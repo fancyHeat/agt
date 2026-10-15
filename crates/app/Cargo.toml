@@ -17,12 +17,17 @@ agt-platform.workspace = true
 agt-stt.workspace = true
 agt-polish.workspace = true
 agt-overlay.workspace = true
+agt-telemetry.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std", "tracing-log"] }
-tracing-appender = "0.2"
+tracing-log = { version = "0.2", default-features = false }
 tray-icon = "0.26"
 velopack = "1.2"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+# `agt stats` attaches to the console it was started from (release builds have none).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [features]
 # Optional STT engines/backends; see agt-stt's Cargo.toml and docs/benchmarks.md.

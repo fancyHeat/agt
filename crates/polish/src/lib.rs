@@ -48,20 +48,25 @@ pub fn load(cfg: &PolishConfig, env: &Env) -> std::result::Result<Box<dyn Polish
 fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, String> {
     let base = cfg.base_url().trim_end_matches('/');
     if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err(format!(
-            "polish.base_url must start with http:// or https:// (got {base:?})"
-        ));
+        // Not echoed: a URL may carry credentials, and errors are recorded in agt.db.
+        return Err("polish.base_url must start with http:// or https://".into());
     }
     let key = cfg.api_key();
     if cfg.provider == PolishProvider::Anthropic && key.is_none() {
-        return Err(format!(
-            "no API key for anthropic: set the {} environment variable or polish.api_key",
-            cfg.api_key_var().unwrap_or("ANTHROPIC_API_KEY")
-        ));
+        let var = cfg.api_key_var().unwrap_or("ANTHROPIC_API_KEY");
+        // A key pasted into api_key_env by mistake must not end up in the error (agt.db).
+        return Err(if is_env_var_name(var) {
+            format!(
+                "no API key for anthropic: set the {var} environment variable or polish.api_key"
+            )
+        } else {
+            "no API key for anthropic: the environment variable named in polish.api_key_env is not set or is empty (or set polish.api_key)".into()
+        });
     }
     if key.is_some() && !is_https_or_loopback(base) {
         tracing::warn!(
-            "polish: the API key will be sent unencrypted over plain http to {base}; use https unless that server is on a network you trust"
+            "polish: the API key will be sent unencrypted over plain http to {}; use https unless that server is on a network you trust",
+            host_of(base)
         );
     }
     let api = match cfg.provider {
@@ -71,20 +76,50 @@ fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, Str
     Ok(Box::new(Llm::new(cfg, api, base, key)))
 }
 
-/// `https://...`, or plain http to this machine.
+/// Shown instead of a base URL that doesn't parse (it may still hold credentials).
+pub(crate) const INVALID_URL: &str = "(invalid URL)";
+
+/// The `host[:port]` of a base URL (port only if given): what may be shown or recorded of
+/// it. Never the userinfo (`user:token@`), path or query (`?key=...`), which may carry
+/// credentials; [`INVALID_URL`] if it doesn't parse.
+pub(crate) fn host_of(base: &str) -> String {
+    match url::Url::parse(base).ok().and_then(|u| {
+        let host = u.host_str()?.to_owned();
+        Some(match u.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        })
+    }) {
+        Some(host) => host,
+        None => INVALID_URL.into(),
+    }
+}
+
+/// An environment variable name as people write them (`ANTHROPIC_API_KEY`): safe to show.
+fn is_env_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    s.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// `https://...`, or plain http to this machine (or a URL that doesn't parse: requests to
+/// it fail anyway, so there's nothing to warn about).
 fn is_https_or_loopback(base: &str) -> bool {
-    let Some(rest) = base.strip_prefix("http://") else {
+    let Ok(u) = url::Url::parse(base) else {
         return true;
     };
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    if u.scheme() != "http" {
+        return true;
+    }
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +174,7 @@ impl Polisher for Llm {
             Api::OpenAi => "openai-compatible",
             Api::Anthropic => "anthropic",
         };
-        format!("{provider} {} at {}", self.cfg.model(), self.base)
+        format!("{provider} {} at {}", self.cfg.model(), host_of(&self.base))
     }
 
     /// Sends one short request: loads the model on a local server, opens the (TLS)
@@ -212,7 +247,8 @@ impl Llm {
                 (req, body)
             }
         };
-        tracing::trace!("polish request to {}: {body}", self.url);
+        // Neither the request nor the response is logged: both hold dictated text, and logs
+        // (agt.db events) must never contain any.
         let mut resp = req
             .send(body.to_string())
             .inspect_err(|_| self.reach.check())?;
@@ -221,8 +257,7 @@ impl Llm {
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status.as_u16(), error_message(&body)).into());
         }
-        // The response holds dictated text: only logged at debug, never put in the error.
-        tracing::debug!("polish response: {}", snippet(&body));
+        // The response holds dictated text: never put it in the error.
         let v: Value =
             serde_json::from_str(&body).map_err(|e| format!("malformed response: {e}"))?;
         Ok(match self.api {
@@ -264,8 +299,8 @@ fn parse_anthropic(v: &Value) -> std::result::Result<String, &'static str> {
 }
 
 /// `error.message` (OpenAI and Anthropic both use it). Any other body (e.g. a proxy's HTML
-/// page, which might echo the request) is only described by its size; its start is logged
-/// at debug, since the error ends up in a WARN line.
+/// page, which might echo the request) is only described by its size, since the error ends
+/// up in a WARN event.
 fn error_message(body: &str) -> String {
     let message = serde_json::from_str::<Value>(body)
         .ok()
@@ -275,10 +310,7 @@ fn error_message(body: &str) -> String {
         });
     match message {
         Some(m) => snippet(&m),
-        None => {
-            tracing::debug!("polish error body: {}", snippet(body));
-            format!("non-JSON error body ({} bytes)", body.len())
-        }
+        None => format!("non-JSON error body ({} bytes)", body.len()),
     }
 }
 

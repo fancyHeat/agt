@@ -1,15 +1,17 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: logs, lock (`data_dir`) | models (`models_dir`) |
-//! |---|---|---|---|
-//! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-models` |
-//! | macOS | `~/Library/Application Support/AGT` | same | `<data>/models` |
-//! | other | `$XDG_CONFIG_HOME/agt` | `$XDG_DATA_HOME/agt` | `<data>/models` |
+//! | | config (`config_dir`) | data: instance lock (`data_dir`) | usage history: `agt.db`, `llama-server.log` (`history_dir`) | models (`models_dir`) |
+//! |---|---|---|---|---|
+//! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-data` | `%LOCALAPPDATA%\AGT-models` |
+//! | macOS | `~/Library/Application Support/AGT` | same | same | `<data>/models` |
+//! | other | `$XDG_CONFIG_HOME/agt` | `$XDG_DATA_HOME/agt` | same as data | `<data>/models` |
 //!
-//! On Windows, models live outside `%LOCALAPPDATA%\AGT` because Velopack wipes that folder
-//! when Setup.exe is re-run; multi-GB models must survive reinstalls.
+//! On Windows, models and the usage history live outside `%LOCALAPPDATA%\AGT` because
+//! Velopack wipes that folder when Setup.exe is re-run: multi-GB models and the history must
+//! survive reinstalls. Uninstalling removes `AGT-data` (the app's uninstall hook) but not
+//! the models.
 //!
-//! `AGT_HOME`, if set, replaces all three (models go to `$AGT_HOME/models`); handy for tests
+//! `AGT_HOME`, if set, replaces them all (models go to `$AGT_HOME/models`); handy for tests
 //! and dev runs. `stt.models_dir` in the config overrides the models location.
 
 use std::path::PathBuf;
@@ -19,9 +21,15 @@ pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
 
-/// Holds logs and the instance lock. Machine-local, never roams.
+/// Holds the instance lock. Machine-local, never roams.
 pub fn data_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::data_dir)
+}
+
+/// Holds the usage history, `agt.db`, and `llama-server.log` (see the module docs).
+/// Machine-local; the tray's "Open data folder".
+pub fn history_dir() -> PathBuf {
+    home_override().unwrap_or_else(platform::history_dir)
 }
 
 /// Default location of downloaded models (see the module docs).
@@ -33,8 +41,9 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-pub fn log_dir() -> PathBuf {
-    data_dir().join("logs")
+/// The telemetry database (sessions, dictation metrics, events; see `agt-telemetry`).
+pub fn db_file() -> PathBuf {
+    history_dir().join("agt.db")
 }
 
 fn home_override() -> Option<PathBuf> {
@@ -57,6 +66,9 @@ mod platform {
     pub fn models_dir() -> PathBuf {
         env_dir("LOCALAPPDATA").join("AGT-models")
     }
+    pub fn history_dir() -> PathBuf {
+        env_dir("LOCALAPPDATA").join("AGT-data")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -70,6 +82,9 @@ mod platform {
     }
     pub fn models_dir() -> PathBuf {
         data_dir().join("models")
+    }
+    pub fn history_dir() -> PathBuf {
+        data_dir()
     }
 }
 
@@ -90,5 +105,8 @@ mod platform {
     }
     pub fn models_dir() -> PathBuf {
         data_dir().join("models")
+    }
+    pub fn history_dir() -> PathBuf {
+        data_dir()
     }
 }

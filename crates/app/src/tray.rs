@@ -1,5 +1,6 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, "Copy last
-//! transcript", "Update now", "Open config folder" and "Quit".
+//! transcript", "Update now", "Open config folder", "Open data folder" (where it differs) and
+//! "Quit".
 
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -19,6 +20,8 @@ pub struct Tray {
     pub copy_last: MenuId,
     pub update: MenuId,
     pub open_config: MenuId,
+    /// "Open data folder" (the usage history, agt.db), when it differs from the config folder.
+    pub open_data: Option<MenuId>,
     pub quit: MenuId,
 }
 
@@ -26,11 +29,13 @@ impl Tray {
     /// `config_error`: shown as a disabled menu line so a broken config is noticeable.
     /// `polish`: a disabled info line, e.g. "Polish: off".
     /// `installed`: whether this is a Velopack install (else "Update now" is disabled).
+    /// `data_folder`: whether to offer "Open data folder".
     pub fn new(
         version: &str,
         config_error: bool,
         polish: &str,
         installed: bool,
+        data_folder: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let title = format!("AGT {version}");
         let title_item = MenuItem::new(&title, false, None);
@@ -45,6 +50,7 @@ impl Tray {
             MenuItem::new("Update now (not installed)", false, None)
         };
         let open_config = MenuItem::new("Open config folder", true, None);
+        let open_data = data_folder.then(|| MenuItem::new("Open data folder", true, None));
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::with_items(&[
             &title_item,
@@ -55,7 +61,11 @@ impl Tray {
         if config_error {
             menu.append(&warning)?;
         }
-        menu.append_items(&[&copy_last, &update, &open_config, &quit])?;
+        menu.append_items(&[&copy_last, &update, &open_config])?;
+        if let Some(item) = &open_data {
+            menu.append(item)?;
+        }
+        menu.append(&quit)?;
 
         let builder = TrayIconBuilder::new()
             .with_tooltip(&title)
@@ -76,6 +86,7 @@ impl Tray {
             update: update.id().clone(),
             update_item: update,
             open_config: open_config.id().clone(),
+            open_data: open_data.map(|i| i.id().clone()),
             quit: quit.id().clone(),
         })
     }
