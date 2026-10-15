@@ -11,6 +11,17 @@
 //! Only the encoder runs on the configured device; the preprocessor and the per-step
 //! decoder are tiny and run on the CPU (a GPU round-trip per decoding step costs more than
 //! it saves).
+//!
+//! ## Core ML (macOS)
+//!
+//! With dynamic input shapes, ONNX Runtime's Core ML EP can only take about half of the
+//! encoder (291 partitions) and the rest bounces to the CPU: no faster than the CPU alone. So
+//! for Core ML the encoder's time axis is fixed to [`COREML_WINDOW_SECS`] (ORT free-dimension
+//! overrides): the whole graph then compiles to one ML Program on the GPU. Shorter audio is
+//! zero-padded (the encoder masks by `length`, so padding doesn't change the result) and
+//! longer audio is chunked to the window by `agt-stt`. Core ML needs the fp32 encoder (the
+//! int8 one uses ops it doesn't support). The compiled model is cached next to the model
+//! (`coreml-<frames>/`), so only the first load pays the ~20 s compile.
 
 use crate::{
     models::{self, ModelFile, Progress},
@@ -105,6 +116,22 @@ const V3: ([ModelFile; 4], [ModelFile; 5]) = parakeet_files!(
     encoder_fp32_data: (2435420160, "9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36"),
 );
 
+/// Core ML's fixed encoder window (see the module docs): every chunk is padded to it, so it's
+/// a trade-off. Measured on an M4 (GPU): 5 s ≈ 51 ms, 10 s ≈ 76 ms, 15 s ≈ 104 ms, 25 s ≈
+/// 170 ms per encoder call, vs. ~100 ms (3 s) to ~330 ms (10 s) on the CPU.
+pub const COREML_WINDOW_SECS: f32 = 10.0;
+
+/// Feature frames (10 ms hop, plus one) for [`COREML_WINDOW_SECS`] of audio.
+const COREML_WINDOW_FRAMES: usize = (COREML_WINDOW_SECS * 100.0) as usize + 1;
+
+/// The encoder precision actually used: Core ML always runs the fp32 encoder.
+fn precision(cfg: &SttConfig) -> Precision {
+    match cfg.device {
+        Device::CoreMl => Precision::Fp32,
+        _ => cfg.precision,
+    }
+}
+
 /// The files `cfg` needs, or an error for an unknown model name.
 pub fn files(cfg: &SttConfig) -> Result<&'static [ModelFile]> {
     let set = match cfg.model.as_str() {
@@ -117,7 +144,7 @@ pub fn files(cfg: &SttConfig) -> Result<&'static [ModelFile]> {
             .into());
         }
     };
-    Ok(match cfg.precision {
+    Ok(match precision(cfg) {
         Precision::Int8 => &set.0,
         Precision::Fp32 => &set.1,
     })
@@ -135,6 +162,9 @@ pub struct Parakeet {
     blank: usize,
     /// Prediction-network LSTM state shape, e.g. `[2, 1, 640]`.
     state_shape: [usize; 3],
+    /// Fixed encoder input length in feature frames (Core ML), if any: features are
+    /// zero-padded to it.
+    window: Option<usize>,
 }
 
 impl Parakeet {
@@ -150,7 +180,13 @@ impl Parakeet {
             .iter()
             .position(|t| t == "<blk>")
             .ok_or("vocab.txt has no <blk> token")?;
-        let enc_file = match cfg.precision {
+        let precision = precision(cfg);
+        if precision != cfg.precision {
+            tracing::info!(
+                "stt.device \"coreml\" uses the fp32 encoder (stt.precision is ignored)"
+            );
+        }
+        let enc_file = match precision {
             Precision::Int8 => "encoder-model.int8.onnx",
             Precision::Fp32 => "encoder-model.onnx",
         };
@@ -190,7 +226,7 @@ impl Parakeet {
         let name = format!(
             "{} {} ({})",
             cfg.model,
-            match cfg.precision {
+            match precision {
                 Precision::Int8 => "int8",
                 Precision::Fp32 => "fp32",
             },
@@ -198,6 +234,7 @@ impl Parakeet {
                 (Device::Cpu, _) => "cpu",
                 (_, Device::Cpu) => FALLBACK_SUFFIX,
                 (Device::DirectMl, _) => "directml",
+                (Device::CoreMl, _) => "coreml",
             }
         );
         tracing::info!("loaded {name} in {:.2} s", start.elapsed().as_secs_f64());
@@ -209,6 +246,7 @@ impl Parakeet {
             vocab,
             blank,
             state_shape,
+            window: (device == Device::CoreMl).then_some(COREML_WINDOW_FRAMES),
         })
     }
 }
@@ -221,7 +259,15 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         b = b.with_intra_threads(threads).map_err(|e| e.to_string())?;
     }
     match device {
-        Device::Cpu => {}
+        Device::Cpu => {
+            // `ort` sets ONNX Runtime's automatic device selection to `MaxEfficiency` (= prefer
+            // an NPU) on every session, which on a Mac put a few hundred encoder nodes, and some
+            // of the per-step decoder's, on Core ML (the Neural Engine) even for "cpu". Machines
+            // without an NPU get the CPU either way.
+            b = b
+                .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+                .map_err(|e| e.to_string())?;
+        }
         #[cfg(windows)]
         Device::DirectMl => {
             // DirectML requires sequential execution and no memory-pattern optimization.
@@ -236,6 +282,39 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         }
         #[cfg(not(windows))]
         Device::DirectMl => return Err("device \"directml\" is only available on Windows".into()),
+        #[cfg(target_os = "macos")]
+        Device::CoreMl => {
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            // Fixed shapes (see the module docs). The names are the export's dynamic axes:
+            // batch (both inputs) and time.
+            for (axis, size) in [
+                ("audio_signal_dynamic_axes_1", 1),
+                ("length_dynamic_axes_1", 1),
+                ("audio_signal_dynamic_axes_2", COREML_WINDOW_FRAMES as i64),
+            ] {
+                b = b
+                    .with_dimension_override(axis, size)
+                    .map_err(|e| e.to_string())?;
+            }
+            // The cache is keyed by the model path only: the window size goes in the folder
+            // name so a different window never picks up a stale compiled model.
+            let cache = path
+                .with_file_name(format!("coreml-{COREML_WINDOW_FRAMES}"))
+                .display()
+                .to_string();
+            // GPU: the Neural Engine took 5x longer on this fp32 graph, and "all" adds nothing.
+            let coreml = ort::ep::CoreML::default()
+                .with_model_format(ModelFormat::MLProgram)
+                .with_compute_units(ComputeUnits::CPUAndGPU)
+                .with_model_cache_dir(cache)
+                .build()
+                .error_on_failure();
+            b = b
+                .with_execution_providers([coreml])
+                .map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        Device::CoreMl => return Err("device \"coreml\" is only available on macOS".into()),
     }
     b.commit_from_file(path)
         .map_err(|e| format!("cannot load {}: {e}", path.display()).into())
@@ -291,6 +370,27 @@ impl SttEngine for Parakeet {
         let (feat_shape, feats) = pre["features"].try_extract_tensor::<f32>()?;
         let (_, feat_lens) = pre["features_lens"].try_extract_tensor::<i64>()?;
         let t1 = Instant::now();
+
+        // Fixed-length encoder (Core ML): zero-pad the time axis; `length` keeps the real one.
+        let mut feat_shape = feat_shape.clone();
+        let padded;
+        let mut feats = feats;
+        if let Some(window) = self.window {
+            let (bins, t) = (feat_shape[1] as usize, feat_shape[2] as usize);
+            if t > window {
+                return Err(format!(
+                    "{t} feature frames don't fit the {window}-frame Core ML window (chunking bug)"
+                )
+                .into());
+            }
+            let mut p = vec![0f32; bins * window];
+            for (dst, src) in p.chunks_exact_mut(window).zip(feats.chunks_exact(t)) {
+                dst[..t].copy_from_slice(src);
+            }
+            padded = p;
+            feats = &padded;
+            feat_shape[2] = window as i64;
+        }
 
         // 2. Encoder: [1, D, T'] (channels first).
         let enc = self.encoder.run(ort::inputs![

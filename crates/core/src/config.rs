@@ -4,19 +4,65 @@
 use serde::Deserialize;
 use std::{fs, io, path::Path, path::PathBuf};
 
-/// Written on first run. Kept as text (not serialized) so the comments survive.
-pub const DEFAULT_CONFIG: &str = r#"# AGT configuration. Restart AGT after editing.
+#[cfg(not(target_os = "macos"))]
+macro_rules! platform_hotkey {
+    () => {
+        r#"# Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
+# LeftShift (still work normally in apps), or F13-F24 (e.g. a remapped mouse button; AGT
+# takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
+key = "RightCtrl"
+"#
+    };
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! platform_hotkey {
+    () => {
+        r#"# Hold this key to dictate, release to paste. One of: RightOption, RightCommand, Fn (the
+# Globe key: set System Settings > Keyboard > "Press Globe key to" to "Do Nothing"), which
+# still work normally in apps, or F13-F20 (e.g. a remapped mouse button; AGT takes these keys
+# over). Pressing any other key while holding it (e.g. Esc) cancels.
+key = "RightOption"
+"#
+    };
+}
+
+#[cfg(not(target_os = "macos"))]
+macro_rules! platform_device {
+    () => {
+        r#"# "int8" (650 MB, fast on CPU) or "fp32" (2.5 GB; use with a GPU).
+precision = "int8"
+# Where inference runs: "cpu", or "directml" (any DirectX 12 GPU; Windows only).
+device = "cpu"
+"#
+    };
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! platform_device {
+    () => {
+        r#"# "int8" (650 MB, fast on CPU) or "fp32" (2.5 GB). Device "coreml" always uses fp32.
+precision = "int8"
+# Where inference runs: "coreml" (the GPU, via Core ML; the first start compiles the model for
+# this Mac, ~20 s, once) or "cpu".
+device = "coreml"
+"#
+    };
+}
+
+/// Written on first run. Kept as text (not serialized) so the comments survive. The hotkey
+/// and device parts differ per platform (see `platform_hotkey!` / `platform_device!`).
+pub const DEFAULT_CONFIG: &str = concat!(
+    r#"# AGT configuration. Restart AGT after editing.
 # If this file has an error, AGT starts with defaults (updates off) and logs the error.
 
 # Log verbosity: "error", "warn", "info", "debug" or "trace".
 log_level = "info"
 
 [hotkey]
-# Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
-# LeftShift (still work normally in apps), or F13-F24 (e.g. a remapped mouse button; AGT
-# takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
-key = "RightCtrl"
-# Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
+"#,
+    platform_hotkey!(),
+    r#"# Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
 
 [audio]
@@ -31,11 +77,9 @@ keep_mic_open = false
 engine = "parakeet"
 # "parakeet-tdt-0.6b-v2" (English) or "parakeet-tdt-0.6b-v3" (25 European languages).
 model = "parakeet-tdt-0.6b-v2"
-# "int8" (650 MB, fast on CPU) or "fp32" (2.5 GB; use with a GPU).
-precision = "int8"
-# Where inference runs: "cpu", or "directml" (any DirectX 12 GPU; Windows only).
-device = "cpu"
-# CPU threads for inference; 0 = automatic.
+"#,
+    platform_device!(),
+    r#"# CPU threads for inference; 0 = automatic.
 threads = 0
 # Where models are downloaded to; "" = the default location (see README).
 models_dir = ""
@@ -95,7 +139,23 @@ position = "bottom"
 enabled = true
 # Minutes between update checks (minimum 30).
 check_interval_minutes = 240
-"#;
+"#
+);
+
+/// The default `hotkey.key` on this platform.
+pub const DEFAULT_KEY: &str = if cfg!(target_os = "macos") {
+    "RightOption"
+} else {
+    "RightCtrl"
+};
+
+/// The default `stt.device` on this platform: Core ML on macOS (3-4x faster than the CPU on
+/// an M4), the CPU elsewhere.
+pub const DEFAULT_DEVICE: Device = if cfg!(target_os = "macos") {
+    Device::CoreMl
+} else {
+    Device::Cpu
+};
 
 /// Lower bound for `update.check_interval_minutes`.
 pub const MIN_CHECK_INTERVAL_MINUTES: u64 = 30;
@@ -152,12 +212,15 @@ pub enum Precision {
     Fp32,
 }
 
-/// ONNX Runtime execution provider. Phase 2 adds `cuda` and `coreml`.
+/// ONNX Runtime execution provider for the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Device {
     Cpu,
+    /// Any DirectX 12 GPU (Windows only).
     DirectMl,
+    /// Apple's Core ML: GPU and Neural Engine (macOS only).
+    CoreMl,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -346,7 +409,7 @@ impl Default for Config {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            key: "RightCtrl".into(),
+            key: DEFAULT_KEY.into(),
             min_hold_ms: 150,
         }
     }
@@ -358,7 +421,7 @@ impl Default for SttConfig {
             engine: Engine::Parakeet,
             model: "parakeet-tdt-0.6b-v2".into(),
             precision: Precision::Int8,
-            device: Device::Cpu,
+            device: DEFAULT_DEVICE,
             threads: 0,
             models_dir: String::new(),
         }
@@ -482,6 +545,13 @@ mod tests {
         let c = Config::parse("[stt]\ndevice = \"directml\"\nprecision = \"fp32\"\n").unwrap();
         assert_eq!(c.stt.device, Device::DirectMl);
         assert_eq!(c.stt.precision, Precision::Fp32);
+        assert_eq!(
+            Config::parse("[stt]\ndevice = \"coreml\"")
+                .unwrap()
+                .stt
+                .device,
+            Device::CoreMl
+        );
         assert!(Config::parse("[stt]\ndevice = \"gpu\"").is_err());
         assert!(Config::parse("[stt]\nengine = \"whisper\"").is_err());
     }

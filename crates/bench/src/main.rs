@@ -6,7 +6,7 @@
 //!   --config <file>     start from this config.toml's [stt] section (default: built-in defaults)
 //!   --model <name>      override stt.model
 //!   --precision <p>     override stt.precision (int8 | fp32)
-//!   --device <d>        override stt.device (cpu | directml)
+//!   --device <d>        override stt.device (cpu | directml | coreml)
 //!   --threads <n>       override stt.threads
 //!   --models-dir <dir>  override stt.models_dir
 //!   --runs <n>          transcribe each file n times (default 3); latency = median
@@ -75,6 +75,7 @@ fn run() -> Result<(), String> {
                 cfg.device = match val()?.as_str() {
                     "cpu" => Device::Cpu,
                     "directml" => Device::DirectMl,
+                    "coreml" => Device::CoreMl,
                     d => return Err(format!("unknown device {d}")),
                 }
             }
@@ -84,7 +85,7 @@ fn run() -> Result<(), String> {
             "--no-warmup" => warmup = false,
             "-h" | "--help" => {
                 println!(
-                    "usage: agt-bench [--config f] [--model m] [--precision int8|fp32] [--device cpu|directml] [--threads n] [--models-dir d] [--runs n] [--no-warmup] <dir>"
+                    "usage: agt-bench [--config f] [--model m] [--precision int8|fp32] [--device cpu|directml|coreml] [--threads n] [--models-dir d] [--runs n] [--no-warmup] <dir>"
                 );
                 return Ok(());
             }

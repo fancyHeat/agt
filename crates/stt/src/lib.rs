@@ -9,7 +9,7 @@ pub mod parakeet;
 pub mod tdt;
 
 use agt_core::{
-    config::{Engine, SttConfig},
+    config::{Device, Engine, SttConfig},
     stt::{Result, SttEngine},
 };
 pub use models::Progress;
@@ -25,10 +25,15 @@ pub fn load(cfg: &SttConfig, progress: &mut dyn FnMut(Progress)) -> Result<Box<d
     let engine: Box<dyn SttEngine> = match cfg.engine {
         Engine::Parakeet => Box::new(parakeet::Parakeet::load(cfg, progress)?),
     };
-    // Parakeet: 20-25 s chunks keep full attention cheap (RTF stays ~0.05 at any length).
+    // Parakeet: 20-25 s chunks keep full attention cheap (RTF stays ~0.05 at any length). On
+    // Core ML every chunk is padded to a fixed window, so chunks match that window.
+    let chunk = match cfg.device {
+        Device::CoreMl => parakeet::COREML_WINDOW_SECS,
+        _ => CHUNK_SECS,
+    };
     Ok(Box::new(chunk::Chunked::new(
         engine,
-        CHUNK_SECS,
-        CHUNK_SEARCH_SECS,
+        chunk,
+        CHUNK_SEARCH_SECS.min(chunk / 2.0),
     )))
 }
