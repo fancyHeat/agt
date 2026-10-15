@@ -19,6 +19,11 @@ whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend"]
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["directml"] }
 
+# macOS: the prebuilt runtime already includes the Core ML EP; this exposes it.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["coreml"] }
+libc = "0.2"
+
 [features]
 # CUDA EP (`stt.device = "cuda"`). Switches to pyke's CUDA 13 ONNX Runtime build, which needs
 # the CUDA 13 runtime, cuBLAS, cuFFT and cuDNN 9 DLLs (~1.3 GB) at run time. Not in releases.
