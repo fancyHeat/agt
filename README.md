@@ -1,18 +1,41 @@
-﻿# AGT — Actually Good Transcription
+# AGT — Actually Good Transcription
 
 Local, fast, hold-to-talk dictation for Windows and Apple Silicon macOS, written in Rust.
 Hold a hotkey, speak, release: the text is transcribed on-device and pasted into the focused app.
 
-> Status: Phase 0. The app is a tray icon with auto-update; dictation comes in later phases.
+> Status: Phase 1. Dictation works on Windows (hold **Right Ctrl**). On macOS the app runs
+> (tray, updates) but dictation is not implemented yet.
+
+## Using it
+
+Hold the hotkey (default Right Ctrl), speak, release. AGT transcribes the recording with NVIDIA
+Parakeet TDT 0.6B on your machine and pastes the text into whatever has focus (via the
+clipboard, which it restores afterwards). The tray menu shows the state: loading/downloading
+the model, ready, recording, transcribing, or an error.
+
+- Holds shorter than `hotkey.min_hold_ms` (150 ms) are ignored, so a stray tap never pastes.
+- Pressing any other non-modifier key while holding (Esc, or a shortcut like Right Ctrl+C)
+  cancels the dictation. The hotkey itself is never swallowed.
+- Dictating again while the previous one is still being transcribed is fine: they're
+  transcribed and pasted in order.
+- The first run downloads the model (~670 MB) with progress in the tray; it's SHA-256 verified.
+  If you're offline the tray shows an error; press the hotkey to retry.
+- Pasting into apps running as administrator doesn't work unless AGT runs elevated too.
+- With a Win or Alt hotkey, releasing it may open the Start menu / focus a menu bar; prefer
+  Right Ctrl, CapsLock, F13–F24, etc.
 
 ## Layout
 
 | Crate | Purpose |
 |---|---|
-| `crates/core` (`agt-core`) | Config, paths; later the pipeline and the `SttEngine` / `Polisher` traits |
-| `crates/app` (`agt`) | The binary: tray icon, auto-update, logging; later the overlay |
+| `crates/core` (`agt-core`) | Config, paths, and the `SttEngine` trait |
+| `crates/audio` (`agt-audio`) | Microphone capture (cpal) to 16 kHz mono, resampler, WAV reading, level meter |
+| `crates/platform` (`agt-platform`) | Global hold-to-talk hotkey and clipboard paste (Windows; macOS stubs) |
+| `crates/stt` (`agt-stt`) | STT engines (Parakeet on ONNX Runtime) and model downloads |
+| `crates/app` (`agt`) | The binary: tray, pipeline threads, auto-update, logging |
+| `crates/bench` (`agt-bench`) | Runs an engine over a folder of WAVs: latency, RTF, WER |
 
-Planned: `crates/audio`, `crates/stt-*`, `crates/polish`, `crates/platform`.
+Planned: `crates/polish` (LLM clean-up), more engines, the macOS platform layer, an overlay.
 
 ## Build
 
@@ -21,7 +44,9 @@ cargo run              # debug build, logs also go to stderr
 cargo build --release  # target/release/agt(.exe); no console window on Windows
 ```
 
-Requires stable Rust. Windows needs the MSVC build tools.
+Requires stable Rust. Windows needs the MSVC build tools. ONNX Runtime is downloaded prebuilt
+(and statically linked) by the `ort` crate at build time; on Windows the build also copies
+`DirectML.dll` next to the exe, which must ship with it.
 
 ## Config, logs and data
 
@@ -29,10 +54,13 @@ Requires stable Rust. Windows needs the MSVC build tools.
 |---|---|---|
 | Config | `%APPDATA%\AGT\config.toml` | `~/Library/Application Support/AGT/config.toml` |
 | Logs | `%LOCALAPPDATA%\AGT\logs\agt.YYYY-MM-DD.log` | `~/Library/Application Support/AGT/logs/` |
+| Models | `%LOCALAPPDATA%\AGT-models\<model>\` | `~/Library/Application Support/AGT/models/<model>/` |
 
-Config is in the roaming profile; logs (and, later, models) are machine-local. On Windows
-`%LOCALAPPDATA%\AGT` is also the install directory, so uninstalling removes logs and models too.
-Set `AGT_HOME` to put everything in one other directory (handy for testing).
+Config is in the roaming profile; logs and models are machine-local. On Windows
+`%LOCALAPPDATA%\AGT` is also the install directory (re-running Setup.exe or uninstalling wipes
+it), which is why models live in a separate `AGT-models` folder. `stt.models_dir` overrides the
+models location. Set `AGT_HOME` to put everything (config, logs, lock, models) in one other
+directory (handy for testing).
 
 A commented default config is written on first run; the tray menu has "Open config folder".
 AGT never rewrites an existing config. If the file has an error (including an unknown key), AGT
@@ -40,6 +68,48 @@ logs it, shows "Config error" in the tray menu, and runs with defaults **with up
 typo can't silently re-enable updates you turned off.
 
 Only one AGT runs at a time (lock file `agt.lock` in the data dir); a second launch exits.
+
+### Speech-to-text
+
+`stt.engine = "parakeet"` uses the ONNX export of Parakeet TDT 0.6B
+([`istupakov/parakeet-tdt-0.6b-v2-onnx`](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx),
+or `-v3` for 25 European languages), pinned to a repo revision and hash-checked. Preprocessing
+(NeMo's log-mel, shipped as an ONNX graph), the encoder and greedy TDT decoding run in-process
+on ONNX Runtime.
+
+| Setting | Default | |
+|---|---|---|
+| `stt.model` | `parakeet-tdt-0.6b-v2` | or `parakeet-tdt-0.6b-v3` |
+| `stt.precision` | `int8` | encoder weights; `fp32` is 2.5 GB (decoder is always int8) |
+| `stt.device` | `cpu` | `directml` runs the encoder on any DX12 GPU (Windows) |
+| `stt.threads` | `0` (auto) | CPU threads for inference |
+
+Every dictation logs its timings at info level, e.g.
+`dictation: audio 2.97 s | release→stt 0 ms | stt 157 ms | paste 4 ms | release→paste 161 ms`.
+
+### Microphone
+
+The input stream is built once at start-up (~40 ms) and only *started* while the hotkey is held
+(~4 ms to start, first audio ~5 ms later), so the OS "microphone in use" indicator is off between
+dictations. `audio.keep_mic_open = true` keeps it running instead (no start-up gap, plus the
+last 300 ms before the key press is included), at the cost of the indicator staying on and ~1%
+of one core.
+
+### Benchmark
+
+```sh
+cargo run --release -p agt-bench -- [--model m] [--precision int8|fp32] [--device cpu|directml] [--runs n] [--no-warmup] <dir>
+```
+
+Transcribes every `*.wav` in `<dir>` (any rate/channels) and prints per-file latency, real-time
+factor and transcript, plus WER against `<name>.txt` when present. `AGT_LOG=debug` adds
+per-stage timings (preprocess / encoder / decode).
+
+### Debug: `AGT_TEST_WAV`
+
+If `AGT_TEST_WAV=<file.wav>` is set, every dictation transcribes that file instead of the
+microphone recording (the hotkey, mic, paste and clipboard paths all run as usual). AGT logs a
+warning at start-up when it's set. Used for end-to-end tests without a human speaker.
 
 ### Updates
 
@@ -58,11 +128,14 @@ and no rate limit), with a hard timeout on every request.
 2. Tag that commit on `main` and push: `git tag v0.1.0 origin/main && git push origin v0.1.0`.
 
 The `Release` workflow:
-- **preflight**: fails unless the tag equals the Cargo version and the commit is on `main`, then runs
+- **preflight**: fails unless the tag equals the Cargo version and the commit is on `main` (and rejects
+  prerelease tags such as `v1.2.0-beta`, since the update feed has no prerelease channel), then runs
   fmt, clippy and tests.
 - **build**: builds Windows x64 and macOS arm64 and packages them with [Velopack](https://velopack.io)
   (`vpk pack`, including a delta from the previous release). macOS uses `packaging/macos/Info.plist`
   (version stamped in CI; `LSUIElement`, microphone usage string) and `packaging/macos/agt.entitlements`.
+  Windows ships `DirectML.dll` next to `agt.exe`, and Setup installs the VC++ 2015-2022 runtime
+  if missing (`--framework vcredist143-x64`; the statically linked ONNX Runtime needs `MSVCP140.dll`).
 - **publish**: uploads both channels (`win-x64`, `osx-arm64`) to a draft release, then publishes it once.
 
 Installers: `AGT-win-x64-Setup.exe`, `AGT-osx-arm64-Setup.pkg` (plus portable zips).
