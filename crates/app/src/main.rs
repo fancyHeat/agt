@@ -27,7 +27,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 enum AppEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
-    Status(pipeline::Status),
+    Pipeline(pipeline::Event),
 }
 
 fn main() {
@@ -87,8 +87,8 @@ fn main() {
     }));
 
     let proxy = event_loop.create_proxy();
-    let pipeline = pipeline::start(&config, move |s| {
-        let _ = proxy.send_event(AppEvent::Status(s));
+    let pipeline = pipeline::start(&config, move |e| {
+        let _ = proxy.send_event(AppEvent::Pipeline(e));
     })
     .map_err(|e| {
         tracing::error!("dictation unavailable: {e}");
@@ -108,7 +108,7 @@ fn main() {
         status: status.map(|s| s.to_string()),
         pipeline: pipeline.ok(),
         overlay: None,
-        failures_when_shown: 0,
+        failures_at_start: 0,
         overlay_position: config
             .overlay
             .enabled
@@ -158,8 +158,9 @@ struct App {
     overlay: Option<agt_overlay::Overlay>,
     /// `None` if the overlay is turned off.
     overlay_position: Option<agt_overlay::Position>,
-    /// [`pipeline::Pipeline::failures`] when the overlay last appeared.
-    failures_when_shown: u64,
+    /// The pipeline's failure count when the current dictation started (see
+    /// [`pipeline::Event::Status`]).
+    failures_at_start: u64,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -189,15 +190,28 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
-        if let AppEvent::Status(s) = &event {
-            // Overlay first: it's what the user is looking at on key down.
-            self.update_overlay(s);
-            let s = s.to_string();
-            if let Some(tray) = &self.tray {
-                tray.set_status(&s);
-                tray.set_copy_enabled(self.pipeline.as_ref().is_some_and(|p| p.has_transcript()));
+        if let AppEvent::Pipeline(e) = &event {
+            match e {
+                pipeline::Event::Status(s, failures) => {
+                    // Overlay first: it's what the user is looking at on key down.
+                    self.update_overlay(s, *failures);
+                    let s = s.to_string();
+                    if let Some(tray) = &self.tray {
+                        tray.set_status(&s);
+                    }
+                    self.status = Some(s);
+                }
+                pipeline::Event::Rejected => {
+                    if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
+                        o.flash_error(p.level.get(), Instant::now());
+                    }
+                }
+                pipeline::Event::CopyAvailable(available) => {
+                    if let Some(tray) = &self.tray {
+                        tray.set_copy_enabled(*available);
+                    }
+                }
             }
-            self.status = Some(s);
             return;
         }
         let Some(tray) = &self.tray else { return };
@@ -215,7 +229,7 @@ impl ApplicationHandler<AppEvent> for App {
                 event_loop.exit();
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
-            AppEvent::Menu(_) | AppEvent::Status(_) => {}
+            AppEvent::Menu(_) | AppEvent::Pipeline(_) => {}
         }
     }
 
@@ -243,22 +257,23 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
-    fn update_overlay(&mut self, status: &pipeline::Status) {
+    fn update_overlay(&mut self, status: &pipeline::Status, failures: u64) {
         use agt_overlay::Mode;
         use pipeline::Status;
         let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) else {
             return;
         };
         let was_hidden = overlay.mode() == Mode::Hidden;
-        if was_hidden {
-            self.failures_when_shown = pipeline.failures();
+        if *status == Status::Recording {
+            // Every recording starts a new baseline (also when an error flash is still up).
+            self.failures_at_start = failures;
         }
         let mode = match status {
             Status::Recording => Mode::Recording,
             Status::Transcribing => Mode::Transcribing,
             // A red flash if this dictation failed. An error from before (still shown in the
             // tray after a cancel, a short tap or "no speech") just hides it.
-            Status::Error(_) if pipeline.failures() != self.failures_when_shown => Mode::Error,
+            Status::Error(_) if failures != self.failures_at_start => Mode::Error,
             Status::Error(_) | Status::Ready(_) | Status::Loading(_) => Mode::Hidden,
         };
         overlay.set_mode(mode, pipeline.level.get(), Instant::now());

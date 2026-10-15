@@ -31,7 +31,6 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -80,6 +79,19 @@ impl fmt::Display for Status {
     }
 }
 
+/// What the pipeline reports to the app.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// The status line changed. With the number of failures (microphone, transcription,
+    /// paste) so far: a `Status::Error` is a new failure only if that went up since.
+    Status(Status, u64),
+    /// The hotkey was pressed but no recording started (model not ready, or no microphone);
+    /// the status line says why.
+    Rejected,
+    /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
+    CopyAvailable(bool),
+}
+
 enum Engine {
     Loading(String),
     Ready(Option<String>),
@@ -109,7 +121,7 @@ impl HubState {
 #[derive(Clone)]
 struct Hub {
     state: Arc<Mutex<HubState>>,
-    notify: Arc<dyn Fn(Status) + Send + Sync>,
+    notify: Arc<dyn Fn(Event) + Send + Sync>,
 }
 
 impl Hub {
@@ -130,8 +142,17 @@ impl Hub {
         if s.last.as_ref() != Some(&status) {
             tracing::debug!("status: {status}");
             s.last = Some(status.clone());
-            (self.notify)(status);
+            (self.notify)(Event::Status(status, s.failures));
         }
+    }
+
+    /// The hotkey was pressed but no recording started.
+    fn reject(&self) {
+        (self.notify)(Event::Rejected);
+    }
+
+    fn copy_available(&self, available: bool) {
+        (self.notify)(Event::CopyAvailable(available));
     }
 
     fn engine_ready(&self) -> bool {
@@ -151,19 +172,13 @@ pub struct Pipeline {
     /// One line for the tray about LLM polish, e.g. "Polish: off".
     pub polish_info: String,
     to_paste: Sender<ToPaste>,
-    has_transcript: Arc<AtomicBool>,
     key_down: Arc<Mutex<Option<Instant>>>,
-    hub: Hub,
 }
 
 impl Pipeline {
-    /// Whether there is a transcript for [`Pipeline::copy_last_transcript`].
-    pub fn has_transcript(&self) -> bool {
-        self.has_transcript.load(Ordering::Relaxed)
-    }
-
     /// Puts the last transcript (pasted or not) on the clipboard, for the user to paste by
-    /// hand: the recovery path when a paste failed. It's kept in memory only.
+    /// hand: the recovery path when a paste failed. It's kept in memory only, for
+    /// [`LAST_TRANSCRIPT_TTL`] ([`Event::CopyAvailable`] says when there is one).
     pub fn copy_last_transcript(&self) {
         let _ = self.to_paste.send(ToPaste::CopyLast);
     }
@@ -172,17 +187,13 @@ impl Pipeline {
     pub fn last_key_down(&self) -> Option<Instant> {
         *self.key_down.lock().unwrap()
     }
-
-    /// Counts failures (microphone, transcription, paste): an [`Status::Error`] is a new
-    /// failure only if this went up since.
-    pub fn failures(&self) -> u64 {
-        self.hub.state.lock().unwrap().failures
-    }
 }
 
 struct Job {
     audio: Vec<f32>,
     released: Instant,
+    /// The foreground window at release ([`agt_platform::foreground_window`]).
+    target: Option<usize>,
 }
 
 enum ToStt {
@@ -202,6 +213,7 @@ enum ToPaste {
         stt_end: Instant,
         /// For the timings log line, e.g. "polish 120 ms (polished)"; `None` when off.
         polish: Option<String>,
+        target: Option<usize>,
     },
     /// The user asked for the last transcript on the clipboard (tray menu).
     CopyLast,
@@ -211,7 +223,7 @@ enum ToPaste {
 /// platform without support yet); the model is then not loaded either.
 pub fn start(
     config: &Config,
-    notify: impl Fn(Status) + Send + Sync + 'static,
+    notify: impl Fn(Event) + Send + Sync + 'static,
 ) -> Result<Pipeline, String> {
     let hub = Hub {
         state: Arc::new(Mutex::new(HubState {
@@ -236,7 +248,6 @@ pub fn start(
     let (to_paste, paste_rx) = mpsc::channel::<ToPaste>();
     let level = Level::default();
     let key_down = Arc::new(Mutex::new(None));
-    let has_transcript = Arc::new(AtomicBool::new(false));
 
     let test_wav = load_test_wav();
     let audio = AudioThread {
@@ -256,8 +267,8 @@ pub fn start(
     let (h, cfg, tp) = (hub.clone(), config.clone(), to_paste.clone());
     spawn("stt", move || stt_thread(cfg, h, stt_rx, tp, polisher));
 
-    let (h, cfg, has) = (hub.clone(), config.clone(), has_transcript.clone());
-    spawn("paste", move || paste_thread(cfg, h, paste_rx, has));
+    let (h, cfg) = (hub.clone(), config.clone());
+    spawn("paste", move || paste_thread(cfg, h, paste_rx));
 
     hub.update(|_| {});
     Ok(Pipeline {
@@ -265,9 +276,7 @@ pub fn start(
         level,
         polish_info,
         to_paste,
-        has_transcript,
         key_down,
-        hub,
     })
 }
 
@@ -454,6 +463,7 @@ impl AudioThread {
                 "{} pressed but the model isn't ready; ignoring",
                 self.key.name
             );
+            self.hub.reject();
             return None;
         }
         match recorder.start() {
@@ -470,12 +480,15 @@ impl AudioThread {
                 tracing::error!("cannot start microphone: {e}");
                 self.hub
                     .update(|s| s.fail("microphone unavailable (see log)"));
+                self.hub.reject();
                 None
             }
         }
     }
 
     fn finish_recording(&self, recorder: &mut Recorder, down: Instant, released: Instant) {
+        // Where the text should go; checked again if pasting gets delayed.
+        let target = agt_platform::foreground_window();
         let rec = recorder.stop();
         let held = released.saturating_duration_since(down);
         tracing::debug!(
@@ -500,7 +513,11 @@ impl AudioThread {
             s.recording = false;
             s.pending += 1;
         });
-        let _ = self.to_stt.send(ToStt::Transcribe(Job { audio, released }));
+        let _ = self.to_stt.send(ToStt::Transcribe(Job {
+            audio,
+            released,
+            target,
+        }));
     }
 }
 
@@ -602,6 +619,7 @@ fn stt_thread(
                         text,
                         audio_secs,
                         released: job.released,
+                        target: job.target,
                         stt_start,
                         stt_end,
                         polish,
@@ -669,14 +687,17 @@ impl Saver {
 /// clipboard open while a slow app renders a large copy): wait up to `wait` for the save to
 /// finish, then try once more (issue #3). A save still running after that is a hung app;
 /// retrying would fail the same way.
+///
+/// Also returns whether it waited: the paste is then late, and the user may have moved on to
+/// another window (see [`may_paste`]).
 fn set_clipboard_retrying<T>(
     saver: &mut Saver,
     wait: Duration,
     mut set: impl FnMut() -> Result<T, agt_platform::Error>,
-) -> Result<T, agt_platform::Error> {
+) -> (Result<T, agt_platform::Error>, bool) {
     let err = match set() {
         Err(e) if saver.in_flight.is_some() => e,
-        result => return result,
+        result => return (result, false),
     };
     tracing::info!(
         "clipboard busy while our clipboard save is still running ({err}); waiting for it"
@@ -688,27 +709,96 @@ fn set_clipboard_retrying<T>(
             "clipboard save still running after {} ms; giving up",
             wait.as_millis()
         );
-        return Err(err);
+        return (Err(err), true);
     }
     tracing::info!(
         "clipboard save finished after {:.0} ms; retrying",
         ms(t.elapsed())
     );
-    set()
+    (set(), true)
 }
 
-fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript: Arc<AtomicBool>) {
+/// Whether Ctrl+V may be sent. Normally yes: it goes to whatever has focus, as always. But if
+/// pasting was delayed by waiting for the clipboard (up to ~2.5 s), the user may have switched
+/// to another app meanwhile, and the dictation must not land there: then only if the window
+/// that had focus at release (`at_release`) still has it (`now`).
+fn may_paste(waited: bool, at_release: Option<usize>, now: Option<usize>) -> bool {
+    !waited || (at_release.is_some() && at_release == now)
+}
+
+/// How long the last transcript is kept for "Copy last transcript".
+const LAST_TRANSCRIPT_TTL: Duration = Duration::from_secs(120);
+
+/// The last transcript (pasted or not), for "Copy last transcript": in memory only, and
+/// forgotten after [`LAST_TRANSCRIPT_TTL`].
+#[derive(Default)]
+struct LastTranscript(Option<(String, Instant)>);
+
+impl LastTranscript {
+    fn set(&mut self, text: &str, now: Instant) {
+        self.0 = Some((text.to_owned(), now));
+    }
+
+    fn get(&self, now: Instant) -> Option<&str> {
+        self.0
+            .as_ref()
+            .filter(|(_, at)| now < *at + LAST_TRANSCRIPT_TTL)
+            .map(|(t, _)| t.as_str())
+    }
+
+    /// When it has to be forgotten.
+    fn deadline(&self) -> Option<Instant> {
+        self.0.as_ref().map(|(_, at)| *at + LAST_TRANSCRIPT_TTL)
+    }
+
+    /// Forgets it if it's due; returns whether it did.
+    fn expire(&mut self, now: Instant) -> bool {
+        if self.0.is_some() && self.get(now).is_none() {
+            self.0 = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// Ends the tray text of every paste failure: the transcript can still be had.
+const USE_COPY: &str = "use Copy last transcript";
+const COPY_FAILED: &str = "clipboard busy; last transcript not copied";
+
+/// Errors that a successful "Copy last transcript" makes moot.
+fn is_paste_error(e: &str) -> bool {
+    e.ends_with(USE_COPY) || e == COPY_FAILED
+}
+
+/// Puts the user's clipboard back right away (our text went nowhere).
+fn undo_clipboard(
+    saver: &mut Saver,
+    token: &PasteToken,
+    pending_restore: &mut Option<(PasteToken, Instant)>,
+) {
+    if let Some(snap) = saver.saved.take() {
+        if let Err(e) = agt_platform::restore_clipboard(&snap, token) {
+            tracing::warn!("cannot restore clipboard: {e}");
+        }
+        *pending_restore = None;
+    }
+}
+
+fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
     let restore_after = Duration::from_millis(config.paste.restore_clipboard_ms);
     let restore = !restore_after.is_zero();
     let mut saver = Saver::default();
     // Our paste that still has to be undone, and when.
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
-    // The last transcript (pasted or not), for "Copy last transcript". Memory only.
-    let mut last: Option<String> = None;
+    let mut last = LastTranscript::default();
 
     loop {
-        let msg = match &pending_restore {
-            Some((_, at)) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+        let deadline = [pending_restore.as_ref().map(|(_, at)| *at), last.deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let msg = match deadline {
+            Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match msg {
@@ -727,6 +817,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript:
                 stt_start,
                 stt_end,
                 polish,
+                target,
             }) => {
                 let paste_start = Instant::now();
                 if restore && pending_restore.is_none() {
@@ -747,9 +838,11 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript:
                         tracing::warn!("clipboard could not be saved; it won't be restored");
                     }
                 }
-                last = Some(text.clone());
-                has_transcript.store(true, Ordering::Relaxed);
-                let set = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
+                if last.get(paste_start).is_none() {
+                    hub.copy_available(true);
+                }
+                last.set(&text, paste_start);
+                let (set, waited) = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
                     agt_platform::set_clipboard_text(&text)
                 });
                 if saver.saved.is_none() && saver.in_flight.is_some() {
@@ -759,16 +852,15 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript:
                 }
                 let result = match set {
                     Err(e) => Err(PasteError::ClipboardBusy(e)),
+                    Ok(token) if !may_paste(waited, target, agt_platform::foreground_window()) => {
+                        // Don't leave the user's clipboard replaced by text that went nowhere.
+                        undo_clipboard(&mut saver, &token, &mut pending_restore);
+                        Err(PasteError::WindowChanged)
+                    }
                     Ok(token) => match agt_platform::send_paste() {
                         Ok(()) => Ok(token),
                         Err(e) => {
-                            // Don't leave the user's clipboard replaced by text that went nowhere.
-                            if let Some(snap) = saver.saved.take() {
-                                if let Err(re) = agt_platform::restore_clipboard(&snap, &token) {
-                                    tracing::warn!("cannot restore clipboard: {re}");
-                                }
-                                pending_restore = None;
-                            }
+                            undo_clipboard(&mut saver, &token, &mut pending_restore);
                             Err(PasteError::Blocked(e))
                         }
                     },
@@ -778,7 +870,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript:
                     s.pending -= 1;
                     match &result {
                         Ok(_) => s.error = None,
-                        Err(e) => s.fail(e.tray_text()),
+                        Err(e) => s.fail(&e.tray_text()),
                     }
                 });
                 match result {
@@ -808,12 +900,23 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript:
                 }
             }
             Ok(ToPaste::CopyLast) => {
-                let Some(text) = &last else { continue };
-                match agt_platform::set_clipboard_text(text) {
+                let Some(text) = last.get(Instant::now()) else {
+                    tracing::info!("no transcript to copy (none yet, or forgotten)");
+                    continue;
+                };
+                // Like our pasted text, it's kept out of Win+V history and clipboard managers.
+                let (set, _) = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
+                    agt_platform::set_clipboard_text(text)
+                });
+                match set {
                     Ok(_) => {
                         // The user wants it there now: don't put the old clipboard back.
                         pending_restore = None;
-                        hub.update(|s| s.error = None);
+                        hub.update(|s| {
+                            if s.error.as_deref().is_some_and(is_paste_error) {
+                                s.error = None;
+                            }
+                        });
                         tracing::info!(
                             "last transcript ({} chars) copied to the clipboard",
                             text.chars().count()
@@ -821,11 +924,20 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, has_transcript:
                     }
                     Err(e) => {
                         tracing::error!("cannot copy the last transcript: {e}");
-                        hub.update(|s| s.fail("clipboard busy; transcript not copied"));
+                        // Shown in the tray, but not a dictation failure (no overlay flash).
+                        hub.update(|s| s.error = Some(COPY_FAILED.into()));
                     }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                if last.expire(now) {
+                    tracing::debug!("last transcript forgotten");
+                    hub.copy_available(false);
+                }
+                if pending_restore.as_ref().is_none_or(|(_, at)| now < *at) {
+                    continue;
+                }
                 saver.collect(Duration::ZERO);
                 if let (Some((token, _)), Some(snap)) = (pending_restore.take(), saver.saved.take())
                 {
@@ -848,18 +960,20 @@ enum PasteError {
     ClipboardBusy(agt_platform::Error),
     /// Ctrl+V could not be sent, typically because the focused app runs as administrator.
     Blocked(agt_platform::Error),
+    /// Pasting was delayed and the user switched windows meanwhile.
+    WindowChanged,
 }
 
 impl PasteError {
-    fn tray_text(&self) -> &'static str {
-        match self {
+    fn tray_text(&self) -> String {
+        let what = match self {
             PasteError::ClipboardBusy(_) => {
-                "clipboard busy (another app is holding it); not pasted - use Copy last transcript"
+                "clipboard busy (another app is holding it); not pasted"
             }
-            PasteError::Blocked(_) => {
-                "paste blocked (admin window?); clipboard restored - use Copy last transcript"
-            }
-        }
+            PasteError::Blocked(_) => "paste blocked (admin window?); clipboard restored",
+            PasteError::WindowChanged => "not pasted: the window changed while waiting",
+        };
+        format!("{what} - {USE_COPY}")
     }
 }
 
@@ -868,6 +982,10 @@ impl fmt::Display for PasteError {
         match self {
             PasteError::ClipboardBusy(e) => write!(f, "cannot put the text on the clipboard: {e}"),
             PasteError::Blocked(e) => write!(f, "cannot send Ctrl+V: {e}"),
+            PasteError::WindowChanged => write!(
+                f,
+                "the clipboard was busy and another window got focus meanwhile; not pasting there"
+            ),
         }
     }
 }
@@ -944,7 +1062,7 @@ mod tests {
         let mut saver = saver_finishing_after(Some(Duration::from_millis(50)));
         let mut calls = 0;
         let t = Instant::now();
-        let r = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
+        let (r, waited) = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
             calls += 1;
             if calls == 1 {
                 Err("busy".into())
@@ -953,6 +1071,10 @@ mod tests {
             }
         });
         assert_eq!(r.unwrap(), 2);
+        assert!(
+            waited,
+            "the paste is late: the caller must re-check the window"
+        );
         assert!(saver.in_flight.is_none(), "save collected");
         assert!(
             t.elapsed() < Duration::from_secs(1),
@@ -964,11 +1086,13 @@ mod tests {
     fn busy_clipboard_without_our_save_fails_at_once() {
         let mut saver = Saver::default();
         let mut calls = 0;
-        let r: Result<(), _> = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
-            calls += 1;
-            Err("busy".into())
-        });
+        let (r, waited): (Result<(), _>, _) =
+            set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
+                calls += 1;
+                Err("busy".into())
+            });
         assert!(r.is_err());
+        assert!(!waited);
         assert_eq!(calls, 1, "someone else holds it: no point waiting");
     }
 
@@ -977,7 +1101,7 @@ mod tests {
         let mut saver = saver_finishing_after(None);
         let mut calls = 0;
         let t = Instant::now();
-        let r: Result<(), _> =
+        let (r, _): (Result<(), _>, _) =
             set_clipboard_retrying(&mut saver, Duration::from_millis(100), || {
                 calls += 1;
                 Err("busy".into())
@@ -995,10 +1119,11 @@ mod tests {
     fn retry_failing_again_reports_the_error() {
         let mut saver = saver_finishing_after(Some(Duration::ZERO));
         let mut calls = 0;
-        let r: Result<(), _> = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
-            calls += 1;
-            Err("busy".into())
-        });
+        let (r, _): (Result<(), _>, _) =
+            set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
+                calls += 1;
+                Err("busy".into())
+            });
         assert!(r.is_err());
         assert_eq!(calls, 2, "exactly one retry");
     }
@@ -1007,9 +1132,56 @@ mod tests {
     fn success_does_not_wait_for_a_running_save() {
         let mut saver = saver_finishing_after(None);
         let t = Instant::now();
-        let r = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || Ok(()));
+        let (r, waited) = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || Ok(()));
         assert!(r.is_ok());
+        assert!(!waited);
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn late_paste_only_into_the_window_that_had_focus_at_release() {
+        // Not delayed: paste wherever focus is, as always.
+        assert!(may_paste(false, Some(1), Some(2)));
+        assert!(may_paste(false, None, None));
+        // Delayed by the busy-clipboard wait: only if focus didn't move.
+        assert!(may_paste(true, Some(1), Some(1)));
+        assert!(!may_paste(true, Some(1), Some(2)), "user switched apps");
+        assert!(!may_paste(true, Some(1), None));
+        assert!(!may_paste(true, None, None), "can't tell: don't risk it");
+    }
+
+    #[test]
+    fn last_transcript_is_forgotten_after_the_ttl() {
+        let t = Instant::now();
+        let mut last = LastTranscript::default();
+        assert_eq!(last.get(t), None);
+        assert_eq!(last.deadline(), None);
+        last.set("hello", t);
+        assert_eq!(last.get(t + LAST_TRANSCRIPT_TTL / 2), Some("hello"));
+        assert_eq!(last.deadline(), Some(t + LAST_TRANSCRIPT_TTL));
+        assert!(!last.expire(t + LAST_TRANSCRIPT_TTL / 2));
+        assert_eq!(
+            last.get(t + LAST_TRANSCRIPT_TTL),
+            None,
+            "expired on read too"
+        );
+        assert!(last.expire(t + LAST_TRANSCRIPT_TTL));
+        assert_eq!(last.deadline(), None, "gone from memory; no more wake-ups");
+        assert!(!last.expire(t + LAST_TRANSCRIPT_TTL * 2));
+    }
+
+    #[test]
+    fn copy_clears_only_paste_errors() {
+        for e in [
+            PasteError::ClipboardBusy("x".into()),
+            PasteError::Blocked("x".into()),
+            PasteError::WindowChanged,
+        ] {
+            assert!(is_paste_error(&e.tray_text()));
+        }
+        assert!(is_paste_error(COPY_FAILED));
+        assert!(!is_paste_error("microphone unavailable (see log)"));
+        assert!(!is_paste_error("transcription failed (see log)"));
     }
 
     #[test]

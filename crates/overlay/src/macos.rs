@@ -9,10 +9,14 @@
 //! - `hidesOnDeactivate = false`: panels hide when their app deactivates by default, and AGT
 //!   (an accessory app) is never active.
 //!
-//! The pill goes on `NSScreen.mainScreen`, the screen with the keyboard focus.
+//! The pill goes on `NSScreen.mainScreen`: the screen with the keyboard focus when "Displays
+//! have separate Spaces" is on (the default), otherwise the primary display.
 
 use crate::{Error, Surface, canvas::Canvas};
-use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, rc::Retained};
+use objc2::{
+    AllocAnyThread, MainThreadMarker, MainThreadOnly,
+    rc::{Retained, autoreleasepool},
+};
 use objc2_app_kit::{
     NSBackingStoreType, NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSImage, NSImageScaling,
     NSImageView, NSPanel, NSScreen, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior,
@@ -30,6 +34,8 @@ pub struct Window {
     margin: f64,
     top: bool,
     frame: Option<NSRect>,
+    /// Reused across frames while the pixel size stays the same.
+    bitmap: Option<(Retained<NSBitmapImageRep>, (usize, usize))>,
     visible: bool,
 }
 
@@ -51,6 +57,7 @@ impl Window {
         panel.setBackgroundColor(Some(&NSColor::clearColor()));
         panel.setHasShadow(false);
         panel.setIgnoresMouseEvents(true);
+        // Not `setFloatingPanel(true)`: that would reset the level to NSFloatingWindowLevel.
         panel.setLevel(NSStatusWindowLevel);
         panel.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -59,7 +66,6 @@ impl Window {
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
         panel.setHidesOnDeactivate(false);
-        panel.setFloatingPanel(true);
         panel.setBecomesKeyOnlyIfNeeded(true);
 
         let view = NSImageView::new(mtm);
@@ -75,6 +81,7 @@ impl Window {
             margin: 0.0,
             top: false,
             frame: None,
+            bitmap: None,
             visible: false,
         })
     }
@@ -95,6 +102,21 @@ impl Surface for Window {
     }
 
     fn present(&mut self, canvas: &Canvas) {
+        // `setImage` etc. autorelease objects; drain them every frame, not when the run loop
+        // gets to it.
+        autoreleasepool(|_| self.present_inner(canvas));
+    }
+
+    fn hide(&mut self) {
+        if self.visible {
+            self.panel.orderOut(None);
+            self.visible = false;
+        }
+    }
+}
+
+impl Window {
+    fn present_inner(&mut self, canvas: &Canvas) {
         let (w, h) = (canvas.width(), canvas.height());
         let size = NSSize::new(w as f64 / self.scale, h as f64 / self.scale);
         let s = self.screen;
@@ -112,25 +134,32 @@ impl Surface for Window {
             self.frame = Some(frame);
         }
 
-        // An RGBA (premultiplied, alpha last) bitmap that owns its pixel buffer.
-        let Some(rep) = (unsafe {
-            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-                NSBitmapImageRep::alloc(),
-                std::ptr::null_mut(),
-                w as isize,
-                h as isize,
-                8,
-                4,
-                true,
-                false,
-                NSDeviceRGBColorSpace,
-                (w * 4) as isize,
-                32,
-            )
-        }) else {
-            tracing::warn!("overlay: cannot create bitmap");
-            return;
-        };
+        // One bitmap (RGBA, premultiplied, alpha last, owning its buffer), reused while the
+        // size stays the same. Phase 4 to verify: if AppKit shows stale frames because it
+        // cached the rep's pixels, create the rep per frame instead.
+        if self.bitmap.as_ref().is_none_or(|(_, size)| *size != (w, h)) {
+            let rep = unsafe {
+                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                    NSBitmapImageRep::alloc(),
+                    std::ptr::null_mut(),
+                    w as isize,
+                    h as isize,
+                    8,
+                    4,
+                    true,
+                    false,
+                    NSDeviceRGBColorSpace,
+                    (w * 4) as isize,
+                    32,
+                )
+            };
+            let Some(rep) = rep else {
+                tracing::warn!("overlay: cannot create bitmap");
+                return;
+            };
+            self.bitmap = Some((rep, (w, h)));
+        }
+        let Some((rep, _)) = &self.bitmap else { return };
         let data = rep.bitmapData();
         if data.is_null() {
             return;
@@ -145,8 +174,9 @@ impl Surface for Window {
                 (px >> 24) as u8,
             ]);
         }
+        // A fresh (small) NSImage per frame so the view doesn't keep drawing a cached one.
         let image = NSImage::initWithSize(NSImage::alloc(), size);
-        image.addRepresentation(&rep);
+        image.addRepresentation(rep);
         self.view.setImage(Some(&image));
 
         if !self.visible {
@@ -154,11 +184,11 @@ impl Surface for Window {
             self.visible = true;
         }
     }
+}
 
-    fn hide(&mut self) {
-        if self.visible {
-            self.panel.orderOut(None);
-            self.visible = false;
-        }
+impl Drop for Window {
+    fn drop(&mut self) {
+        self.panel.orderOut(None);
+        self.panel.close();
     }
 }

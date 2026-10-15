@@ -16,7 +16,8 @@ the model, ready, recording, transcribing, or an error.
 
 While you hold the key, a small bar near the bottom of the screen shows a live waveform; after
 you release, it shows a sweeping highlight until the text is pasted, then disappears (a short
-red flash means the dictation failed; the tray says why). It never takes focus or catches
+red flash means the dictation failed, or that the key press couldn't start one, e.g. the model
+is still loading or there's no microphone; the tray says why). It never takes focus or catches
 clicks.
 
 | Recording | Transcribing | Failed |
@@ -44,9 +45,13 @@ clicks.
 - Pasting into apps running as administrator doesn't work unless AGT runs elevated too; AGT
   then puts your clipboard back and shows an error in the tray.
 - If a paste fails, nothing is lost: tray → **Copy last transcript** puts the last transcript on
-  the clipboard so you can paste it yourself. (It's kept in memory only, never on disk.)
+  the clipboard so you can paste it yourself. It's kept in memory only (never on disk) and
+  forgotten after 2 minutes. Like the pasted text, the copy is kept out of Windows clipboard
+  history (Win+V) and clipboard managers, on purpose: dictation can be private.
 - Right after copying something large from an app that renders it lazily (e.g. a big Excel
   range), the clipboard can stay busy for a while; AGT waits up to 2 s for it before pasting.
+  If you switched to another window meanwhile, it doesn't paste there (the tray says so; use
+  Copy last transcript).
 
 ## Layout
 

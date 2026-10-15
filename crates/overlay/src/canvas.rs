@@ -9,17 +9,6 @@ impl Rgba {
     pub fn with_alpha(self, a: f32) -> Self {
         Rgba(self.0, self.1, self.2, a)
     }
-
-    /// Linear blend towards `other` by `t` (0 = self).
-    pub fn mix(self, other: Rgba, t: f32) -> Self {
-        let l = |a: f32, b: f32| a + (b - a) * t;
-        Rgba(
-            l(self.0, other.0),
-            l(self.1, other.1),
-            l(self.2, other.2),
-            l(self.3, other.3),
-        )
-    }
 }
 
 /// Premultiplied ARGB pixels, one `u32` each (`0xAARRGGBB`; in memory on little-endian that's
@@ -51,16 +40,12 @@ impl Canvas {
         &self.pixels
     }
 
-    /// Resizes (contents are then undefined) and clears to transparent.
+    /// Resizes and clears to transparent.
     pub fn reset(&mut self, width: usize, height: usize) {
         self.width = width;
         self.height = height;
         self.pixels.clear();
         self.pixels.resize(width * height, 0);
-    }
-
-    pub fn clear(&mut self) {
-        self.pixels.fill(0);
     }
 
     /// Becomes a copy of `other` (same size and pixels), reusing the allocation.

@@ -34,7 +34,8 @@ pub enum Mode {
     Recording,
     /// Waiting for the transcript to be pasted.
     Transcribing,
-    /// Something failed: a red flash for [`ERROR_FOR`], then hidden. Ignored while hidden.
+    /// Something failed: a red flash for [`ERROR_FOR`], then hidden. `set_mode` ignores it
+    /// while hidden (nothing on screen failed); [`Overlay::flash_error`] shows it anyway.
     Error,
 }
 
@@ -117,6 +118,18 @@ impl Overlay {
             Mode::Error if self.mode == Mode::Hidden => return,
             _ => {}
         }
+        self.enter(mode, level, now);
+    }
+
+    /// Flashes the error state even if hidden: for a key press that couldn't start a
+    /// recording (no microphone, model not ready), which would otherwise show nothing.
+    pub fn flash_error(&mut self, level: f32, now: Instant) {
+        if self.mode != Mode::Error {
+            self.enter(Mode::Error, level, now);
+        }
+    }
+
+    fn enter(&mut self, mode: Mode, level: f32, now: Instant) {
         let showing = self.mode == Mode::Hidden;
         if showing {
             // Pick the screen (and so the scale) each time it appears.
@@ -290,5 +303,18 @@ mod tests {
         assert_eq!(o.mode(), Mode::Hidden);
         assert!(!log.borrow().visible);
         assert_eq!(o.next_frame(), None);
+    }
+
+    #[test]
+    fn flash_error_shows_even_from_hidden_then_hides() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.flash_error(0.0, t);
+        assert_eq!(o.mode(), Mode::Error);
+        assert!(log.borrow().visible);
+        assert_eq!(log.borrow().places, 1);
+        o.tick(0.0, t + ERROR_FOR);
+        assert_eq!(o.mode(), Mode::Hidden);
+        assert!(!log.borrow().visible);
     }
 }
