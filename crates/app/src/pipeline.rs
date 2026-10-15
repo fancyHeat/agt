@@ -487,7 +487,7 @@ impl AudioThread {
     }
 
     fn finish_recording(&self, recorder: &mut Recorder, down: Instant, released: Instant) {
-        // Where the text should go; checked again if pasting gets delayed.
+        // Where the text should go: pasting is skipped if focus has moved by then.
         let target = agt_platform::foreground_window();
         let rec = recorder.stop();
         let held = released.saturating_duration_since(down);
@@ -687,17 +687,14 @@ impl Saver {
 /// clipboard open while a slow app renders a large copy): wait up to `wait` for the save to
 /// finish, then try once more (issue #3). A save still running after that is a hung app;
 /// retrying would fail the same way.
-///
-/// Also returns whether it waited: the paste is then late, and the user may have moved on to
-/// another window (see [`may_paste`]).
 fn set_clipboard_retrying<T>(
     saver: &mut Saver,
     wait: Duration,
     mut set: impl FnMut() -> Result<T, agt_platform::Error>,
-) -> (Result<T, agt_platform::Error>, bool) {
+) -> Result<T, agt_platform::Error> {
     let err = match set() {
         Err(e) if saver.in_flight.is_some() => e,
-        result => return (result, false),
+        result => return result,
     };
     tracing::info!(
         "clipboard busy while our clipboard save is still running ({err}); waiting for it"
@@ -709,21 +706,26 @@ fn set_clipboard_retrying<T>(
             "clipboard save still running after {} ms; giving up",
             wait.as_millis()
         );
-        return (Err(err), true);
+        return Err(err);
     }
     tracing::info!(
         "clipboard save finished after {:.0} ms; retrying",
         ms(t.elapsed())
     );
-    (set(), true)
+    set()
 }
 
-/// Whether Ctrl+V may be sent. Normally yes: it goes to whatever has focus, as always. But if
-/// pasting was delayed by waiting for the clipboard (up to ~2.5 s), the user may have switched
-/// to another app meanwhile, and the dictation must not land there: then only if the window
-/// that had focus at release (`at_release`) still has it (`now`).
-fn may_paste(waited: bool, at_release: Option<usize>, now: Option<usize>) -> bool {
-    !waited || (at_release.is_some() && at_release == now)
+/// Whether Ctrl+V may be sent. Between key release and paste there can be seconds
+/// (transcription, LLM polish, a busy clipboard), and the user may have switched to another
+/// app meanwhile: the dictation must not land there. So only paste if the window that had
+/// focus at release (`at_release`) still has it (`now`; a `None` now means focus is in
+/// transit, e.g. mid Alt+Tab, so no).
+///
+/// If the window at release is unknown (`None`: no foreground window at that moment, e.g.
+/// the desktop or a focus change in progress, or a platform without the check), there's
+/// nothing to compare with: paste as before, rather than never pasting.
+fn may_paste(at_release: Option<usize>, now: Option<usize>) -> bool {
+    at_release.is_none() || at_release == now
 }
 
 /// How long the last transcript is kept for "Copy last transcript".
@@ -842,22 +844,30 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                     hub.copy_available(true);
                 }
                 last.set(&text, paste_start);
-                let (set, waited) = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
-                    agt_platform::set_clipboard_text(&text)
-                });
-                if saver.saved.is_none() && saver.in_flight.is_some() {
-                    tracing::warn!(
-                        "clipboard not saved in time; it won't be restored unless the save finishes first"
-                    );
-                }
+                // Focus already moved on: don't even touch the clipboard.
+                let set = if may_paste(target, agt_platform::foreground_window()) {
+                    let set = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
+                        agt_platform::set_clipboard_text(&text)
+                    });
+                    if saver.saved.is_none() && saver.in_flight.is_some() {
+                        tracing::warn!(
+                            "clipboard not saved in time; it won't be restored unless the save finishes first"
+                        );
+                    }
+                    Some(set)
+                } else {
+                    None
+                };
                 let result = match set {
-                    Err(e) => Err(PasteError::ClipboardBusy(e)),
-                    Ok(token) if !may_paste(waited, target, agt_platform::foreground_window()) => {
+                    None => Err(PasteError::WindowChanged),
+                    Some(Err(e)) => Err(PasteError::ClipboardBusy(e)),
+                    // Checked again right before Ctrl+V: setting the clipboard can take seconds.
+                    Some(Ok(token)) if !may_paste(target, agt_platform::foreground_window()) => {
                         // Don't leave the user's clipboard replaced by text that went nowhere.
                         undo_clipboard(&mut saver, &token, &mut pending_restore);
                         Err(PasteError::WindowChanged)
                     }
-                    Ok(token) => match agt_platform::send_paste() {
+                    Some(Ok(token)) => match agt_platform::send_paste() {
                         Ok(()) => Ok(token),
                         Err(e) => {
                             undo_clipboard(&mut saver, &token, &mut pending_restore);
@@ -905,7 +915,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                     continue;
                 };
                 // Like our pasted text, it's kept out of Win+V history and clipboard managers.
-                let (set, _) = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
+                let set = set_clipboard_retrying(&mut saver, BUSY_SAVE_WAIT, || {
                     agt_platform::set_clipboard_text(text)
                 });
                 match set {
@@ -971,7 +981,7 @@ impl PasteError {
                 "clipboard busy (another app is holding it); not pasted"
             }
             PasteError::Blocked(_) => "paste blocked (admin window?); clipboard restored",
-            PasteError::WindowChanged => "not pasted: the window changed while waiting",
+            PasteError::WindowChanged => "not pasted: focus moved to another window",
         };
         format!("{what} - {USE_COPY}")
     }
@@ -984,7 +994,7 @@ impl fmt::Display for PasteError {
             PasteError::Blocked(e) => write!(f, "cannot send Ctrl+V: {e}"),
             PasteError::WindowChanged => write!(
                 f,
-                "the clipboard was busy and another window got focus meanwhile; not pasting there"
+                "another window got focus since the key was released; not pasting there"
             ),
         }
     }
@@ -1062,7 +1072,7 @@ mod tests {
         let mut saver = saver_finishing_after(Some(Duration::from_millis(50)));
         let mut calls = 0;
         let t = Instant::now();
-        let (r, waited) = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
+        let r = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
             calls += 1;
             if calls == 1 {
                 Err("busy".into())
@@ -1071,10 +1081,6 @@ mod tests {
             }
         });
         assert_eq!(r.unwrap(), 2);
-        assert!(
-            waited,
-            "the paste is late: the caller must re-check the window"
-        );
         assert!(saver.in_flight.is_none(), "save collected");
         assert!(
             t.elapsed() < Duration::from_secs(1),
@@ -1086,13 +1092,11 @@ mod tests {
     fn busy_clipboard_without_our_save_fails_at_once() {
         let mut saver = Saver::default();
         let mut calls = 0;
-        let (r, waited): (Result<(), _>, _) =
-            set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
-                calls += 1;
-                Err("busy".into())
-            });
+        let r: Result<(), _> = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
+            calls += 1;
+            Err("busy".into())
+        });
         assert!(r.is_err());
-        assert!(!waited);
         assert_eq!(calls, 1, "someone else holds it: no point waiting");
     }
 
@@ -1101,7 +1105,7 @@ mod tests {
         let mut saver = saver_finishing_after(None);
         let mut calls = 0;
         let t = Instant::now();
-        let (r, _): (Result<(), _>, _) =
+        let r: Result<(), _> =
             set_clipboard_retrying(&mut saver, Duration::from_millis(100), || {
                 calls += 1;
                 Err("busy".into())
@@ -1119,11 +1123,10 @@ mod tests {
     fn retry_failing_again_reports_the_error() {
         let mut saver = saver_finishing_after(Some(Duration::ZERO));
         let mut calls = 0;
-        let (r, _): (Result<(), _>, _) =
-            set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
-                calls += 1;
-                Err("busy".into())
-            });
+        let r: Result<(), _> = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || {
+            calls += 1;
+            Err("busy".into())
+        });
         assert!(r.is_err());
         assert_eq!(calls, 2, "exactly one retry");
     }
@@ -1132,22 +1135,20 @@ mod tests {
     fn success_does_not_wait_for_a_running_save() {
         let mut saver = saver_finishing_after(None);
         let t = Instant::now();
-        let (r, waited) = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || Ok(()));
+        let r = set_clipboard_retrying(&mut saver, Duration::from_secs(2), || Ok(()));
         assert!(r.is_ok());
-        assert!(!waited);
         assert!(t.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
-    fn late_paste_only_into_the_window_that_had_focus_at_release() {
-        // Not delayed: paste wherever focus is, as always.
-        assert!(may_paste(false, Some(1), Some(2)));
-        assert!(may_paste(false, None, None));
-        // Delayed by the busy-clipboard wait: only if focus didn't move.
-        assert!(may_paste(true, Some(1), Some(1)));
-        assert!(!may_paste(true, Some(1), Some(2)), "user switched apps");
-        assert!(!may_paste(true, Some(1), None));
-        assert!(!may_paste(true, None, None), "can't tell: don't risk it");
+    fn paste_only_into_the_window_that_had_focus_at_release() {
+        assert!(may_paste(Some(1), Some(1)), "same window: paste");
+        assert!(!may_paste(Some(1), Some(2)), "user switched apps");
+        assert!(!may_paste(Some(1), None), "focus in transit: don't");
+        // Unknown at release (no foreground window, or no platform support): nothing to
+        // compare with, so paste as before instead of never pasting.
+        assert!(may_paste(None, None));
+        assert!(may_paste(None, Some(2)));
     }
 
     #[test]

@@ -50,8 +50,10 @@ clicks.
   history (Win+V) and clipboard managers, on purpose: dictation can be private.
 - Right after copying something large from an app that renders it lazily (e.g. a big Excel
   range), the clipboard can stay busy for a while; AGT waits up to 2 s for it before pasting.
-  If you switched to another window meanwhile, it doesn't paste there (the tray says so; use
-  Copy last transcript).
+- AGT only pastes into the window that had focus when you released the key. If you switch to
+  another window before the text is ready (transcription, LLM polish or a busy clipboard can
+  take a few seconds), it doesn't paste there: the tray says so, and Copy last transcript has
+  the text. (If no window had focus at release, e.g. the desktop, it pastes wherever focus is.)
 
 ## Layout
 
