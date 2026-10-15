@@ -179,9 +179,10 @@ fn read_reference(wav: &Path) -> Option<String> {
     std::fs::read_to_string(wav.with_extension("txt")).ok()
 }
 
-/// Lowercased words with punctuation stripped (apostrophes inside words kept).
+/// Lowercased words with punctuation stripped (apostrophes inside words kept); hyphens split
+/// words, so "double-check" and "double check" compare equal.
 fn normalize(s: &str) -> Vec<String> {
-    s.split_whitespace()
+    s.split(|c: char| c.is_whitespace() || c == '-')
         .map(|w| {
             w.chars()
                 .filter(|c| c.is_alphanumeric() || *c == '\'')
@@ -220,5 +221,6 @@ mod tests {
         assert_eq!(word_errors("the cat sat", "the bat sat down"), (2, 3));
         assert_eq!(word_errors("a b c", ""), (3, 3));
         assert_eq!(word_errors("Don't stop", "don't stop"), (0, 2));
+        assert_eq!(word_errors("double check", "double-check"), (0, 2));
     }
 }

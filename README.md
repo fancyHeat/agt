@@ -23,8 +23,10 @@ the model, ready, recording, transcribing, or an error.
 - If the release is missed (it happened on the UAC / Ctrl+Alt+Del screen), AGT notices within
   250 ms that a Ctrl/Shift hotkey is up and finishes the dictation normally; for F13-F24 the
   stale recording is discarded on the next press.
-- Long dictations are fine: audio over 25 s is transcribed in chunks split at pauses, so time
-  and memory grow linearly (a 5-minute recording takes ~12 s on an i9-9900K).
+- Long dictations are fine: audio over 25 s is transcribed in chunks split at pauses (the
+  quietest 400 ms near each 25 s mark), so time and memory grow linearly (a 5-minute recording
+  takes ~12 s on an i9-9900K). Each chunk is transcribed without the previous one as context,
+  so a split can occasionally start a new sentence where you only paused.
 - Dictating again while the previous one is still being transcribed is fine: they're
   transcribed and pasted in order.
 - The first run downloads the model (~670 MB) with progress in the tray; it's SHA-256 verified.

@@ -9,22 +9,24 @@
 use agt_core::stt::{Result, SAMPLE_RATE, SttEngine, TranscribeOpts, Transcript};
 use std::ops::Range;
 
-/// Energy is measured over 20 ms frames when looking for a split point.
-const FRAME: usize = SAMPLE_RATE as usize / 50;
+/// Energy is summed over 10 ms blocks; candidate cut windows slide in 10 ms steps.
+const HOP: usize = SAMPLE_RATE as usize / 100;
+/// A cut goes in the middle of the quietest 400 ms stretch. Single 20-40 ms dips also occur
+/// between words *inside* a phrase; cutting there makes the model finish the clipped clause on
+/// its own ("licenses, and so on. And the timeline"). 400 ms only fits a real pause.
+const PAUSE: usize = 40 * HOP;
 
-/// Splits `audio` into consecutive ranges of at most `max_len` samples. Each cut is placed at
-/// the centre of the lowest-energy frame within the last `search_len` samples before the limit.
+/// Splits `audio` into consecutive ranges of at most `max_len` samples. Each cut is placed in
+/// the middle of the lowest-energy [`PAUSE`]-long window within the last `search_len` samples
+/// before the limit.
 pub fn split(audio: &[f32], max_len: usize, search_len: usize) -> Vec<Range<usize>> {
     assert!(max_len > 0 && search_len <= max_len);
     let mut ranges = Vec::new();
     let mut start = 0;
     while audio.len() - start > max_len {
         let limit = start + max_len;
-        let from = limit - search_len;
-        let cut = (from..=limit.saturating_sub(FRAME))
-            .step_by(FRAME / 2)
-            .min_by(|&a, &b| energy(&audio[a..a + FRAME]).total_cmp(&energy(&audio[b..b + FRAME])))
-            .map_or(limit, |f| f + FRAME / 2);
+        let cut = quietest_point(&audio[limit - search_len..limit])
+            .map_or(limit, |c| limit - search_len + c);
         ranges.push(start..cut);
         start = cut;
     }
@@ -32,8 +34,28 @@ pub fn split(audio: &[f32], max_len: usize, search_len: usize) -> Vec<Range<usiz
     ranges
 }
 
-fn energy(frame: &[f32]) -> f32 {
-    frame.iter().map(|x| x * x).sum()
+/// Centre of the lowest-energy window of `PAUSE` samples (or of the whole region, if shorter),
+/// as an offset into `region`. `None` if the region is shorter than one block.
+fn quietest_point(region: &[f32]) -> Option<usize> {
+    let blocks: Vec<f64> = region
+        .as_chunks::<HOP>()
+        .0
+        .iter()
+        .map(|b| b.iter().map(|&x| f64::from(x) * f64::from(x)).sum())
+        .collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    let w = (PAUSE / HOP).min(blocks.len());
+    let mut sum: f64 = blocks[..w].iter().sum();
+    let (mut best, mut best_at) = (sum, 0);
+    for i in w..blocks.len() {
+        sum += blocks[i] - blocks[i - w];
+        if sum < best {
+            (best, best_at) = (sum, i + 1 - w);
+        }
+    }
+    Some(best_at * HOP + w * HOP / 2)
 }
 
 /// Wraps an engine so long audio is transcribed in chunks (see the module docs).
@@ -47,7 +69,7 @@ impl Chunked {
     /// Chunks are at most `max_secs` long, cut within the last `search_secs` of each.
     pub fn new(inner: Box<dyn SttEngine>, max_secs: f32, search_secs: f32) -> Self {
         let max_len = (max_secs * SAMPLE_RATE as f32) as usize;
-        let search_len = ((search_secs * SAMPLE_RATE as f32) as usize).clamp(FRAME, max_len);
+        let search_len = ((search_secs * SAMPLE_RATE as f32) as usize).clamp(HOP, max_len);
         Self {
             inner,
             max_len,
@@ -96,14 +118,14 @@ mod tests {
 
     const S: usize = SAMPLE_RATE as usize;
 
-    /// Loud "speech" everywhere except quiet gaps at the given second offsets (0.2 s each).
+    /// Loud "speech" everywhere except quiet pauses at the given second offsets (0.5 s each).
     fn speech_with_gaps(secs: usize, gaps: &[f32]) -> Vec<f32> {
         let mut a: Vec<f32> = (0..secs * S)
             .map(|i| ((i as f32) * 0.05).sin() * 0.5)
             .collect();
         for &g in gaps {
             let at = (g * S as f32) as usize;
-            a[at..at + S / 5].iter_mut().for_each(|x| *x *= 0.001);
+            a[at..at + S / 2].iter_mut().for_each(|x| *x *= 0.001);
         }
         a
     }
@@ -128,10 +150,28 @@ mod tests {
         assert!(ranges.iter().all(|r| r.len() <= 25 * S));
         let in_gap = |cut: usize, gap: f32| {
             let g = (gap * S as f32) as usize;
-            (g..g + S / 5).contains(&cut)
+            (g..g + S / 2).contains(&cut)
         };
         assert!(in_gap(ranges[0].end, 22.0), "cut at {}", ranges[0].end);
         assert!(in_gap(ranges[1].end, 44.0), "cut at {}", ranges[1].end);
+    }
+
+    #[test]
+    fn a_real_pause_beats_a_deeper_but_brief_dip() {
+        // Speech with a 20 ms dead-silent dip at 21 s (between words inside a phrase) and a
+        // 450 ms pause at 23 s that is quiet but not silent (room noise).
+        let mut audio = speech_with_gaps(40, &[]);
+        audio[21 * S..21 * S + S / 50]
+            .iter_mut()
+            .for_each(|x| *x = 0.0);
+        let pause = 23 * S..23 * S + S * 45 / 100;
+        audio[pause.clone()].iter_mut().for_each(|x| *x *= 0.02);
+        let ranges = split(&audio, 25 * S, 5 * S);
+        assert!(
+            pause.contains(&ranges[0].end),
+            "cut at {} s",
+            ranges[0].end as f32 / S as f32
+        );
     }
 
     #[test]
