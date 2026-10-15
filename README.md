@@ -188,7 +188,7 @@ enabled = true
 
 That uses the default `provider = "s1-mini"`: [S1-mini](https://huggingface.co/superwhisper/s1-mini)
 by Superwhisper, a 0.6B model (a Qwen3-0.6B fine-tune) trained only for this job, run by AGT
-on your machine. Nothing is sent anywhere. (A config file written by AGT 0.0.5 or older says
+on your machine. Nothing is sent anywhere. (A config file written by AGT 0.0.6 or older says
 `provider = "openai"`: change that line to `provider = "s1-mini"`, or delete it.)
 
 #### S1-mini (`provider = "s1-mini"`, the default)
