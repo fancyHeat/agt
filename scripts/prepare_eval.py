@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10,<3.14"
 # dependencies = ["huggingface_hub==0.36.0", "pyarrow==21.0.0", "soundfile==0.13.1", "numpy==2.3.3", "soxr==1.0.0"]
 # ///
 """Download and prepare AGT's speech eval set (real speech, ~80 clips, ~13 min).
