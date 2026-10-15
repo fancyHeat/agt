@@ -1,0 +1,138 @@
+# Push a `vX.Y.Z` tag (matching the workspace version in Cargo.toml) to build, package
+# with Velopack, and publish a GitHub Release that installed apps update from.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  PACK_ID: AGT
+  BUNDLE_ID: io.notics.agt
+  VPK_VERSION: 1.2.161 # keep in sync with the `velopack` crate version in Cargo.lock
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            channel: win-x64
+            exe: agt.exe
+          - os: macos-14
+            channel: osx-arm64
+            exe: agt
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CHANNEL: ${{ matrix.channel }}
+      # Optional Windows signing: signtool parameters, e.g. `/a /fd sha256 /tr http://timestamp.digicert.com /td sha256`.
+      WINDOWS_SIGN_PARAMS: ${{ secrets.WINDOWS_SIGN_PARAMS }}
+      # Optional macOS signing + notarization (see README).
+      APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+      APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 9.0.x
+      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+
+      - name: Check tag matches Cargo version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(cargo pkgid -p agt)"; CARGO_VERSION="${CARGO_VERSION##*@}"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo version $CARGO_VERSION"; exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - run: cargo build --release --locked -p agt
+
+      - name: Set up macOS signing
+        if: runner.os == 'macOS' && env.APPLE_CERT_P12_BASE64 != ''
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/agt.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ]; then
+            xcrun notarytool store-credentials agt-notary --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$KEYCHAIN"
+            echo "NOTARIZE=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package
+        run: |
+          mkdir publish && cp "target/release/${{ matrix.exe }}" publish/
+          # Fetch the previous release so vpk can generate a delta package.
+          vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+            --channel "$CHANNEL" -o Releases || echo "No previous release; skipping delta."
+
+          ARGS=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ARGS+=(--shortcuts StartMenuRoot)
+            # Windows signing hook: unsigned unless the WINDOWS_SIGN_PARAMS secret is set.
+            if [ -n "$WINDOWS_SIGN_PARAMS" ]; then ARGS+=(--signParams "$WINDOWS_SIGN_PARAMS"); fi
+          else
+            ARGS+=(--bundleId "$BUNDLE_ID")
+            if [ -n "$KEYCHAIN" ]; then
+              ARGS+=(--keychain "$KEYCHAIN" --signAppIdentity "$APPLE_SIGN_IDENTITY")
+              # A .pkg installer needs a "Developer ID Installer" identity; without it, ship only the .zip.
+              if [ -n "$APPLE_INSTALLER_IDENTITY" ]; then
+                ARGS+=(--signInstallIdentity "$APPLE_INSTALLER_IDENTITY")
+              else
+                ARGS+=(--noInst)
+              fi
+              if [ -n "$NOTARIZE" ]; then ARGS+=(--notaryProfile agt-notary); fi
+            fi
+          fi
+
+          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
+            --packDir publish --mainExe "${{ matrix.exe }}" --channel "$CHANNEL" --runtime "$CHANNEL" \
+            -o Releases "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: releases-${{ matrix.channel }}
+          path: Releases
+
+  # One job uploads both channels, so the two builds never race to create the release.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 9.0.x
+      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: releases-*
+      - name: Upload to GitHub Releases
+        run: |
+          for CHANNEL in win-x64 osx-arm64; do
+            vpk upload github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+              --channel "$CHANNEL" -o "releases-$CHANNEL" --tag "$GITHUB_REF_NAME" \
+              --releaseName "AGT ${GITHUB_REF_NAME#v}" --publish --merge
+          done
