@@ -2,31 +2,32 @@
 //!
 //! Checks on startup and every `update.check_interval_minutes`, downloads in the background,
 //! and applies the update when the user quits (or on the next launch, via `VelopackApp`).
+//!
+//! The feed is read from `releases/latest/download/` (plain HTTPS, no GitHub API, so no token
+//! and no API rate limit). That release's feed lists its full package plus the delta from the
+//! previous version; installs further behind fall back to the full package.
+//! Every request has a hard timeout, so a dead connection can't stall the updater thread.
 
 use agt_core::config::UpdateConfig;
 use std::{thread, time::Duration};
-use velopack::{UpdateCheck, UpdateManager, sources::GithubSource};
+use velopack::{HttpOptions, UpdateCheck, UpdateManager, sources::HttpSource};
 
-const REPO_URL: &str = "https://github.com/fancyHeat/agt";
+const FEED_URL: &str = "https://github.com/fancyHeat/agt/releases/latest/download";
+/// Whole-request timeout (connect + transfer) for the feed and each package download.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Starts the background updater. Returns the manager (for applying on quit), or `None`
 /// if updates are disabled or the app isn't a Velopack install.
 pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
     if !cfg.enabled {
-        tracing::info!("updates disabled in config");
+        tracing::info!("updates disabled");
         return None;
     }
-    // The repo is public; a token is optional and only lifts GitHub's anonymous rate limit.
-    let token = cfg.token();
-    tracing::info!(
-        "update source: {REPO_URL} ({})",
-        if token.is_some() {
-            "authenticated"
-        } else {
-            "anonymous"
-        }
-    );
-    let source = GithubSource::new(REPO_URL, token, false);
+    let options = HttpOptions {
+        TimeoutMilliseconds: REQUEST_TIMEOUT.as_millis() as u64,
+        ..Default::default()
+    };
+    let source = HttpSource::new_with_options(FEED_URL, options);
     let um = match UpdateManager::new(source, None, None) {
         Ok(um) => um,
         Err(e) => {
@@ -34,13 +35,12 @@ pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
             return None;
         }
     };
+    let minutes = cfg.check_interval_minutes();
     tracing::info!(
-        "updater started: current version {}, checking every {} min",
-        um.get_current_version_as_string(),
-        cfg.check_interval_minutes
+        "updater started: current version {}, checking every {minutes} min",
+        um.get_current_version_as_string()
     );
 
-    let interval = Duration::from_secs(cfg.check_interval_minutes.max(1) * 60);
     let worker = um.clone();
     thread::Builder::new()
         .name("updater".into())
@@ -49,7 +49,7 @@ pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
                 if let Err(e) = check_and_download(&worker) {
                     tracing::warn!("update check failed: {e}");
                 }
-                thread::sleep(interval);
+                thread::sleep(Duration::from_secs(minutes * 60));
             }
         })
         .expect("spawn updater thread");
@@ -72,7 +72,12 @@ fn check_and_download(um: &UpdateManager) -> Result<(), velopack::Error> {
         tracing::debug!("update {target} already downloaded");
         return Ok(());
     }
-    tracing::info!("update {target} available; downloading");
+    let kind = if info.DeltasToTarget.is_empty() {
+        "full"
+    } else {
+        "delta"
+    };
+    tracing::info!("update {target} available; downloading ({kind})");
     um.download_updates(&info, None)?;
     tracing::info!("update {target} downloaded; it will be applied on quit or next launch");
     Ok(())
