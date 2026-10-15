@@ -1,9 +1,11 @@
 # Release: push a `vX.Y.Z` tag on a commit that is on `main` and whose Cargo version is X.Y.Z.
-# preflight (checks + fmt/clippy/test) -> build + package per platform -> publish one GitHub
-# Release, which installed apps then update from.
+# preflight (checks + fmt/clippy/test) -> build (+ macOS package) -> package-windows (signs, no
+# compiling) -> publish one GitHub Release, which installed apps then update from.
 #
-# Dry run: on PRs touching this file or packaging/ (and via workflow_dispatch from main), the
-# same build + package runs without signing and without publishing.
+# Dry run: on PRs touching this file or packaging/ the same build + package runs without signing
+# and without publishing. Via workflow_dispatch from main it also signs (when configured), still
+# without publishing; from other branches package-windows fails (the `release` environment only
+# admits main and v* tags).
 name: Release
 
 on:
@@ -58,6 +60,9 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # Compiles and stages the app. No environment and no `id-token`: the build scripts of every
+  # dependency run here, so nothing in this job can reach the Windows signer. macOS is packaged
+  # (and signed with its secrets) here as before; Windows is packaged in `package-windows`.
   build:
     needs: preflight
     strategy:
@@ -82,9 +87,11 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: runner.os == 'macOS'
         with:
           dotnet-version: 9.0.x
-      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      - if: runner.os == 'macOS'
+        run: dotnet tool install -g vpk --version "$VPK_VERSION"
       - run: cargo build --release --locked -p agt
 
       - name: Stage files
@@ -93,25 +100,18 @@ jobs:
           # Windows: ONNX Runtime's DirectML build imports DirectML.dll (copied next to the exe by
           # the ort build); the copy in System32 may be older than ONNX Runtime needs.
           if [ "$RUNNER_OS" = Windows ]; then cp target/release/DirectML.dll publish/; fi
-          if [ "$IS_RELEASE" = true ]; then
+          if [ "$IS_RELEASE" = true ] && [ "$RUNNER_OS" = macOS ]; then
             # The previous release lets vpk build a delta package (public repo: no token needed).
             vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --channel "$CHANNEL" -o Releases \
               || echo "No previous release; skipping delta."
           fi
 
-      - name: Package (Windows)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Windows'
-        env:
-          # Hook only, see README: also needs a certificate import step before this one.
-          WINDOWS_SIGN_PARAMS: ${{ secrets.WINDOWS_SIGN_PARAMS }}
-        run: |
-          ARGS=()
-          if [ -n "$WINDOWS_SIGN_PARAMS" ] && [ "$IS_RELEASE" = true ]; then
-            ARGS+=(--signParams "$WINDOWS_SIGN_PARAMS")
-          fi
-          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
-            --packDir publish --mainExe agt.exe --channel "$CHANNEL" --runtime "$CHANNEL" \
-            --shortcuts StartMenuRoot --framework vcredist143-x64 -o Releases "${ARGS[@]}"
+        with:
+          name: publish-win-x64
+          path: publish
+          if-no-files-found: error
 
       - name: Check for macOS signing secrets
         id: signing
@@ -179,14 +179,114 @@ jobs:
             -o Releases "${ARGS[@]}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: runner.os == 'macOS'
         with:
           name: releases-${{ matrix.channel }}
+          path: Releases
+
+  # Packages and signs Windows from the files `build` staged. It never checks out or compiles
+  # code, so while an Azure-trusted OIDC token can be minted only pinned actions, vpk and signtool
+  # run. Tag pushes and workflow_dispatch enter the `release` environment: its variables configure
+  # Azure Artifact Signing, and its OIDC subject (`…:environment:release`) is the only one Azure
+  # trusts. PR dry runs get no environment and package unsigned.
+  package-windows:
+    needs: [preflight, build]
+    runs-on: windows-latest
+    environment: ${{ github.event_name != 'pull_request' && 'release' || '' }}
+    permissions:
+      contents: read
+      id-token: write # azure/login (OIDC)
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      CHANNEL: win-x64
+    steps:
+      - name: Check for Windows signing configuration
+        id: winsign
+        env:
+          # Variables of the `release` environment (empty outside it, e.g. on PR dry runs).
+          HAS_CONFIG: >-
+            ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != ''
+            && vars.AZURE_SIGNING_ENDPOINT != '' && vars.AZURE_SIGNING_ACCOUNT != '' && vars.AZURE_SIGNING_PROFILE != '' }}
+        run: |
+          SIGN=false
+          if [ "$HAS_CONFIG" = true ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then SIGN=true; fi
+          # Installed apps auto-update from releases: never ship an unsigned Windows build.
+          if [ "$IS_RELEASE" = true ] && [ "$SIGN" != true ]; then
+            echo "::error::Windows signing is not configured (variables of the release environment); refusing to release unsigned"
+            exit 1
+          fi
+          echo "sign=$SIGN" >> "$GITHUB_OUTPUT"
+          echo "sign=$SIGN"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publish-win-x64
+          path: publish
+
+      # vpk signs every unsigned binary in --packDir, so only the expected files may be there, and
+      # DirectML.dll must keep its Microsoft signature (otherwise it would get signed as ours).
+      - name: Check staged files
+        shell: pwsh
+        run: |
+          $names = (Get-ChildItem -Recurse -Force publish | ForEach-Object Name | Sort-Object) -join ','
+          if ($names -ne 'agt.exe,DirectML.dll') { Write-Output "::error::Unexpected staged files: $names"; exit 1 }
+          $sig = Get-AuthenticodeSignature publish/DirectML.dll
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            Write-Output "::error::DirectML.dll is not validly Microsoft-signed ($($sig.Status))"; exit 1
+          }
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 9.0.x
+      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      - name: Download previous release (delta)
+        if: env.IS_RELEASE == 'true'
+        run: |
+          # The previous release lets vpk build a delta package (public repo: no token needed).
+          vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --channel "$CHANNEL" -o Releases \
+            || echo "No previous release; skipping delta."
+
+      - name: Azure login (Windows signing)
+        if: steps.winsign.outputs.sign == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Package (Windows)
+        env:
+          SIGN: ${{ steps.winsign.outputs.sign }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+        run: |
+          ARGS=()
+          if [ "$SIGN" = true ]; then
+            # vpk signs agt.exe, Update.exe, the launcher stub and Setup.exe with signtool + the
+            # Artifact Signing dlib (RFC 3161 timestamp from timestamp.acs.microsoft.com),
+            # authenticating through the az CLI session from the login step. No secret is involved.
+            META="$RUNNER_TEMP/artifact-signing.json"
+            jq -n --arg e "$AZURE_SIGNING_ENDPOINT" --arg a "$AZURE_SIGNING_ACCOUNT" --arg p "$AZURE_SIGNING_PROFILE" \
+              '{Endpoint: $e, CodeSigningAccountName: $a, CertificateProfileName: $p}' > "$META"
+            ARGS+=(--azureTrustedSignFile "$META")
+          fi
+          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
+            --packDir publish --mainExe agt.exe --channel "$CHANNEL" --runtime "$CHANNEL" \
+            --shortcuts StartMenuRoot --framework vcredist143-x64 -o Releases "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: releases-win-x64
           path: Releases
 
   # One job uploads both channels to a draft, then publishes it once, so the release never
   # appears half-populated and the two builds never race to create it.
   publish:
-    needs: build
+    needs: [build, package-windows]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
