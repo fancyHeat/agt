@@ -3,26 +3,30 @@
 //! Checks on startup and every `update.check_interval_minutes`, downloads in the background,
 //! and applies the update when the user quits (or on the next launch, via `VelopackApp`).
 
-use agt_core::config::{TOKEN_ENV, UpdateConfig};
+use agt_core::config::UpdateConfig;
 use std::{thread, time::Duration};
 use velopack::{UpdateCheck, UpdateManager, sources::GithubSource};
 
 const REPO_URL: &str = "https://github.com/fancyHeat/agt";
 
 /// Starts the background updater. Returns the manager (for applying on quit), or `None`
-/// if updates are disabled, no token is configured, or the app isn't a Velopack install.
+/// if updates are disabled or the app isn't a Velopack install.
 pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
     if !cfg.enabled {
         tracing::info!("updates disabled in config");
         return None;
     }
-    let Some(token) = cfg.token() else {
-        tracing::info!(
-            "no GitHub token (update.github_token or {TOKEN_ENV}); skipping update checks"
-        );
-        return None;
-    };
-    let source = GithubSource::new(REPO_URL, Some(token), false);
+    // The repo is public; a token is optional and only lifts GitHub's anonymous rate limit.
+    let token = cfg.token();
+    tracing::info!(
+        "update source: {REPO_URL} ({})",
+        if token.is_some() {
+            "authenticated"
+        } else {
+            "anonymous"
+        }
+    );
+    let source = GithubSource::new(REPO_URL, token, false);
     let um = match UpdateManager::new(source, None, None) {
         Ok(um) => um,
         Err(e) => {

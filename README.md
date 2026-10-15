@@ -33,21 +33,16 @@ Requires stable Rust. Windows needs the MSVC build tools.
 A commented default config is written on first run; the tray menu has "Open config folder".
 Set `AGT_HOME` to use a different directory (handy for testing).
 
-### Updates from the private repo
+### Updates
 
-The release repo is private, so the updater needs a GitHub token with read access to it
-(a fine-grained token scoped to `fancyHeat/agt` with **Contents: Read-only** is enough).
-Put it in `config.toml`:
+Installed builds update themselves from this repo's public GitHub Releases: the app checks on
+startup and every `update.check_interval_minutes` (default 240), downloads in the background, and
+applies the update when you quit from the tray (or on next launch). Set `update.enabled = false`
+to turn this off.
 
-```toml
-[update]
-github_token = "github_pat_..."
-```
-
-or set the `AGT_GITHUB_TOKEN` environment variable (takes precedence). Without a token, update
-checks are skipped (logged). The app checks on startup and every `check_interval_minutes`
-(default 240), downloads in the background, and applies the update when you quit from the tray
-(or on next launch).
+No token is needed. Optionally, `update.github_token` (or the `AGT_GITHUB_TOKEN` environment
+variable, which takes precedence) authenticates the GitHub API calls to lift the anonymous
+rate limit (60 requests/hour per IP). Never commit a token; the config file lives outside the repo.
 
 ## Releasing
 

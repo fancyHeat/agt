@@ -14,9 +14,8 @@ log_level = "info"
 enabled = true
 # Minutes between update checks.
 check_interval_minutes = 240
-# GitHub token with read access to the (private) release repo.
+# Optional GitHub token. Not needed (releases are public); only raises GitHub's API rate limit.
 # Can also be set via the AGT_GITHUB_TOKEN environment variable, which takes precedence.
-# Without a token, update checks are skipped.
 github_token = ""
 "#;
 
