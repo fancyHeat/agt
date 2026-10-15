@@ -8,44 +8,58 @@
 //! The feed is read from `releases/latest/download/` (plain HTTPS, no GitHub API, so no token
 //! and no API rate limit). That release's feed lists its full package plus the delta from the
 //! previous version; installs further behind fall back to the full package.
-//! Every request has a hard timeout, so a dead connection can't stall the updater thread.
+//! Every request has a hard timeout, so a dead connection can't stall the updater thread: a
+//! short one for the feed (a few KB), a long one for packages.
 
 use agt_core::config::UpdateConfig;
 use std::{sync::Mutex, thread, time::Duration};
 use velopack::{HttpOptions, UpdateCheck, UpdateManager, VelopackAsset, sources::HttpSource};
 
 const FEED_URL: &str = "https://github.com/fancyHeat/agt/releases/latest/download";
-/// Whole-request timeout (connect + transfer) for the feed and each package download.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Whole-request timeouts (connect + transfer) for the feed and for each package download.
+const FEED_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Held for a whole check + download, so the background thread and "Update now" never run
 /// at the same time (the second one waits, then finds the update already downloaded).
 static CHECK: Mutex<()> = Mutex::new(());
 
-/// Returns the manager (for "Update now" and applying on quit), or `None` if the app isn't a
-/// Velopack install. Starts the background updater only if updates are enabled.
-pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
+/// Velopack handles for this install. Velopack sets timeouts per source, so the feed is checked
+/// through a second manager; the `UpdateInfo` it returns is plain data that `um` downloads.
+#[derive(Clone)]
+pub struct Updater {
+    /// Downloads, and finds/applies a downloaded update.
+    pub um: UpdateManager,
+    feed: UpdateManager,
+}
+
+fn manager(timeout: Duration) -> Result<UpdateManager, velopack::Error> {
     let options = HttpOptions {
-        TimeoutMilliseconds: REQUEST_TIMEOUT.as_millis() as u64,
+        TimeoutMilliseconds: timeout.as_millis() as u64,
         ..Default::default()
     };
-    let source = HttpSource::new_with_options(FEED_URL, options);
-    let um = match UpdateManager::new(source, None, None) {
-        Ok(um) => um,
-        Err(e) => {
+    UpdateManager::new(HttpSource::new_with_options(FEED_URL, options), None, None)
+}
+
+/// Returns the updater (for "Update now" and applying on quit), or `None` if the app isn't a
+/// Velopack install. Starts the background updater only if updates are enabled.
+pub fn start(cfg: &UpdateConfig) -> Option<Updater> {
+    let updater = match (manager(DOWNLOAD_TIMEOUT), manager(FEED_TIMEOUT)) {
+        (Ok(um), Ok(feed)) => Updater { um, feed },
+        (Err(e), _) | (_, Err(e)) => {
             tracing::info!("not running from a Velopack install ({e}); updates unavailable");
             return None;
         }
     };
-    let version = um.get_current_version_as_string();
+    let version = updater.um.get_current_version_as_string();
     if !cfg.enabled {
         tracing::info!("automatic updates disabled (current version {version})");
-        return Some(um);
+        return Some(updater);
     }
     let minutes = cfg.check_interval_minutes();
     tracing::info!("updater started: current version {version}, checking every {minutes} min");
 
-    let worker = um.clone();
+    let worker = updater.clone();
     thread::Builder::new()
         .name("updater".into())
         .spawn(move || {
@@ -57,25 +71,25 @@ pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
             }
         })
         .expect("spawn updater thread");
-    Some(um)
+    Some(updater)
 }
 
 /// Checks and downloads now (blocking: run it off the UI thread). `downloading` is called
 /// with the version before a download starts. Returns the update ready to apply, if any.
 pub fn check_now(
-    um: &UpdateManager,
+    updater: &Updater,
     downloading: impl Fn(&str),
 ) -> Result<Option<VelopackAsset>, velopack::Error> {
-    check_and_download(um, downloading)?;
-    Ok(um.get_update_pending_restart())
+    check_and_download(updater, downloading)?;
+    Ok(updater.um.get_update_pending_restart())
 }
 
 fn check_and_download(
-    um: &UpdateManager,
+    Updater { um, feed }: &Updater,
     downloading: impl Fn(&str),
 ) -> Result<(), velopack::Error> {
     let _guard = CHECK.lock().unwrap_or_else(|e| e.into_inner());
-    let info = match um.check_for_updates()? {
+    let info = match feed.check_for_updates()? {
         UpdateCheck::UpdateAvailable(info) => info,
         UpdateCheck::NoUpdateAvailable | UpdateCheck::RemoteIsEmpty => {
             tracing::info!("no update available");
