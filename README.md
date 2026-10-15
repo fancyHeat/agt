@@ -351,7 +351,7 @@ generated password as `APPLE_APP_PASSWORD`.
 
 Windows builds are signed with [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/)
 (formerly Trusted Signing) as **Notics Security LLC**. `vpk pack --azureTrustedSignFile` signs
-`agt.exe`, `Update.exe` and `Setup.exe` with signtool and the Artifact Signing dlib, timestamped by
+`agt.exe`, `Update.exe`, `Setup.exe` and the portable launcher stubs with signtool and the Artifact Signing dlib, timestamped by
 `timestamp.acs.microsoft.com`. The certificates are short-lived (3 days, rotated by Azure); the
 timestamp keeps signatures valid after they expire. No secret is stored anywhere: CI authenticates
 with GitHub OIDC.
@@ -377,4 +377,5 @@ certificate profile in the Azure portal (revocation can be backdated to a point 
 another profile or account, change the environment variables and grant the role on the new profile.
 
 **Cost:** Basic SKU is about $9.99/month for the account (already paid for other Notics products)
-and includes 5,000 signatures per month; each release signs 3 files.
+and includes 5,000 signatures per month; each signed run (release or manual dry run) uses about 5
+(`agt.exe`, `Update.exe`, the execution stubs and `Setup.exe`).
