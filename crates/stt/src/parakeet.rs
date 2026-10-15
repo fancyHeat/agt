@@ -135,7 +135,15 @@ pub struct Parakeet {
     blank: usize,
     /// Prediction-network LSTM state shape, e.g. `[2, 1, 640]`.
     state_shape: [usize; 3],
+    /// Fixed encoder input length (feature frames) if the encoder has static shapes.
+    fixed_frames: Option<usize>,
 }
+
+const ENCODER_INT8: &str = "encoder-model.int8.onnx";
+const ENCODER_FP32: &str = "encoder-model.onnx";
+/// DirectML encoder input length: the longest chunk [`crate::load`] passes (25 s = 2501
+/// feature frames at 100 per second), rounded up.
+pub const DML_FRAMES: usize = (crate::CHUNK_SECS as usize) * 100 + 11;
 
 impl Parakeet {
     /// Downloads missing files, then loads the three sessions.
@@ -151,8 +159,8 @@ impl Parakeet {
             .position(|t| t == "<blk>")
             .ok_or("vocab.txt has no <blk> token")?;
         let enc_file = match cfg.precision {
-            Precision::Int8 => "encoder-model.int8.onnx",
-            Precision::Fp32 => "encoder-model.onnx",
+            Precision::Int8 => ENCODER_INT8,
+            Precision::Fp32 => ENCODER_FP32,
         };
         let env = ort::init().with_name("agt").build()?;
         let preprocessor = session(&env, &dir.join("nemo128.onnx"), Device::Cpu, cfg.threads)?;
@@ -198,6 +206,9 @@ impl Parakeet {
                 (Device::Cpu, _) => "cpu",
                 (_, Device::Cpu) => FALLBACK_SUFFIX,
                 (Device::DirectMl, _) => "directml",
+                (Device::Cuda, _) => "cuda",
+                (Device::CoreMl, _) => "coreml",
+                (Device::Vulkan | Device::Metal, _) => unreachable!("rejected by session()"),
             }
         );
         tracing::info!("loaded {name} in {:.2} s", start.elapsed().as_secs_f64());
@@ -209,6 +220,7 @@ impl Parakeet {
             vocab,
             blank,
             state_shape,
+            fixed_frames: (device == Device::DirectMl).then_some(DML_FRAMES),
         })
     }
 }
@@ -226,6 +238,23 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         Device::DirectMl => {
             // DirectML requires sequential execution and no memory-pattern optimization.
             let dml = ort::ep::DirectML::default().build().error_on_failure();
+            if path.ends_with(ENCODER_INT8) || path.ends_with(ENCODER_FP32) {
+                // With dynamic shapes DirectML re-creates its operators on every run: a
+                // ~250 ms floor per call, however short the audio. A fixed input length lets
+                // it compile them once (the features are zero-padded to DML_FRAMES; `length`
+                // masks the padding). DirectML's whole-graph fusion of the static graph gives
+                // wrong output (empty transcripts), so it's off; op by op it's still ~2.5x
+                // faster than dynamic shapes. See docs/benchmarks.md.
+                b = b
+                    .with_dimension_override("audio_signal_dynamic_axes_1", 1)
+                    .map_err(|e| e.to_string())?
+                    .with_dimension_override("audio_signal_dynamic_axes_2", DML_FRAMES as i64)
+                    .map_err(|e| e.to_string())?
+                    .with_dimension_override("length_dynamic_axes_1", 1)
+                    .map_err(|e| e.to_string())?
+                    .with_config_entry("ep.dml.disable_graph_fusion", "1")
+                    .map_err(|e| e.to_string())?;
+            }
             b = b.with_memory_pattern(false).map_err(|e| e.to_string())?;
             b = b
                 .with_parallel_execution(false)
@@ -236,6 +265,34 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         }
         #[cfg(not(windows))]
         Device::DirectMl => return Err("device \"directml\" is only available on Windows".into()),
+        #[cfg(feature = "cuda")]
+        Device::Cuda => {
+            let cuda = ort::ep::CUDA::default().build().error_on_failure();
+            b = b
+                .with_execution_providers([cuda])
+                .map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        Device::Cuda => {
+            return Err("device \"cuda\" needs a build with the `cuda` feature".into());
+        }
+        #[cfg(target_os = "macos")]
+        Device::CoreMl => {
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            let coreml = ort::ep::CoreML::default()
+                .with_model_format(ModelFormat::MLProgram)
+                .with_compute_units(ComputeUnits::All)
+                .build()
+                .error_on_failure();
+            b = b
+                .with_execution_providers([coreml])
+                .map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        Device::CoreMl => return Err("device \"coreml\" is only available on macOS".into()),
+        Device::Vulkan | Device::Metal => {
+            return Err(format!("the parakeet engine can't use device {device:?}").into());
+        }
     }
     b.commit_from_file(path)
         .map_err(|e| format!("cannot load {}: {e}", path.display()).into())
@@ -293,18 +350,36 @@ impl SttEngine for Parakeet {
         let t1 = Instant::now();
 
         // 2. Encoder: [1, D, T'] (channels first).
+        // A static-shape (DirectML) encoder takes exactly `fixed_frames` frames: zero-pad.
+        let padded;
+        let (feat_shape, feats) = match self.fixed_frames {
+            Some(n) => {
+                let (c, t) = (feat_shape[1] as usize, feat_shape[2] as usize);
+                if t > n {
+                    return Err(format!("{t} feature frames exceed the encoder's fixed {n}").into());
+                }
+                let mut p = vec![0f32; c * n];
+                for ch in 0..c {
+                    p[ch * n..ch * n + t].copy_from_slice(&feats[ch * t..(ch + 1) * t]);
+                }
+                padded = p;
+                (ort::value::Shape::new([1i64, c as i64, n as i64]), &padded[..])
+            }
+            None => (feat_shape.clone(), feats),
+        };
         let enc = self.encoder.run(ort::inputs![
-            "audio_signal" => TensorRef::from_array_view((feat_shape.clone(), feats))?,
+            "audio_signal" => TensorRef::from_array_view((feat_shape, feats))?,
             "length" => TensorRef::from_array_view(([1usize], feat_lens))?,
         ])?;
         let (enc_shape, enc_out) = enc["outputs"].try_extract_tensor::<f32>()?;
         let (_, enc_lens) = enc["encoded_lengths"].try_extract_tensor::<i64>()?;
         let (dim, frames) = (enc_shape[1] as usize, enc_shape[2] as usize);
         let valid = (enc_lens[0].max(0) as usize).min(frames);
-        // Frame-major copy so each decoder step reads one contiguous [D] slice.
-        let mut by_frame = vec![0f32; frames * dim];
+        // Frame-major copy (of the valid frames only: a padded encoder has many more) so each
+        // decoder step reads one contiguous [D] slice.
+        let mut by_frame = vec![0f32; valid * dim];
         for d in 0..dim {
-            for t in 0..frames {
+            for t in 0..valid {
                 by_frame[t * dim + d] = enc_out[d * frames + t];
             }
         }

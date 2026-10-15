@@ -17,3 +17,17 @@ agt-stt.workspace = true
 agt-polish.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 tracing.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+cuda = ["agt-stt/cuda"]
+whisper = ["agt-stt/whisper"]
+whisper-vulkan = ["agt-stt/whisper-vulkan"]
+whisper-metal = ["agt-stt/whisper-metal"]

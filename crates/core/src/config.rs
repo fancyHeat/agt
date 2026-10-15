@@ -143,6 +143,7 @@ pub struct SttConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     Parakeet,
+    Whisper,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -152,12 +153,16 @@ pub enum Precision {
     Fp32,
 }
 
-/// ONNX Runtime execution provider. Phase 2 adds `cuda` and `coreml`.
+/// Where inference runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Device {
     Cpu,
     DirectMl,
+    Cuda,
+    CoreMl,
+    Vulkan,
+    Metal,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -483,7 +488,12 @@ mod tests {
         assert_eq!(c.stt.device, Device::DirectMl);
         assert_eq!(c.stt.precision, Precision::Fp32);
         assert!(Config::parse("[stt]\ndevice = \"gpu\"").is_err());
-        assert!(Config::parse("[stt]\nengine = \"whisper\"").is_err());
+        assert!(Config::parse("[stt]\nengine = \"vosk\"").is_err());
+        let c = Config::parse("[stt]\nengine = \"whisper\"\ndevice = \"vulkan\"").unwrap();
+        assert_eq!((c.stt.engine, c.stt.device), (Engine::Whisper, Device::Vulkan));
+        for d in ["cpu", "directml", "cuda", "coreml", "vulkan", "metal"] {
+            assert!(Config::parse(&format!("[stt]\ndevice = \"{d}\"")).is_ok(), "{d}");
+        }
     }
 
     #[test]

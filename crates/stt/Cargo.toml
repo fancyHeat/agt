@@ -13,7 +13,23 @@ sha2 = "0.11"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # ONNX Runtime 1.31, statically linked from pyke's prebuilt binaries (CPU on every platform).
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
+# whisper.cpp (`stt.engine = "whisper"`); built from source with CMake, so it's optional.
+whisper-rs = { version = "0.16", optional = true, features = ["tracing_backend"] }
 
 # Windows: the prebuilt runtime that includes the DirectML EP (any DX12 GPU).
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["directml"] }
+
+# macOS: the prebuilt runtime always contains the CoreML EP; this only exposes its API.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["coreml"] }
+
+[features]
+# CUDA EP (`stt.device = "cuda"`). Switches to pyke's CUDA 13 ONNX Runtime build, which needs
+# the CUDA 13 runtime, cuBLAS, cuFFT and cuDNN 9 DLLs (~1.3 GB) at run time. Not in releases.
+cuda = ["ort/cuda"]
+# whisper.cpp engine (CPU). Needs CMake and a C++ compiler at build time.
+whisper = ["dep:whisper-rs"]
+# whisper.cpp GPU backends.
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
+whisper-metal = ["whisper", "whisper-rs/metal"]
