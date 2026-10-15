@@ -60,6 +60,10 @@ pub fn restore_clipboard(_s: &ClipboardSnapshot, _t: &PasteToken) -> Result<bool
     Err(format!("clipboard access {MSG}").into())
 }
 
+pub fn accessibility_name() -> &'static str {
+    "Accessibility"
+}
+
 pub fn missing_permissions() -> Vec<Permission> {
     Vec::new()
 }

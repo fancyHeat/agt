@@ -233,7 +233,7 @@ fn wanted_device(cfg: &SttConfig) -> Device {
 /// `auto`; if Core ML then loses the timing check, the CPU runs fp32 too).
 fn precision(cfg: &SttConfig) -> Precision {
     match wanted_device(cfg) {
-        Device::CoreMl => Precision::Fp32,
+        Device::CoreMl if cfg!(target_os = "macos") => Precision::Fp32,
         _ => cfg.precision,
     }
 }

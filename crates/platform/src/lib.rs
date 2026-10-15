@@ -281,7 +281,8 @@ pub enum Permission {
     Microphone,
     /// Seeing the hotkey (the keyboard event tap).
     InputMonitoring,
-    /// Sending Cmd+V (and swallowing F13-F20).
+    /// Sending Cmd+V (and swallowing F13-F20). Listed as "Device Control" in System Settings
+    /// from macOS 27 on.
     Accessibility,
 }
 
@@ -290,7 +291,7 @@ impl fmt::Display for Permission {
         f.write_str(match self {
             Permission::Microphone => "Microphone",
             Permission::InputMonitoring => "Input Monitoring",
-            Permission::Accessibility => "Accessibility",
+            Permission::Accessibility => imp::accessibility_name(),
         })
     }
 }
@@ -407,8 +408,8 @@ pub fn paste_count() -> u64 {
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
 /// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
-/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, the poll reads the
-/// hardware state, which our injected events don't change).
+/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, Cmd+V only posts Left
+/// Command and V).
 pub fn paste_may_release(key: Key) -> bool {
     imp::paste_may_release(key)
 }

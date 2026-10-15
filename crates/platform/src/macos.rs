@@ -18,13 +18,15 @@ use objc2::{
     runtime::{AnyClass, AnyObject, Bool, ProtocolObject},
 };
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSWorkspace};
-use objc2_core_foundation::{CFMachPort, CFRetained, CFRunLoop, CFString, kCFRunLoopCommonModes};
+use objc2_core_foundation::{
+    CFMachPort, CFRetained, CFRunLoop, CFString, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
     CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType,
     CGPreflightListenEventAccess, CGPreflightPostEventAccess, CGRequestListenEventAccess,
-    CGRequestPostEventAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
-    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowLayer,
+    kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString};
 use std::{
@@ -173,9 +175,9 @@ fn run_tap_thread(shared: Arc<Shared>) {
                 tracing::warn!(
                     "hotkey: cannot watch the keyboard yet (needs {}); retrying every second",
                     if shared.swallow {
-                        "Input Monitoring and Accessibility"
+                        format!("Input Monitoring and {}", accessibility_name())
                     } else {
-                        "Input Monitoring"
+                        "Input Monitoring".to_owned()
                     }
                 );
                 waiting = true;
@@ -198,10 +200,10 @@ fn run_tap_thread(shared: Arc<Shared>) {
             st.run_loop = Some(Cf(run_loop));
         }
         tracing::info!("hotkey: hold {} to dictate", shared.hotkey);
-        // Until the handle is dropped. (A stop that raced ahead of `run_loop` being stored is
-        // caught here.)
-        if !shared.stop.load(Ordering::SeqCst) {
-            CFRunLoop::run();
+        // Until the handle is dropped. Its `stop()` ends a wait at once; the timeout catches a
+        // stop that came before the run loop was running (stopping an idle loop does nothing).
+        while !shared.stop.load(Ordering::SeqCst) {
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 1.0, false);
         }
         CFMachPort::invalidate(&tap);
         let mut st = shared.state.lock().unwrap();
@@ -214,7 +216,7 @@ fn run_tap_thread(shared: Arc<Shared>) {
 fn create_tap(shared: &Arc<Shared>) -> Option<CFRetained<CFMachPort>> {
     // Without the permission a listen-only tap is still created, but never gets a keyboard
     // event: don't settle for one.
-    if !CGPreflightListenEventAccess() || (shared.swallow && !CGPreflightPostEventAccess()) {
+    if !listen_access() || (shared.swallow && !post_access()) {
         return None;
     }
     let mask = (1u64 << CGEventType::KeyDown.0)
@@ -298,15 +300,15 @@ unsafe extern "C-unwind" fn tap_callback(
     pass
 }
 
-/// macOS side of [`crate::paste_may_release`]: never. Cmd+V comes from a private event source,
-/// and [`key_down`] reads the hardware state, which injected events don't change.
+/// macOS side of [`crate::paste_may_release`]: never. [`send_paste`] only posts Left Command
+/// and V, neither of which can be a hotkey key, and nothing for the keys the user holds.
 pub fn paste_may_release(_key: Key) -> bool {
     false
 }
 
 pub fn key_down(key: Key) -> Option<bool> {
-    // The hardware state: neither swallowing at the session tap nor our injected events
-    // change it.
+    // The HID system state: swallowing at the session tap doesn't change it. (Events posted at
+    // the HID tap do; `send_paste` posts none for hotkey keys.)
     Some(CGEventSource::key_state(
         CGEventSourceStateID::HIDSystemState,
         key.code,
@@ -481,11 +483,12 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Re
 /// Never releases a held modifier (see [`paste_may_release`]), so `_before_releasing` is never
 /// called.
 pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
-    if !CGPreflightPostEventAccess() {
-        return Err(
-            "AGT doesn't have the Accessibility permission (System Settings > Privacy & Security > Accessibility)"
-                .into(),
-        );
+    if !post_access() {
+        let name = accessibility_name();
+        return Err(format!(
+            "AGT doesn't have the {name} permission (System Settings > Privacy & Security > {name})"
+        )
+        .into());
     }
     // A private source: the events carry exactly the flags we set, not the modifiers the user
     // is holding (e.g. Option for the next dictation, which would make it Cmd+Option+V).
@@ -546,13 +549,88 @@ pub fn missing_permissions() -> Vec<Permission> {
     if mic_access() != MicAccess::Authorized {
         missing.push(Permission::Microphone);
     }
-    if !CGPreflightListenEventAccess() {
+    if !listen_access() {
         missing.push(Permission::InputMonitoring);
     }
-    if !CGPreflightPostEventAccess() {
+    if !post_access() {
         missing.push(Permission::Accessibility);
     }
     missing
+}
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    /// `IOHIDRequestType` 1 = `kIOHIDRequestTypeListenEvent`; returns `IOHIDAccessType`
+    /// (0 = granted).
+    fn IOHIDCheckAccess(request: u32) -> u32;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: &NSDictionary<NSString, AnyObject>) -> bool;
+    static kAXTrustedCheckOptionPrompt: &'static NSString;
+}
+
+/// Shows the Accessibility ("Device Control") prompt. Not `CGRequestPostEventAccess`: once
+/// `AXIsProcessTrusted` (polled by `missing_permissions`) has registered the app as "off",
+/// that no longer prompts (seen on macOS 27); this does.
+fn request_accessibility() {
+    let yes = NSNumber::new_bool(true);
+    let options = NSDictionary::from_slices(
+        &[unsafe { kAXTrustedCheckOptionPrompt }],
+        &[&*yes as &AnyObject],
+    );
+    unsafe { AXIsProcessTrustedWithOptions(&options) };
+}
+
+// `CGPreflightListenEventAccess` / `CGPreflightPostEventAccess` keep answering "no" for the
+// rest of the process after a grant (seen on macOS 27), so a grant would need a restart. These
+// two ask TCC on every call.
+
+/// Input Monitoring.
+fn listen_access() -> bool {
+    (unsafe { IOHIDCheckAccess(1) } == 0) || CGPreflightListenEventAccess()
+}
+
+/// Accessibility ("Device Control"): posting events.
+fn post_access() -> bool {
+    (unsafe { AXIsProcessTrusted() }) || CGPreflightPostEventAccess()
+}
+
+/// What System Settings calls the Accessibility permission: "Device Control" from macOS 27 on.
+pub fn accessibility_name() -> &'static str {
+    static NAME: LazyLock<&str> = LazyLock::new(|| {
+        let mut buf = [0u8; 32];
+        let mut len = buf.len();
+        // SAFETY: `buf`/`len` describe a writable buffer.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.osproductversion".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                null_mut(),
+                0,
+            )
+        };
+        let major = (rc == 0)
+            .then(|| std::str::from_utf8(&buf[..len]).ok())
+            .flatten()
+            .and_then(|v| {
+                v.trim_end_matches('\0')
+                    .split('.')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        if major >= 27 {
+            "Device Control"
+        } else {
+            "Accessibility"
+        }
+    });
+    *NAME
 }
 
 /// Asks for the Microphone first and for the others only once it's answered: while the
@@ -590,9 +668,7 @@ fn request_event_access(missing: &[Permission]) {
             Permission::InputMonitoring => {
                 CGRequestListenEventAccess();
             }
-            Permission::Accessibility => {
-                CGRequestPostEventAccess();
-            }
+            Permission::Accessibility => request_accessibility(),
         }
     }
 }

@@ -64,8 +64,8 @@ model = "parakeet-tdt-0.6b-v2"
 # Parakeet encoder weights: "int8" (650 MB) or "fp32" (2.5 GB download and RAM/VRAM; a bit
 # faster and more accurate on a GPU).
 precision = "int8"
-# Where inference runs. "auto": the GPU (DirectML on Windows, Core ML on Macs with 16 GB or
-# more) if a quick check at start-up finds it no slower than the CPU, else the CPU. "cpu";
+# Where inference runs. "auto": the GPU (DirectML on Windows, Core ML on Macs with more
+# than 8 GB) if a quick check at start-up finds it no slower than the CPU, else the CPU. "cpu";
 # "directml" (Windows, any DirectX 12 GPU; holds ~1.1 GB of VRAM while AGT runs); "coreml"
 # (macOS; always the fp32 encoder: 2.4 GB download, ~3 GB of memory; the first start compiles
 # the model for this Mac, ~20 s, once); "cuda" (NVIDIA; builds with the `cuda` feature);

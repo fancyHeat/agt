@@ -164,7 +164,7 @@ impl Hub {
             Status::Recording
         } else if s.pending > 0 {
             Status::Transcribing
-        } else if !s.missing.is_empty() {
+        } else if !s.missing.is_empty() && !matches!(s.engine, Engine::Failed(_)) {
             Status::NeedsPermission(s.missing.clone())
         } else {
             match (&s.engine, &s.error) {
@@ -1171,9 +1171,10 @@ impl PasteError {
             PasteError::ClipboardBusy(_) => {
                 "clipboard busy (another app is holding it); not pasted"
             }
-            PasteError::Blocked(_) if cfg!(target_os = "macos") => {
-                "paste blocked (Accessibility permission?); clipboard restored"
-            }
+            PasteError::Blocked(_) if cfg!(target_os = "macos") => &format!(
+                "paste blocked ({} permission?); clipboard restored",
+                Permission::Accessibility
+            ),
             PasteError::Blocked(_) => "paste blocked (admin window?); clipboard restored",
             PasteError::WindowChanged => "not pasted: focus moved to another window",
         };
@@ -1471,7 +1472,10 @@ mod tests {
         assert_eq!(
             Status::NeedsPermission(vec![Permission::Microphone, Permission::Accessibility])
                 .to_string(),
-            "Needs permission: Microphone, Accessibility (System Settings > Privacy & Security)"
+            format!(
+                "Needs permission: Microphone, {} (System Settings > Privacy & Security)",
+                Permission::Accessibility
+            )
         );
     }
 }
