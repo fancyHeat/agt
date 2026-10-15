@@ -25,7 +25,7 @@ use std::{
     hash::{BuildHasher, Hasher},
     net::TcpListener,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     time::Duration,
 };
 
@@ -139,9 +139,10 @@ impl Launcher for LlamaLauncher {
             None => (Stdio::null(), Stdio::null()),
         };
         cmd.stdout(stdout).stderr(stderr);
-        let child = spawn(cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+        let mut child = spawn(cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
         Ok(Box::new(LlamaServer {
             gate: Gate::for_child(&child),
+            watchdog_pipe: child.stdin.take(),
             child,
             root: format!("http://127.0.0.1:{port}"),
             key,
@@ -152,6 +153,9 @@ impl Launcher for LlamaLauncher {
 
 struct LlamaServer {
     child: Child,
+    /// Unix: AGT's end of the watchdog's stdin; dropping it stops the server. Kept out of
+    /// `child`, because `Child::wait` closes the stdin it holds.
+    watchdog_pipe: Option<ChildStdin>,
     /// `http://127.0.0.1:<port>`
     root: String,
     key: String,
@@ -194,7 +198,7 @@ impl Server for LlamaServer {
 
     fn kill(&mut self) {
         // Unix: closing the watchdog's stdin makes it stop the server.
-        drop(self.child.stdin.take());
+        drop(self.watchdog_pipe.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -411,11 +415,24 @@ mod tests {
                 .success()
         };
         assert!(alive(&pid));
-        assert!(child.try_wait().unwrap().is_none());
-        let t = Instant::now();
-        drop(child.stdin.take());
+        // As `LlamaServer` does: keep the pipe out of `child` (`Child::wait` would close it)
+        // and wait while it's open; the server keeps running until the pipe closes.
+        let pipe = child.stdin.take().unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let closing = Instant::now();
+            drop(pipe);
+            closing
+        });
         let status = child.wait().unwrap();
-        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let exited = Instant::now();
+        let closed = closer.join().unwrap();
+        assert!(exited >= closed, "the server stopped before AGT went away");
+        assert!(
+            exited - closed < Duration::from_secs(5),
+            "{:?}",
+            exited - closed
+        );
         assert!(!status.success());
         assert!(!alive(&pid), "the server outlived the watchdog");
         let _ = fs::remove_file(&pid_file);
@@ -426,6 +443,7 @@ mod tests {
             &["-c".into(), "exit 7".into()],
         ))
         .unwrap();
+        let _pipe = child.stdin.take();
         assert_eq!(child.wait().unwrap().code(), Some(7));
     }
 
