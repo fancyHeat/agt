@@ -212,7 +212,8 @@ impl Llm {
                 (req, body)
             }
         };
-        tracing::trace!("polish request to {}: {body}", self.url);
+        // Neither the request nor the response is logged: both hold dictated text, and logs
+        // (agt.db events) must never contain any.
         let mut resp = req
             .send(body.to_string())
             .inspect_err(|_| self.reach.check())?;
@@ -221,8 +222,7 @@ impl Llm {
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status.as_u16(), error_message(&body)).into());
         }
-        // The response holds dictated text: only logged at debug, never put in the error.
-        tracing::debug!("polish response: {}", snippet(&body));
+        // The response holds dictated text: never put it in the error.
         let v: Value =
             serde_json::from_str(&body).map_err(|e| format!("malformed response: {e}"))?;
         Ok(match self.api {
@@ -264,8 +264,8 @@ fn parse_anthropic(v: &Value) -> std::result::Result<String, &'static str> {
 }
 
 /// `error.message` (OpenAI and Anthropic both use it). Any other body (e.g. a proxy's HTML
-/// page, which might echo the request) is only described by its size; its start is logged
-/// at debug, since the error ends up in a WARN line.
+/// page, which might echo the request) is only described by its size, since the error ends
+/// up in a WARN event.
 fn error_message(body: &str) -> String {
     let message = serde_json::from_str::<Value>(body)
         .ok()
@@ -275,10 +275,7 @@ fn error_message(body: &str) -> String {
         });
     match message {
         Some(m) => snippet(&m),
-        None => {
-            tracing::debug!("polish error body: {}", snippet(body));
-            format!("non-JSON error body ({} bytes)", body.len())
-        }
+        None => format!("non-JSON error body ({} bytes)", body.len()),
     }
 }
 

@@ -1,6 +1,6 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: logs, lock (`data_dir`) | models (`models_dir`) |
+//! | | config (`config_dir`) | data: telemetry db, lock (`data_dir`) | models (`models_dir`) |
 //! |---|---|---|---|
 //! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-models` |
 //! | macOS | `~/Library/Application Support/AGT` | same | `<data>/models` |
@@ -19,7 +19,7 @@ pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
 
-/// Holds logs and the instance lock. Machine-local, never roams.
+/// Holds the telemetry database and the instance lock. Machine-local, never roams.
 pub fn data_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::data_dir)
 }
@@ -33,8 +33,9 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-pub fn log_dir() -> PathBuf {
-    data_dir().join("logs")
+/// The telemetry database (sessions, dictation metrics, events; see `agt-telemetry`).
+pub fn db_file() -> PathBuf {
+    data_dir().join("agt.db")
 }
 
 fn home_override() -> Option<PathBuf> {

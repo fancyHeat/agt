@@ -24,9 +24,10 @@ pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
     r#"# AGT configuration. Restart AGT after editing.
-# If this file has an error, AGT starts with defaults (updates off) and logs the error.
+# If this file has an error, AGT starts with defaults (updates off) and records the error.
 
-# Log verbosity: "error", "warn", "info", "debug" or "trace".
+# Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
+# or "trace".
 log_level = "info"
 
 [hotkey]

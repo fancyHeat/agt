@@ -12,7 +12,11 @@
 //! short one for the feed (a few KB), a long one for packages.
 
 use agt_core::config::UpdateConfig;
-use std::{sync::Mutex, thread, time::Duration};
+use std::{
+    sync::Mutex,
+    thread,
+    time::{Duration, Instant},
+};
 use velopack::{HttpOptions, UpdateCheck, UpdateManager, VelopackAsset, sources::HttpSource};
 
 const FEED_URL: &str = "https://github.com/fancyHeat/agt/releases/latest/download";
@@ -84,12 +88,48 @@ pub fn check_now(
     Ok(updater.um.get_update_pending_restart())
 }
 
+/// Records an update step in the telemetry database's `updates` table. `ok`: the result
+/// to record on success ("none", "available" or "ok").
+fn record<T, E: std::fmt::Display>(
+    kind: &'static str,
+    to_version: Option<&str>,
+    started: Instant,
+    result: &Result<T, E>,
+    ok: &'static str,
+) {
+    agt_telemetry::global().update(agt_telemetry::Update {
+        kind,
+        from_version: env!("CARGO_PKG_VERSION").into(),
+        to_version: to_version.map(str::to_owned),
+        result: if result.is_ok() { ok } else { "error" },
+        error: result.as_ref().err().map(ToString::to_string),
+        duration_ms: started.elapsed().as_secs_f64() * 1e3,
+    });
+}
+
 fn check_and_download(
     Updater { um, feed }: &Updater,
     downloading: impl Fn(&str),
 ) -> Result<(), velopack::Error> {
     let _guard = CHECK.lock().unwrap_or_else(|e| e.into_inner());
-    let info = match feed.check_for_updates()? {
+    let t = Instant::now();
+    let check = feed.check_for_updates();
+    let available = match &check {
+        Ok(UpdateCheck::UpdateAvailable(info)) => Some(info.TargetFullRelease.Version.as_str()),
+        _ => None,
+    };
+    record(
+        "check",
+        available,
+        t,
+        &check,
+        if available.is_some() {
+            "available"
+        } else {
+            "none"
+        },
+    );
+    let info = match check? {
         UpdateCheck::UpdateAvailable(info) => info,
         UpdateCheck::NoUpdateAvailable | UpdateCheck::RemoteIsEmpty => {
             tracing::info!("no update available");
@@ -111,7 +151,10 @@ fn check_and_download(
     };
     tracing::info!("update {target} available; downloading ({kind})");
     downloading(target);
-    um.download_updates(&info, None)?;
+    let t = Instant::now();
+    let downloaded = um.download_updates(&info, None);
+    record("download", Some(target), t, &downloaded, "ok");
+    downloaded?;
     tracing::info!("update {target} downloaded; it will be applied on quit or next launch");
     Ok(())
 }
@@ -120,7 +163,10 @@ fn check_and_download(
 /// starts the new version. Call right before exiting.
 pub fn apply_and_restart(um: &UpdateManager, asset: &VelopackAsset) -> Result<(), velopack::Error> {
     tracing::info!("applying update {} and restarting", asset.Version);
-    um.wait_exit_then_apply_updates(asset, true, true, Vec::<String>::new())
+    let t = Instant::now();
+    let result = um.wait_exit_then_apply_updates(asset, true, true, Vec::<String>::new());
+    record("apply", Some(&asset.Version), t, &result, "ok");
+    result
 }
 
 /// If an update has been downloaded, hand it to the Velopack updater, which applies it
@@ -130,7 +176,10 @@ pub fn apply_pending_on_exit(um: &UpdateManager) {
         return;
     };
     tracing::info!("applying update {} on exit", asset.Version);
-    if let Err(e) = um.wait_exit_then_apply_updates(&asset, true, false, Vec::<String>::new()) {
+    let t = Instant::now();
+    let result = um.wait_exit_then_apply_updates(&asset, true, false, Vec::<String>::new());
+    record("apply", Some(&asset.Version), t, &result, "ok");
+    if let Err(e) = result {
         tracing::error!("failed to start updater: {e}");
     }
 }
