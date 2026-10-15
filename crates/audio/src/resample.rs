@@ -1,12 +1,14 @@
 //! A small streaming windowed-sinc resampler (any rate → any rate), good enough for speech
-//! recognition and cheap enough to run inside the audio callback: 32 taps per output sample,
-//! kernel precomputed for 256 fractional phases (nearest phase, no interpolation).
+//! recognition and cheap enough to run inside the audio callback: 128 taps per output sample
+//! (Blackman-windowed sinc, about 2 M multiply-adds per second at 48 -> 16 kHz), kernel
+//! precomputed for 256 fractional phases (nearest phase, no interpolation). At 48 -> 16 kHz:
+//! flat to ~5.5 kHz, -60 dB or better from 8.5 kHz, so nothing audible aliases below 8 kHz.
 //! Positions are tracked as exact fractions, so chunking never changes the output.
 
 use std::f64::consts::PI;
 
 /// Taps on each side of the output position.
-const HALF: usize = 16;
+const HALF: usize = 64;
 const PHASES: usize = 256;
 
 pub struct Resampler {
@@ -33,8 +35,9 @@ impl Resampler {
         let g = gcd(in_rate as u64, out_rate as u64);
         let (num, den) = (in_rate as u64 / g, out_rate as u64 / g);
         let kernel = (in_rate != out_rate).then(|| {
-            // Low-pass at 90% of the lower Nyquist frequency (relative to the input rate).
-            let cutoff = (out_rate as f64 / in_rate as f64).min(1.0) * 0.9;
+            // Low-pass at 85% of the lower Nyquist frequency (relative to the input rate), so the
+            // transition band ends at about that Nyquist frequency.
+            let cutoff = (out_rate as f64 / in_rate as f64).min(1.0) * 0.85;
             let mut k = vec![0f32; PHASES * 2 * HALF];
             for phase in 0..PHASES {
                 let frac = phase as f64 / PHASES as f64;
@@ -176,6 +179,32 @@ mod tests {
 
         let dc = resample(&vec![0.5; 44_100], 44_100, 16_000);
         assert!(dc[100..15_000].iter().all(|v| (v - 0.5).abs() < 1e-3));
+    }
+
+    /// Gain in dB of a `freq` sine through 48 -> 16 kHz (ignoring edges).
+    fn gain_db(freq: f64) -> f32 {
+        let out = resample(&sine(freq, 48_000, 1.0), 48_000, 16_000);
+        20.0 * (rms(&out[1000..15_000]) / std::f32::consts::FRAC_1_SQRT_2).log10()
+    }
+
+    #[test]
+    fn frequency_response_48k_to_16k() {
+        for (f, min, max) in [
+            (1_000.0, -0.2, 0.2),
+            (4_000.0, -0.5, 0.2),
+            (5_500.0, -1.5, 0.2),
+            // Above 8 kHz everything aliases into the top mel bins: must be well down.
+            (8_500.0, -200.0, -60.0),
+            (9_000.0, -200.0, -60.0),
+            (12_000.0, -200.0, -60.0),
+        ] {
+            let g = gain_db(f);
+            eprintln!("48k->16k {f} Hz: {g:.1} dB");
+            assert!(
+                (min..=max).contains(&g),
+                "{f} Hz: {g:.1} dB, want {min}..{max}"
+            );
+        }
     }
 
     #[test]

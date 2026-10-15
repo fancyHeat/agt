@@ -86,7 +86,8 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn new(keep_open: bool) -> Self {
+    /// `level` is updated with the input level while the stream runs (see [`Level`]).
+    pub fn new(keep_open: bool, level: Level) -> Self {
         Self {
             keep_open,
             live: None,
@@ -102,7 +103,7 @@ impl Recorder {
                 truncated: false,
             })),
             failed: Arc::new(AtomicBool::new(false)),
-            level: Level::default(),
+            level,
         }
     }
 
@@ -308,7 +309,7 @@ mod tests {
     #[ignore]
     fn records_from_default_microphone() {
         for keep_open in [false, true] {
-            let mut r = Recorder::new(keep_open);
+            let mut r = Recorder::new(keep_open, Level::default());
             let t = Instant::now();
             r.prepare().expect("prepare");
             let built = t.elapsed();
