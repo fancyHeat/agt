@@ -48,9 +48,8 @@ pub fn load(cfg: &PolishConfig, env: &Env) -> std::result::Result<Box<dyn Polish
 fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, String> {
     let base = cfg.base_url().trim_end_matches('/');
     if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err(format!(
-            "polish.base_url must start with http:// or https:// (got {base:?})"
-        ));
+        // Not echoed: a URL may carry credentials, and errors are recorded in agt.db.
+        return Err("polish.base_url must start with http:// or https://".into());
     }
     let key = cfg.api_key();
     if cfg.provider == PolishProvider::Anthropic && key.is_none() {
@@ -61,7 +60,8 @@ fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, Str
     }
     if key.is_some() && !is_https_or_loopback(base) {
         tracing::warn!(
-            "polish: the API key will be sent unencrypted over plain http to {base}; use https unless that server is on a network you trust"
+            "polish: the API key will be sent unencrypted over plain http to {}; use https unless that server is on a network you trust",
+            host_of(base)
         );
     }
     let api = match cfg.provider {
@@ -71,12 +71,20 @@ fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, Str
     Ok(Box::new(Llm::new(cfg, api, base, key)))
 }
 
+/// The `host[:port]` of a base URL: what may be shown or recorded of it. Never the
+/// userinfo (`user:token@`), path or query (`?key=...`), which may carry credentials.
+pub(crate) fn host_of(base: &str) -> &str {
+    let rest = base.split_once("://").map_or(base, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.rsplit('@').next().unwrap_or_default()
+}
+
 /// `https://...`, or plain http to this machine.
 fn is_https_or_loopback(base: &str) -> bool {
-    let Some(rest) = base.strip_prefix("http://") else {
+    if !base.starts_with("http://") {
         return true;
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
+    }
+    let authority = host_of(base);
     let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or_default(),
         None => authority.split(':').next().unwrap_or_default(),
@@ -139,7 +147,7 @@ impl Polisher for Llm {
             Api::OpenAi => "openai-compatible",
             Api::Anthropic => "anthropic",
         };
-        format!("{provider} {} at {}", self.cfg.model(), self.base)
+        format!("{provider} {} at {}", self.cfg.model(), host_of(&self.base))
     }
 
     /// Sends one short request: loads the model on a local server, opens the (TLS)

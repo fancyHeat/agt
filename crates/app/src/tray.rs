@@ -20,7 +20,7 @@ pub struct Tray {
     pub copy_last: MenuId,
     pub update: MenuId,
     pub open_config: MenuId,
-    /// "Open data folder" (the telemetry database), when it differs from the config folder.
+    /// "Open data folder" (the usage history, agt.db), when it differs from the config folder.
     pub open_data: Option<MenuId>,
     pub quit: MenuId,
 }

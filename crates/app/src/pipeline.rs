@@ -314,7 +314,8 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
     let notify = hub.notify.clone();
     let env = agt_polish::Env {
         models_dir: config.stt.models_path(),
-        log_file: Some(paths::log_dir().join("llama-server.log")),
+        // Start-up output only (see agt-polish), overwritten each launch.
+        log_file: Some(paths::data_dir().join("llama-server.log")),
         on_status: Arc::new(move |s: &agt_polish::Status| {
             tracing::info!("polish: {s}");
             notify(Event::PolishInfo(s.to_string()));
@@ -782,23 +783,28 @@ fn finish_text(raw: &str, trailing_space: bool) -> String {
 #[derive(Default)]
 struct Saver {
     saved: Option<ClipboardSnapshot>,
-    /// How long the last finished save took (ms), for telemetry.
-    save_ms: Option<f64>,
+    /// Which save finished last (see [`Saver::start`]) and how long it took (ms), for
+    /// telemetry.
+    save_ms: Option<(u64, f64)>,
+    /// How many saves were started; the running one is number `starts`.
+    starts: u64,
     in_flight: Option<Receiver<(Option<ClipboardSnapshot>, f64)>>,
 }
 
 impl Saver {
-    /// Starts saving the clipboard unless a save is already running.
-    fn start(&mut self) {
+    /// Starts saving the clipboard unless a save is already running. Returns the new save's
+    /// number, if it started one.
+    fn start(&mut self) -> Option<u64> {
         if self.in_flight.is_some() {
-            return;
+            return None;
         }
         let (tx, rx) = mpsc::channel();
         spawn("clipboard-save", move || {
             let _ = tx.send(snapshot());
         });
         self.in_flight = Some(rx);
-        self.save_ms = None;
+        self.starts += 1;
+        Some(self.starts)
     }
 
     /// Picks up a finished save, waiting at most `wait`.
@@ -807,7 +813,7 @@ impl Saver {
             match rx.recv_timeout(wait) {
                 Ok((s, took)) => {
                     self.saved = s;
-                    self.save_ms = Some(took);
+                    self.save_ms = Some((self.starts, took));
                     self.in_flight = None;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -959,6 +965,8 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
     let mut last = LastTranscript::default();
     let sensitive = paste_sensitive_keys(&hotkey);
+    // The clipboard save started for the next paste (its time is credited to that one).
+    let mut save_for_paste: Option<u64> = None;
 
     loop {
         let deadline = [pending_restore.as_ref().map(|(_, at)| *at), last.deadline()]
@@ -975,7 +983,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                 // holds the user's data; saving now would save our own text instead.
                 if restore && pending_restore.is_none() {
                     saver.saved = None;
-                    saver.start();
+                    save_for_paste = saver.start();
                 }
             }
             Ok(ToPaste::Paste {
@@ -1019,7 +1027,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                         .is_some_and(ClipboardSnapshot::is_stale);
                     if stale || (saver.saved.is_none() && saver.in_flight.is_none()) {
                         saver.saved = None;
-                        saver.start();
+                        save_for_paste = saver.start().or(save_for_paste);
                         saver.collect(SNAPSHOT_WAIT);
                     }
                     if saver.saved.is_none() && saver.in_flight.is_none() {
@@ -1073,8 +1081,12 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                 let chars = text.chars().count();
                 d.chars_out = Some(chars as i64);
                 d.words_out = Some(text.split_whitespace().count() as i64);
-                // Taken: a save is attributed to one dictation at most.
-                d.clipboard_save_ms = saver.save_ms.take();
+                // Only the save made for this paste, and only if it finished by now.
+                let ours = save_for_paste.take();
+                d.clipboard_save_ms = saver
+                    .save_ms
+                    .filter(|&(n, _)| Some(n) == ours)
+                    .map(|(_, took)| took);
                 d.paste_ms = Some(ms(pasted - paste_start));
                 match result {
                     Ok(token) => {

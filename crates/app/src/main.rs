@@ -70,7 +70,20 @@ fn main() {
     };
 
     // Handles Velopack install/update hooks (may exit) and applies downloaded updates.
-    VelopackApp::build().run();
+    #[allow(unused_mut)]
+    let mut velopack = VelopackApp::build();
+    // The usage history lives outside the install folder so reinstalls keep it (see
+    // `paths`); uninstalling still removes it. Models are left, as before.
+    #[cfg(windows)]
+    {
+        velopack = velopack.on_before_uninstall_fast_callback(|_| {
+            let history = paths::history_dir();
+            if history != paths::data_dir() {
+                let _ = std::fs::remove_dir_all(history);
+            }
+        });
+    }
+    velopack.run();
 
     tracing::info!(
         "AGT {VERSION} starting; config at {}",
@@ -157,12 +170,14 @@ fn main() {
     agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
 }
 
-/// The session's non-secret settings. Polish: provider, model and style only (never the
-/// API key or the URL, which may carry credentials).
+/// The session's non-secret settings. Polish: provider, model, style and S1-mini's options
+/// only (never the API key, its variable, the URL, which may carry credentials, or a custom
+/// prompt).
 fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionStart {
     let lower = |v: &dyn std::fmt::Debug| format!("{v:?}").to_lowercase();
     let polish = &config.polish;
     let on = polish.enabled;
+    let s1 = on && polish.provider == agt_core::config::PolishProvider::S1Mini;
     agt_telemetry::SessionStart {
         app_version: VERSION.into(),
         hotkey: config.hotkey.key.clone(),
@@ -177,6 +192,10 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         polish_provider: on.then(|| lower(&polish.provider)),
         polish_model: on.then(|| polish.model().to_owned()),
         polish_style: on.then(|| lower(&polish.style)),
+        s1_styling: s1.then(|| lower(&polish.s1_mini.styling)),
+        s1_structure: s1.then(|| lower(&polish.s1_mini.structure)),
+        s1_context: s1.then(|| lower(&polish.s1_mini.context)),
+        s1_device: s1.then(|| lower(&polish.s1_mini.device)),
         restore_clipboard_ms: config.paste.restore_clipboard_ms as i64,
         trailing_space: config.paste.trailing_space,
         overlay_enabled: config.overlay.enabled,
@@ -261,8 +280,8 @@ impl ApplicationHandler<AppEvent> for App {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
             let installed = self.updater.is_some();
-            // On macOS (and with AGT_HOME) data and config share a folder: one item is enough.
-            let data_folder = paths::data_dir() != paths::config_dir();
+            // On macOS (and with AGT_HOME) the history is in the config folder: one item will do.
+            let data_folder = paths::history_dir() != paths::config_dir();
             let tray = tray::Tray::new(
                 VERSION,
                 self.config_error,
@@ -339,7 +358,7 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if Some(&e.id) == tray.open_data.as_ref() => {
-                open_folder(&paths::data_dir())
+                open_folder(&paths::history_dir())
             }
             AppEvent::Menu(e) if e.id == tray.quit => {
                 if let Some(u) = &self.updater {

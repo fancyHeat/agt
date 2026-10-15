@@ -106,7 +106,7 @@ pub(crate) fn report_from(conn: &Connection, now: i64) -> rusqlite::Result<Strin
         let _ = writeln!(
             out,
             "  {:<20} {:>6} {:>9} {:>9} {:>9} {:>9}",
-            "metric", "n", "p50", "p90", "p99", "max"
+            "pasted: metric", "n", "p50", "p90", "p99", "max"
         );
         for metric in ROLLUP_METRICS {
             if let Some(s) = Summary::of(metric_values(conn, metric, start, i64::MAX)?) {
@@ -125,7 +125,7 @@ pub(crate) fn report_from(conn: &Connection, now: i64) -> rusqlite::Result<Strin
 
     let mut stmt = conn.prepare(
         "SELECT day, count, p50, p90, p99 FROM metric_rollups
-        WHERE metric = 'release_to_paste_ms' ORDER BY day DESC LIMIT ?1",
+        WHERE metric = 'latency_ms' ORDER BY day DESC LIMIT ?1",
     )?;
     let history = stmt
         .query_map([HISTORY_DAYS], |r| {
@@ -141,7 +141,7 @@ pub(crate) fn report_from(conn: &Connection, now: i64) -> rusqlite::Result<Strin
     if !history.is_empty() {
         let _ = writeln!(
             out,
-            "\nrelease_to_paste_ms by day (rollups, kept forever):\n  {:<10} {:>6} {:>9} {:>9} {:>9}",
+            "\nlatency_ms (release → paste, not counting a held hotkey) by day, rollups kept forever:\n  {:<10} {:>6} {:>9} {:>9} {:>9}",
             "day", "n", "p50", "p90", "p99"
         );
         for (day, n, p50, p90, p99) in history {

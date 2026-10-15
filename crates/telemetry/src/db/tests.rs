@@ -86,7 +86,7 @@ fn rollups_cover_completed_days_once() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!((n, p50, max), (4, 100.0, 300.0));
+    assert_eq!((n, p50, max), (3, 200.0, 300.0), "pasted dictations only");
     let no_speech: i64 = conn
         .query_row(
             "SELECT count FROM metric_rollups WHERE metric = 'outcome.no_speech'",
@@ -105,8 +105,61 @@ fn rollups_cover_completed_days_once() {
     );
 
     let rows = count(&conn, "SELECT count(*) FROM metric_rollups");
-    assert_eq!(rollup(&mut conn).unwrap(), 0, "nothing new");
+    assert_eq!(rollup(&mut conn).unwrap(), 1, "only the last day is redone");
     assert_eq!(count(&conn, "SELECT count(*) FROM metric_rollups"), rows);
+
+    // Recorded late (it ended after midnight, or the database was locked): the last
+    // rolled-up day picks it up; days before it are final.
+    dictation(&conn, now - 2 * DAY_MS, 70.0, Outcome::Pasted);
+    dictation(&conn, now - 3 * DAY_MS, 70.0, Outcome::Pasted);
+    assert_eq!(rollup(&mut conn).unwrap(), 1);
+    let counts: Vec<i64> = conn
+        .prepare(
+            "SELECT count FROM metric_rollups WHERE metric = 'release_to_paste_ms' ORDER BY day",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(counts, [3, 2]);
+    assert_eq!(count(&conn, "SELECT count(*) FROM metric_rollups"), rows);
+}
+
+#[test]
+fn latency_excludes_the_hotkey_wait() {
+    let conn = memory();
+    let d = Dictation {
+        started_at: now_ms(),
+        release_to_paste_ms: Some(900.0),
+        hotkey_wait_ms: Some(700.0),
+        ..Default::default()
+    };
+    insert_dictation(&conn, 1, &d, Outcome::Pasted).unwrap();
+    let latency: f64 = conn
+        .query_row("SELECT latency_ms FROM dictations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(latency, 200.0);
+}
+
+#[test]
+fn home_directory_is_redacted() {
+    let home = Home::new(Some(r"C:\Users\Jane Doe"));
+    assert_eq!(
+        home.redact(r"config at C:\Users\Jane Doe\AppData\Roaming\AGT\config.toml"),
+        r"config at ~\AppData\Roaming\AGT\config.toml"
+    );
+    assert_eq!(
+        home.redact("models in C:/Users/Jane Doe/AGT"),
+        "models in ~/AGT"
+    );
+    assert_eq!(home.redact("no path"), "no path");
+    let root = Home::new(Some("/"));
+    assert_eq!(
+        root.redact("/usr/lib"),
+        "/usr/lib",
+        "too short to be a home"
+    );
 }
 
 #[test]
@@ -163,13 +216,33 @@ fn stale_sessions_are_closed_as_crash_or_unknown() {
     let conn = memory();
     let crashed = insert_session(&conn, &SessionStart::default(), 1000).unwrap();
     let killed = insert_session(&conn, &SessionStart::default(), 2000).unwrap();
-    conn.execute(
-        "INSERT INTO events (ts, session_id, level, target, message)
-        VALUES (5000, ?1, 'ERROR', 'agt', 'panic at src/main.rs:1:1')",
-        [crashed],
-    )
-    .unwrap();
-    assert_eq!(close_stale_sessions(&conn).unwrap(), 2);
+    // A worker thread panicked, the app kept running, then was killed.
+    let survived = insert_session(&conn, &SessionStart::default(), 3000).unwrap();
+    let not_a_panic = insert_session(&conn, &SessionStart::default(), 4000).unwrap();
+    let event = |ts: i64, session: i64, level: &str, message: &str| {
+        conn.execute(
+            "INSERT INTO events (ts, session_id, level, target, message)
+            VALUES (?1, ?2, ?3, 'agt', ?4)",
+            params![ts, session, level, message],
+        )
+        .unwrap();
+    };
+    event(4000, crashed, "INFO", "ready");
+    event(
+        5000,
+        crashed,
+        "ERROR",
+        "panic at src/main.rs:1:1 on thread main: x",
+    );
+    event(
+        5000,
+        survived,
+        "ERROR",
+        "panic at src/pipeline.rs:1:1 on thread stt: x",
+    );
+    event(6000, survived, "INFO", "status: Ready");
+    event(7000, not_a_panic, "ERROR", "Panic at the disco");
+    assert_eq!(close_stale_sessions(&conn).unwrap(), 4);
     let get = |id: i64| -> (String, i64) {
         conn.query_row(
             "SELECT exit_reason, ended_at FROM app_sessions WHERE id = ?1",
@@ -184,6 +257,49 @@ fn stale_sessions_are_closed_as_crash_or_unknown() {
         "ended at its last event"
     );
     assert_eq!(get(killed), ("unknown".into(), 2000));
+    assert_eq!(get(survived), ("unknown".into(), 6000));
+    assert_eq!(get(not_a_panic), ("unknown".into(), 7000));
+}
+
+#[test]
+fn queue_is_capped_while_the_writer_is_stalled() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    let sink = Sink::default();
+    // Not started yet: nothing is drained, like a database locked for a long time.
+    for _ in 0..crate::QUEUE_SOFT_CAP + 500 {
+        sink.event("DEBUG", "t", "verbose".into());
+    }
+    sink.event("WARN", "t", "important".into());
+    sink.dictation(Dictation::default(), Outcome::Pasted);
+    assert!(sink.start(path.clone(), SessionStart::default()));
+    assert!(sink.flush(Duration::from_secs(10)));
+    let conn = open_read_only(&path).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'verbose'"
+        ) as usize,
+        crate::QUEUE_SOFT_CAP
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'important'"
+        ),
+        1,
+        "warnings get more room than debug events"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = '500 events were dropped while the database was unavailable'"
+        ),
+        1
+    );
+    drop(conn);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -252,7 +368,13 @@ fn senders_never_wait_for_the_disk() {
         sending < Duration::from_millis(500),
         "10k sends took {sending:?} while the database was locked"
     );
-    std::thread::sleep(Duration::from_millis(200));
+    sink.event("DEBUG", "t", "during the lock".into());
+    // Longer than the connection's busy timeout (2 s): the batch is kept and retried, and
+    // a flush only succeeds once it's really committed.
+    assert!(
+        !sink.flush(Duration::from_secs(3)),
+        "nothing can be committed while the lock is held"
+    );
     blocker.execute_batch("COMMIT").unwrap();
 
     sink.update(Update {
@@ -267,6 +389,13 @@ fn senders_never_wait_for_the_disk() {
     let conn = open_read_only(&path).unwrap();
     assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 10_000);
     assert_eq!(count(&conn, "SELECT count(*) FROM updates"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'during the lock'"
+        ),
+        1
+    );
     assert_eq!(
         count(
             &conn,

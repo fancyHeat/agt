@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "agt-telemetry"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "rusqlite",
 ]

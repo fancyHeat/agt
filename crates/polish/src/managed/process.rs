@@ -9,8 +9,9 @@
 //! - Unix: started through a tiny `sh` watchdog whose stdin is a pipe from AGT. When AGT
 //!   exits for any reason, the pipe closes, `read` returns, and the watchdog sends the server
 //!   SIGTERM. The watchdog exits with the server's status, so AGT still sees crashes.
-//! - Its output goes to `Env::log_file` (the previous run's kept as `.1`). At its default
-//!   verbosity llama-server logs start-up, devices and per-request timings, never prompts.
+//! - Its start-up output goes to `Env::log_file` (the previous run's kept as `.1`); later
+//!   output is dropped (see `StartupLog`): at its default verbosity llama-server logs
+//!   per-request timings, not prompts, but an error path could quote a request.
 
 use super::{
     Status,
@@ -132,18 +133,33 @@ impl Launcher for LlamaLauncher {
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }
-        let (stdout, stderr) = match &self.log_file {
-            Some(path) => match rotate_and_create(path).and_then(|f| Ok((f.try_clone()?, f))) {
-                Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        let log = match &self.log_file {
+            Some(path) => match rotate_and_create(path) {
+                Ok(f) => Some(Arc::new(StartupLog::new(f))),
                 Err(e) => {
                     tracing::warn!("cannot write {}: {e}", path.display());
-                    (Stdio::null(), Stdio::null())
+                    None
                 }
             },
-            None => (Stdio::null(), Stdio::null()),
+            None => None,
         };
-        cmd.stdout(stdout).stderr(stderr);
+        let piped = || {
+            if log.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            }
+        };
+        cmd.stdout(piped()).stderr(piped());
         let mut child = spawn(cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+        if let Some(log) = log {
+            if let Some(out) = child.stdout.take() {
+                log.clone().tap(out);
+            }
+            if let Some(err) = child.stderr.take() {
+                log.tap(err);
+            }
+        }
         let root = format!("http://127.0.0.1:{port}");
         let idle_check = {
             let (agent, url, key) = (self.health.clone(), format!("{root}/slots"), key.clone());
@@ -176,6 +192,68 @@ fn slots_idle(agent: &ureq::Agent, url: &str, key: &str) -> bool {
         None => {
             tracing::debug!("cannot read llama-server's /slots; assuming idle");
             true
+        }
+    }
+}
+
+/// llama-server's output, written to its log file only until it's up (model loaded,
+/// listening): devices, memory, load errors. After that it logs per-request lines, and even
+/// at its default verbosity an error path could quote part of a request, i.e. dictated
+/// text, so later output is read (the server must never block on a full pipe) and dropped.
+struct StartupLog {
+    file: std::sync::Mutex<Option<fs::File>>,
+}
+
+/// Lines that mean llama-server finished starting (wording differs between its versions).
+const STARTED: &[&str] = &[
+    "listening on http",
+    "starting the main loop",
+    "all slots are idle",
+];
+
+/// Parts of lines about requests: if one shows up before a start-up line (an unknown
+/// version's wording), the log stops there, without it.
+const REQUEST_LINE: &[&str] = &["| task ", "launch_slot", "request:"];
+
+/// A start-up log longer than this is cut off (it's a few KB normally).
+const STARTUP_LOG_MAX: u64 = 256 * 1024;
+
+impl StartupLog {
+    fn new(f: fs::File) -> Self {
+        Self {
+            file: std::sync::Mutex::new(Some(f)),
+        }
+    }
+
+    /// Copies `stream` line by line on a helper thread (see the type docs).
+    fn tap(self: Arc<Self>, stream: impl std::io::Read + Send + 'static) {
+        let spawned = std::thread::Builder::new()
+            .name("llama-server-log".into())
+            .spawn(move || self.copy(stream));
+        if let Err(e) = spawned {
+            tracing::warn!("cannot read llama-server's output: {e}");
+        }
+    }
+
+    /// Reads `stream` to its end, writing lines to the file until the server has started.
+    fn copy(&self, stream: impl std::io::Read) {
+        use std::io::{BufRead, Write};
+        let mut written = 0u64;
+        for line in std::io::BufReader::new(stream).split(b'\n') {
+            let Ok(line) = line else { return };
+            let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(f) = file.as_mut() else { continue };
+            let text = String::from_utf8_lossy(&line);
+            let request = REQUEST_LINE.iter().any(|m| text.contains(m));
+            if !request {
+                written += line.len() as u64 + 1;
+                let _ = f.write_all(&line);
+                let _ = f.write_all(b"\n");
+            }
+            if request || STARTED.iter().any(|m| text.contains(m)) || written > STARTUP_LOG_MAX {
+                let _ = f.write_all(b"[AGT: later output is not kept, it may describe requests]\n");
+                *file = None;
+            }
         }
     }
 }
@@ -401,6 +479,47 @@ mod job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_log_keeps_only_start_up() {
+        let path = std::env::temp_dir().join(format!("agt-startup-log-{}", std::process::id()));
+        let log = StartupLog::new(fs::File::create(&path).unwrap());
+        let out = "load_tensors: offloaded 29/29 layers to GPU\n\
+                   main: server is listening on http://127.0.0.1:4242 - starting the main loop\n\
+                   srv  log_server_r: request: {\"messages\":[\"dictated words\"]}\n";
+        log.copy(out.as_bytes());
+        drop(log);
+        let text = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(text.contains("offloaded 29/29"), "{text}");
+        assert!(text.contains("starting the main loop"), "{text}");
+        assert!(!text.contains("dictated words"), "{text}");
+
+        // b11669's wording, and a request line where a start-up line was expected.
+        for (out, kept) in [
+            (
+                "srv  llama_server: model loaded\n\
+                 srv  llama_server: listening on http://127.0.0.1:64599\n\
+                 slot launch_slot_: id  0 | task 0 | processing task\n",
+                "listening on",
+            ),
+            (
+                "srv    load_model: loading model\n\
+                 slot launch_slot_: id  0 | task 0 | processing task\n\
+                 srv  later: dictated words\n",
+                "loading model",
+            ),
+        ] {
+            let log = StartupLog::new(fs::File::create(&path).unwrap());
+            log.copy(out.as_bytes());
+            drop(log);
+            let text = fs::read_to_string(&path).unwrap();
+            let _ = fs::remove_file(&path);
+            assert!(text.contains(kept), "{text}");
+            assert!(!text.contains("task 0"), "{text}");
+            assert!(!text.contains("dictated words"), "{text}");
+        }
+    }
 
     #[test]
     fn keys_are_random_hex() {

@@ -77,6 +77,26 @@ fn anthropic(url: &str) -> PolishConfig {
     }
 }
 
+#[test]
+fn base_url_credentials_are_never_shown() {
+    assert_eq!(
+        host_of("https://user:tok@proxy.example:8443/v1?key=s#x"),
+        "proxy.example:8443"
+    );
+    assert_eq!(host_of("http://localhost:11434/v1"), "localhost:11434");
+    assert_eq!(host_of("https://api.anthropic.com"), "api.anthropic.com");
+    let mut cfg = openai("https://user:SECRET@proxy.example");
+    cfg.base_url.push_str("?key=SECRET");
+    let name = load_remote(&cfg).unwrap().name();
+    assert_eq!(name, "openai-compatible test-model at proxy.example");
+    cfg.base_url = "ftp://user:SECRET@x".into();
+    let e = load_remote(&cfg).err().unwrap();
+    assert!(!e.contains("SECRET"), "{e}");
+    // Userinfo doesn't confuse the loopback check behind the plain-http warning.
+    assert!(!is_https_or_loopback("http://user:pw@example.com/v1"));
+    assert!(is_https_or_loopback("http://user:pw@localhost:8080/v1"));
+}
+
 const RAW: &str = "um so this is uh a test of the polish thing";
 const CLEAN: &str = "So this is a test of the polish thing.";
 

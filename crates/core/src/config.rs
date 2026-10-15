@@ -568,14 +568,41 @@ impl UpdateConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
-    Parse(toml::de::Error),
+    /// Only toml's message and where (1-based line and column): its full error quotes the
+    /// offending line, which may hold an API key, and this error is recorded in agt.db.
+    Parse {
+        message: String,
+        at: Option<(usize, usize)>,
+    },
+}
+
+impl ConfigError {
+    fn parse(e: toml::de::Error, text: &str) -> Self {
+        let at = e.span().map(|span| {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            (line, column)
+        });
+        Self::Parse {
+            message: e.message().trim().to_owned(),
+            at,
+        }
+    }
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "config I/O error: {e}"),
-            Self::Parse(e) => write!(f, "invalid config.toml: {e}"),
+            Self::Parse {
+                message,
+                at: Some((line, column)),
+            } => write!(
+                f,
+                "invalid config.toml at line {line}, column {column}: {message}"
+            ),
+            Self::Parse { message, at: None } => write!(f, "invalid config.toml: {message}"),
         }
     }
 }
@@ -588,11 +615,12 @@ impl Config {
     /// turns polish off ([`Config::polish_error`] says why) and keeps the rest of the
     /// user's settings. Anything wrong elsewhere fails the whole file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut table: toml::Table = toml::from_str(text).map_err(ConfigError::Parse)?;
+        let mut table: toml::Table =
+            toml::from_str(text).map_err(|e| ConfigError::parse(e, text))?;
         let polish = table.remove("polish");
         let mut config: Self = toml::Value::Table(table)
             .try_into()
-            .map_err(ConfigError::Parse)?;
+            .map_err(|e| ConfigError::parse(e, text))?;
         if let Some(mut polish) = polish {
             // Written before `s1-mini` became the default: `base_url` without a provider
             // meant the OpenAI-compatible one (a server the user runs).
@@ -685,6 +713,27 @@ mod tests {
         assert!(Config::parse("[stt]\ntypo = 1").is_err());
         // ...except in [polish], where they only turn polish off (see below).
         assert!(polish_error("[polish]\ntypo = 1"));
+    }
+
+    #[test]
+    fn parse_errors_never_quote_the_file() {
+        // A key with a missing closing quote, and an error on the line after one.
+        for text in [
+            "[polish]\napi_key = \"sk-ant-SECRET123\n",
+            "[polish]\napi_key = \"sk-ant-SECRET123\"\n= 1\n",
+            "log_level = \"info\"\n[polish]\napi_key = \"sk-ant-SECRET123\" x\n",
+        ] {
+            let e = Config::parse(text).unwrap_err().to_string();
+            assert!(!e.contains("SECRET"), "{e}");
+            assert!(e.contains("line "), "{e}");
+        }
+        let e = Config::parse("a = 1\n\n  b = \"x\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("invalid config.toml at line 3, column "),
+            "{e}"
+        );
     }
 
     /// Parses, and says whether `[polish]` was rejected (with polish then off).

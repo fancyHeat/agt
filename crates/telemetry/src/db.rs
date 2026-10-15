@@ -3,8 +3,10 @@
 //! Times are unix milliseconds (`INTEGER`); days are local dates (`YYYY-MM-DD`), computed by
 //! SQLite's `localtime`. Readable form: `datetime(ts / 1000, 'unixepoch', 'localtime')`.
 
-use crate::{Dictation, Msg, Outcome, SessionStart, SessionUpdate, now_ms, stats::Summary};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params};
+use crate::{Dictation, Msg, Outcome, Queue, SessionStart, SessionUpdate, now_ms, stats::Summary};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, RecvTimeoutError},
@@ -24,11 +26,15 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// How often the writer checks for a new local day (rollups + pruning) while running.
 const DAY_CHECK: Duration = Duration::from_secs(60);
 
+/// Longest wait between retries while another program holds the database's write lock.
+const BUSY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 /// Upper bound on records per transaction, so one huge backlog doesn't hold a write lock long.
 const MAX_BATCH: usize = 1000;
 
 /// `dictations` columns rolled up into daily percentiles.
 pub const ROLLUP_METRICS: &[&str] = &[
+    "latency_ms",
     "release_to_paste_ms",
     "stt_ms",
     "rtf",
@@ -72,6 +78,10 @@ CREATE TABLE app_sessions (
     polish_provider TEXT,
     polish_model TEXT,
     polish_style TEXT,
+    s1_styling TEXT,
+    s1_structure TEXT,
+    s1_context TEXT,
+    s1_device TEXT,
     restore_clipboard_ms INTEGER,
     trailing_space INTEGER,
     overlay_enabled INTEGER,
@@ -107,6 +117,7 @@ CREATE TABLE dictations (
     clipboard_save_ms REAL,
     paste_ms REAL,
     release_to_paste_ms REAL,
+    latency_ms REAL,
     chars_out INTEGER,
     words_out INTEGER,
     stt_backend TEXT
@@ -219,15 +230,16 @@ fn move_aside(path: &Path) -> PathBuf {
     aside
 }
 
-/// Closes sessions left open by a previous run that didn't exit cleanly: `crash` if it
-/// recorded a panic, else `unknown` (killed, logged off, power loss). `ended_at` is its last
-/// event.
+/// Closes sessions left open by a previous run that didn't exit cleanly: `crash` if its
+/// last event was a panic (`panic at ...`, see the app's panic hook), else `unknown`
+/// (killed, logged off, power loss; also a worker-thread panic the app outlived). `ended_at`
+/// is its last event.
 pub(crate) fn close_stale_sessions(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE app_sessions SET
-            exit_reason = CASE WHEN EXISTS (
-                SELECT 1 FROM events e WHERE e.session_id = app_sessions.id
-                    AND e.level = 'ERROR' AND e.message LIKE 'panic%'
+            exit_reason = CASE WHEN (
+                SELECT e.level = 'ERROR' AND e.message GLOB 'panic at *' FROM events e
+                WHERE e.session_id = app_sessions.id ORDER BY e.ts DESC, e.id DESC LIMIT 1
             ) THEN 'crash' ELSE 'unknown' END,
             ended_at = max(started_at, coalesce(
                 (SELECT max(ts) FROM events e WHERE e.session_id = app_sessions.id), 0))
@@ -245,9 +257,10 @@ pub(crate) fn insert_session(
         "INSERT INTO app_sessions (started_at, app_version, os, arch, hotkey, min_hold_ms,
             keep_mic_open, stt_engine, stt_model, stt_precision, stt_device, stt_threads,
             polish_enabled, polish_provider, polish_model, polish_style, restore_clipboard_ms,
-            trailing_space, overlay_enabled, updates_enabled, log_level, config_error)
+            trailing_space, overlay_enabled, updates_enabled, log_level, config_error,
+            s1_styling, s1_structure, s1_context, s1_device)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22)",
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             at,
             s.app_version,
@@ -271,6 +284,10 @@ pub(crate) fn insert_session(
             s.updates_enabled,
             s.log_level,
             s.config_error,
+            s.s1_styling,
+            s.s1_structure,
+            s.s1_context,
+            s.s1_device,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -313,13 +330,17 @@ pub(crate) fn insert_dictation(
         (Some(stt), Some(secs)) if secs > 0.0 => Some(stt / 1e3 / secs),
         _ => None,
     };
+    // The pipeline's latency: time the user still held a hotkey key isn't part of it.
+    let latency = d
+        .release_to_paste_ms
+        .map(|t| t - d.hotkey_wait_ms.unwrap_or(0.0));
     conn.execute(
         "INSERT INTO dictations (session_id, started_at, outcome, hold_ms, audio_secs, rms,
             key_down_to_mic_ms, first_audio_ms, missed_release, queue_wait_ms, stt_ms, rtf,
             polish_ms, polish_outcome, hotkey_wait_ms, clipboard_save_ms, paste_ms,
-            release_to_paste_ms, chars_out, words_out, stt_backend)
+            release_to_paste_ms, chars_out, words_out, stt_backend, latency_ms)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21)",
+            ?19, ?20, ?21, ?22)",
         params![
             session,
             d.started_at,
@@ -342,21 +363,24 @@ pub(crate) fn insert_dictation(
             d.chars_out,
             d.words_out,
             d.stt_backend,
+            latency,
         ],
     )?;
     Ok(())
 }
 
-/// Writes `batch` in one transaction. Flush requests are returned, to be answered once it's
-/// committed (or failed: a flush must never hang).
+/// Writes `batch` in one transaction, taking the write lock once up front (`IMMEDIATE`, so
+/// a lock held by another program is waited for once per batch, not once per record).
+/// `Err` if nothing was committed: busy (retry the whole batch), corrupt, or a failed
+/// commit. A record that fails on its own is skipped (reported on stderr) and the rest
+/// committed.
 fn write_batch(
     conn: &mut Connection,
     session: i64,
-    batch: Vec<Msg>,
-    acks: &mut Vec<std::sync::mpsc::SyncSender<()>>,
+    batch: &[Msg],
+    home: &Home,
 ) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    let mut result = Ok(());
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for msg in batch {
         let r = match msg {
             Msg::Event {
@@ -368,11 +392,11 @@ fn write_batch(
                 .execute(
                     "INSERT INTO events (ts, session_id, level, target, message)
                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![ts, session, level, target, message],
+                    params![ts, session, level, target, home.redact(message)],
                 )
                 .map(drop),
-            Msg::Dictation(d, outcome) => insert_dictation(&tx, session, &d, outcome),
-            Msg::Session(u) => update_session(&tx, session, &u),
+            Msg::Dictation(d, outcome) => insert_dictation(&tx, session, d, *outcome),
+            Msg::Session(u) => update_session(&tx, session, u),
             Msg::Update(u, ts) => tx
                 .execute(
                     "INSERT INTO updates (ts, session_id, kind, from_version, to_version,
@@ -385,7 +409,7 @@ fn write_batch(
                         u.from_version,
                         u.to_version,
                         u.result,
-                        u.error,
+                        u.error.as_deref().map(|e| home.redact(e)),
                         u.duration_ms
                     ],
                 )
@@ -396,21 +420,77 @@ fn write_batch(
                     params![session, ts, reason.as_str()],
                 )
                 .map(drop),
-            Msg::Flush(ack) => {
-                acks.push(ack);
-                Ok(())
-            }
+            Msg::Flush(_) => Ok(()),
         };
-        // Keep going: one bad record must not lose the rest of the batch.
-        if let Err(e) = r {
-            if is_corrupt(&e) {
-                return Err(e);
-            }
-            result = Err(e);
+        match r {
+            Err(e) if is_busy(&e) || is_corrupt(&e) => return Err(e),
+            // Keep going: one bad record must not lose the rest of the batch.
+            Err(e) => eprintln!("agt: telemetry record skipped: {e}"),
+            Ok(()) => {}
         }
     }
-    tx.commit()?;
-    result
+    tx.commit()
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Runs `f` until the database isn't busy (another program, e.g. an SQLite browser with
+/// unsaved changes, holds the write lock), backing off up to [`BUSY_BACKOFF_MAX`]. Never
+/// gives up: records wait in the channel meanwhile (see `Sink`'s queue cap).
+fn while_busy<T>(mut f: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    let mut wait = Duration::from_millis(50);
+    let mut warned = false;
+    loop {
+        match f() {
+            Err(e) if is_busy(&e) => {
+                if !warned {
+                    eprintln!("agt: telemetry database busy ({e}); retrying");
+                    warned = true;
+                }
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(BUSY_BACKOFF_MAX);
+            }
+            r => return r,
+        }
+    }
+}
+
+/// The user's home directory, replaced by `~` in stored messages: paths in events would
+/// otherwise carry the user name.
+pub(crate) struct Home(Vec<String>);
+
+impl Home {
+    pub(crate) fn from_env() -> Self {
+        let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        Self::new(std::env::var(var).ok().as_deref())
+    }
+
+    pub(crate) fn new(home: Option<&str>) -> Self {
+        let home = home.map(|h| h.trim_end_matches(['/', '\\'])).unwrap_or("");
+        // Too short to be a real home (e.g. "/"): replacing it would mangle every path.
+        if home.len() < 4 {
+            return Self(Vec::new());
+        }
+        // Also with the other separator: config values are often written with `/`.
+        let mut forms = vec![home.to_owned(), home.replace('\\', "/")];
+        forms.dedup();
+        Self(forms)
+    }
+
+    pub(crate) fn redact(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        for h in &self.0 {
+            if text.contains(h.as_str()) {
+                text = text.replace(h.as_str(), "~");
+            }
+        }
+        text
+    }
 }
 
 /// Deletes rows past their retention (see the constants above). `now`: unix ms.
@@ -444,27 +524,36 @@ pub(crate) fn prune(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     Ok(n)
 }
 
-/// Computes `metric_rollups` for every completed local day after the last rolled-up one.
-/// Idempotent: a day is rolled up once (and re-running replaces identical rows). Returns the
-/// number of days rolled up.
+/// Days before this local date are complete, for rollups: the date 10 minutes ago, so a
+/// dictation that started before midnight but was recorded just after it is still counted.
+const COMPLETED_BEFORE: &str = "date('now', '-10 minutes', 'localtime')";
+
+/// Computes `metric_rollups` for every completed local day (see [`COMPLETED_BEFORE`]) from
+/// the last rolled-up one on. That last day is rolled up again, which picks up rows
+/// recorded late (e.g. held back by a long external lock). Idempotent: a day's rows are
+/// replaced as a whole. Returns the number of days (re)computed.
+///
+/// Durations are over `pasted` dictations only: a failed one has partial timings (e.g. no
+/// paste), and the `outcome.<x>` counts cover failures.
 pub(crate) fn rollup(conn: &mut Connection) -> rusqlite::Result<usize> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let days: Vec<(String, i64, i64)> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "SELECT day, strftime('%s', day, 'utc') * 1000, strftime('%s', day, '+1 day', 'utc') * 1000
             FROM (
                 SELECT DISTINCT date(started_at / 1000, 'unixepoch', 'localtime') AS day
                 FROM dictations
                 WHERE started_at >= coalesce(
-                    (SELECT strftime('%s', max(day), '+1 day', 'utc') * 1000 FROM metric_rollups), 0)
+                    (SELECT strftime('%s', max(day), 'utc') * 1000 FROM metric_rollups), 0)
             )
-            WHERE day < date('now', 'localtime')
-            ORDER BY day",
-        )?;
+            WHERE day < {COMPLETED_BEFORE}
+            ORDER BY day"
+        ))?;
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
     for (day, start, end) in &days {
+        tx.execute("DELETE FROM metric_rollups WHERE day = ?1", [day])?;
         let mut insert = tx.prepare(
             "INSERT OR REPLACE INTO metric_rollups (day, metric, count, min, p50, p90, p99, max, mean)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -508,7 +597,8 @@ pub(crate) fn rollup(conn: &mut Connection) -> rusqlite::Result<usize> {
     Ok(days.len())
 }
 
-/// The non-null values of `metric` (a `dictations` column) for rows started in [start, end).
+/// The non-null values of `metric` (a `dictations` column) for `pasted` dictations started
+/// in [start, end) (see [`rollup`] for why only those).
 pub(crate) fn metric_values(
     conn: &Connection,
     metric: &str,
@@ -517,72 +607,96 @@ pub(crate) fn metric_values(
 ) -> rusqlite::Result<Vec<f64>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {metric} FROM dictations
-        WHERE started_at >= ?1 AND started_at < ?2 AND {metric} IS NOT NULL"
+        WHERE started_at >= ?1 AND started_at < ?2 AND outcome = 'pasted'
+            AND {metric} IS NOT NULL"
     ))?;
     stmt.query_map([start, end], |r| r.get::<_, f64>(0))?
         .collect()
 }
 
-fn today(conn: &Connection) -> Option<String> {
-    conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
+/// The latest completed day (see [`COMPLETED_BEFORE`]): maintenance runs when it changes.
+fn completed_day(conn: &Connection) -> Option<String> {
+    conn.query_row(&format!("SELECT {COMPLETED_BEFORE}"), [], |r| r.get(0))
         .optional()
         .ok()
         .flatten()
 }
 
-/// Rollups first (so nothing is pruned before it's rolled up), then retention.
-fn maintenance(conn: &mut Connection) {
+/// Rollups first (so nothing is pruned before it's rolled up), then retention. False if it
+/// has to be tried again (the database was busy).
+fn maintenance(conn: &mut Connection) -> bool {
+    let mut done = true;
     if let Err(e) = rollup(conn) {
         eprintln!("agt: telemetry rollup failed: {e}");
+        done &= !is_busy(&e);
     }
     if let Err(e) = prune(conn, now_ms()) {
         eprintln!("agt: telemetry pruning failed: {e}");
+        done &= !is_busy(&e);
     }
+    done
 }
 
-/// Opens the database, closes stale sessions, starts a new one and does start-up
-/// maintenance. `None` if the database can't be used.
+/// Opens the database, closes stale sessions and starts a new one (waiting while the
+/// database is busy). `None` if the database can't be used.
 fn connect(path: &Path, session: &SessionStart) -> Option<(Connection, i64)> {
-    let mut conn = match open(path) {
+    let conn = match open(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("agt: telemetry off, cannot open {}: {e}", path.display());
             return None;
         }
     };
-    let id = close_stale_sessions(&conn).and_then(|_| insert_session(&conn, session, now_ms()));
-    let id = match id {
-        Ok(id) => id,
+    let id = while_busy(|| {
+        close_stale_sessions(&conn)?;
+        insert_session(&conn, session, now_ms())
+    });
+    match id {
+        Ok(id) => Some((conn, id)),
         Err(e) => {
             eprintln!("agt: telemetry off, cannot start a session: {e}");
-            return None;
+            None
         }
-    };
-    maintenance(&mut conn);
-    Some((conn, id))
+    }
 }
 
 /// The writer thread (see the crate docs). Returns, dropping `rx` (which turns every send
 /// into a no-op), if the database can't be used.
-pub(crate) fn writer(path: &Path, session: &SessionStart, rx: Receiver<Msg>) {
+pub(crate) fn writer(path: &Path, session: &SessionStart, rx: Receiver<Msg>, queue: &Queue) {
     let Some((mut conn, mut session_id)) = connect(path, session) else {
         return;
     };
-    let mut day = today(&conn);
+    let home = Home::from_env();
+    let mut maintenance_due = true;
+    let mut day = completed_day(&conn);
     let mut day_checked = Instant::now();
     loop {
+        if maintenance_due {
+            maintenance_due = !maintenance(&mut conn);
+        }
         let first = match rx.recv_timeout(DAY_CHECK) {
             Ok(m) => Some(m),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
         if let Some(first) = first {
-            let batch: Vec<Msg> = std::iter::once(first)
+            let mut batch: Vec<Msg> = std::iter::once(first)
                 .chain(rx.try_iter().take(MAX_BATCH))
                 .collect();
-            let mut acks = Vec::new();
-            let result = write_batch(&mut conn, session_id, batch, &mut acks);
-            match result {
+            queue.received(batch.len());
+            if let Some(event) = queue.dropped_event() {
+                batch.push(event);
+            }
+            // The whole batch is kept and retried while another program holds the lock.
+            match while_busy(|| write_batch(&mut conn, session_id, &batch, &home)) {
+                Ok(()) => {
+                    // Flushes are answered only after their records were committed.
+                    for msg in batch {
+                        if let Msg::Flush(ack) = msg {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
                 Err(e) if is_corrupt(&e) => {
                     // Corrupted while running: start over with a fresh file and session.
                     drop(conn);
@@ -596,19 +710,16 @@ pub(crate) fn writer(path: &Path, session: &SessionStart, rx: Receiver<Msg>) {
                     };
                     (conn, session_id) = c;
                 }
+                // Lost (e.g. disk full); pending flushes see their ack dropped.
                 Err(e) => eprintln!("agt: telemetry write failed: {e}"),
-                Ok(()) => {}
-            }
-            for ack in acks {
-                let _ = ack.send(());
             }
         }
         if day_checked.elapsed() >= DAY_CHECK {
             day_checked = Instant::now();
-            let now = today(&conn);
+            let now = completed_day(&conn);
             if now != day {
                 day = now;
-                maintenance(&mut conn);
+                maintenance_due = true;
             }
         }
     }
