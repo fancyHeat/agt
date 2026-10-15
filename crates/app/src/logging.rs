@@ -14,7 +14,9 @@ pub fn init(log_dir: &Path, level: &str) {
     // Velopack logs ~10 lines per update check at INFO; keep only its warnings.
     let filter = Targets::new()
         .with_default(level)
-        .with_target("velopack", LevelFilter::WARN.min(level));
+        .with_target("velopack", LevelFilter::WARN.min(level))
+        // ONNX Runtime logs device discovery and graph details at INFO.
+        .with_target("ort", LevelFilter::WARN.min(level));
 
     let _ = std::fs::create_dir_all(log_dir);
     let appender = RollingFileAppender::builder()

@@ -1,4 +1,4 @@
-//! Tray icon with "Open config folder" and "Quit".
+//! Tray icon: a status line, "Open config folder" and "Quit".
 
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -6,7 +6,9 @@ use tray_icon::{
 };
 
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    title: String,
+    status: MenuItem,
     pub open_config: MenuId,
     pub quit: MenuId,
 }
@@ -14,18 +16,20 @@ pub struct Tray {
 impl Tray {
     /// `config_error`: shown as a disabled menu line so a broken config is noticeable.
     pub fn new(version: &str, config_error: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        let title = MenuItem::new(format!("AGT {version}"), false, None);
+        let title = format!("AGT {version}");
+        let title_item = MenuItem::new(&title, false, None);
+        let status = MenuItem::new("Starting...", false, None);
         let warning = MenuItem::new("Config error (updates off) - see log", false, None);
         let open_config = MenuItem::new("Open config folder", true, None);
         let quit = MenuItem::new("Quit", true, None);
-        let menu = Menu::with_items(&[&title, &PredefinedMenuItem::separator()])?;
+        let menu = Menu::with_items(&[&title_item, &status, &PredefinedMenuItem::separator()])?;
         if config_error {
             menu.append(&warning)?;
         }
         menu.append_items(&[&open_config, &quit])?;
 
         let builder = TrayIconBuilder::new()
-            .with_tooltip(format!("AGT {version}"))
+            .with_tooltip(&title)
             .with_menu(Box::new(menu));
         // macOS: monochrome template (the system tints it for light/dark menu bars).
         #[cfg(target_os = "macos")]
@@ -34,10 +38,25 @@ impl Tray {
         #[cfg(not(target_os = "macos"))]
         let builder = builder.with_icon(icon(Style::Color)?);
         Ok(Self {
-            _icon: builder.build()?,
+            icon: builder.build()?,
+            title,
+            status,
             open_config: open_config.id().clone(),
             quit: quit.id().clone(),
         })
+    }
+
+    /// Shows `status` in the menu and the tooltip.
+    pub fn set_status(&self, status: &str) {
+        self.status.set_text(status);
+        // Tooltips are limited to 127 characters on Windows.
+        let tip: String = format!("{} - {status}", self.title)
+            .chars()
+            .take(127)
+            .collect();
+        if let Err(e) = self.icon.set_tooltip(Some(tip)) {
+            tracing::debug!("cannot set tooltip: {e}");
+        }
     }
 }
 
