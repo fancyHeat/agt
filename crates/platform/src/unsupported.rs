@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation yet (macOS until Phase 4).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, HotkeyEvent, Key};
+use crate::{Error, Hotkey, HotkeyEvent, Key};
 
 const MSG: &str = "not yet supported on this platform (macOS support is planned)";
 
@@ -22,10 +22,14 @@ impl HotkeyReset {
 }
 
 pub fn start_hotkey(
-    _key: Key,
+    _hotkey: Hotkey,
     _on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
     Err(format!("global hotkey {MSG}").into())
+}
+
+pub fn paste_may_release(_key: Key) -> bool {
+    false
 }
 
 pub fn key_down(_key: Key) -> Option<bool> {
@@ -48,7 +52,7 @@ pub fn set_clipboard_text(_text: &str) -> Result<PasteToken, Error> {
     Err(format!("clipboard access {MSG}").into())
 }
 
-pub fn send_paste() -> Result<(), Error> {
+pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
     Err(format!("pasting {MSG}").into())
 }
 

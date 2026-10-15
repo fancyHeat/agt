@@ -27,13 +27,32 @@ clicks.
 - Holds shorter than `hotkey.min_hold_ms` (150 ms) are ignored, so a stray tap never pastes.
 - Hotkeys (`hotkey.key`): `RightCtrl` (default), `LeftCtrl`, `RightShift`, `LeftShift` keep
   working normally in apps; `F13`-`F24` (handy for a remapped mouse or keyboard button) are
-  taken over by AGT, so apps never see them. Alt, Win, CapsLock, F1-F12 etc. are not offered:
+  taken over by AGT, so apps never see them. Alt, CapsLock, F1-F12 etc. are not offered:
   they would either open menus on release or have to be taken away from apps.
+- Chords: `hotkey.key = "LeftCtrl+LeftWin"` (like Wispr Flow's Ctrl+Win) is the recommended
+  alternative if Right Ctrl is awkward. Up to 3 `+`-separated keys from the list above plus
+  `LeftWin` / `RightWin` (left and right are distinct; at most one F13-F24). Recording starts
+  once every key is down, in any order, and stops as soon as any of them is released; to
+  dictate again, release all of them first. Win only works in a chord with Ctrl or Shift: on
+  its own a tap could no longer open the Start menu, and every key typed while holding it
+  would be a Windows shortcut. AGT keeps a Win chord from opening the Start menu on release.
+  If a Shift, Left Ctrl or Win hotkey key is still held when the text is ready (you let go of
+  Ctrl but not yet of Win, or are already holding the hotkey for the next dictation; this
+  includes the single-key `LeftCtrl`, `LeftShift` and `RightShift` hotkeys, whose text then
+  lands when you release the key, not during the next hold), the
+  paste waits until you release it (pastes stay in order; after 10 s it pastes anyway), so it
+  never turns into e.g. Win+Ctrl+V (the sound output panel).
 - Pressing any other non-modifier key while holding (Esc, or a shortcut like Right Ctrl+C)
-  cancels the dictation.
+  cancels the dictation; with a chord, shortcuts such as Ctrl+Win+Left/Right (switch
+  desktop) or Ctrl+Win+D still do their thing and simply cancel. Careful with
+  `LeftCtrl+LeftWin`: Ctrl+Win+Enter turns on Narrator, Ctrl+Win+O opens the on-screen
+  keyboard and Ctrl+Win+C toggles color filters (if enabled), so don't hit Enter, O or C
+  while dictating. Pressing another key while only part of a chord is down (Ctrl+C, then
+  Win) doesn't start a dictation either. On AltGr keyboard layouts, AltGr never counts as
+  Left Ctrl.
 - If the release is missed (it happened on the UAC / Ctrl+Alt+Del screen), AGT notices within
-  250 ms that a Ctrl/Shift hotkey is up and finishes the dictation normally; for F13-F24 the
-  stale recording is discarded on the next press.
+  250 ms that a Ctrl/Shift/Win hotkey key is up and finishes the dictation normally; for
+  F13-F24 the stale recording is discarded on the next press.
 - Long dictations are fine: audio over 25 s is transcribed in chunks split at pauses (the
   quietest 400 ms near each 25 s mark), so time and memory grow linearly (a 5-minute recording
   takes ~12 s on an i9-9900K). Each chunk is transcribed without the previous one as context,
