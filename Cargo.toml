@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+# Single source of truth for the app version. Bump this, then tag `vX.Y.Z`.
+version = "0.0.3"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/fancyHeat/agt"
+
+[workspace.dependencies]
+agt-core = { path = "crates/core" }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

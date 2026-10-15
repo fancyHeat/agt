@@ -1,0 +1,20 @@
+[package]
+name = "agt"
+description = "AGT (Actually Good Transcription): local hold-to-talk dictation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "agt"
+path = "src/main.rs"
+
+[dependencies]
+agt-core.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std", "tracing-log"] }
+tracing-appender = "0.2"
+tray-icon = "0.26"
+velopack = "1.2"
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }

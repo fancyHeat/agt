@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Passed to `vpk pack --plist`. The release workflow replaces __VERSION__. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>AGT</string>
+    <key>CFBundleDisplayName</key>
+    <string>AGT</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.notics.agt</string>
+    <key>CFBundleExecutable</key>
+    <string>agt</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- Menu-bar app: no Dock icon or app menu. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>AGT records your voice while you hold the dictation hotkey and transcribes it on this Mac.</string>
+</dict>
+</plist>

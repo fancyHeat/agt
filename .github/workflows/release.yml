@@ -1,0 +1,204 @@
+# Release: push a `vX.Y.Z` tag on a commit that is on `main` and whose Cargo version is X.Y.Z.
+# preflight (checks + fmt/clippy/test) -> build + package per platform -> publish one GitHub
+# Release, which installed apps then update from.
+#
+# Dry run: on PRs touching this file or packaging/ (and via workflow_dispatch from main), the
+# same build + package runs without signing and without publishing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml", "packaging/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  PACK_ID: AGT
+  VPK_VERSION: 1.2.161 # keep in sync with the `velopack` crate version in Cargo.lock
+  IS_RELEASE: ${{ github.event_name == 'push' }}
+
+jobs:
+  preflight:
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check version and branch
+        id: version
+        run: |
+          VERSION="$(cargo pkgid -p agt)"; VERSION="${VERSION##*@}"
+          if [ "$IS_RELEASE" = true ]; then
+            if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match Cargo version $VERSION"; exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::$GITHUB_REF_NAME is not on main; releases must be cut from main"; exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: preflight
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            channel: win-x64
+            exe: agt.exe
+          - os: macos-14
+            channel: osx-arm64
+            exe: agt
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      CHANNEL: ${{ matrix.channel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 9.0.x
+      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      - run: cargo build --release --locked -p agt
+
+      - name: Stage files
+        run: |
+          mkdir publish && cp "target/release/${{ matrix.exe }}" publish/
+          if [ "$IS_RELEASE" = true ]; then
+            # The previous release lets vpk build a delta package (public repo: no token needed).
+            vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --channel "$CHANNEL" -o Releases \
+              || echo "No previous release; skipping delta."
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        env:
+          # Hook only, see README: also needs a certificate import step before this one.
+          WINDOWS_SIGN_PARAMS: ${{ secrets.WINDOWS_SIGN_PARAMS }}
+        run: |
+          ARGS=()
+          if [ -n "$WINDOWS_SIGN_PARAMS" ] && [ "$IS_RELEASE" = true ]; then
+            ARGS+=(--signParams "$WINDOWS_SIGN_PARAMS")
+          fi
+          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
+            --packDir publish --mainExe agt.exe --channel "$CHANNEL" --runtime "$CHANNEL" \
+            --shortcuts StartMenuRoot -o Releases "${ARGS[@]}"
+
+      - name: Check for macOS signing secrets
+        id: signing
+        if: runner.os == 'macOS'
+        env:
+          HAS_CERT: ${{ secrets.APPLE_CERT_P12_BASE64 != '' }}
+          HAS_NOTARY: ${{ secrets.APPLE_ID != '' }}
+        run: |
+          SIGN=false; NOTARIZE=false
+          if [ "$HAS_CERT" = true ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            SIGN=true; NOTARIZE="$HAS_NOTARY"
+          fi
+          echo "sign=$SIGN" >> "$GITHUB_OUTPUT"
+          echo "notarize=$NOTARIZE" >> "$GITHUB_OUTPUT"
+          echo "sign=$SIGN notarize=$NOTARIZE"
+
+      - name: Set up macOS signing keychain
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          NOTARIZE: ${{ steps.signing.outputs.notarize }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/agt.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          if [ "$NOTARIZE" = true ]; then
+            xcrun notarytool store-credentials agt-notary --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$KEYCHAIN"
+          fi
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          SIGN: ${{ steps.signing.outputs.sign }}
+          NOTARIZE: ${{ steps.signing.outputs.notarize }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+        run: |
+          sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > "$RUNNER_TEMP/Info.plist"
+          ARGS=(--plist "$RUNNER_TEMP/Info.plist" --signEntitlements packaging/macos/agt.entitlements)
+          if [ "$SIGN" = true ]; then
+            ARGS+=(--keychain "$KEYCHAIN" --signAppIdentity "$APPLE_SIGN_IDENTITY")
+            # A .pkg installer needs a "Developer ID Installer" identity; without it, ship only the .zip.
+            if [ -n "$APPLE_INSTALLER_IDENTITY" ]; then
+              ARGS+=(--signInstallIdentity "$APPLE_INSTALLER_IDENTITY")
+            else
+              ARGS+=(--noInst)
+            fi
+            if [ "$NOTARIZE" = true ]; then ARGS+=(--notaryProfile agt-notary); fi
+          fi
+          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
+            --packDir publish --mainExe agt --channel "$CHANNEL" --runtime "$CHANNEL" \
+            -o Releases "${ARGS[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: releases-${{ matrix.channel }}
+          path: Releases
+
+  # One job uploads both channels to a draft, then publishes it once, so the release never
+  # appears half-populated and the two builds never race to create it.
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 9.0.x
+      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: releases-*
+      - name: Upload and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for CHANNEL in win-x64 osx-arm64; do
+            vpk upload github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
+              --channel "$CHANNEL" -o "releases-$CHANNEL" --tag "$GITHUB_REF_NAME" \
+              --releaseName "AGT ${GITHUB_REF_NAME#v}" --merge
+          done
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
