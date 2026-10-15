@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation yet (macOS until Phase 4).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, HotkeyEvent, Key};
+use crate::{Error, Hotkey, HotkeyEvent, Key};
 
 const MSG: &str = "not yet supported on this platform (macOS support is planned)";
 
@@ -22,7 +22,7 @@ impl HotkeyReset {
 }
 
 pub fn start_hotkey(
-    _key: Key,
+    _hotkey: Hotkey,
     _on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
     Err(format!("global hotkey {MSG}").into())

@@ -25,7 +25,7 @@ use agt_core::{
     polish::Polisher,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
-use agt_platform::{ClipboardSnapshot, HotkeyEvent, HotkeyHandle, HotkeyReset, Key, PasteToken};
+use agt_platform::{ClipboardSnapshot, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, PasteToken};
 use agt_polish::Outcome;
 use std::{
     fmt,
@@ -236,10 +236,10 @@ pub fn start(
         })),
         notify: Arc::new(notify),
     };
-    let key = Key::parse(&config.hotkey.key)?;
+    let key = Hotkey::parse(&config.hotkey.key)?;
 
     let (to_audio, audio_rx) = mpsc::channel::<HotkeyEvent>();
-    let hotkey = agt_platform::start_hotkey(key, move |ev| {
+    let hotkey = agt_platform::start_hotkey(&key, move |ev| {
         let _ = to_audio.send(ev);
     })
     .map_err(|e| e.to_string())?;
@@ -336,35 +336,50 @@ fn load_test_wav() -> Option<Vec<f32>> {
 
 /// Decides whether a key-state poll that says "up" really means the hook missed a release.
 ///
+/// Every key of the hotkey (all keys of a chord) is polled; any one of them up means the hold
+/// ended.
+///
 /// The poll sees the *logical* key state, which our own paste changes: pasting releases held
-/// Shift keys, and its Ctrl-up maps to Left Ctrl. So when the user holds a Shift or Left Ctrl
-/// hotkey for the next dictation while the previous one is pasted, the key looks released
-/// though it isn't. If a paste happened since this recording started, a poll for such a key is
-/// not trusted: a genuinely missed release is then caught on the next press instead (the
-/// stale recording is discarded). Right Ctrl (the default) is never touched by a paste.
+/// Shift and Win keys, and its Ctrl-up maps to Left Ctrl. So when the user holds a Shift, Win
+/// or Left Ctrl hotkey key for the next dictation while the previous one is pasted, the key
+/// looks released though it isn't. If a paste happened since this recording started, a poll
+/// for such a key is not trusted (the chord's other keys still are): a genuinely missed
+/// release is then caught on the next press instead (the stale recording is discarded).
+/// Right Ctrl (the default) is never touched by a paste.
 #[derive(Debug, Clone, Copy)]
 struct ReleaseWatch {
-    paste_may_release: bool,
+    /// Bit `i`: a paste can make chord key `i` look released.
+    paste_may_release: u8,
     pastes_at_start: u64,
 }
 
 impl ReleaseWatch {
-    fn new(key: Key, pastes_now: u64) -> Self {
+    fn new(hotkey: &Hotkey, pastes_now: u64) -> Self {
+        let paste_may_release = hotkey
+            .keys()
+            .iter()
+            .enumerate()
+            .filter(|&(_, &k)| agt_platform::paste_may_release(k))
+            .fold(0, |bits, (i, _)| bits | 1 << i);
         Self {
-            paste_may_release: agt_platform::paste_may_release(key),
+            paste_may_release,
             pastes_at_start: pastes_now,
         }
     }
 
-    /// `key_down`: the poll result; `pastes_now`: [`agt_platform::paste_count`].
-    fn missed(&self, key_down: Option<bool>, pastes_now: u64) -> bool {
-        key_down == Some(false) && !(self.paste_may_release && pastes_now != self.pastes_at_start)
+    /// `keys_down`: the poll result for each chord key; `pastes_now`:
+    /// [`agt_platform::paste_count`].
+    fn missed(&self, keys_down: &[Option<bool>], pastes_now: u64) -> bool {
+        let pasted = pastes_now != self.pastes_at_start;
+        keys_down.iter().enumerate().any(|(i, &down)| {
+            down == Some(false) && !(pasted && self.paste_may_release & (1 << i) != 0)
+        })
     }
 }
 
 struct AudioThread {
     config: Config,
-    key: Key,
+    key: Hotkey,
     reset: HotkeyReset,
     hub: Hub,
     to_stt: Sender<ToStt>,
@@ -380,7 +395,7 @@ impl AudioThread {
             tracing::warn!("microphone not available yet: {e}");
         }
         let mut down_at: Option<Instant> = None;
-        let mut watch = ReleaseWatch::new(self.key, 0);
+        let mut watch = ReleaseWatch::new(&self.key, 0);
 
         loop {
             let ev = if down_at.is_some() {
@@ -410,7 +425,7 @@ impl AudioThread {
                         self.hub.update(|s| s.recording = false);
                     }
                     // Before starting: any paste from here on counts as "during this recording".
-                    watch = ReleaseWatch::new(self.key, agt_platform::paste_count());
+                    watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
                     down_at = self.start_recording(&mut recorder, t);
                 }
                 HotkeyEvent::Up(released) => {
@@ -420,7 +435,9 @@ impl AudioThread {
                 HotkeyEvent::Cancel => {
                     if down_at.take().is_some() {
                         recorder.stop();
-                        tracing::info!("dictation cancelled (another key was pressed)");
+                        tracing::info!(
+                            "dictation cancelled (another key was pressed, or the hold was stale)"
+                        );
                         self.hub.update(|s| s.recording = false);
                     }
                 }
@@ -435,10 +452,13 @@ impl AudioThread {
         events: &Receiver<HotkeyEvent>,
         watch: &ReleaseWatch,
     ) -> Option<HotkeyEvent> {
-        if !watch.missed(
-            agt_platform::key_down(self.key),
-            agt_platform::paste_count(),
-        ) {
+        let keys_down: Vec<_> = self
+            .key
+            .keys()
+            .iter()
+            .map(|&k| agt_platform::key_down(k))
+            .collect();
+        if !watch.missed(&keys_down, agt_platform::paste_count()) {
             return None; // still held, can't tell, or our own paste made it look released
         }
         // The hook runs before the key state updates, so a real release would normally be
@@ -448,7 +468,7 @@ impl AudioThread {
         }
         tracing::warn!(
             "{} is no longer down but no release was seen; finishing the dictation and re-installing the keyboard hook",
-            self.key.name
+            self.key
         );
         self.reset.reset();
         Some(HotkeyEvent::Up(Instant::now()))
@@ -459,10 +479,7 @@ impl AudioThread {
             if self.hub.engine_failed() {
                 let _ = self.to_stt.send(ToStt::RetryLoad);
             }
-            tracing::info!(
-                "{} pressed but the model isn't ready; ignoring",
-                self.key.name
-            );
+            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
             self.hub.reject();
             return None;
         }
@@ -1035,22 +1052,44 @@ mod tests {
 
     #[test]
     fn release_watch_ignores_our_own_paste() {
-        let k = |n| Key::parse(n).unwrap();
+        let k = |n| Hotkey::parse(n).unwrap();
+        let (up, down) = (Some(false), Some(true));
         // Right Ctrl: a paste never touches it, so "up" is always trusted.
-        let w = ReleaseWatch::new(k("RightCtrl"), 5);
-        assert!(w.missed(Some(false), 5));
-        assert!(w.missed(Some(false), 6));
-        assert!(!w.missed(Some(true), 6));
-        assert!(!w.missed(None, 5));
+        let w = ReleaseWatch::new(&k("RightCtrl"), 5);
+        assert!(w.missed(&[up], 5));
+        assert!(w.missed(&[up], 6));
+        assert!(!w.missed(&[down], 6));
+        assert!(!w.missed(&[None], 5));
         // Shift / Left Ctrl: trusted until a paste happens during the recording.
         for name in ["LeftShift", "RightShift", "LeftCtrl"] {
-            let w = ReleaseWatch::new(k(name), 5);
-            assert!(w.missed(Some(false), 5), "{name}");
-            assert!(!w.missed(Some(false), 6), "{name}: our paste released it");
-            assert!(!w.missed(Some(true), 5), "{name}");
+            let w = ReleaseWatch::new(&k(name), 5);
+            assert!(w.missed(&[up], 5), "{name}");
+            assert!(!w.missed(&[up], 6), "{name}: our paste released it");
+            assert!(!w.missed(&[down], 5), "{name}");
         }
         // Swallowed keys can't be polled at all.
-        assert!(!ReleaseWatch::new(k("F13"), 0).missed(None, 0));
+        assert!(!ReleaseWatch::new(&k("F13"), 0).missed(&[None], 0));
+    }
+
+    #[test]
+    fn release_watch_checks_every_chord_key() {
+        let k = |n| Hotkey::parse(n).unwrap();
+        let (up, down) = (Some(false), Some(true));
+        let w = ReleaseWatch::new(&k("LeftCtrl+LeftWin"), 5);
+        assert!(!w.missed(&[down, down], 5));
+        assert!(w.missed(&[up, down], 5));
+        assert!(w.missed(&[down, up], 5));
+        // A paste releases held Win (so it can't combine with Ctrl+V) and Left Ctrl: neither
+        // poll is trusted after one.
+        assert!(!w.missed(&[up, up], 6));
+        // Right Ctrl is still trusted after a paste, Win isn't.
+        let w = ReleaseWatch::new(&k("RightCtrl+RightWin"), 5);
+        assert!(w.missed(&[up, down], 6));
+        assert!(!w.missed(&[down, up], 6));
+        // F13 can't be polled; its Ctrl partner still can.
+        let w = ReleaseWatch::new(&k("RightCtrl+F13"), 0);
+        assert!(!w.missed(&[down, None], 0));
+        assert!(w.missed(&[up, None], 0));
     }
 
     /// A clipboard that is busy while our save holds it, then free.

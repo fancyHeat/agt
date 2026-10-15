@@ -1,6 +1,6 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, HotkeyEvent, Key, is_modifier};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, is_modifier};
 use std::{
     cell::RefCell,
     ptr::{null, null_mut},
@@ -39,7 +39,7 @@ use windows_sys::Win32::{
 /// `dwExtraInfo` tag on the keystrokes we synthesize, so our own hook ignores them.
 const INJECTED_MARK: usize = 0x4147_5421; // "AGT!"
 
-/// Unassigned virtual key, injected before releasing a held Alt/Win so the release doesn't
+/// Unassigned virtual key, injected while Alt/Win is held so its release doesn't
 /// open the menu bar / Start menu (the same trick AutoHotkey uses).
 const VK_MASK: u16 = 0xE8;
 
@@ -50,10 +50,42 @@ const WM_RESET_HOOK: u32 = WM_APP + 1;
 // Hotkey
 
 struct HookState {
-    vk: u32,
-    swallow: bool,
+    hotkey: Hotkey,
     detector: HoldDetector,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
+    /// For chords with Win: asks the masking thread to inject [`VK_MASK`].
+    mask: Option<mpsc::Sender<()>>,
+}
+
+/// For a chord that includes Win: once the chord is complete, injects a [`VK_MASK`] press so
+/// that Win is no longer "the last key pressed" when it's released, and Windows doesn't open
+/// the Start menu (which it does when Win is released last, e.g. after Ctrl down, Win down,
+/// Ctrl up, Win up). Done from its own thread, not inside the hook callback: the hook must
+/// return fast, and the injected keys pass through the hook themselves.
+fn spawn_masker() -> Result<mpsc::Sender<()>, Error> {
+    let (tx, rx) = mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("hotkey-mask".into())
+        .spawn(move || {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+            // Ends when the hook thread drops the sender.
+            while rx.recv().is_ok() {
+                let inputs = [key_input(VK_MASK, false), key_input(VK_MASK, true)];
+                let sent = unsafe {
+                    SendInput(
+                        inputs.len() as u32,
+                        inputs.as_ptr(),
+                        size_of::<INPUT>() as i32,
+                    )
+                };
+                if sent as usize != inputs.len() {
+                    tracing::debug!("cannot inject the Start menu mask (error {})", unsafe {
+                        GetLastError()
+                    });
+                }
+            }
+        })?;
+    Ok(tx)
 }
 
 thread_local! {
@@ -94,9 +126,15 @@ fn install_hook() -> HHOOK {
 }
 
 pub fn start_hotkey(
-    key: Key,
+    hotkey: Hotkey,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
+    let name = hotkey.to_string();
+    let mask = if hotkey.has_win() {
+        Some(spawn_masker()?)
+    } else {
+        None
+    };
     let (tx, rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("hotkey".into())
@@ -106,10 +144,10 @@ pub fn start_hotkey(
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
             HOOK.with(|h| {
                 *h.borrow_mut() = Some(HookState {
-                    vk: key.vk as u32,
-                    swallow: key.swallowed(),
-                    detector: HoldDetector::default(),
+                    detector: HoldDetector::new(hotkey.keys().len()),
+                    hotkey,
                     on_event,
+                    mask,
                 })
             });
             // The hook runs on this thread, inside GetMessageW; it needs this message loop.
@@ -149,7 +187,7 @@ pub fn start_hotkey(
             unsafe { UnhookWindowsHookEx(hook) };
         })?;
     let thread_id = rx.recv().map_err(|_| "hotkey thread died")??;
-    tracing::info!("hotkey: hold {} to dictate", key.name);
+    tracing::info!("hotkey: hold {name} to dictate");
     Ok(HotkeyHandle { thread_id })
 }
 
@@ -173,15 +211,20 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 if let Ok(mut h) = h.try_borrow_mut()
                     && let Some(s) = h.as_mut()
                 {
-                    let is_hotkey = kb.vkCode == s.vk;
-                    swallow = is_hotkey && s.swallow;
+                    let chord_key = s.hotkey.index_of(kb.vkCode);
+                    swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed());
                     // Other modifiers don't cancel: they're part of a shortcut only together
                     // with a non-modifier key, which does cancel. (This also ignores the
                     // fake LeftCtrl that AltGr layouts send with RightAlt.)
-                    if (is_hotkey || !is_modifier(kb.vkCode))
+                    if (chord_key.is_some() || !is_modifier(kb.vkCode))
                         && let Some(ev) =
-                            s.detector.on_key(is_hotkey, down, kb.time, Instant::now())
+                            s.detector.on_key(chord_key, down, kb.time, Instant::now())
                     {
+                        if let (HotkeyEvent::Down(_), Some(mask)) = (ev, &s.mask) {
+                            // Covers both a dictation and a hold later cancelled by another
+                            // key (Ctrl+Win+D, ...). Non-blocking.
+                            let _ = mask.send(());
+                        }
                         (s.on_event)(ev);
                     }
                 }
@@ -192,7 +235,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // F13-F24 hotkeys: apps never see them.
         return 1;
     }
-    // Ctrl/Shift hotkeys and every other key pass through.
+    // Ctrl/Shift/Win hotkey keys and every other key pass through.
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
