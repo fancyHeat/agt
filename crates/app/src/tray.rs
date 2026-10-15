@@ -1,5 +1,6 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, "Copy last
-//! transcript", "Update now", "Open config folder" and "Quit".
+//! transcript", "Update now", (macOS) "Privacy & Security settings", "Open config folder" and
+//! "Quit".
 
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -18,6 +19,8 @@ pub struct Tray {
     update_item: MenuItem,
     pub copy_last: MenuId,
     pub update: MenuId,
+    /// macOS only: opens the System Settings page of the first missing permission.
+    pub privacy: Option<MenuId>,
     pub open_config: MenuId,
     pub quit: MenuId,
 }
@@ -44,6 +47,8 @@ impl Tray {
         } else {
             MenuItem::new("Update now (not installed)", false, None)
         };
+        let privacy = cfg!(target_os = "macos")
+            .then(|| MenuItem::new("Privacy & Security settings...", true, None));
         let open_config = MenuItem::new("Open config folder", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::with_items(&[
@@ -55,7 +60,11 @@ impl Tray {
         if config_error {
             menu.append(&warning)?;
         }
-        menu.append_items(&[&copy_last, &update, &open_config, &quit])?;
+        menu.append_items(&[&copy_last, &update])?;
+        if let Some(p) = &privacy {
+            menu.append(p)?;
+        }
+        menu.append_items(&[&open_config, &quit])?;
 
         let builder = TrayIconBuilder::new()
             .with_tooltip(&title)
@@ -75,6 +84,7 @@ impl Tray {
             copy_last_item: copy_last,
             update: update.id().clone(),
             update_item: update,
+            privacy: privacy.map(|p| p.id().clone()),
             open_config: open_config.id().clone(),
             quit: quit.id().clone(),
         })
