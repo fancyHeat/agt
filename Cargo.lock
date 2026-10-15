@@ -15,6 +15,7 @@ dependencies = [
  "agt-audio",
  "agt-core",
  "agt-platform",
+ "agt-polish",
  "agt-stt",
  "tracing",
  "tracing-appender",
@@ -40,6 +41,7 @@ version = "0.0.3"
 dependencies = [
  "agt-audio",
  "agt-core",
+ "agt-polish",
  "agt-stt",
  "tracing",
  "tracing-subscriber",
@@ -60,6 +62,16 @@ version = "0.0.3"
 dependencies = [
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agt-polish"
+version = "0.0.3"
+dependencies = [
+ "agt-core",
+ "serde_json",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]

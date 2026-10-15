@@ -8,6 +8,8 @@
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
 //!   recording may start while the previous one is still being transcribed: jobs queue up
 //!   and are pasted in order (nothing is dropped). Long recordings are chunked by `agt-stt`.
+//!   With `polish.enabled`, each transcript is then cleaned up by an LLM (`agt-polish`),
+//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted.
 //! - `paste`: saves the clipboard when a recording starts (on a helper thread, with a
 //!   deadline, so a hung clipboard owner can't block pasting), pastes, and restores the
 //!   clipboard `paste.restore_clipboard_ms` later.
@@ -17,9 +19,11 @@
 use agt_audio::{Level, Recorder};
 use agt_core::{
     Config,
+    polish::Polisher,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
 use agt_platform::{ClipboardSnapshot, HotkeyEvent, HotkeyHandle, HotkeyReset, Key, PasteToken};
+use agt_polish::Outcome;
 use std::{
     fmt,
     sync::{
@@ -127,6 +131,8 @@ pub struct Pipeline {
     /// Live microphone level (RMS, 0..1) while recording, for a level meter / overlay.
     #[allow(dead_code)] // consumed by the Phase 3 overlay
     pub level: Level,
+    /// One line for the tray about LLM polish, e.g. "Polish: off".
+    pub polish_info: String,
 }
 
 struct Job {
@@ -149,6 +155,8 @@ enum ToPaste {
         released: Instant,
         stt_start: Instant,
         stt_end: Instant,
+        /// For the timings log line, e.g. "polish 120 ms (polished)"; `None` when off.
+        polish: Option<String>,
     },
 }
 
@@ -193,8 +201,11 @@ pub fn start(
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
 
+    let (polisher, polish_info) = load_polisher(config);
     let (h, cfg) = (hub.clone(), config.clone());
-    spawn("stt", move || stt_thread(cfg, h, stt_rx, to_paste));
+    spawn("stt", move || {
+        stt_thread(cfg, h, stt_rx, to_paste, polisher)
+    });
 
     let (h, cfg) = (hub.clone(), config.clone());
     spawn("paste", move || paste_thread(cfg, h, paste_rx));
@@ -203,7 +214,37 @@ pub fn start(
     Ok(Pipeline {
         _hotkey: hotkey,
         level,
+        polish_info,
     })
+}
+
+/// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
+/// so a local server loads its model before the first dictation. Returns the tray line.
+fn load_polisher(config: &Config) -> (Option<Arc<dyn Polisher>>, String) {
+    if !config.polish.enabled {
+        return (None, "Polish: off".into());
+    }
+    match agt_polish::load(&config.polish) {
+        Ok(p) => {
+            let p: Arc<dyn Polisher> = Arc::from(p);
+            tracing::info!("polish: {}", p.name());
+            let warm = p.clone();
+            spawn("polish-warmup", move || {
+                let t = Instant::now();
+                match warm.warmup() {
+                    Ok(()) => tracing::info!("polish warmed up ({:.0} ms)", ms(t.elapsed())),
+                    Err(e) => tracing::warn!(
+                        "polish warmup failed ({e}); dictations are pasted unpolished until the server responds"
+                    ),
+                }
+            });
+            (Some(p), format!("Polish: on ({})", config.polish.model()))
+        }
+        Err(e) => {
+            tracing::error!("polish disabled: {e}");
+            (None, "Polish: off (config problem, see log)".into())
+        }
+    }
 }
 
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
@@ -451,7 +492,13 @@ fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
     }
 }
 
-fn stt_thread(config: Config, hub: Hub, jobs: Receiver<ToStt>, to_paste: Sender<ToPaste>) {
+fn stt_thread(
+    config: Config,
+    hub: Hub,
+    jobs: Receiver<ToStt>,
+    to_paste: Sender<ToPaste>,
+    polisher: Option<Arc<dyn Polisher>>,
+) {
     let mut engine = load_engine(&config, &hub);
     let opts = TranscribeOpts::default();
     for msg in jobs {
@@ -475,7 +522,20 @@ fn stt_thread(config: Config, hub: Hub, jobs: Receiver<ToStt>, to_paste: Sender<
         let audio_secs = job.audio.len() as f64 / SAMPLE_RATE as f64;
         match result {
             Ok(t) => {
-                let text = finish_text(&t.text, config.paste.trailing_space);
+                let mut text = finish_text(&t.text, false);
+                let mut polish = None;
+                if let Some(p) = polisher.as_deref().filter(|_| !text.is_empty()) {
+                    let t = Instant::now();
+                    let (polished, outcome) = agt_polish::polish_or_raw(p, &text, &config.polish);
+                    if let Outcome::Fallback(why) = &outcome {
+                        tracing::warn!("polish failed, pasting the raw transcript: {why}");
+                    }
+                    text = polished;
+                    polish = Some(format!("polish {:.0} ms ({outcome})", ms(t.elapsed())));
+                }
+                if config.paste.trailing_space && !text.is_empty() {
+                    text.push(' ');
+                }
                 if text.is_empty() {
                     tracing::info!(
                         "no speech recognized in {audio_secs:.1} s of audio (stt {:.0} ms)",
@@ -489,6 +549,7 @@ fn stt_thread(config: Config, hub: Hub, jobs: Receiver<ToStt>, to_paste: Sender<
                         released: job.released,
                         stt_start,
                         stt_end,
+                        polish,
                     });
                 }
             }
@@ -575,6 +636,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                 released,
                 stt_start,
                 stt_end,
+                polish,
             }) => {
                 let paste_start = Instant::now();
                 if restore && pending_restore.is_none() {
@@ -619,9 +681,10 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                 match result {
                     Ok(token) => {
                         tracing::info!(
-                            "dictation: audio {audio_secs:.2} s | release→stt {:.0} ms | stt {:.0} ms | paste {:.0} ms | release→paste {:.0} ms | {} chars",
+                            "dictation: audio {audio_secs:.2} s | release→stt {:.0} ms | stt {:.0} ms | {}paste {:.0} ms | release→paste {:.0} ms | {} chars",
                             ms(stt_start - released),
                             ms(stt_end - stt_start),
+                            polish.map(|p| p + " | ").unwrap_or_default(),
                             ms(pasted - paste_start),
                             ms(pasted - released),
                             text.chars().count()
