@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the hardened runtime (vpk signs with `codesign -o runtime`).
+  Keep this minimal: a native Rust binary needs no JIT, unsigned memory, DYLD env vars or
+  disabled library validation, and those would let other processes inject into AGT and
+  inherit its Microphone/Accessibility permissions.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Microphone access under the hardened runtime (Phase 1 recording). -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
