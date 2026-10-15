@@ -381,16 +381,24 @@ request a token Azure trusts. On a tag release, missing signing variables fail t
 unsigned Windows build is never published. Manual dry runs sign when the variables are present and
 build unsigned when they're not. PR dry runs are always unsigned.
 
+**Repository rulesets:**
+- **`main`:** changes need a pull request, and `check (windows-latest)` and `check (macos-14)` must
+  pass. Deletion and force-push are blocked, and there are no bypass actors.
+- **`release tags`** (on `refs/tags/v*`): existing tags can't be moved or deleted. Creating a *new*
+  `v*` tag is not restricted.
+
+The `release` environment has no required reviewer; that's the owner's choice.
+
 **Residual risk:** GitHub checks only the tag's *name* against the environment's `v*` rule, and the
 workflow that runs is the one in the tagged commit. The "tag must be on `main`" check in preflight is
-part of that workflow, so it doesn't protect anything here. In practice, anyone (or any token) that
-can push a `v*` tag, or push to `main` and start the workflow, can get files signed as Notics
+part of that workflow, so it doesn't protect anything here. The `main` ruleset stops a direct push
+to `main` from reaching the signer, but tag creation is unrestricted. Anyone with write access can
+tag *any* commit `v*` (including a branch with a modified workflow) and get files signed as Notics
 Security LLC. That includes coding agents using the owner's `gh`/git credentials. The certificate
-profile is shared with other Notics products, so recommended mitigations are:
+profile is shared with other Notics products. Remaining options to close this:
 - a **required reviewer** on the `release` environment (you can approve your own deployments: one
   click per release, and it stops automated or stolen-token paths);
-- a **tag ruleset** on `refs/tags/v*` that restricts creation, update and deletion to the repo admin,
-  plus branch protection on `main`;
+- **restricting tag creation** in the `release tags` ruleset, with a bypass for the repo admin only;
 - a dedicated AGT certificate profile, so revoking an AGT signature doesn't affect other products.
 
 **Rotate / revoke:** there's nothing to rotate (no secrets; Azure renews the certificate daily).
