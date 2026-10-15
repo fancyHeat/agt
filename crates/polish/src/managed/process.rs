@@ -496,6 +496,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[ignore = "helper process for unix_suspended_server_dies_with_a_crashed_agt"]
+    #[allow(clippy::zombie_processes, reason = "this process is killed, never exits")]
     fn fake_agt() {
         let Some(pid_file) = std::env::var_os("AGT_TEST_FAKE_AGT_PIDFILE") else {
             return;
