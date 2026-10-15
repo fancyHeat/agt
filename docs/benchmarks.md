@@ -43,6 +43,13 @@ files in the OS cache (a cold first start after boot reads 0.65-2.5 GB more from
 **RSS** is the peak working set; **VRAM** the process's dedicated GPU memory at the end of the
 run (Windows "GPU Process Memory" counters, which cover D3D12, CUDA and Vulkan alike).
 
+**CPU means CPU**: `ort` defaults every session to ONNX Runtime's automatic device selection
+with a "max efficiency" (prefer NPU) policy; CPU sessions now ask for `PreferCPU` explicitly
+(same change as the Phase 4 macOS branch, where an M4's Neural Engine silently took nodes).
+This machine has no NPU: the GPU memory counters show no GPU use in any CPU run, and re-running
+the CPU rows with `PreferCPU` gave the same latency within noise (e.g. 141-154 ms short, 410-441
+ms medium, both ways).
+
 **Hardware**: Intel i9-9900K (8 cores / 16 threads), 32 GB, NVIDIA RTX 2080 Ti 11 GB (driver
 617.14), Windows 11 Pro 26200. ONNX Runtime 1.31 (pyke prebuilt; DirectML build, CUDA 13
 build for `cuda`), whisper.cpp 1.8.3 (whisper-rs 0.16), CUDA 13.4 / cuDNN 9.27 runtime DLLs.
@@ -154,7 +161,10 @@ static-shape encoder, falling back to the CPU when there is no usable DirectX 12
 **macOS best guess (unmeasured on real hardware): Parakeet v2 int8 on the CPU** (`auto` = CPU
 on macOS). Apple Silicon CPUs run ONNX Runtime's int8 kernels well and it needs no extra
 shipping; its latency on an M-series Mac is likely close to or better than the i9 numbers above.
-Candidates to measure on a real Mac before changing that:
+The Phase 4 (macOS) work measured on a real M4 that Core ML with a fixed encoder window (the
+same trick as DirectML here) runs the fp32 encoder on the GPU in ~76 ms per 10 s vs ~330 ms on
+the CPU, so `auto` on macOS should likely become that once it lands; that decision belongs to
+Phase 4, which has the hardware. Candidates:
 
 - ONNX Runtime CoreML EP (`stt.device = "coreml"`, wired up; ships in the existing ORT build).
   Parakeet's encoder has dynamic shapes and int64 ops, so CoreML may only take part of the

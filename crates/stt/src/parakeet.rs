@@ -249,7 +249,15 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         b = b.with_intra_threads(threads).map_err(|e| e.to_string())?;
     }
     match device {
-        Device::Cpu => {}
+        Device::Cpu => {
+            // `ort` sets ONNX Runtime's automatic device selection to `MaxEfficiency` (= prefer
+            // an NPU) on every session, which on a Mac put a few hundred encoder nodes, and some
+            // of the per-step decoder's, on Core ML (the Neural Engine) even for "cpu". Machines
+            // without an NPU get the CPU either way.
+            b = b
+                .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+                .map_err(|e| e.to_string())?;
+        }
         #[cfg(windows)]
         Device::DirectMl => {
             // DirectML requires sequential execution and no memory-pattern optimization.
