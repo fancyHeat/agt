@@ -1,12 +1,16 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: logs, models, lock (`data_dir`) |
-//! |---|---|---|
-//! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (local; also the Velopack install root) |
-//! | macOS | `~/Library/Application Support/AGT` | same |
-//! | other | `$XDG_CONFIG_HOME/agt` | `$XDG_DATA_HOME/agt` |
+//! | | config (`config_dir`) | data: logs, lock (`data_dir`) | models (`models_dir`) |
+//! |---|---|---|---|
+//! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-models` |
+//! | macOS | `~/Library/Application Support/AGT` | same | `<data>/models` |
+//! | other | `$XDG_CONFIG_HOME/agt` | `$XDG_DATA_HOME/agt` | `<data>/models` |
 //!
-//! `AGT_HOME`, if set, replaces both (handy for tests and dev runs).
+//! On Windows, models live outside `%LOCALAPPDATA%\AGT` because Velopack wipes that folder
+//! when Setup.exe is re-run; multi-GB models must survive reinstalls.
+//!
+//! `AGT_HOME`, if set, replaces all three (models go to `$AGT_HOME/models`); handy for tests
+//! and dev runs. `stt.models_dir` in the config overrides the models location.
 
 use std::path::PathBuf;
 
@@ -15,9 +19,14 @@ pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
 
-/// Holds logs, the instance lock and (later) models. Machine-local, never roams.
+/// Holds logs and the instance lock. Machine-local, never roams.
 pub fn data_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::data_dir)
+}
+
+/// Default location of downloaded models (see the module docs).
+pub fn models_dir() -> PathBuf {
+    home_override().map_or_else(platform::models_dir, |h| h.join("models"))
 }
 
 pub fn config_file() -> PathBuf {
@@ -45,6 +54,9 @@ mod platform {
     pub fn data_dir() -> PathBuf {
         env_dir("LOCALAPPDATA").join("AGT")
     }
+    pub fn models_dir() -> PathBuf {
+        env_dir("LOCALAPPDATA").join("AGT-models")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -55,6 +67,9 @@ mod platform {
     }
     pub fn data_dir() -> PathBuf {
         config_dir()
+    }
+    pub fn models_dir() -> PathBuf {
+        data_dir().join("models")
     }
 }
 
@@ -72,5 +87,8 @@ mod platform {
     }
     pub fn data_dir() -> PathBuf {
         xdg("XDG_DATA_HOME", ".local/share")
+    }
+    pub fn models_dir() -> PathBuf {
+        data_dir().join("models")
     }
 }

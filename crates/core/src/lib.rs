@@ -1,9 +1,8 @@
-//! AGT core: configuration and well-known paths.
-//!
-//! Later phases add the dictation pipeline and the `SttEngine` / `Polisher` traits here.
+//! AGT core: configuration, well-known paths and the [`stt::SttEngine`] trait.
 
 pub mod config;
 pub mod paths;
+pub mod stt;
 
 pub use config::Config;
 
