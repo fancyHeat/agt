@@ -7,7 +7,7 @@
 //!   surrounding quotes, `<transcript>` tags, a `<think>` block), it is empty; has fewer than
 //!   25% or more than 125% (+3) of the input's words; starts like an assistant reply
 //!   ("Sure", "Here is", "I can't", ...) when the transcript didn't (its leading fillers and
-//!   next 3 words don't contain that word); or (built-in prompt only)
+//!   next 3 words don't contain that word); or (built-in prompt of the openai/anthropic providers only)
 //!   more than 30% of its words (50% for the `formal` style), and at least 2, don't occur in
 //!   the transcript at all, which is what an answer to a dictated question looks like
 //!   ("what's the capital of France" → "The capital of France is Paris.").
@@ -22,7 +22,7 @@
 //! They are a backstop: the prompt (or a dedicated clean-up model) is the main defense.
 
 use agt_core::{
-    config::{PolishConfig, PolishStyle},
+    config::{PolishConfig, PolishProvider, PolishStyle},
     polish::{PolishCtx, Polisher},
 };
 use std::{collections::HashSet, fmt};
@@ -58,6 +58,9 @@ pub fn polish_or_raw(p: &dyn Polisher, raw: &str, cfg: &PolishConfig) -> (String
         Err(e) => return (raw.to_owned(), Outcome::Fallback(e.to_string())),
     };
     let max_novel = match (cfg.prompt.trim().is_empty(), cfg.style) {
+        // S1-mini isn't a chat model (it doesn't answer questions), and it legitimately
+        // rewrites many words: numbers, times, emails, expanded contractions.
+        _ if cfg.provider == PolishProvider::S1Mini => None,
         (false, _) => None, // a custom prompt may legitimately change most words
         (true, PolishStyle::Light) => Some(0.3),
         (true, PolishStyle::Formal) => Some(0.5),

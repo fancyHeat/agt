@@ -244,6 +244,12 @@ impl ApplicationHandler<AppEvent> for App {
                         tray.set_copy_enabled(*available);
                     }
                 }
+                pipeline::Event::PolishInfo(info) => {
+                    if let Some(tray) = &self.tray {
+                        tray.set_polish(info);
+                    }
+                    self.polish_info = info.clone();
+                }
             }
             return;
         }

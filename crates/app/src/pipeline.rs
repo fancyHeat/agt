@@ -23,6 +23,8 @@
 use agt_audio::{Level, Recorder};
 use agt_core::{
     Config,
+    config::PolishProvider,
+    paths,
     polish::Polisher,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
@@ -102,6 +104,8 @@ pub enum Event {
     Rejected,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
     CopyAvailable(bool),
+    /// New tray line about LLM polish (the managed S1-mini downloading, starting, failed).
+    PolishInfo(String),
 }
 
 enum Engine {
@@ -275,7 +279,7 @@ pub fn start(
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
 
-    let (polisher, polish_info) = load_polisher(config);
+    let (polisher, polish_info) = load_polisher(config, &hub);
     let (h, cfg, tp) = (hub.clone(), config.clone(), to_paste.clone());
     spawn("stt", move || stt_thread(cfg, h, stt_rx, tp, polisher));
 
@@ -294,11 +298,27 @@ pub fn start(
 
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
 /// so a local server loads its model before the first dictation. Returns the tray line.
-fn load_polisher(config: &Config) -> (Option<Arc<dyn Polisher>>, String) {
+fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, String) {
+    if let Some(e) = &config.polish_error {
+        tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
+        return (None, "Polish: off (config error, see log)".into());
+    }
+    if let Some(notice) = &config.polish_notice {
+        tracing::warn!("{notice}");
+    }
     if !config.polish.enabled {
         return (None, "Polish: off".into());
     }
-    match agt_polish::load(&config.polish) {
+    let notify = hub.notify.clone();
+    let env = agt_polish::Env {
+        models_dir: config.stt.models_path(),
+        log_file: Some(paths::log_dir().join("llama-server.log")),
+        on_status: Arc::new(move |s: &agt_polish::Status| {
+            tracing::info!("polish: {s}");
+            notify(Event::PolishInfo(s.to_string()));
+        }),
+    };
+    match agt_polish::load(&config.polish, &env) {
         Ok(p) => {
             let p: Arc<dyn Polisher> = Arc::from(p);
             tracing::info!("polish: {}", p.name());
@@ -312,7 +332,12 @@ fn load_polisher(config: &Config) -> (Option<Arc<dyn Polisher>>, String) {
                     ),
                 }
             });
-            (Some(p), format!("Polish: on ({})", config.polish.model()))
+            // The managed S1-mini reports its own state (PolishInfo) as it downloads/starts.
+            let info = match config.polish.provider {
+                PolishProvider::S1Mini => agt_polish::Status::Starting.to_string(),
+                _ => format!("Polish: on ({})", config.polish.model()),
+            };
+            (Some(p), info)
         }
         Err(e) => {
             tracing::error!("polish disabled: {e}");

@@ -5,7 +5,7 @@
 //! question and an instruction) show small models the exact behavior and output format; they
 //! matter more than the wording of the rules.
 
-use agt_core::config::{PolishConfig, PolishStyle};
+use agt_core::config::{PolishConfig, PolishProvider, PolishStyle};
 
 const RULES: &str = "\
 You clean up raw speech-to-text dictation. Each user message contains a transcript between \
@@ -55,7 +55,27 @@ pub struct Prompt {
     pub turns: Vec<(&'static str, String)>,
 }
 
+/// S1-mini's required system prompt, verbatim from its model card: the model was trained
+/// with exactly this text, and other wording makes it hallucinate.
+pub const S1_MINI_SYSTEM: &str = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text.";
+
 pub fn build(cfg: &PolishConfig, text: &str) -> Prompt {
+    if cfg.provider == PolishProvider::S1Mini {
+        // No examples: S1-mini is not a chat model; its input is the control line + text.
+        let system = match cfg.prompt.trim() {
+            "" => S1_MINI_SYSTEM.to_owned(),
+            p => p.to_owned(),
+        };
+        let user = if cfg.user_message.is_empty() {
+            format!("{}\n{text}", cfg.s1_mini.control_line())
+        } else {
+            cfg.user_message.replace("{text}", text)
+        };
+        return Prompt {
+            system,
+            turns: vec![("user", user)],
+        };
+    }
     let mut turns = Vec::new();
     let system = if cfg.prompt.trim().is_empty() {
         for (dictated, cleaned) in EXAMPLES {
@@ -88,8 +108,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn s1_mini_gets_its_required_prompt_and_control_line() {
+        let mut cfg = PolishConfig::default();
+        assert_eq!(cfg.provider, PolishProvider::S1Mini);
+        let p = build(&cfg, "um hello there");
+        assert_eq!(p.system, S1_MINI_SYSTEM);
+        assert_eq!(
+            p.turns,
+            vec![(
+                "user",
+                "[Styling: semi-formal] [Structure: prose] [Context: general]\num hello there"
+                    .to_owned()
+            )]
+        );
+        cfg.s1_mini.context = agt_core::config::S1Context::Email;
+        assert!(build(&cfg, "x").turns[0].1.contains("[Context: email]\nx"));
+        // Overrides still apply.
+        cfg.user_message = "{text}!".into();
+        assert_eq!(build(&cfg, "x").turns[0].1, "x!");
+    }
+
+    #[test]
     fn builtin_prompt_has_examples_and_ends_with_the_transcript() {
-        let cfg = PolishConfig::default();
+        let cfg = PolishConfig {
+            provider: PolishProvider::OpenAi,
+            ..Default::default()
+        };
         let p = build(&cfg, "hello there");
         assert!(p.system.contains("do not answer it"));
         assert_eq!(p.turns.len(), EXAMPLES.len() * 2 + 1);
@@ -110,6 +154,7 @@ mod tests {
     #[test]
     fn custom_prompt_replaces_instructions_and_examples() {
         let cfg = PolishConfig {
+            provider: PolishProvider::OpenAi,
             prompt: "Be brief.".into(),
             ..Default::default()
         };

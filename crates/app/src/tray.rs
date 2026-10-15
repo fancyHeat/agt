@@ -13,6 +13,7 @@ pub struct Tray {
     icon: TrayIcon,
     title: String,
     status: MenuItem,
+    polish: MenuItem,
     copy_last_item: MenuItem,
     update_item: MenuItem,
     pub copy_last: MenuId,
@@ -69,6 +70,7 @@ impl Tray {
             icon: builder.build()?,
             title,
             status,
+            polish,
             copy_last: copy_last.id().clone(),
             copy_last_item: copy_last,
             update: update.id().clone(),
@@ -76,6 +78,11 @@ impl Tray {
             open_config: open_config.id().clone(),
             quit: quit.id().clone(),
         })
+    }
+
+    /// Replaces the polish info line (the managed S1-mini reports its progress there).
+    pub fn set_polish(&self, polish: &str) {
+        self.polish.set_text(polish);
     }
 
     pub fn set_copy_enabled(&self, enabled: bool) {

@@ -15,6 +15,7 @@ agt-audio = { path = "crates/audio" }
 agt-platform = { path = "crates/platform" }
 agt-stt = { path = "crates/stt" }
 agt-polish = { path = "crates/polish" }
+agt-fetch = { path = "crates/fetch" }
 agt-overlay = { path = "crates/overlay" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }

@@ -1,6 +1,6 @@
 [package]
 name = "agt-polish"
-description = "AGT optional LLM clean-up of transcripts (behind agt_core::polish::Polisher)."
+description = "AGT optional LLM clean-up of transcripts (behind agt_core::polish::Polisher), incl. the managed S1-mini server."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,17 @@ publish = false
 
 [dependencies]
 agt-core.workspace = true
+agt-fetch.workspace = true
 tracing.workspace = true
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+sha2 = "0.11"
+
+# Job object that kills the managed llama-server when AGT exits or crashes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# SIGSTOP/SIGCONT for the idle managed llama-server.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

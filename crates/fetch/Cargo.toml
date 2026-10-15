@@ -1,0 +1,12 @@
+[package]
+name = "agt-fetch"
+description = "AGT downloads: pinned files fetched over HTTPS, SHA-256 verified, atomically put in place."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tracing.workspace = true
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls"] }

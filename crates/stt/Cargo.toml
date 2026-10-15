@@ -8,9 +8,8 @@ publish = false
 
 [dependencies]
 agt-core.workspace = true
+agt-fetch.workspace = true
 tracing.workspace = true
-sha2 = "0.11"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
 # ONNX Runtime 1.31, statically linked from pyke's prebuilt binaries (CPU on every platform).
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
 # whisper.cpp (`stt.engine = "whisper"`); built from source with CMake, so it's optional.
