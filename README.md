@@ -62,7 +62,7 @@ clicks.
 | `crates/core` (`agt-core`) | Config, paths, and the `SttEngine` trait |
 | `crates/audio` (`agt-audio`) | Microphone capture (cpal) to 16 kHz mono, resampler, WAV reading, level meter |
 | `crates/platform` (`agt-platform`) | Global hold-to-talk hotkey and clipboard paste (Windows; macOS stubs) |
-| `crates/stt` (`agt-stt`) | STT engines (Parakeet on ONNX Runtime) and model downloads |
+| `crates/stt` (`agt-stt`) | STT engines (Parakeet on ONNX Runtime; optional whisper.cpp) and model downloads |
 | `crates/app` (`agt`) | The binary: tray, overlay wiring, pipeline threads, auto-update, logging |
 | `crates/polish` (`agt-polish`) | Optional LLM clean-up of transcripts (OpenAI-compatible or Anthropic API) and its guards |
 | `crates/bench` (`agt-bench`) | Runs an engine over a folder of WAVs: latency, RTF, WER; `agt-bench polish` for the LLM clean-up |
@@ -80,6 +80,16 @@ cargo build --release  # target/release/agt(.exe); no console window on Windows
 Requires stable Rust. Windows needs the MSVC build tools. ONNX Runtime is downloaded prebuilt
 (and statically linked) by the `ort` crate at build time; on Windows the build also copies
 `DirectML.dll` next to the exe, which must ship with it.
+
+Optional engines and backends are cargo features (on `agt`, `agt-bench` and `agt-stt`); releases
+build none of them. See [docs/benchmarks.md](docs/benchmarks.md) for why.
+
+| Feature | Adds | Needs |
+|---|---|---|
+| `cuda` | `stt.device = "cuda"` (Parakeet on the ONNX Runtime CUDA EP) | at run time, the CUDA 13 runtime, cuBLAS, cuFFT and cuDNN 9 DLLs on `PATH` (~1.3 GB) |
+| `whisper` | `stt.engine = "whisper"` (whisper.cpp, CPU) | CMake, libclang (`LIBCLANG_PATH`); on Windows set `CMAKE_GENERATOR` (e.g. `Ninja`) or the `cmake` crate builds ggml without optimizations |
+| `whisper-vulkan` | `stt.device = "vulkan"` for whisper | the Vulkan SDK (`VULKAN_SDK`: headers, `vulkan-1.lib`, `glslc`) |
+| `whisper-metal` | `stt.device = "metal"` for whisper (macOS) | Xcode command line tools |
 
 ## Config, logs and data
 
@@ -117,8 +127,20 @@ on ONNX Runtime.
 |---|---|---|
 | `stt.model` | `parakeet-tdt-0.6b-v2` | or `parakeet-tdt-0.6b-v3` |
 | `stt.precision` | `int8` | encoder weights; `fp32` is 2.5 GB (decoder is always int8) |
-| `stt.device` | `cpu` | `directml` runs the encoder on any DX12 GPU (Windows); falls back to the CPU (with a note in the tray) if no GPU is usable |
+| `stt.device` | `auto` | `auto` = DirectML on Windows, CPU on macOS, falling back to the CPU if no GPU is usable. `cpu`, `directml` (any DX12 GPU, Windows), `coreml` (macOS), `cuda` (builds with the `cuda` feature): an explicit GPU device that can't be used also falls back to the CPU, with a note in the tray |
 | `stt.threads` | `0` (auto) | CPU threads for inference |
+
+Warm latency on an i9-9900K + RTX 2080 Ti (v2 int8, p50 over short / medium / long clips
+averaging 3.4 s / 10.7 s / 36.5 s of real speech):
+DirectML 142 / 162 / 362 ms, CPU 152 / 407 / 1335 ms. On DirectML the encoder runs with a
+fixed 25 s input shape (shorter audio is zero-padded), which is ~2.5x faster than letting
+the shape vary. With `precision = "fp32"` DirectML takes 101 / 120 / 284 ms but holds 2.6 GB
+of VRAM instead of 1.1 GB. Details and other engines: [docs/benchmarks.md](docs/benchmarks.md).
+
+`stt.engine = "whisper"` (builds with the `whisper` feature only) runs whisper.cpp:
+`stt.model` is one of `whisper-large-v3-turbo`, `-turbo-q8_0`, `-turbo-q5_0`,
+`whisper-small.en`, `whisper-small.en-q8_0` (ggml files from `ggerganov/whisper.cpp`, pinned and
+hash-checked), `stt.device` is `cpu`, or `vulkan` / `metal` with the matching feature.
 
 Every dictation logs its timings at info level, e.g.
 `dictation: audio 2.97 s | release→stt 0 ms | stt 157 ms | paste 4 ms | release→paste 161 ms`.
@@ -264,12 +286,15 @@ of one core.
 ### Benchmark
 
 ```sh
-cargo run --release -p agt-bench -- [--model m] [--precision int8|fp32] [--device cpu|directml] [--runs n] [--no-warmup] <dir>
+uv run scripts/prepare_eval.py   # once: real-speech eval set (78 clips, 12 min) into eval-data/
+cargo run --release -p agt-bench -- [--engine e] [--model m] [--precision p] [--device d] [--runs n] [--no-warmup] [--quiet] eval-data/clips
 ```
 
-Transcribes every `*.wav` in `<dir>` (any rate/channels) and prints per-file latency, real-time
-factor and transcript, plus WER against `<name>.txt` when present. `AGT_LOG=debug` adds
-per-stage timings (preprocess / encoder / decode).
+Transcribes every `*.wav` in the directory (any rate/channels) and prints per-file latency,
+real-time factor and transcript, WER against `<name>.txt` when present, p50/p90 latency for
+short/medium/long clips, WER per source and for read vs real-world speech, and peak memory.
+`AGT_LOG=debug` adds per-stage timings (preprocess / encoder / decode). Method, eval set and
+results: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Debug: `AGT_TEST_WAV`
 
