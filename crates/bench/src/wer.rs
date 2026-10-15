@@ -51,14 +51,14 @@ pub fn normalize(s: &str) -> Vec<String> {
         if w.is_empty() {
             continue;
         }
-        if w.starts_with(|c: char| c.is_ascii_digit()) {
-            if let Some(words) = number_words(w) {
-                out.extend(words);
-                if dollars {
-                    out.push("dollars".into());
-                }
-                continue;
+        if w.starts_with(|c: char| c.is_ascii_digit())
+            && let Some(words) = number_words(w)
+        {
+            out.extend(words);
+            if dollars {
+                out.push("dollars".into());
             }
+            continue;
         }
         let w: String = w.chars().filter(|c| !matches!(c, '.' | ',')).collect();
         let w = w.trim_matches('\'');
@@ -115,7 +115,10 @@ fn number_words(tok: &str) -> Option<Vec<String>> {
         }
         if !f.is_empty() {
             words.push("point".into());
-            words.extend(f.chars().map(|c| ONES[c as usize - '0' as usize].to_owned()));
+            words.extend(
+                f.chars()
+                    .map(|c| ONES[c as usize - '0' as usize].to_owned()),
+            );
         }
     }
     if ordinal {
@@ -228,7 +231,10 @@ mod tests {
     #[test]
     fn numbers_become_words() {
         assert_eq!(n("7 days"), "seven days");
-        assert_eq!(n("the last 10 to 15 years."), "the last ten to fifteen years");
+        assert_eq!(
+            n("the last 10 to 15 years."),
+            "the last ten to fifteen years"
+        );
         assert_eq!(n("1,250"), "one thousand two hundred fifty");
         assert_eq!(n("3.5%"), "three point five percent");
         assert_eq!(n("$20"), "twenty dollars");

@@ -139,6 +139,15 @@ pub struct Parakeet {
     fixed_frames: Option<usize>,
 }
 
+/// What `stt.device = "auto"` runs the encoder on (falling back to the CPU if it can't be
+/// used). Windows: DirectML (see docs/benchmarks.md). macOS: the CPU; CoreML is unproven
+/// (CI runners have no GPU/Neural Engine to measure it on).
+const AUTO_DEVICE: Device = if cfg!(windows) {
+    Device::DirectMl
+} else {
+    Device::Cpu
+};
+
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
 const ENCODER_FP32: &str = "encoder-model.onnx";
 /// DirectML encoder input length: the longest chunk [`crate::load`] passes (25 s = 2501
@@ -164,11 +173,16 @@ impl Parakeet {
         };
         let env = ort::init().with_name("agt").build()?;
         let preprocessor = session(&env, &dir.join("nemo128.onnx"), Device::Cpu, cfg.threads)?;
-        let (encoder, device) = match session(&env, &dir.join(enc_file), cfg.device, cfg.threads) {
-            Ok(s) => (s, cfg.device),
+        let wanted = match cfg.device {
+            Device::Auto => AUTO_DEVICE,
+            d => d,
+        };
+        let (encoder, device) = match session(&env, &dir.join(enc_file), wanted, cfg.threads) {
+            Ok(s) => (s, wanted),
             // No usable GPU (no D3D12 adapter, some RDP/VM sessions, broken driver): run on
-            // the CPU rather than fail, and say so in the engine name.
-            Err(e) if cfg.device != Device::Cpu => {
+            // the CPU rather than fail, and (unless the device was "auto") say so in the
+            // engine name.
+            Err(e) if wanted != Device::Cpu => {
                 tracing::warn!("{e}; falling back to the CPU");
                 let s = session(&env, &dir.join(enc_file), Device::Cpu, cfg.threads)?;
                 (s, Device::Cpu)
@@ -203,12 +217,14 @@ impl Parakeet {
                 Precision::Fp32 => "fp32",
             },
             match (cfg.device, device) {
-                (Device::Cpu, _) => "cpu",
+                (Device::Cpu | Device::Auto, Device::Cpu) => "cpu",
                 (_, Device::Cpu) => FALLBACK_SUFFIX,
-                (Device::DirectMl, _) => "directml",
-                (Device::Cuda, _) => "cuda",
-                (Device::CoreMl, _) => "coreml",
-                (Device::Vulkan | Device::Metal, _) => unreachable!("rejected by session()"),
+                (_, Device::DirectMl) => "directml",
+                (_, Device::Cuda) => "cuda",
+                (_, Device::CoreMl) => "coreml",
+                (_, Device::Auto | Device::Vulkan | Device::Metal) => {
+                    unreachable!("rejected by session()")
+                }
             }
         );
         tracing::info!("loaded {name} in {:.2} s", start.elapsed().as_secs_f64());
@@ -290,7 +306,7 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         }
         #[cfg(not(target_os = "macos"))]
         Device::CoreMl => return Err("device \"coreml\" is only available on macOS".into()),
-        Device::Vulkan | Device::Metal => {
+        Device::Auto | Device::Vulkan | Device::Metal => {
             return Err(format!("the parakeet engine can't use device {device:?}").into());
         }
     }
@@ -363,7 +379,10 @@ impl SttEngine for Parakeet {
                     p[ch * n..ch * n + t].copy_from_slice(&feats[ch * t..(ch + 1) * t]);
                 }
                 padded = p;
-                (ort::value::Shape::new([1i64, c as i64, n as i64]), &padded[..])
+                (
+                    ort::value::Shape::new([1i64, c as i64, n as i64]),
+                    &padded[..],
+                )
             }
             None => (feat_shape.clone(), feats),
         };

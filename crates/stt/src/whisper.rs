@@ -72,6 +72,7 @@ impl Whisper {
 
         let use_gpu = match cfg.device {
             Device::Cpu => false,
+            Device::Auto => cfg!(any(feature = "whisper-vulkan", feature = "whisper-metal")),
             Device::Vulkan if cfg!(feature = "whisper-vulkan") => true,
             Device::Metal if cfg!(feature = "whisper-metal") => true,
             d => {
@@ -105,10 +106,10 @@ impl Whisper {
             0 => std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(1)),
             n => n,
         } as i32;
-        let device = match cfg.device {
-            Device::Vulkan => "vulkan",
-            Device::Metal => "metal",
-            _ => "cpu",
+        let device = match use_gpu {
+            false => "cpu",
+            true if cfg!(feature = "whisper-metal") => "metal",
+            true => "vulkan",
         };
         let name = format!("{} ({device})", cfg.model);
         tracing::info!("loaded {name} in {:.2} s", start.elapsed().as_secs_f64());
@@ -128,7 +129,10 @@ impl SttEngine for Whisper {
 
     fn warmup(&mut self) -> Result<()> {
         // A short tone-free silence still runs the encoder and one decoder pass.
-        self.transcribe(&vec![0.0; 2 * SAMPLE_RATE as usize], &TranscribeOpts::default())?;
+        self.transcribe(
+            &vec![0.0; 2 * SAMPLE_RATE as usize],
+            &TranscribeOpts::default(),
+        )?;
         Ok(())
     }
 

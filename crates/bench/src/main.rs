@@ -238,10 +238,7 @@ fn run() -> Result<(), String> {
         let mut all = (0, 0, 0);
         for c in &clips {
             if let Some((e, w)) = c.errors {
-                for acc in [
-                    by_set.entry(c.set.clone()).or_default(),
-                    &mut all,
-                ] {
+                for acc in [by_set.entry(c.set.clone()).or_default(), &mut all] {
                     *acc = (acc.0 + 1, acc.1 + e, acc.2 + w);
                 }
                 if let Some(cat) = categories.get(&c.name) {
@@ -327,7 +324,10 @@ fn set_of(name: &str) -> String {
 
 /// name -> category from `manifest.tsv` (written by `scripts/prepare_eval.py`), if present.
 fn read_categories(dir: &Path) -> BTreeMap<String, String> {
-    let candidates = [Some(dir.join("manifest.tsv")), dir.parent().map(|p| p.join("manifest.tsv"))];
+    let candidates = [
+        Some(dir.join("manifest.tsv")),
+        dir.parent().map(|p| p.join("manifest.tsv")),
+    ];
     let Some(text) = candidates
         .into_iter()
         .flatten()

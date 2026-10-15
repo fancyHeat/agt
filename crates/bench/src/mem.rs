@@ -23,7 +23,11 @@ pub fn peak_rss() -> Option<u64> {
     }
     let max = u.ru_maxrss as u64;
     // Bytes on macOS, kilobytes on Linux.
-    Some(if cfg!(target_os = "macos") { max } else { max * 1024 })
+    Some(if cfg!(target_os = "macos") {
+        max
+    } else {
+        max * 1024
+    })
 }
 
 #[cfg(not(any(windows, unix)))]
