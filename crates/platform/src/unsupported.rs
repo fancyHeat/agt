@@ -1,9 +1,9 @@
-//! Placeholder for platforms without an implementation yet (macOS until Phase 4).
+//! Placeholder for platforms without an implementation (anything but Windows and macOS).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, Hotkey, HotkeyEvent, Key};
+use crate::{Error, Hotkey, HotkeyEvent, Key, Permission};
 
-const MSG: &str = "not yet supported on this platform (macOS support is planned)";
+const MSG: &str = "not supported on this platform";
 
 pub struct HotkeyHandle;
 #[derive(Clone)]
@@ -59,3 +59,11 @@ pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
 pub fn restore_clipboard(_s: &ClipboardSnapshot, _t: &PasteToken) -> Result<bool, Error> {
     Err(format!("clipboard access {MSG}").into())
 }
+
+pub fn missing_permissions() -> Vec<Permission> {
+    Vec::new()
+}
+
+pub fn request_permissions(_missing: &[Permission]) {}
+
+pub fn open_permission_settings(_permission: Permission) {}
