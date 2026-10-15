@@ -110,8 +110,9 @@ directory (handy for testing).
 
 A commented default config is written on first run; the tray menu has "Open config folder".
 AGT never rewrites an existing config. If the file has an error (including an unknown key), AGT
-logs it, shows "Config error" in the tray menu, and runs with defaults **with updates off**, so a
-typo can't silently re-enable updates you turned off.
+logs it, shows "Config error" in the tray menu, and runs with defaults **with automatic update
+checks off**, so a typo can't silently turn back on the checks and downloads you turned off. Tray →
+**Update now** still works, and an update that was already downloaded is still applied.
 
 Only one AGT runs at a time (lock file `agt.lock` in the data dir); a second launch exits.
 
@@ -312,6 +313,14 @@ Installed builds update themselves from this repo's public GitHub Releases: the 
 startup and every `update.check_interval_minutes` (default 240, minimum 30), downloads in the
 background, and applies the update when you quit from the tray (or on next launch). Set
 `update.enabled = false` to turn this off.
+
+Tray → **Update now** (on macOS, in the menu-bar menu) checks right away, even with
+`update.enabled = false`: if there's an update it downloads it and restarts into the new version.
+Before restarting it waits until dictation has been idle (Ready) for 5 s, so a recording, a
+pending paste or the clipboard restore isn't cut off. Meanwhile the item reads **Restart into X
+now**, and clicking it restarts at once. After an error (e.g. a failed paste) it doesn't restart by
+itself: copy the transcript first if you need it, then click. In builds that aren't installed
+(e.g. `cargo run`) the item is disabled.
 
 The feed is read from `releases/latest/download/` over plain HTTPS (no GitHub API, so no token
 and no rate limit), with a hard timeout on every request.

@@ -9,18 +9,23 @@ mod update;
 use agt_core::{Config, config::OverlayPosition, paths};
 use std::{
     fs::{File, TryLockError},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
-use velopack::{UpdateManager, VelopackApp};
+use velopack::{VelopackApp, VelopackAsset};
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::WindowId,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long dictation must be idle ([`pipeline::Status::Ready`], no status change) before an
+/// update restart: covers the clipboard restore after a paste and back-to-back dictations.
+const RESTART_SETTLE: Duration = Duration::from_secs(5);
 
 /// Everything other threads post to the UI thread, via `EventLoopProxy<AppEvent>`.
 #[derive(Debug)]
@@ -28,6 +33,18 @@ enum AppEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Pipeline(pipeline::Event),
+    Update(UpdateEvent),
+}
+
+/// Progress of an "Update now" check, from its worker thread.
+#[derive(Debug)]
+enum UpdateEvent {
+    /// Found this version; downloading it.
+    Downloading(String),
+    /// The update ready to apply (`None`: up to date), or the error.
+    Done(Result<Option<VelopackAsset>, String>),
+    /// [`RESTART_SETTLE`] has passed since status change number `.0`.
+    Settled(u64),
 }
 
 fn main() {
@@ -102,10 +119,13 @@ fn main() {
 
     let mut app = App {
         tray: None,
+        proxy: event_loop.create_proxy(),
         updater,
+        restart_with: None,
+        status_changes: 0,
         config_error,
         polish_info,
-        status: status.map(|s| s.to_string()),
+        status,
         pipeline: pipeline.ok(),
         overlay: None,
         failures_at_start: 0,
@@ -147,12 +167,19 @@ fn acquire_instance_lock() -> Option<Option<File>> {
 
 struct App {
     tray: Option<tray::Tray>,
-    updater: Option<UpdateManager>,
+    proxy: EventLoopProxy<AppEvent>,
+    /// `None` if this isn't a Velopack install.
+    updater: Option<update::Updater>,
+    /// A downloaded update to restart into ("Update now"), once dictation has been idle for
+    /// [`RESTART_SETTLE`] or when the user clicks the item again.
+    restart_with: Option<VelopackAsset>,
+    /// Counts pipeline status changes: a restart timer is stale if this moved on.
+    status_changes: u64,
     config_error: bool,
     /// Tray line about LLM polish.
     polish_info: String,
     /// Latest pipeline status, kept so it can be shown once the tray exists.
-    status: Option<String>,
+    status: Option<pipeline::Status>,
     pipeline: Option<pipeline::Pipeline>,
     /// Created at start-up (hidden) when enabled and dictation works.
     overlay: Option<agt_overlay::Overlay>,
@@ -167,10 +194,11 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
-            match tray::Tray::new(VERSION, self.config_error, &self.polish_info) {
+            let installed = self.updater.is_some();
+            match tray::Tray::new(VERSION, self.config_error, &self.polish_info, installed) {
                 Ok(t) => {
                     if let Some(s) = &self.status {
-                        t.set_status(s);
+                        t.set_status(&s.to_string());
                     }
                     self.tray = Some(t);
                 }
@@ -190,16 +218,21 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        // Already restarting into an update (or quitting): don't hand Velopack a second job.
+        if event_loop.exiting() {
+            return;
+        }
         if let AppEvent::Pipeline(e) = &event {
             match e {
                 pipeline::Event::Status(s, failures) => {
                     // Overlay first: it's what the user is looking at on key down.
                     self.update_overlay(s, *failures);
-                    let s = s.to_string();
                     if let Some(tray) = &self.tray {
-                        tray.set_status(&s);
+                        tray.set_status(&s.to_string());
                     }
-                    self.status = Some(s);
+                    self.status = Some(s.clone());
+                    self.status_changes += 1;
+                    self.start_restart_timer();
                 }
                 pipeline::Event::Rejected => {
                     if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
@@ -221,12 +254,34 @@ impl ApplicationHandler<AppEvent> for App {
                     p.copy_last_transcript();
                 }
             }
+            AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if e.id == tray.quit => {
-                if let Some(um) = &self.updater {
-                    update::apply_pending_on_exit(um);
+                if let Some(u) = &self.updater {
+                    update::apply_pending_on_exit(&u.um);
                 }
                 event_loop.exit();
+            }
+            AppEvent::Update(UpdateEvent::Downloading(version)) => {
+                tray.set_update(&format!("Downloading update {version}..."), false);
+            }
+            AppEvent::Update(UpdateEvent::Done(Ok(Some(asset)))) => self.restart_when_idle(asset),
+            AppEvent::Update(UpdateEvent::Settled(n)) => {
+                if n == self.status_changes
+                    && let Some(asset) = self.restart_with.take()
+                {
+                    self.restart_now(&asset, event_loop);
+                }
+            }
+            AppEvent::Update(UpdateEvent::Done(Ok(None))) => {
+                tray.set_update(
+                    &format!("{} - up to date ({VERSION})", tray::UPDATE_NOW),
+                    true,
+                );
+            }
+            AppEvent::Update(UpdateEvent::Done(Err(e))) => {
+                tracing::error!("update failed: {e}");
+                tray.set_update("Update failed - see log", true);
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
             AppEvent::Menu(_) | AppEvent::Pipeline(_) => {}
@@ -257,6 +312,82 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    /// "Update now": while a restart is waiting, restarts right away (the user's choice);
+    /// with an update already downloaded, restarts into it once idle; else checks and
+    /// downloads on a worker thread, which reports back as [`AppEvent::Update`].
+    fn update_now(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(asset) = self.restart_with.take() {
+            return self.restart_now(&asset, event_loop);
+        }
+        let (Some(updater), Some(tray)) = (&self.updater, &self.tray) else {
+            return;
+        };
+        if let Some(asset) = updater.um.get_update_pending_restart() {
+            return self.restart_when_idle(asset);
+        }
+        tray.set_update("Checking for updates...", false);
+        let (updater, proxy) = (updater.clone(), self.proxy.clone());
+        let spawned = thread::Builder::new()
+            .name("update-now".into())
+            .spawn(move || {
+                let result = update::check_now(&updater, |version| {
+                    let _ = proxy
+                        .send_event(AppEvent::Update(UpdateEvent::Downloading(version.into())));
+                });
+                let result = result.map_err(|e| e.to_string());
+                let _ = proxy.send_event(AppEvent::Update(UpdateEvent::Done(result)));
+            });
+        if let Err(e) = spawned {
+            tracing::error!("cannot start update check: {e}");
+            tray.set_update("Update failed - see log", true);
+        }
+    }
+
+    /// Restarts into `asset` once dictation has been idle for [`RESTART_SETTLE`]. Until then
+    /// the item offers to restart right away (also the way out after an error, which waits
+    /// for the user so a failed paste's transcript can still be copied).
+    fn restart_when_idle(&mut self, asset: VelopackAsset) {
+        if let Some(tray) = &self.tray {
+            tray.set_update(&format!("Restart into {} now", asset.Version), true);
+        }
+        self.restart_with = Some(asset);
+        self.start_restart_timer();
+    }
+
+    /// If a restart is waiting and dictation is idle, posts [`UpdateEvent::Settled`] after
+    /// [`RESTART_SETTLE`]; any status change in between makes it stale.
+    fn start_restart_timer(&self) {
+        // Idle: ready, or dictation unavailable altogether. Not on Error/Loading.
+        let idle =
+            self.pipeline.is_none() || matches!(self.status, Some(pipeline::Status::Ready(_)));
+        if self.restart_with.is_none() || !idle {
+            return;
+        }
+        let (proxy, n) = (self.proxy.clone(), self.status_changes);
+        // If this fails, the item still restarts on click.
+        let _ = thread::Builder::new()
+            .name("restart-timer".into())
+            .spawn(move || {
+                thread::sleep(RESTART_SETTLE);
+                let _ = proxy.send_event(AppEvent::Update(UpdateEvent::Settled(n)));
+            });
+    }
+
+    /// Applies `asset` and exits, so Velopack restarts into it.
+    fn restart_now(&mut self, asset: &VelopackAsset, event_loop: &ActiveEventLoop) {
+        let (Some(updater), Some(tray)) = (&self.updater, &self.tray) else {
+            return;
+        };
+        tray.set_update(&format!("Restarting into {}...", asset.Version), false);
+        match update::apply_and_restart(&updater.um, asset) {
+            Ok(()) => event_loop.exit(),
+            Err(e) => {
+                tracing::error!("failed to start updater: {e}");
+                tray.set_update("Update failed - see log", true);
+            }
+        }
+    }
+
     fn update_overlay(&mut self, status: &pipeline::Status, failures: u64) {
         use agt_overlay::Mode;
         use pipeline::Status;
