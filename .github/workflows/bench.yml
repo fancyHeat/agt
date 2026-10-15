@@ -1,0 +1,48 @@
+# STT benchmark on a GitHub-hosted Apple Silicon runner (macos-14, M1, virtualized).
+# Manual (workflow_dispatch), plus on PRs that change this file. Results are in the job
+# summary and the `bench-macos` artifact. These runners are VMs: CPU numbers are indicative
+# of an M1 (slower than a real one under load); GPU/Neural Engine access may be missing.
+name: Bench (macOS)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: [".github/workflows/bench.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare eval set
+        run: uv run scripts/prepare_eval.py
+      - name: Build
+        run: |
+          cargo build --release --locked -p agt-bench
+          cargo build --release --locked -p agt-bench --features whisper-metal --target-dir target/whisper
+      - name: Run
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize | tee results.txt
+          system_profiler SPDisplaysDataType | tee -a results.txt
+          run() { echo "=== $*" | tee -a results.txt; "$@" eval-data/clips 2>&1 | tee -a results.txt || true; }
+          B=target/release/agt-bench
+          W=target/whisper/release/agt-bench
+          run $B --model parakeet-tdt-0.6b-v2 --precision int8 --device cpu --runs 3 --quiet
+          run $B --model parakeet-tdt-0.6b-v2 --precision fp32 --device cpu --runs 1 --quiet
+          run $B --model parakeet-tdt-0.6b-v2 --precision fp32 --device coreml --runs 3 --quiet
+          run $B --model parakeet-tdt-0.6b-v2 --precision int8 --device coreml --runs 1 --quiet
+          run $W --engine whisper --model whisper-large-v3-turbo-q5_0 --device metal --runs 3 --quiet
+          run $W --engine whisper --model whisper-large-v3-turbo-q5_0 --device cpu --runs 1 --quiet
+          run $W --engine whisper --model whisper-small.en-q8_0 --device metal --runs 3 --quiet
+          { echo '```'; cat results.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-macos
+          path: results.txt

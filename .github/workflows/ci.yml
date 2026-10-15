@@ -28,3 +28,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # Optional engines/backends (cargo features) that releases don't build.
+      - name: Clippy with optional engines
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then F=cuda,whisper; else F=whisper-metal; fi
+          cargo clippy -p agt-bench --all-targets --locked --features "$F" -- -D warnings
