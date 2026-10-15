@@ -12,6 +12,17 @@ use std::{
 /// Serves one request with `status` and `body` after `delay`; returns the base URL and the
 /// received request (head lowercased, body).
 fn serve(status: u16, body: &str, delay: Duration) -> (String, mpsc::Receiver<(String, Value)>) {
+    serve_with(status, "", body, delay)
+}
+
+/// [`serve`] with extra response header lines (each ending in `\r\n`).
+fn serve_with(
+    status: u16,
+    headers: &str,
+    body: &str,
+    delay: Duration,
+) -> (String, mpsc::Receiver<(String, Value)>) {
+    let headers = headers.to_owned();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let body = body.to_owned();
@@ -34,12 +45,12 @@ fn serve(status: u16, body: &str, delay: Duration) -> (String, mpsc::Receiver<(S
             .map_or(0, |v| v.trim().parse().unwrap());
         let mut req = vec![0; len];
         reader.read_exact(&mut req).unwrap();
-        let _ = tx.send((head, serde_json::from_slice(&req).unwrap()));
+        let _ = tx.send((head, serde_json::from_slice(&req).unwrap_or(Value::Null)));
         thread::sleep(delay);
         let mut stream = stream;
         let _ = write!(
             stream,
-            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status} X\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
     });
@@ -249,4 +260,77 @@ fn guard_rejects_an_answer_from_the_server() {
     let (text, outcome) = polish_or_raw(load(&cfg).unwrap().as_ref(), raw, &cfg);
     assert_eq!(text, raw);
     assert!(matches!(outcome, Outcome::Fallback(_)));
+}
+
+#[test]
+fn anthropic_refusal_falls_back_to_raw() {
+    let body = json!({
+        "content": [],
+        "stop_reason": "refusal",
+        "stop_details": {"type": "refusal", "category": null, "explanation": null}
+    });
+    let (url, _rx) = serve(200, &body.to_string(), Duration::ZERO);
+    let cfg = anthropic(&url);
+    let (text, outcome) = polish_or_raw(load(&cfg).unwrap().as_ref(), RAW, &cfg);
+    assert_eq!(text, RAW);
+    assert_eq!(outcome, Outcome::Fallback("model refused".into()));
+}
+
+#[test]
+fn redirects_are_not_followed() {
+    let (target, target_rx) = serve(200, "{}", Duration::ZERO);
+    let (url, _rx) = serve_with(
+        302,
+        &format!("location: {target}/v1/messages\r\n"),
+        "",
+        Duration::ZERO,
+    );
+    let err = load(&anthropic(&url))
+        .unwrap()
+        .polish(RAW, &PolishCtx::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with("HTTP 302"), "{err}");
+    assert!(target_rx.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+#[test]
+fn non_json_error_bodies_stay_out_of_the_error() {
+    let page = format!("<html>Bad gateway for {RAW}</html>");
+    let (url, _rx) = serve(502, &page, Duration::ZERO);
+    let err = load(&openai(&url))
+        .unwrap()
+        .polish(RAW, &PolishCtx::default())
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        format!("HTTP 502: non-JSON error body ({} bytes)", page.len())
+    );
+}
+
+#[test]
+fn max_tokens_scales_with_utf8_bytes() {
+    let resp = json!({"choices": [{"message": {"content": "x"}}]});
+    let (url, rx) = serve(200, &resp.to_string(), Duration::ZERO);
+    let text = "\u{4eca}\u{5929}\u{5f88}\u{597d}".repeat(25); // 100 CJK chars, 300 bytes
+    let _ = load(&openai(&url))
+        .unwrap()
+        .polish(&text, &PolishCtx::default());
+    assert_eq!(rx.recv().unwrap().1["max_tokens"], 300 / 2 + 64);
+}
+
+#[test]
+fn plain_http_detection() {
+    for ok in [
+        "https://api.example.com",
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:8080/v1",
+        "http://[::1]:8080/v1",
+    ] {
+        assert!(is_https_or_loopback(ok), "{ok}");
+    }
+    for bad in ["http://192.168.1.5:8080/v1", "http://example.com/v1"] {
+        assert!(!is_https_or_loopback(bad), "{bad}");
+    }
 }

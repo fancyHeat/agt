@@ -113,9 +113,11 @@ It never makes a dictation fail or hang. The raw transcript is pasted (and a war
 logged) when:
 - the transcript has fewer than `polish.min_words` words (default 4; not sent at all);
 - the request fails or takes longer than `polish.timeout_ms` + `polish.timeout_per_word_ms`
-  per word (default 2000 + 15 ms/word; covers connect, send and the whole response);
+  per word (default 2000 ms for `openai`, 3000 ms for `anthropic`, + 15 ms/word; covers
+  DNS, connect, send and the whole response);
 - the output looks wrong: empty; under 25% or over 125% (+3) of the input's words; starting
-  like an assistant reply ("Sure", "Here is", "I can't", ...) when the transcript didn't; or,
+  like an assistant reply ("Sure", "Here is", "I can't", ...) when the transcript didn't
+  (leading fillers ignored: "um sorry I'm late" → "Sorry I'm late" is fine); or,
   with the built-in prompt, too many words that aren't in the transcript (what an answer
   to a dictated question looks like). Code fences, quotes and tags the model wraps its
   answer in are stripped first.
@@ -164,17 +166,25 @@ transcript); `llama-server` as above is the tested setup.
 with `ollama pull qwen2.5:3b`. Without a GPU a 3B model is slow (1-3 s per sentence on an
 i9-9900K) and does sometimes answer instead of cleaning up (the guards catch most of it).
 
+**Cloud via `provider = "openai"`:** set `base_url`, `model` and the key (`api_key_env`).
+Requests send `max_tokens` and `temperature = 0`; newer OpenAI reasoning models reject those
+(they want `max_completion_tokens` and the default temperature), so every polish would fail
+and the raw text be pasted. The warmup line in the log shows such errors at start-up. Over
+plain `http://` to another machine the key travels unencrypted; AGT logs a warning.
+
 **Claude (cloud):** `provider = "anthropic"` uses Claude Haiku 5.5 (`claude-haiku-5-5`) with
 the key from the `ANTHROPIC_API_KEY` environment variable (or the variable named by
 `polish.api_key_env`, or `polish.api_key` in the config file, which is local to your machine:
 never share or commit it). Expect ~0.7-1.5 s per dictation including the network, with a
-slow tail: in testing about 1 in 7 requests took over 2 s and was pasted raw at the default
-timeout. Raise `polish.timeout_ms` (e.g. 3000) if you'd rather wait.
+slow tail: in testing about 1 in 7 requests took over 2 s, hence the 3 s default timeout for
+this provider (slower ones are pasted raw). The connection is kept open for 90 s between
+dictations, so a quick follow-up skips the TLS handshake.
 
 ```toml
 [polish]
 enabled = true
 provider = "anthropic"
+# timeout_ms = 3000   # the default for anthropic; lower it to trade polish for latency
 ```
 
 Measured with `agt-bench polish` (i9-9900K, RTX 2080 Ti, llama.cpp b11669, Q4_K_M; median

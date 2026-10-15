@@ -9,14 +9,23 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-pub fn init(log_dir: &Path, level: &str) {
-    let level: LevelFilter = level.parse().unwrap_or(LevelFilter::INFO);
-    // Velopack logs ~10 lines per update check at INFO; keep only its warnings.
-    let filter = Targets::new()
+fn filter(level: LevelFilter) -> Targets {
+    Targets::new()
         .with_default(level)
+        // Velopack logs ~10 lines per update check at INFO; keep only its warnings.
         .with_target("velopack", LevelFilter::WARN.min(level))
         // ONNX Runtime logs device discovery and graph details at INFO.
-        .with_target("ort", LevelFilter::WARN.min(level));
+        .with_target("ort", LevelFilter::WARN.min(level))
+        // SECURITY: at TRACE, ureq hex-dumps raw request bytes, unredacted, including the
+        // `x-api-key` / `authorization` headers of LLM polish requests. Never let that into
+        // the log file, whatever `log_level` says (its DEBUG output redacts headers).
+        .with_target("ureq", LevelFilter::DEBUG.min(level))
+        .with_target("ureq_proto", LevelFilter::DEBUG.min(level))
+}
+
+pub fn init(log_dir: &Path, level: &str) {
+    let level: LevelFilter = level.parse().unwrap_or(LevelFilter::INFO);
+    let filter = filter(level);
 
     let _ = std::fs::create_dir_all(log_dir);
     let appender = RollingFileAppender::builder()
@@ -44,4 +53,26 @@ pub fn init(log_dir: &Path, level: &str) {
     }
 
     std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn http_wire_dumps_never_logged() {
+        let f = filter(LevelFilter::TRACE);
+        assert!(f.would_enable("agt::pipeline", &Level::TRACE));
+        for target in [
+            "ureq",
+            "ureq::unversioned",
+            "ureq_proto",
+            "ureq_proto::util",
+        ] {
+            assert!(!f.would_enable(target, &Level::TRACE), "{target}");
+            assert!(f.would_enable(target, &Level::DEBUG), "{target}");
+        }
+        assert!(!filter(LevelFilter::INFO).would_enable("ureq_proto::util", &Level::DEBUG));
+    }
 }

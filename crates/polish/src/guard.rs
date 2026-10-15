@@ -6,7 +6,8 @@
 //! - the output fails [`check`]: after stripping wrappers the model may add (code fences,
 //!   surrounding quotes, `<transcript>` tags, a `<think>` block), it is empty; has fewer than
 //!   25% or more than 125% (+3) of the input's words; starts like an assistant reply
-//!   ("Sure", "Here is", "I can't", ...) when the transcript didn't; or (built-in prompt only)
+//!   ("Sure", "Here is", "I can't", ...) when the transcript didn't (its leading fillers and
+//!   next 3 words don't contain that word); or (built-in prompt only)
 //!   more than 30% of its words (50% for the `formal` style), and at least 2, don't occur in
 //!   the transcript at all, which is what an answer to a dictated question looks like
 //!   ("what's the capital of France" → "The capital of France is Paris.").
@@ -101,10 +102,22 @@ pub fn check(raw: &str, out: &str, max_novel: Option<f64>) -> Result<String, &'s
         "ok here",
         "note",
     ];
+    // The speaker may really have started that way, after fillers that polish removes
+    // ("um sorry I'm late" → "Sorry I'm late"): the transcript's opening is its leading
+    // fillers plus the next 3 words.
+    const FILLERS: &[&str] = &[
+        "um", "umm", "uh", "uhm", "erm", "er", "ah", "eh", "oh", "hmm", "mm", "so", "well", "okay",
+        "ok", "like", "yeah", "and",
+    ];
+    let skip = rw
+        .iter()
+        .take_while(|w| FILLERS.contains(&w.as_str()))
+        .count();
+    let opening = &rw[..(skip + 3).min(rw.len())];
     for start in REPLY_STARTS {
         let sw: Vec<&str> = start.split(' ').collect();
-        let starts = |w: &[String]| w.len() >= sw.len() && w.iter().zip(&sw).all(|(a, b)| a == b);
-        if starts(&ow) && rw.first().map(String::as_str) != Some(sw[0]) {
+        let starts = ow.len() >= sw.len() && ow.iter().zip(&sw).all(|(a, b)| a == b);
+        if starts && !opening.iter().any(|w| w == sw[0]) {
             return Err("output looks like a reply, not the dictation");
         }
     }
@@ -232,7 +245,34 @@ mod tests {
             check(raw, "What's the capital of France?", LIGHT).unwrap(),
             "What's the capital of France?"
         );
-        // ...unless the speaker really started that way.
+        // ...unless the speaker really started that way, possibly after fillers.
+        for (raw, out) in [
+            (
+                "um sorry I'm late to the meeting the train was delayed",
+                "Sorry I'm late to the meeting, the train was delayed.",
+            ),
+            (
+                "uh sure I can send that over to you by friday",
+                "Sure, I can send that over to you by Friday.",
+            ),
+            (
+                "uh note to self buy milk and eggs on the way home",
+                "Note to self: buy milk and eggs on the way home.",
+            ),
+            (
+                "um here's the thing we really need to ship this week",
+                "Here's the thing: we really need to ship this week.",
+            ),
+            (
+                "okay so here's the plan for tomorrow morning",
+                "Okay, here's the plan for tomorrow morning.",
+            ),
+        ] {
+            assert_eq!(check(raw, out, LIGHT).as_deref(), Ok(out), "{raw:?}");
+        }
+        // A reply opener that only occurs later in the transcript is still a reply.
+        let raw = "can you tell me what's the right thing here sure or not";
+        assert!(check(raw, "Sure! The right thing is to ask.", None).is_err());
         let raw = "sure I can do that tomorrow morning";
         assert!(check(raw, "Sure, I can do that tomorrow morning.", LIGHT).is_ok());
     }

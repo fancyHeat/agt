@@ -41,9 +41,20 @@ pub fn load(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, String
             cfg.api_key_var().unwrap_or("ANTHROPIC_API_KEY")
         ));
     }
+    if key.is_some() && !is_https_or_loopback(base) {
+        tracing::warn!(
+            "polish: the API key will be sent unencrypted over plain http to {base}; use https unless that server is on a network you trust"
+        );
+    }
     let agent = ureq::Agent::config_builder()
         // Read error bodies instead of turning 4xx/5xx into opaque errors.
         .http_status_as_error(false)
+        // A redirect would be followed as a GET (useless here) and ureq would carry our
+        // custom `x-api-key` header along to wherever it points.
+        .max_redirects(0)
+        // Dictations are often minutes apart; keep the (TLS) connection for reuse longer
+        // than ureq's 15 s default. A failed request never returns its connection.
+        .max_idle_age(Duration::from_secs(90))
         .user_agent(concat!("agt/", env!("CARGO_PKG_VERSION")))
         .build()
         .new_agent();
@@ -56,6 +67,22 @@ pub fn load(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, String
         key,
         agent,
     }))
+}
+
+/// `https://...`, or plain http to this machine.
+fn is_https_or_loopback(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("http://") else {
+        return true;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 struct Llm {
@@ -90,9 +117,10 @@ impl Polisher for Llm {
 impl Llm {
     fn request(&self, text: &str, timeout: Duration) -> Result<String> {
         let p = prompt::build(&self.cfg, text);
-        // Cleaned text is about as long as the input (~4 chars per token in English); this
-        // leaves ~2x headroom while stopping a runaway answer early.
-        let max_tokens = text.chars().count() / 2 + 64;
+        // Cleaned text is about as long as the input. UTF-8 bytes / 2 leaves ~2x headroom for
+        // English (~4 bytes per token) and still enough for CJK (3 bytes per char, ~1 token
+        // per char), while stopping a runaway answer early.
+        let max_tokens = text.len() / 2 + 64;
         let messages: Vec<Value> = p
             .turns
             .iter()
@@ -187,15 +215,23 @@ fn parse_anthropic(v: &Value) -> std::result::Result<String, &'static str> {
     Ok(text)
 }
 
-/// `error.message` (OpenAI and Anthropic both use it), else the start of the body.
+/// `error.message` (OpenAI and Anthropic both use it). Any other body (e.g. a proxy's HTML
+/// page, which might echo the request) is only described by its size; its start is logged
+/// at debug, since the error ends up in a WARN line.
 fn error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
+    let message = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| match &v["error"] {
             Value::String(s) => Some(s.clone()),
             e => e["message"].as_str().map(str::to_owned),
-        })
-        .unwrap_or_else(|| snippet(body))
+        });
+    match message {
+        Some(m) => snippet(&m),
+        None => {
+            tracing::debug!("polish error body: {}", snippet(body));
+            format!("non-JSON error body ({} bytes)", body.len())
+        }
+    }
 }
 
 fn snippet(s: &str) -> String {

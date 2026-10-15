@@ -77,7 +77,8 @@ prompt = ""
 # <transcript> tags. For models that expect a specific input format (see README: S1-mini).
 user_message = ""
 # Give up and paste the raw transcript after timeout_ms + timeout_per_word_ms per word.
-timeout_ms = 2000
+# 0 = provider default: 2000 for openai (local servers), 3000 for anthropic (cloud).
+timeout_ms = 0
 timeout_per_word_ms = 15
 # Transcripts with fewer words than this are pasted as they are.
 min_words = 4
@@ -207,7 +208,7 @@ impl Default for PolishConfig {
             style: PolishStyle::Light,
             prompt: String::new(),
             user_message: String::new(),
-            timeout_ms: 2000,
+            timeout_ms: 0,
             timeout_per_word_ms: 15,
             min_words: 4,
         }
@@ -250,11 +251,16 @@ impl PolishConfig {
         (!key.is_empty()).then(|| key.to_owned())
     }
 
-    /// The time budget for polishing a transcript of `words` words.
+    /// The time budget for polishing a transcript of `words` words. `timeout_ms = 0` means
+    /// the provider default: cloud round trips have a slower tail than a local server.
     pub fn timeout(&self, words: usize) -> std::time::Duration {
+        let base = match (self.timeout_ms, self.provider) {
+            (0, PolishProvider::OpenAi) => 2000,
+            (0, PolishProvider::Anthropic) => 3000,
+            (ms, _) => ms,
+        };
         std::time::Duration::from_millis(
-            self.timeout_ms
-                .saturating_add(self.timeout_per_word_ms.saturating_mul(words as u64)),
+            base.saturating_add(self.timeout_per_word_ms.saturating_mul(words as u64)),
         )
     }
 }
@@ -468,7 +474,13 @@ mod tests {
         assert_eq!(c.base_url(), "https://api.anthropic.com");
         assert_eq!(c.model(), "m");
         assert_eq!(c.api_key_var(), Some("ANTHROPIC_API_KEY"));
-        assert_eq!(c.timeout(100), std::time::Duration::from_millis(3500));
+        assert_eq!(c.timeout(100), std::time::Duration::from_millis(4500));
+        assert_eq!(
+            Config::default().polish.timeout(100),
+            std::time::Duration::from_millis(3500)
+        );
+        let c = Config::parse("[polish]\nprovider = \"anthropic\"\ntimeout_ms = 1000\n").unwrap();
+        assert_eq!(c.polish.timeout(0), std::time::Duration::from_millis(1000));
         assert!(Config::parse("[polish]\nprovider = \"gemini\"").is_err());
         assert!(Config::parse("[polish]\nstyle = \"pirate\"").is_err());
     }
