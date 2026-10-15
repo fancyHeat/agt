@@ -6,8 +6,11 @@ mod pipeline;
 mod tray;
 mod update;
 
-use agt_core::{Config, paths};
-use std::fs::{File, TryLockError};
+use agt_core::{Config, config::OverlayPosition, paths};
+use std::{
+    fs::{File, TryLockError},
+    time::Instant,
+};
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
 use velopack::{UpdateManager, VelopackApp};
 use winit::{
@@ -103,7 +106,16 @@ fn main() {
         config_error,
         polish_info,
         status: status.map(|s| s.to_string()),
-        _pipeline: pipeline.ok(),
+        pipeline: pipeline.ok(),
+        overlay: None,
+        failures_when_shown: 0,
+        overlay_position: config
+            .overlay
+            .enabled
+            .then_some(match config.overlay.position {
+                OverlayPosition::Bottom => agt_overlay::Position::Bottom,
+                OverlayPosition::Top => agt_overlay::Position::Top,
+            }),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop error: {e}");
@@ -141,7 +153,13 @@ struct App {
     polish_info: String,
     /// Latest pipeline status, kept so it can be shown once the tray exists.
     status: Option<String>,
-    _pipeline: Option<pipeline::Pipeline>,
+    pipeline: Option<pipeline::Pipeline>,
+    /// Created at start-up (hidden) when enabled and dictation works.
+    overlay: Option<agt_overlay::Overlay>,
+    /// `None` if the overlay is turned off.
+    overlay_position: Option<agt_overlay::Position>,
+    /// [`pipeline::Pipeline::failures`] when the overlay last appeared.
+    failures_when_shown: u64,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -160,20 +178,35 @@ impl ApplicationHandler<AppEvent> for App {
                     event_loop.exit();
                 }
             }
+            // Created hidden now, so showing it on key down is a single present.
+            if let (Some(position), Some(_)) = (self.overlay_position, &self.pipeline) {
+                match agt_overlay::Overlay::new(position) {
+                    Ok(o) => self.overlay = Some(o),
+                    Err(e) => tracing::warn!("no overlay: {e}"),
+                }
+            }
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         if let AppEvent::Status(s) = &event {
+            // Overlay first: it's what the user is looking at on key down.
+            self.update_overlay(s);
             let s = s.to_string();
             if let Some(tray) = &self.tray {
                 tray.set_status(&s);
+                tray.set_copy_enabled(self.pipeline.as_ref().is_some_and(|p| p.has_transcript()));
             }
             self.status = Some(s);
             return;
         }
         let Some(tray) = &self.tray else { return };
         match event {
+            AppEvent::Menu(e) if e.id == tray.copy_last => {
+                if let Some(p) = &self.pipeline {
+                    p.copy_last_transcript();
+                }
+            }
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if e.id == tray.quit => {
                 if let Some(um) = &self.updater {
@@ -186,9 +219,59 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
+    /// Draws overlay frames while it's visible. While hidden, the loop just waits for events:
+    /// no timer, no wake-ups.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) else {
+            return;
+        };
+        if overlay
+            .next_frame()
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            overlay.tick(pipeline.level.get(), Instant::now());
+        }
+        event_loop.set_control_flow(match overlay.next_frame() {
+            Some(due) => ControlFlow::WaitUntil(due),
+            None => ControlFlow::Wait,
+        });
+    }
+
     fn resumed(&mut self, _: &ActiveEventLoop) {}
 
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+}
+
+impl App {
+    fn update_overlay(&mut self, status: &pipeline::Status) {
+        use agt_overlay::Mode;
+        use pipeline::Status;
+        let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) else {
+            return;
+        };
+        let was_hidden = overlay.mode() == Mode::Hidden;
+        if was_hidden {
+            self.failures_when_shown = pipeline.failures();
+        }
+        let mode = match status {
+            Status::Recording => Mode::Recording,
+            Status::Transcribing => Mode::Transcribing,
+            // A red flash if this dictation failed. An error from before (still shown in the
+            // tray after a cancel, a short tap or "no speech") just hides it.
+            Status::Error(_) if pipeline.failures() != self.failures_when_shown => Mode::Error,
+            Status::Error(_) | Status::Ready(_) | Status::Loading(_) => Mode::Hidden,
+        };
+        overlay.set_mode(mode, pipeline.level.get(), Instant::now());
+        if was_hidden
+            && mode == Mode::Recording
+            && let Some(down) = pipeline.last_key_down()
+        {
+            tracing::debug!(
+                "key down → overlay visible {:.1} ms",
+                down.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
 }
 
 fn open_folder(dir: &std::path::Path) {

@@ -3,8 +3,9 @@
 Local, fast, hold-to-talk dictation for Windows and Apple Silicon macOS (13.4+), written in Rust.
 Hold a hotkey, speak, release: the text is transcribed on-device and pasted into the focused app.
 
-> Status: Phase 1 + optional LLM polish. Dictation works on Windows (hold **Right Ctrl**). On macOS the app runs
-> (tray, updates) but dictation is not implemented yet.
+> Status: Phase 3 + optional LLM polish. Dictation works on Windows (hold **Right Ctrl**),
+> with an on-screen overlay. On macOS the app runs (tray, updates) but dictation is not
+> implemented yet.
 
 ## Using it
 
@@ -12,6 +13,15 @@ Hold the hotkey (default Right Ctrl), speak, release. AGT transcribes the record
 Parakeet TDT 0.6B on your machine and pastes the text into whatever has focus (via the
 clipboard, which it restores afterwards). The tray menu shows the state: loading/downloading
 the model, ready, recording, transcribing, or an error.
+
+While you hold the key, a small bar near the bottom of the screen shows a live waveform; after
+you release, it shows a sweeping highlight until the text is pasted, then disappears (a short
+red flash means the dictation failed; the tray says why). It never takes focus or catches
+clicks.
+
+| Recording | Transcribing | Failed |
+|---|---|---|
+| ![recording](docs/img/overlay-recording.png) | ![transcribing](docs/img/overlay-transcribing.png) | ![error](docs/img/overlay-error.png) |
 
 - Holds shorter than `hotkey.min_hold_ms` (150 ms) are ignored, so a stray tap never pastes.
 - Hotkeys (`hotkey.key`): `RightCtrl` (default), `LeftCtrl`, `RightShift`, `LeftShift` keep
@@ -32,7 +42,11 @@ the model, ready, recording, transcribing, or an error.
 - The first run downloads the model (~670 MB) with progress in the tray; it's SHA-256 verified.
   If you're offline the tray shows an error; press the hotkey to retry.
 - Pasting into apps running as administrator doesn't work unless AGT runs elevated too; AGT
-  then puts your clipboard back, shows an error in the tray and writes the transcript to the log.
+  then puts your clipboard back and shows an error in the tray.
+- If a paste fails, nothing is lost: tray → **Copy last transcript** puts the last transcript on
+  the clipboard so you can paste it yourself. (It's kept in memory only, never on disk.)
+- Right after copying something large from an app that renders it lazily (e.g. a big Excel
+  range), the clipboard can stay busy for a while; AGT waits up to 2 s for it before pasting.
 
 ## Layout
 
@@ -42,11 +56,12 @@ the model, ready, recording, transcribing, or an error.
 | `crates/audio` (`agt-audio`) | Microphone capture (cpal) to 16 kHz mono, resampler, WAV reading, level meter |
 | `crates/platform` (`agt-platform`) | Global hold-to-talk hotkey and clipboard paste (Windows; macOS stubs) |
 | `crates/stt` (`agt-stt`) | STT engines (Parakeet on ONNX Runtime) and model downloads |
-| `crates/app` (`agt`) | The binary: tray, pipeline threads, auto-update, logging |
+| `crates/app` (`agt`) | The binary: tray, overlay wiring, pipeline threads, auto-update, logging |
 | `crates/polish` (`agt-polish`) | Optional LLM clean-up of transcripts (OpenAI-compatible or Anthropic API) and its guards |
 | `crates/bench` (`agt-bench`) | Runs an engine over a folder of WAVs: latency, RTF, WER; `agt-bench polish` for the LLM clean-up |
+| `crates/overlay` (`agt-overlay`) | The recording/transcribing bar: CPU-drawn, shown in a no-focus, click-through window |
 
-Planned: more engines, the macOS platform layer, an overlay.
+Planned: more engines, the macOS platform layer.
 
 ## Build
 
@@ -206,6 +221,30 @@ cargo run --release -p agt-bench -- polish [--config config.toml] [--provider op
 
 It polishes each line of the file and prints the latency, the guard's verdict and the
 output.
+
+### Overlay
+
+| Setting | Default | |
+|---|---|---|
+| `overlay.enabled` | `true` | |
+| `overlay.position` | `bottom` | or `top`: that edge of the work area (above the taskbar / below the menu bar), centered |
+
+It goes on the monitor of the foreground window (where the text is pasted); on macOS on
+`NSScreen.mainScreen` (the screen with keyboard focus). 180×36 logical pixels, scaled per
+monitor DPI.
+
+How it stays out of the way: the window is created hidden at start-up and drawn on the CPU (a
+few antialiased rounded rectangles, ~25-100 µs per frame; no GPU, no webview). On Windows it's
+a layered, click-through, no-activate, topmost tool window (`WS_EX_LAYERED | WS_EX_TRANSPARENT
+| WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`, per-pixel alpha via
+`UpdateLayeredWindow`, shown with `SWP_NOACTIVATE`), so it's not in the taskbar or Alt+Tab and
+never changes focus. On macOS it's a non-activating `NSPanel` that ignores the mouse, at
+status-bar level, on all Spaces including full-screen apps. It redraws at 60 fps only while
+visible; while hidden there is no timer at all.
+
+`cargo run --release -p agt-overlay --example demo -- --png <dir>` renders each state to PNGs
+off-screen (the images above); `-- --show` shows it for ~4 s and prints show latency, frame
+rate, CPU use and whether focus changed.
 
 ### Microphone
 
