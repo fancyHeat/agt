@@ -2,6 +2,7 @@
 *.onnx
 *.bin
 /models
+/eval-data
 .DS_Store
 
 # Never commit signing material or local secrets
