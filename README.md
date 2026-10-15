@@ -307,7 +307,8 @@ The `Release` workflow:
 Installers: `AGT-win-x64-Setup.exe`, `AGT-osx-arm64-Setup.pkg` (plus portable zips).
 
 PRs that touch the workflow or `packaging/` run the same build + package as a dry run (no signing,
-no publishing); from `main` it can also be started manually (`workflow_dispatch`).
+no publishing); from `main` it can also be started manually (`workflow_dispatch`), which also signs
+(when configured) but never publishes, so it's the way to check signing without cutting a release.
 
 When bumping the `velopack` crate, bump `VPK_VERSION` in `.github/workflows/release.yml` to match.
 
@@ -346,9 +347,34 @@ needs `APPLE_ID`. The app is signed with the hardened runtime and only the entit
 Security* → *App-Specific Passwords* → *+*, name it e.g. "AGT notarization", and save the
 generated password as `APPLE_APP_PASSWORD`.
 
-### Windows signing (not set up)
+### Windows signing (Azure Artifact Signing)
 
-Windows builds are unsigned (SmartScreen will warn). `release.yml` only has a **hook**: if a
-`WINDOWS_SIGN_PARAMS` secret is set, it's passed to `vpk pack --signParams` (signtool parameters).
-That alone signs nothing: a step that imports the code-signing certificate onto the runner (or a
-switch to `--azureTrustedSignFile` with Azure Trusted Signing) is still to be written.
+Windows builds are signed with [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/)
+(formerly Trusted Signing) as **Notics Security LLC**. `vpk pack --azureTrustedSignFile` signs
+`agt.exe`, `Update.exe` and `Setup.exe` with signtool and the Artifact Signing dlib, timestamped by
+`timestamp.acs.microsoft.com`. The certificates are short-lived (3 days, rotated by Azure); the
+timestamp keeps signatures valid after they expire. No secret is stored anywhere: CI authenticates
+with GitHub OIDC.
+
+What's configured:
+
+| Where | What |
+|---|---|
+| Azure (tenant `notics.io`, subscription *Azure subscription 1*) | Artifact Signing account `notics-signing` (resource group `notics-signing`, East US, Basic SKU, endpoint `https://eus.codesigning.azure.net/`), PublicTrust certificate profile `notics-rmm` (shared with other Notics products) |
+| Entra ID | App registration **`agt-github-signing`** with one federated credential, `agt-release-environment`: issuer `https://token.actions.githubusercontent.com`, subject `repo:fancyHeat@12637981/agt@1420770096:environment:release` (this repo's immutable OIDC subject). No client secret or certificate. |
+| Azure RBAC | That app's service principal has **Artifact Signing Certificate Profile Signer** on the `notics-rmm` certificate profile only |
+| GitHub | Environment **`release`**, deployable only from `main` and `v*` tags, holding the variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE` (identifiers, not secrets) |
+
+The Windows build job enters the `release` environment on tag pushes and `workflow_dispatch` (never
+on PRs), logs in with `azure/login` (OIDC), and signs. If any of the variables is missing, it skips
+signing and builds unsigned, like macOS without its secrets.
+
+**Rotate / revoke:** there's nothing to rotate (no secrets; Azure renews the certificate daily).
+To cut CI off immediately, delete the role assignment (Azure portal → the certificate profile →
+*Access control (IAM)*) or the federated credential/app registration (Entra ID → App registrations →
+`agt-github-signing`). To stop a compromised certificate from being trusted, revoke it from the
+certificate profile in the Azure portal (revocation can be backdated to a point in time). To move to
+another profile or account, change the environment variables and grant the role on the new profile.
+
+**Cost:** Basic SKU is about $9.99/month for the account (already paid for other Notics products)
+and includes 5,000 signatures per month; each release signs 3 files.

@@ -2,8 +2,9 @@
 # preflight (checks + fmt/clippy/test) -> build + package per platform -> publish one GitHub
 # Release, which installed apps then update from.
 #
-# Dry run: on PRs touching this file or packaging/ (and via workflow_dispatch from main), the
-# same build + package runs without signing and without publishing.
+# Dry run: on PRs touching this file or packaging/ the same build + package runs without signing
+# and without publishing. Via workflow_dispatch from main it also signs (when configured), still
+# without publishing.
 name: Release
 
 on:
@@ -70,6 +71,15 @@ jobs:
             channel: osx-arm64
             exe: agt
     runs-on: ${{ matrix.os }}
+    # Windows signing: only the Windows leg of a non-PR run enters the `release` environment
+    # (deployable from `main` and `v*` tags only). Its variables configure Azure Artifact Signing, and
+    # its OIDC subject (…:environment:release) is the only one Azure trusts. Other legs get no environment.
+    environment: ${{ (matrix.channel == 'win-x64' && github.event_name != 'pull_request') && 'release' || '' }}
+    permissions:
+      contents: read
+      # Azure OIDC login for Windows signing. Job-level because of the matrix; a token minted
+      # outside the `release` environment has a subject Azure does not trust.
+      id-token: write
     defaults:
       run:
         shell: bash
@@ -99,15 +109,45 @@ jobs:
               || echo "No previous release; skipping delta."
           fi
 
+      - name: Check for Windows signing configuration
+        id: winsign
+        if: runner.os == 'Windows'
+        env:
+          # Environment variables of `release` (empty outside it, e.g. on PR dry runs).
+          HAS_CONFIG: >-
+            ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != ''
+            && vars.AZURE_SIGNING_ENDPOINT != '' && vars.AZURE_SIGNING_ACCOUNT != '' && vars.AZURE_SIGNING_PROFILE != '' }}
+        run: |
+          SIGN=false
+          if [ "$HAS_CONFIG" = true ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then SIGN=true; fi
+          echo "sign=$SIGN" >> "$GITHUB_OUTPUT"
+          echo "sign=$SIGN"
+
+      - name: Azure login (Windows signing)
+        if: steps.winsign.outputs.sign == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
       - name: Package (Windows)
         if: runner.os == 'Windows'
         env:
-          # Hook only, see README: also needs a certificate import step before this one.
-          WINDOWS_SIGN_PARAMS: ${{ secrets.WINDOWS_SIGN_PARAMS }}
+          SIGN: ${{ steps.winsign.outputs.sign }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
         run: |
           ARGS=()
-          if [ -n "$WINDOWS_SIGN_PARAMS" ] && [ "$IS_RELEASE" = true ]; then
-            ARGS+=(--signParams "$WINDOWS_SIGN_PARAMS")
+          if [ "$SIGN" = true ]; then
+            # vpk signs agt.exe, Update.exe and Setup.exe with signtool + the Artifact Signing dlib
+            # (RFC 3161 timestamp from timestamp.acs.microsoft.com), authenticating through the az
+            # CLI session from the login step. No secret is involved.
+            META="$RUNNER_TEMP/artifact-signing.json"
+            jq -n --arg e "$AZURE_SIGNING_ENDPOINT" --arg a "$AZURE_SIGNING_ACCOUNT" --arg p "$AZURE_SIGNING_PROFILE" \
+              '{Endpoint: $e, CodeSigningAccountName: $a, CertificateProfileName: $p}' > "$META"
+            ARGS+=(--azureTrustedSignFile "$META")
           fi
           vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
             --packDir publish --mainExe agt.exe --channel "$CHANNEL" --runtime "$CHANNEL" \
