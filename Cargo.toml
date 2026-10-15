@@ -11,6 +11,9 @@ repository = "https://github.com/fancyHeat/agt"
 
 [workspace.dependencies]
 agt-core = { path = "crates/core" }
+agt-audio = { path = "crates/audio" }
+agt-platform = { path = "crates/platform" }
+agt-stt = { path = "crates/stt" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 tracing = "0.1"

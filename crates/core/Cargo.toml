@@ -1,6 +1,6 @@
 [package]
 name = "agt-core"
-description = "AGT core: config, paths, and (later) the dictation pipeline and engine traits."
+description = "AGT core: config, paths and the speech-to-text engine trait."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

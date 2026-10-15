@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod logging;
+mod pipeline;
 mod tray;
 mod update;
 
@@ -19,11 +20,11 @@ use winit::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Everything other threads post to the UI thread, via `EventLoopProxy<AppEvent>`.
-/// Later phases add hotkey, audio level and transcript events here.
 #[derive(Debug)]
 enum AppEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
+    Status(pipeline::Status),
 }
 
 fn main() {
@@ -82,10 +83,22 @@ fn main() {
         }
     }));
 
+    let proxy = event_loop.create_proxy();
+    let pipeline = pipeline::start(&config, move |s| {
+        let _ = proxy.send_event(AppEvent::Status(s));
+    })
+    .map_err(|e| {
+        tracing::error!("dictation unavailable: {e}");
+        pipeline::Status::Error(e)
+    });
+    let status = pipeline.as_ref().err().cloned();
+
     let mut app = App {
         tray: None,
         updater,
         config_error,
+        status: status.map(|s| s.to_string()),
+        _pipeline: pipeline.ok(),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop error: {e}");
@@ -119,6 +132,9 @@ struct App {
     tray: Option<tray::Tray>,
     updater: Option<UpdateManager>,
     config_error: bool,
+    /// Latest pipeline status, kept so it can be shown once the tray exists.
+    status: Option<String>,
+    _pipeline: Option<pipeline::Pipeline>,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -126,7 +142,12 @@ impl ApplicationHandler<AppEvent> for App {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
             match tray::Tray::new(VERSION, self.config_error) {
-                Ok(t) => self.tray = Some(t),
+                Ok(t) => {
+                    if let Some(s) = &self.status {
+                        t.set_status(s);
+                    }
+                    self.tray = Some(t);
+                }
                 Err(e) => {
                     tracing::error!("failed to create tray icon: {e}");
                     event_loop.exit();
@@ -136,6 +157,14 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        if let AppEvent::Status(s) = &event {
+            let s = s.to_string();
+            if let Some(tray) = &self.tray {
+                tray.set_status(&s);
+            }
+            self.status = Some(s);
+            return;
+        }
         let Some(tray) = &self.tray else { return };
         match event {
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
@@ -146,7 +175,7 @@ impl ApplicationHandler<AppEvent> for App {
                 event_loop.exit();
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
-            AppEvent::Menu(_) => {}
+            AppEvent::Menu(_) | AppEvent::Status(_) => {}
         }
     }
 

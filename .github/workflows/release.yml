@@ -42,6 +42,10 @@ jobs:
         run: |
           VERSION="$(cargo pkgid -p agt)"; VERSION="${VERSION##*@}"
           if [ "$IS_RELEASE" = true ]; then
+            # The update feed has no prerelease channel: a vX.Y.Z-beta tag would ship to everyone.
+            case "$GITHUB_REF_NAME" in *-*)
+              echo "::error::Prerelease tags ($GITHUB_REF_NAME) are not supported: the update feed would serve them to all users"; exit 1;;
+            esac
             if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
               echo "::error::Tag $GITHUB_REF_NAME does not match Cargo version $VERSION"; exit 1
             fi
@@ -86,6 +90,9 @@ jobs:
       - name: Stage files
         run: |
           mkdir publish && cp "target/release/${{ matrix.exe }}" publish/
+          # Windows: ONNX Runtime's DirectML build imports DirectML.dll (copied next to the exe by
+          # the ort build); the copy in System32 may be older than ONNX Runtime needs.
+          if [ "$RUNNER_OS" = Windows ]; then cp target/release/DirectML.dll publish/; fi
           if [ "$IS_RELEASE" = true ]; then
             # The previous release lets vpk build a delta package (public repo: no token needed).
             vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --channel "$CHANNEL" -o Releases \
@@ -104,7 +111,7 @@ jobs:
           fi
           vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
             --packDir publish --mainExe agt.exe --channel "$CHANNEL" --runtime "$CHANNEL" \
-            --shortcuts StartMenuRoot -o Releases "${ARGS[@]}"
+            --shortcuts StartMenuRoot --framework vcredist143-x64 -o Releases "${ARGS[@]}"
 
       - name: Check for macOS signing secrets
         id: signing

@@ -1,0 +1,11 @@
+# ONNX Runtime's prebuilt macOS objects (CoreML EP) use `@available`, which needs clang's
+# runtime library (___isPlatformVersionAtLeast); rustc links with -nodefaultlibs, so ask for it.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fapple-link-rtlib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-fapple-link-rtlib"]
+
+[env]
+# The ONNX Runtime prebuilt targets macOS 13.4; match it (also LSMinimumSystemVersion).
+MACOSX_DEPLOYMENT_TARGET = "13.4"

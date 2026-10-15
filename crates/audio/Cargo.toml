@@ -1,0 +1,13 @@
+[package]
+name = "agt-audio"
+description = "AGT audio: microphone capture to 16 kHz mono f32, resampling, WAV reading."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agt-core.workspace = true
+tracing.workspace = true
+cpal = "0.18"
+hound = "3.5"

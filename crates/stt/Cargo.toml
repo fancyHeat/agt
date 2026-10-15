@@ -1,0 +1,19 @@
+[package]
+name = "agt-stt"
+description = "AGT speech-to-text engines (behind agt_core::stt::SttEngine) and model downloads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agt-core.workspace = true
+tracing.workspace = true
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# ONNX Runtime 1.31, statically linked from pyke's prebuilt binaries (CPU on every platform).
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
+
+# Windows: the prebuilt runtime that includes the DirectML EP (any DX12 GPU).
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["directml"] }

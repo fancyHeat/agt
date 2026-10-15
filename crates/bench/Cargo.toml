@@ -1,0 +1,18 @@
+[package]
+name = "agt-bench"
+description = "AGT bench: run an STT engine over a folder of WAVs; latency, RTF and WER."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "agt-bench"
+path = "src/main.rs"
+
+[dependencies]
+agt-core.workspace = true
+agt-audio.workspace = true
+agt-stt.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+tracing.workspace = true
