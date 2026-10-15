@@ -231,6 +231,34 @@ fn load_test_wav() -> Option<Vec<f32>> {
     }
 }
 
+/// Decides whether a key-state poll that says "up" really means the hook missed a release.
+///
+/// The poll sees the *logical* key state, which our own paste changes: pasting releases held
+/// Shift keys, and its Ctrl-up maps to Left Ctrl. So when the user holds a Shift or Left Ctrl
+/// hotkey for the next dictation while the previous one is pasted, the key looks released
+/// though it isn't. If a paste happened since this recording started, a poll for such a key is
+/// not trusted: a genuinely missed release is then caught on the next press instead (the
+/// stale recording is discarded). Right Ctrl (the default) is never touched by a paste.
+#[derive(Debug, Clone, Copy)]
+struct ReleaseWatch {
+    paste_may_release: bool,
+    pastes_at_start: u64,
+}
+
+impl ReleaseWatch {
+    fn new(key: Key, pastes_now: u64) -> Self {
+        Self {
+            paste_may_release: agt_platform::paste_may_release(key),
+            pastes_at_start: pastes_now,
+        }
+    }
+
+    /// `key_down`: the poll result; `pastes_now`: [`agt_platform::paste_count`].
+    fn missed(&self, key_down: Option<bool>, pastes_now: u64) -> bool {
+        key_down == Some(false) && !(self.paste_may_release && pastes_now != self.pastes_at_start)
+    }
+}
+
 struct AudioThread {
     config: Config,
     key: Key,
@@ -248,12 +276,13 @@ impl AudioThread {
             tracing::warn!("microphone not available yet: {e}");
         }
         let mut down_at: Option<Instant> = None;
+        let mut watch = ReleaseWatch::new(self.key, 0);
 
         loop {
             let ev = if down_at.is_some() {
                 match events.recv_timeout(RELEASE_POLL) {
                     Ok(ev) => ev,
-                    Err(RecvTimeoutError::Timeout) => match self.missed_release(&events) {
+                    Err(RecvTimeoutError::Timeout) => match self.missed_release(&events, &watch) {
                         Some(ev) => ev,
                         None => continue,
                     },
@@ -275,6 +304,8 @@ impl AudioThread {
                         tracing::warn!("previous hold was never released; discarded it");
                         self.hub.update(|s| s.recording = false);
                     }
+                    // Before starting: any paste from here on counts as "during this recording".
+                    watch = ReleaseWatch::new(self.key, agt_platform::paste_count());
                     down_at = self.start_recording(&mut recorder, t);
                 }
                 HotkeyEvent::Up(released) => {
@@ -294,9 +325,16 @@ impl AudioThread {
 
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
     /// release if the key turns out not to be down any more.
-    fn missed_release(&self, events: &Receiver<HotkeyEvent>) -> Option<HotkeyEvent> {
-        if agt_platform::key_down(self.key) != Some(false) {
-            return None; // still held, or can't tell
+    fn missed_release(
+        &self,
+        events: &Receiver<HotkeyEvent>,
+        watch: &ReleaseWatch,
+    ) -> Option<HotkeyEvent> {
+        if !watch.missed(
+            agt_platform::key_down(self.key),
+            agt_platform::paste_count(),
+        ) {
+            return None; // still held, can't tell, or our own paste made it look released
         }
         // The hook runs before the key state updates, so a real release would normally be
         // queued already; give a racing one a moment to arrive.
@@ -541,8 +579,14 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                 let paste_start = Instant::now();
                 if restore && pending_restore.is_none() {
                     saver.collect(SNAPSHOT_WAIT);
-                    // The user copied something during the hold (or no save ran): save again.
-                    if saver.saved.as_ref().is_none_or(ClipboardSnapshot::is_stale) {
+                    // Save again if the user copied something during the hold, or if no save is
+                    // running. A save still in flight (slow or hung clipboard owner) is not waited
+                    // for again: we paste now and the restore picks up its result if it arrives.
+                    let stale = saver
+                        .saved
+                        .as_ref()
+                        .is_some_and(ClipboardSnapshot::is_stale);
+                    if stale || (saver.saved.is_none() && saver.in_flight.is_none()) {
                         saver.saved = None;
                         saver.start();
                         saver.collect(SNAPSHOT_WAIT);
@@ -551,29 +595,26 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                         tracing::warn!("clipboard not saved in time; it won't be restored");
                     }
                 }
-                let result = agt_platform::set_clipboard_text(&text).and_then(|token| {
-                    match agt_platform::send_paste() {
+                let result = match agt_platform::set_clipboard_text(&text) {
+                    Err(e) => Err(PasteError::ClipboardBusy(e)),
+                    Ok(token) => match agt_platform::send_paste() {
                         Ok(()) => Ok(token),
-                        Err(e) => Err((e, Some(token))),
-                    }
-                    .map_err(|(e, token)| {
-                        // Don't leave the user's clipboard replaced by text that went nowhere.
-                        if let (Some(token), Some(snap)) = (token, saver.saved.take()) {
-                            if let Err(re) = agt_platform::restore_clipboard(&snap, &token) {
-                                tracing::warn!("cannot restore clipboard: {re}");
+                        Err(e) => {
+                            // Don't leave the user's clipboard replaced by text that went nowhere.
+                            if let Some(snap) = saver.saved.take() {
+                                if let Err(re) = agt_platform::restore_clipboard(&snap, &token) {
+                                    tracing::warn!("cannot restore clipboard: {re}");
+                                }
+                                pending_restore = None;
                             }
-                            pending_restore = None;
+                            Err(PasteError::Blocked(e))
                         }
-                        e
-                    })
-                });
+                    },
+                };
                 let pasted = Instant::now();
                 hub.update(|s| {
                     s.pending -= 1;
-                    s.error = result
-                        .as_ref()
-                        .err()
-                        .map(|_| "paste failed (admin window?); transcript is in the log".into());
+                    s.error = result.as_ref().err().map(|e| e.tray_text().into());
                 });
                 match result {
                     Ok(token) => {
@@ -591,8 +632,12 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("paste failed: {e}");
-                        tracing::warn!("unpasted transcript: {text:?}");
+                        tracing::error!(
+                            "paste failed ({} chars not pasted): {e}",
+                            text.chars().count()
+                        );
+                        // Dictated text stays out of the log unless debug logging is on.
+                        tracing::debug!("unpasted transcript: {text:?}");
                     }
                 }
             }
@@ -610,6 +655,33 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+enum PasteError {
+    /// Another app is holding the clipboard open (or a hung app never closed it).
+    ClipboardBusy(agt_platform::Error),
+    /// Ctrl+V could not be sent, typically because the focused app runs as administrator.
+    Blocked(agt_platform::Error),
+}
+
+impl PasteError {
+    fn tray_text(&self) -> &'static str {
+        match self {
+            PasteError::ClipboardBusy(_) => {
+                "clipboard busy (another app is holding it); not pasted"
+            }
+            PasteError::Blocked(_) => "paste blocked (admin window?); clipboard restored",
+        }
+    }
+}
+
+impl fmt::Display for PasteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PasteError::ClipboardBusy(e) => write!(f, "cannot put the text on the clipboard: {e}"),
+            PasteError::Blocked(e) => write!(f, "cannot send Ctrl+V: {e}"),
         }
     }
 }
@@ -641,6 +713,26 @@ mod tests {
         assert_eq!(finish_text("  Hello,\n world.  ", true), "Hello, world. ");
         assert_eq!(finish_text("Hi", false), "Hi");
         assert_eq!(finish_text("   ", true), "");
+    }
+
+    #[test]
+    fn release_watch_ignores_our_own_paste() {
+        let k = |n| Key::parse(n).unwrap();
+        // Right Ctrl: a paste never touches it, so "up" is always trusted.
+        let w = ReleaseWatch::new(k("RightCtrl"), 5);
+        assert!(w.missed(Some(false), 5));
+        assert!(w.missed(Some(false), 6));
+        assert!(!w.missed(Some(true), 6));
+        assert!(!w.missed(None, 5));
+        // Shift / Left Ctrl: trusted until a paste happens during the recording.
+        for name in ["LeftShift", "RightShift", "LeftCtrl"] {
+            let w = ReleaseWatch::new(k(name), 5);
+            assert!(w.missed(Some(false), 5), "{name}");
+            assert!(!w.missed(Some(false), 6), "{name}: our paste released it");
+            assert!(!w.missed(Some(true), 5), "{name}");
+        }
+        // Swallowed keys can't be polled at all.
+        assert!(!ReleaseWatch::new(k("F13"), 0).missed(None, 0));
     }
 
     #[test]

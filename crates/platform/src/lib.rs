@@ -3,7 +3,10 @@
 //! Windows is implemented (low-level keyboard hook, Win32 clipboard, `SendInput`).
 //! macOS (and anything else) currently returns [`Error`]s saying so; Phase 4 fills it in.
 
-use std::time::Instant;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 #[cfg(windows)]
 mod windows;
@@ -161,7 +164,23 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
 /// keystrokes are queued; the target app reads the clipboard asynchronously, so wait a bit
 /// before restoring it. Fails e.g. when the focused app runs elevated.
 pub fn send_paste() -> Result<(), Error> {
+    PASTES.fetch_add(1, Ordering::SeqCst);
     imp::send_paste()
+}
+
+static PASTES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`send_paste`] has been called. With [`paste_may_release`], lets a caller
+/// tell a real release of the hotkey from our own injected key-ups.
+pub fn paste_count() -> u64 {
+    PASTES.load(Ordering::SeqCst)
+}
+
+/// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
+/// physically held: it injects a Shift-up for held Shift keys and a Ctrl-up that maps to Left
+/// Ctrl. Right Ctrl is never touched.
+pub fn paste_may_release(key: Key) -> bool {
+    matches!(key.vk, 0xA0..=0xA2) // LeftShift, RightShift, LeftCtrl
 }
 
 /// Identifies the clipboard state [`set_clipboard_text`] created.
@@ -262,6 +281,9 @@ mod tests {
         }
         assert!(!Key::parse("LeftShift").unwrap().swallowed());
         assert!(Key::parse("F24").unwrap().swallowed());
+        assert!(!paste_may_release(Key::parse("RightCtrl").unwrap()));
+        assert!(paste_may_release(Key::parse("LeftCtrl").unwrap()));
+        assert!(paste_may_release(Key::parse("RightShift").unwrap()));
     }
 
     #[test]
