@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10,<3.14"
+# requires-python = ">=3.11,<3.14"
 # dependencies = ["huggingface_hub==0.36.0", "pyarrow==21.0.0", "soundfile==0.13.1", "numpy==2.3.3", "soxr==1.0.0"]
 # ///
 """Download and prepare AGT's speech eval set (real speech, ~80 clips, ~13 min).
@@ -8,10 +8,13 @@
 
 Writes `<out_dir>/clips/<source>-<bucket>-<n>.wav` (16 kHz mono 16-bit) with the reference
 transcript in a `.txt` sidecar, which is what `agt-bench` reads, plus `<out_dir>/manifest.tsv`
-(source, license, original id, duration, SHA-256 of the WAV). The manifest is checked against
-the committed `scripts/eval_manifest.tsv`, the checksum for the whole set: a different clip
-selection fails; different WAV hashes for the same clips (a different decoder/resampler build)
-only warn. Nothing is committed to the repo but this script and the manifest. Requires `uv`.
+(source, license, original id, duration, SHA-256 of the WAV and of the reference). Other files
+in `clips/` (e.g. from an older selection) are deleted, so the bench sees exactly this set.
+The manifest is checked against the committed `scripts/eval_manifest.tsv`, the checksum for
+the whole set: a different clip selection or reference text fails; different WAV hashes for
+the same clips (a different decoder/resampler build) only warn. Nothing is committed to the
+repo but this script, its lockfile (`prepare_eval.py.lock`: every dependency, direct and
+indirect, pinned; `uv run` uses it) and the manifest. Requires `uv`.
 
 Sources: the ESB test sets as packaged for the Hugging Face Open ASR Leaderboard, pinned to a
 dataset revision. Only the needed parquet row groups are fetched (HTTP range requests), so the
@@ -199,6 +202,7 @@ def main():
     clips.mkdir(parents=True, exist_ok=True)
     fs = HfFileSystem()
     rows = []
+    written = set()
     for source, (category, license_, files) in SOURCES.items():
         print(f"{source}: listing segments", flush=True)
         segs = list_segments(fs, source, files)
@@ -215,13 +219,21 @@ def main():
             name = f"{source}-{bucket}-{n:02}"
             wav = clips / f"{name}.wav"
             sf.write(wav, pcm, SR, subtype="PCM_16")
-            text = " ".join(texts)
-            (clips / f"{name}.txt").write_text(text + "\n", encoding="utf-8")
+            txt = clips / f"{name}.txt"
+            txt.write_text(" ".join(texts) + "\n", encoding="utf-8", newline="\n")
             digest = hashlib.sha256(wav.read_bytes()).hexdigest()
+            ref_digest = hashlib.sha256(txt.read_bytes()).hexdigest()
             ids = "+".join(s["id"] for s in group)
-            rows.append(f"{name}\t{category}\t{license_}\t{len(pcm) / SR:.2f}\t{digest}\t{ids}")
+            rows.append(f"{name}\t{category}\t{license_}\t{len(pcm) / SR:.2f}\t{digest}\t"
+                        f"{ref_digest}\t{ids}")
+            written.update((wav.name, txt.name))
         print(f"{source}: {len(picked)} clips", flush=True)
-    manifest = "name\tcategory\tlicense\tseconds\tsha256\tsource_ids\n" + "\n".join(rows) + "\n"
+    for f in clips.iterdir():
+        if f.name not in written:
+            print(f"removing {f} (not in this eval set)")
+            f.unlink()
+    manifest = ("name\tcategory\tlicense\tseconds\tsha256\tref_sha256\tsource_ids\n"
+                + "\n".join(rows) + "\n")
     (out / "manifest.tsv").write_text(manifest, encoding="utf-8", newline="\n")
     total = sum(float(r.split("\t")[3]) for r in rows)
     print(f"wrote {len(rows)} clips ({total / 60:.1f} min) to {clips}")
@@ -233,7 +245,8 @@ def main():
             print(f"checksums match {expected.name}")
         else:
             # Same clips and references but different WAV bytes can only come from decoding /
-            # resampling differences (e.g. another soxr build): warn. Anything else is an error.
+            # resampling differences (e.g. another soxr build): warn. Anything else (including
+            # a changed reference text) is an error.
             def no_hash(lines):
                 return [l.split("\t")[:4] + l.split("\t")[5:] for l in lines]
             for w, g in zip(want, got):
