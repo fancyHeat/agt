@@ -115,7 +115,17 @@ class Driver: NSObject, NSApplicationDelegate {
     }
 
     func run() {
-        Thread.sleep(forTimeInterval: 1.0)
+        // Activation can take a moment after `open`; a run before it would paste elsewhere.
+        let me = Bundle.main.bundleIdentifier ?? ""
+        for _ in 0..<50 where frontmost() != me {
+            DispatchQueue.main.sync { NSApp.activate(ignoringOtherApps: true) }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        DispatchQueue.main.sync {
+            self.window.makeKeyAndOrderFront(nil)
+            self.window.makeFirstResponder(self.text)
+        }
+        Thread.sleep(forTimeInterval: 0.5)
         say("frontmost: \(frontmost()); key \(key), hold \(holdMs) ms, \(runs) runs")
         var latencies: [Double] = []
         for i in 1...runs {
@@ -163,6 +173,15 @@ class Driver: NSObject, NSApplicationDelegate {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
+// Cmd+V only pastes through a menu item's key equivalent: without an Edit menu, AGT's paste
+// keystroke would do nothing here.
+let mainMenu = NSMenu()
+let editItem = NSMenuItem()
+mainMenu.addItem(editItem)
+let editMenu = NSMenu(title: "Edit")
+editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+editItem.submenu = editMenu
+app.mainMenu = mainMenu
 let delegate = Driver()
 app.delegate = delegate
 app.run()

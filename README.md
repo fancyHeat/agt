@@ -13,10 +13,8 @@ text **on your own computer**; your voice never leaves it.
   <sub>Always the newest version · <a href="https://github.com/fancyHeat/agt/releases/latest">All releases</a></sub>
 </p>
 
-> **macOS: dictation is not working yet.** The Mac app installs, runs in the menu bar and
-> updates itself, but the dictation hotkey doesn't work there yet. Windows is fully supported.
-> On macOS, only Apple Silicon (M1 and later) Macs running macOS 13.4 or newer are supported;
-> **Intel Macs are not supported.**
+> **macOS:** Apple Silicon (M1 and later) Macs running macOS 13.4 or newer. **Intel Macs are
+> not supported.** See [macOS](#macos) for the permissions AGT asks for.
 
 ![The AGT overlay while recording](docs/img/overlay-recording.png)
 
@@ -25,8 +23,9 @@ text **on your own computer**; your voice never leaves it.
 1. **Install.** Windows: run `AGT-win-x64-Setup.exe`. macOS: unzip and move `AGT.app` to
    Applications.
 2. **First launch.** AGT lives in the system tray (macOS: the menu bar). It downloads its
-   speech model (about 670 MB) once; the tray menu shows the progress and says "Ready" when
-   it's done.
+   speech model once (about 670 MB; 2.4 GB on Macs with more than 8 GB of memory, which run it
+   on the GPU); the tray menu shows the progress and says "Ready" when it's done. On a Mac,
+   allow the permissions it asks for first (see [macOS](#macos)).
 3. **Dictate.** Click into any text field, then hold the hotkey and speak:
    - Windows: **Left Ctrl + Windows key**
    - macOS: **Fn** (the Globe key)
@@ -38,6 +37,33 @@ Good to know:
 
 - Press **Esc** while holding the hotkey to cancel.
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
+
+## macOS
+
+AGT asks for three permissions on first launch, one after another:
+
+- **Microphone**: to hear you. Click Allow.
+- **Input Monitoring** ("receive keystrokes from any application"): to notice the hotkey. Click
+  Open System Settings and switch AGT on; macOS then offers to quit and reopen AGT, which it
+  needs before the hotkey works.
+- **Accessibility** (called **Device Control** from macOS 27 on): to paste with Cmd+V. Switch AGT
+  on in the same way; this one takes effect right away.
+
+Until everything is granted, the menu-bar item says which permission is missing, and its
+"Privacy & Security settings..." item opens the right page.
+
+The default hotkey is **Fn** (the 🌐 Globe key). Set System Settings > Keyboard > "Press 🌐 key
+to" to **Do Nothing**, or releasing it also opens the emoji picker or starts Apple's dictation.
+Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
+`"Fn+RightOption"`.
+
+On Macs with more than 8 GB of memory AGT transcribes on the GPU (Core ML), which is about
+twice as fast as the CPU for longer dictations. That needs the larger model (2.4 GB download,
+about 3 GB of memory while AGT runs) and a one-time ~20 s preparation on first start. To use
+the smaller CPU model instead, set `device = "cpu"` under `[stt]` in `config.toml`.
+
+Known gap: Cmd+V is sent as the key in the "V" position of a QWERTY keyboard, so with a Dvorak
+or Colemak layout (other than "Dvorak - QWERTY ⌘") the paste may not work.
 
 ## Updates
 
