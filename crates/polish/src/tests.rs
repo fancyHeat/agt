@@ -85,6 +85,24 @@ fn base_url_credentials_are_never_shown() {
     );
     assert_eq!(host_of("http://localhost:11434/v1"), "localhost:11434");
     assert_eq!(host_of("https://api.anthropic.com"), "api.anthropic.com");
+    assert_eq!(host_of("http://[::1]:8080/v1"), "[::1]:8080");
+    assert_eq!(host_of("https://[2001:db8::1]/v1"), "[2001:db8::1]");
+    assert_eq!(host_of("https://a:b@host/v1?email=a@b&key=K"), "host");
+    // A password with unencoded `/`, `?`, `#` or `@`: never part of the output.
+    for url in [
+        "https://user:ab/cd+ef@host/v1",
+        "https://user:p?ss@host/v1",
+        "https://user:p#ss@host/v1",
+        "https://user:p@ss@host/v1",
+        "not a url user:pw",
+    ] {
+        let shown = host_of(url);
+        assert!(
+            !shown.contains("user") && !shown.contains('p'),
+            "{url} -> {shown}"
+        );
+        assert!(shown == "host" || shown == INVALID_URL, "{url} -> {shown}");
+    }
     let mut cfg = openai("https://user:SECRET@proxy.example");
     cfg.base_url.push_str("?key=SECRET");
     let name = load_remote(&cfg).unwrap().name();
@@ -95,6 +113,20 @@ fn base_url_credentials_are_never_shown() {
     // Userinfo doesn't confuse the loopback check behind the plain-http warning.
     assert!(!is_https_or_loopback("http://user:pw@example.com/v1"));
     assert!(is_https_or_loopback("http://user:pw@localhost:8080/v1"));
+}
+
+#[test]
+fn missing_key_error_names_only_real_variable_names() {
+    let mut cfg = anthropic("https://api.anthropic.com");
+    cfg.api_key = String::new();
+    cfg.api_key_env = "AGT_TEST_UNSET_VAR_1".into();
+    let e = load_remote(&cfg).err().unwrap();
+    assert!(e.contains("AGT_TEST_UNSET_VAR_1"), "{e}");
+    // The key pasted into api_key_env (the variable doesn't exist, so no key either).
+    cfg.api_key_env = "sk-ant-api03-SECRET".into();
+    let e = load_remote(&cfg).err().unwrap();
+    assert!(!e.contains("SECRET"), "{e}");
+    assert!(e.contains("api_key_env"), "{e}");
 }
 
 const RAW: &str = "um so this is uh a test of the polish thing";

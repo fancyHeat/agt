@@ -152,12 +152,12 @@ impl Launcher for LlamaLauncher {
         };
         cmd.stdout(piped()).stderr(piped());
         let mut child = spawn(cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
-        if let Some(log) = log {
+        if let Some(log) = &log {
             if let Some(out) = child.stdout.take() {
                 log.clone().tap(out);
             }
             if let Some(err) = child.stderr.take() {
-                log.tap(err);
+                log.clone().tap(err);
             }
         }
         let root = format!("http://127.0.0.1:{port}");
@@ -172,6 +172,7 @@ impl Launcher for LlamaLauncher {
             root,
             key,
             health: self.health.clone(),
+            log,
         }))
     }
 }
@@ -196,8 +197,9 @@ fn slots_idle(agent: &ureq::Agent, url: &str, key: &str) -> bool {
     }
 }
 
-/// llama-server's output, written to its log file only until it's up (model loaded,
-/// listening): devices, memory, load errors. After that it logs per-request lines, and even
+/// llama-server's output, written to its log file only until it's up (its first passed
+/// health check, or a start-up line, whichever comes first): devices, memory, load
+/// errors. After that it logs per-request lines, and even
 /// at its default verbosity an error path could quote part of a request, i.e. dictated
 /// text, so later output is read (the server must never block on a full pipe) and dropped.
 struct StartupLog {
@@ -235,24 +237,63 @@ impl StartupLog {
         }
     }
 
+    /// Stops writing: the server passed its health check (or a line said it started).
+    fn close(&self) {
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = file.as_mut() {
+            use std::io::Write;
+            let _ = f.write_all(b"[AGT: later output is not kept, it may describe requests]\n");
+        }
+        *file = None;
+    }
+
     /// Reads `stream` to its end, writing lines to the file until the server has started.
-    fn copy(&self, stream: impl std::io::Read) {
-        use std::io::{BufRead, Write};
+    /// It keeps reading after that, and after any error, so the server never blocks on a
+    /// full pipe (nor gets SIGPIPE).
+    fn copy(&self, mut stream: impl std::io::Read) {
+        use std::io::{ErrorKind, Write};
+        let (mut buf, mut line) = (vec![0u8; 16 * 1024], Vec::new());
         let mut written = 0u64;
-        for line in std::io::BufReader::new(stream).split(b'\n') {
-            let Ok(line) = line else { return };
+        let mut errors = 0u64;
+        loop {
+            let n = match stream.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // Shouldn't happen on a pipe. Keep the read end open (closing it could
+                    // kill the server with SIGPIPE), without spinning.
+                    errors += 1;
+                    std::thread::sleep(Duration::from_millis((50 * errors).min(1000)));
+                    continue;
+                }
+            };
             let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(f) = file.as_mut() else { continue };
-            let text = String::from_utf8_lossy(&line);
-            let request = REQUEST_LINE.iter().any(|m| text.contains(m));
-            if !request {
-                written += line.len() as u64 + 1;
-                let _ = f.write_all(&line);
-                let _ = f.write_all(b"\n");
+            if file.is_none() {
+                continue; // drained to nowhere
             }
-            if request || STARTED.iter().any(|m| text.contains(m)) || written > STARTUP_LOG_MAX {
-                let _ = f.write_all(b"[AGT: later output is not kept, it may describe requests]\n");
-                *file = None;
+            for &b in &buf[..n] {
+                if b != b'\n' {
+                    line.push(b);
+                    if line.len() <= 64 * 1024 {
+                        continue;
+                    }
+                }
+                let Some(f) = file.as_mut() else { break };
+                let text = String::from_utf8_lossy(&line);
+                let request = REQUEST_LINE.iter().any(|m| text.contains(m));
+                if !request {
+                    written += line.len() as u64 + 1;
+                    let _ = f.write_all(&line);
+                    let _ = f.write_all(b"\n");
+                }
+                let started = STARTED.iter().any(|m| text.contains(m));
+                line.clear();
+                if request || started || written > STARTUP_LOG_MAX {
+                    let _ =
+                        f.write_all(b"[AGT: later output is not kept, it may describe requests]\n");
+                    *file = None;
+                }
             }
         }
     }
@@ -260,6 +301,9 @@ impl StartupLog {
 
 /// Keeps the previous run's log as `<name>.1` (e.g. the one that says why it crashed).
 fn rotate_and_create(path: &std::path::Path) -> std::io::Result<fs::File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     if path.exists() {
         let mut old = path.as_os_str().to_owned();
         old.push(".1");
@@ -278,6 +322,8 @@ struct LlamaServer {
     key: String,
     health: ureq::Agent,
     gate: Arc<Gate>,
+    /// Closed when the first health check passes: no request can come before that.
+    log: Option<Arc<StartupLog>>,
 }
 
 impl Server for LlamaServer {
@@ -292,10 +338,15 @@ impl Server for LlamaServer {
 
     /// `GET /health` is 503 while the model loads, 200 once it can serve.
     fn healthy(&mut self) -> bool {
-        self.health
+        let healthy = self
+            .health
             .get(format!("{}/health", self.root))
             .call()
-            .is_ok_and(|r| r.status() == 200)
+            .is_ok_and(|r| r.status() == 200);
+        if healthy && let Some(log) = self.log.take() {
+            log.close();
+        }
+        healthy
     }
 
     fn try_wait(&mut self) -> Option<String> {
@@ -493,6 +544,42 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert!(text.contains("offloaded 29/29"), "{text}");
         assert!(text.contains("starting the main loop"), "{text}");
+        assert!(!text.contains("dictated words"), "{text}");
+
+        // Closed by the health check: nothing more is written, but the pipe is still read
+        // to its end, also past a read error.
+        struct Flaky(Vec<std::io::Result<&'static [u8]>>);
+        impl std::io::Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop() {
+                    None => Ok(0),
+                    Some(Err(e)) => Err(e),
+                    Some(Ok(b)) => {
+                        buf[..b.len()].copy_from_slice(b);
+                        Ok(b.len())
+                    }
+                }
+            }
+        }
+        let log = StartupLog::new(fs::File::create(&path).unwrap());
+        let mut chunks = vec![
+            Ok(&b"load_model: loading\n"[..]),
+            Err(std::io::Error::other("glitch")),
+            Ok(&b"init: threads = 8\n"[..]),
+        ];
+        chunks.reverse();
+        log.copy(Flaky(chunks));
+        log.close();
+        let mut stream = Flaky(vec![Ok(&b"srv something: dictated words\n"[..])]);
+        log.copy(&mut stream);
+        assert!(stream.0.is_empty(), "drained");
+        drop(log);
+        let text = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(
+            text.contains("loading") && text.contains("threads = 8"),
+            "{text}"
+        );
         assert!(!text.contains("dictated words"), "{text}");
 
         // b11669's wording, and a request line where a start-up line was expected.

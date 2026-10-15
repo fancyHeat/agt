@@ -127,6 +127,31 @@ fn rollups_cover_completed_days_once() {
 }
 
 #[test]
+fn old_rollups_are_final() {
+    let mut conn = memory();
+    let now = now_ms();
+    for v in [100.0, 200.0] {
+        dictation(&conn, now - 5 * DAY_MS, v, Outcome::Pasted);
+    }
+    assert_eq!(rollup(&mut conn).unwrap(), 1);
+    // Retention pruned part of that day (or it's simply old): its rollup isn't redone.
+    conn.execute(
+        "DELETE FROM dictations WHERE release_to_paste_ms = 100.0",
+        [],
+    )
+    .unwrap();
+    assert_eq!(rollup(&mut conn).unwrap(), 0);
+    let n: i64 = conn
+        .query_row(
+            "SELECT count FROM metric_rollups WHERE metric = 'release_to_paste_ms'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "the complete rollup is kept");
+}
+
+#[test]
 fn latency_excludes_the_hotkey_wait() {
     let conn = memory();
     let d = Dictation {

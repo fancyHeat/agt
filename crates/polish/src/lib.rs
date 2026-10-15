@@ -53,10 +53,15 @@ fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, Str
     }
     let key = cfg.api_key();
     if cfg.provider == PolishProvider::Anthropic && key.is_none() {
-        return Err(format!(
-            "no API key for anthropic: set the {} environment variable or polish.api_key",
-            cfg.api_key_var().unwrap_or("ANTHROPIC_API_KEY")
-        ));
+        let var = cfg.api_key_var().unwrap_or("ANTHROPIC_API_KEY");
+        // A key pasted into api_key_env by mistake must not end up in the error (agt.db).
+        return Err(if is_env_var_name(var) {
+            format!(
+                "no API key for anthropic: set the {var} environment variable or polish.api_key"
+            )
+        } else {
+            "no API key for anthropic: the environment variable named in polish.api_key_env is not set or is empty (or set polish.api_key)".into()
+        });
     }
     if key.is_some() && !is_https_or_loopback(base) {
         tracing::warn!(
@@ -71,28 +76,50 @@ fn load_remote(cfg: &PolishConfig) -> std::result::Result<Box<dyn Polisher>, Str
     Ok(Box::new(Llm::new(cfg, api, base, key)))
 }
 
-/// The `host[:port]` of a base URL: what may be shown or recorded of it. Never the
-/// userinfo (`user:token@`), path or query (`?key=...`), which may carry credentials.
-pub(crate) fn host_of(base: &str) -> &str {
-    let rest = base.split_once("://").map_or(base, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    authority.rsplit('@').next().unwrap_or_default()
+/// Shown instead of a base URL that doesn't parse (it may still hold credentials).
+pub(crate) const INVALID_URL: &str = "(invalid URL)";
+
+/// The `host[:port]` of a base URL (port only if given): what may be shown or recorded of
+/// it. Never the userinfo (`user:token@`), path or query (`?key=...`), which may carry
+/// credentials; [`INVALID_URL`] if it doesn't parse.
+pub(crate) fn host_of(base: &str) -> String {
+    match url::Url::parse(base).ok().and_then(|u| {
+        let host = u.host_str()?.to_owned();
+        Some(match u.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        })
+    }) {
+        Some(host) => host,
+        None => INVALID_URL.into(),
+    }
 }
 
-/// `https://...`, or plain http to this machine.
+/// An environment variable name as people write them (`ANTHROPIC_API_KEY`): safe to show.
+fn is_env_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    s.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// `https://...`, or plain http to this machine (or a URL that doesn't parse: requests to
+/// it fail anyway, so there's nothing to warn about).
 fn is_https_or_loopback(base: &str) -> bool {
-    if !base.starts_with("http://") {
+    let Ok(u) = url::Url::parse(base) else {
+        return true;
+    };
+    if u.scheme() != "http" {
         return true;
     }
-    let authority = host_of(base);
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

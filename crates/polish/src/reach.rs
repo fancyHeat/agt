@@ -33,21 +33,11 @@ struct State {
 impl Reach {
     /// `base`: the server's base URL (`http(s)://host[:port]/...`).
     pub fn new(base: &str) -> Self {
-        let port = if base.starts_with("https://") {
-            443
-        } else {
-            80
-        };
-        let host = crate::host_of(base);
-        let has_port = match host.rfind(']') {
-            Some(end) => host[end..].contains(':'),
-            None => host.contains(':'),
-        };
-        let authority = if has_port {
-            host.to_owned()
-        } else {
-            format!("{host}:{port}")
-        };
+        // Host and port only: never the userinfo (this is logged when unreachable).
+        let authority = url::Url::parse(base)
+            .ok()
+            .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)))
+            .unwrap_or_else(|| crate::INVALID_URL.into());
         Self {
             authority,
             state: Arc::default(),

@@ -314,8 +314,8 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
     let notify = hub.notify.clone();
     let env = agt_polish::Env {
         models_dir: config.stt.models_path(),
-        // Start-up output only (see agt-polish), overwritten each launch.
-        log_file: Some(paths::data_dir().join("llama-server.log")),
+        // Start-up output only (see agt-polish), next to agt.db ("Open data folder").
+        log_file: Some(paths::history_dir().join("llama-server.log")),
         on_status: Arc::new(move |s: &agt_polish::Status| {
             tracing::info!("polish: {s}");
             notify(Event::PolishInfo(s.to_string()));

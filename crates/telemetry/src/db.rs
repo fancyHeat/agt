@@ -529,9 +529,11 @@ pub(crate) fn prune(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
 const COMPLETED_BEFORE: &str = "date('now', '-10 minutes', 'localtime')";
 
 /// Computes `metric_rollups` for every completed local day (see [`COMPLETED_BEFORE`]) from
-/// the last rolled-up one on. That last day is rolled up again, which picks up rows
-/// recorded late (e.g. held back by a long external lock). Idempotent: a day's rows are
-/// replaced as a whole. Returns the number of days (re)computed.
+/// the last rolled-up one on. That last day is rolled up again while it's within the last 2
+/// days, which picks up rows recorded late (e.g. held back by a long external lock); an
+/// older one is final, so a rollup is never recomputed from raw rows that retention has
+/// started to prune. Idempotent: a day's rows are replaced as a whole. Returns the number
+/// of days (re)computed.
 ///
 /// Durations are over `pasted` dictations only: a failed one has partial timings (e.g. no
 /// paste), and the `outcome.<x>` counts cover failures.
@@ -543,8 +545,12 @@ pub(crate) fn rollup(conn: &mut Connection) -> rusqlite::Result<usize> {
             FROM (
                 SELECT DISTINCT date(started_at / 1000, 'unixepoch', 'localtime') AS day
                 FROM dictations
-                WHERE started_at >= coalesce(
-                    (SELECT strftime('%s', max(day), 'utc') * 1000 FROM metric_rollups), 0)
+                WHERE started_at >= coalesce((
+                    SELECT strftime('%s', max(day),
+                        CASE WHEN max(day) >= date('now', '-2 days', 'localtime')
+                            THEN '+0 days' ELSE '+1 day' END,
+                        'utc') * 1000
+                    FROM metric_rollups), 0)
             )
             WHERE day < {COMPLETED_BEFORE}
             ORDER BY day"

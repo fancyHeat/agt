@@ -1,6 +1,6 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: lock, llama-server log (`data_dir`) | usage history: `agt.db` (`history_dir`) | models (`models_dir`) |
+//! | | config (`config_dir`) | data: instance lock (`data_dir`) | usage history: `agt.db`, `llama-server.log` (`history_dir`) | models (`models_dir`) |
 //! |---|---|---|---|---|
 //! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-data` | `%LOCALAPPDATA%\AGT-models` |
 //! | macOS | `~/Library/Application Support/AGT` | same | same | `<data>/models` |
@@ -21,12 +21,13 @@ pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
 
-/// Holds the instance lock and llama-server's log. Machine-local, never roams.
+/// Holds the instance lock. Machine-local, never roams.
 pub fn data_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::data_dir)
 }
 
-/// Holds the usage history, `agt.db` (see the module docs). Machine-local.
+/// Holds the usage history, `agt.db`, and `llama-server.log` (see the module docs).
+/// Machine-local; the tray's "Open data folder".
 pub fn history_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::history_dir)
 }
