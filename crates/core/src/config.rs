@@ -62,17 +62,21 @@ restore_clipboard_ms = 500
 [polish]
 # Optional clean-up of each transcript by an LLM before pasting: punctuation, capitalization,
 # filler words ("um", "you know") and false starts. Off by default. Adds latency (typically
-# 0.2-1 s), and the transcript is sent to the configured server (local or cloud). On any
-# error, timeout or suspicious output, the raw transcript is pasted instead.
+# 0.05-0.5 s on a GPU). On any error, timeout or suspicious output, the raw transcript is
+# pasted instead.
 enabled = false
-# "openai": any OpenAI-compatible chat completions server: Ollama, LM Studio, llama.cpp's
-# llama-server (all local), or a cloud provider. "anthropic": the Claude API.
-provider = "openai"
-# "" = provider default: "http://localhost:11434/v1" (Ollama) for openai,
-# "https://api.anthropic.com" for anthropic. LM Studio: "http://localhost:1234/v1",
+# "s1-mini": S1-mini by Superwhisper, a small model made for exactly this (English only), run
+# by AGT on this machine. On first use AGT downloads it (485 MB) and llama.cpp's llama-server
+# (12-32 MB) to the models folder and starts the server in the background (see README).
+# "openai": an OpenAI-compatible chat completions server you run yourself: Ollama, LM Studio,
+# llama.cpp's llama-server, or a cloud provider. "anthropic": the Claude API (cloud).
+provider = "s1-mini"
+# openai/anthropic only. "" = provider default: "http://localhost:11434/v1" (Ollama) for
+# openai, "https://api.anthropic.com" for anthropic. LM Studio: "http://localhost:1234/v1",
 # llama-server: "http://localhost:8080/v1".
 base_url = ""
-# "" = provider default: "qwen2.5:3b" for openai, "claude-haiku-5-5" for anthropic.
+# openai/anthropic only. "" = provider default: "qwen2.5:3b" for openai, "claude-haiku-5-5"
+# for anthropic.
 model = ""
 # Name of an environment variable holding the API key. "" = provider default:
 # ANTHROPIC_API_KEY for anthropic, none for openai (local servers need no key).
@@ -80,20 +84,35 @@ api_key_env = ""
 # Or the API key itself (takes precedence over api_key_env). This file is local to your
 # machine; never share or commit it with a key in it.
 api_key = ""
+# openai/anthropic built-in prompt (s1-mini: see [polish.s1-mini] below).
 # "light": punctuation, capitalization, fillers and false starts; keeps your wording.
 # "formal": also tidies grammar and phrasing for written text.
 style = "light"
-# Replaces the built-in instructions (the system prompt) and examples; "" = use the style.
+# Replaces the built-in instructions (the system prompt; for s1-mini its required prompt);
+# "" = built-in.
 prompt = ""
-# The user message; {text} is replaced by the transcript. "" = the transcript between
-# <transcript> tags. For models that expect a specific input format (see README: S1-mini).
+# The user message; {text} is replaced by the transcript. "" = built-in: the transcript between
+# <transcript> tags, or for s1-mini its control line (from [polish.s1-mini]) and the transcript.
 user_message = ""
 # Give up and paste the raw transcript after timeout_ms + timeout_per_word_ms per word.
-# 0 = provider default: 2000 for openai (local servers), 3000 for anthropic (cloud).
+# 0 = provider default: 2000 for s1-mini and openai (local servers), 3000 for anthropic (cloud).
 timeout_ms = 0
 timeout_per_word_ms = 15
 # Transcripts with fewer words than this are pasted as they are.
 min_words = 4
+
+[polish.s1-mini]
+# How S1-mini writes: "casual" (all lowercase, no apostrophes), "semi-casual" (your phrasing,
+# "I" capitalized), "semi-formal" (standard written English, contractions kept, "gonna" →
+# "going to"), or "formal" (also expands contractions: "I am", "cannot").
+styling = "semi-formal"
+# "prose", or "lists": lets it turn an enumeration of 3 or more items into a bulleted list.
+structure = "prose"
+# "general", or "email": lays the text out as an email (greeting line, body, sign-off).
+context = "general"
+# "auto": on the GPU (Metal on a Mac, Vulkan on Windows; ~0.6 GB of VRAM) if there is one,
+# else the CPU. "cpu": always on the CPU (slower: ~0.25 s for a short sentence).
+device = "auto"
 
 [overlay]
 # Show a small bar with a live waveform while recording and an animation while transcribing.
@@ -207,15 +226,96 @@ pub struct PolishConfig {
     pub timeout_ms: u64,
     pub timeout_per_word_ms: u64,
     pub min_words: usize,
+    /// `[polish.s1-mini]`: settings of the managed S1-mini.
+    #[serde(rename = "s1-mini")]
+    pub s1_mini: S1MiniConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolishProvider {
+    /// S1-mini by Superwhisper, downloaded and run (llama.cpp's `llama-server`) by AGT.
+    #[serde(rename = "s1-mini")]
+    S1Mini,
     /// OpenAI-compatible `/chat/completions` (Ollama, LM Studio, llama-server, cloud).
     OpenAi,
     /// Anthropic Messages API.
     Anthropic,
+}
+
+/// `[polish.s1-mini]`. The first three are S1-mini's control-line axes, with the values it
+/// was trained on (anything else makes it produce garbage, so they're enums).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S1MiniConfig {
+    pub styling: S1Styling,
+    pub structure: S1Structure,
+    pub context: S1Context,
+    pub device: S1Device,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum S1Styling {
+    Casual,
+    SemiCasual,
+    SemiFormal,
+    Formal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum S1Structure {
+    Prose,
+    Lists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum S1Context {
+    General,
+    Email,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum S1Device {
+    /// All layers on the GPU if llama.cpp finds one (Metal, Vulkan), else the CPU.
+    Auto,
+    Cpu,
+}
+
+impl Default for S1MiniConfig {
+    fn default() -> Self {
+        Self {
+            styling: S1Styling::SemiFormal,
+            structure: S1Structure::Prose,
+            context: S1Context::General,
+            device: S1Device::Auto,
+        }
+    }
+}
+
+impl S1MiniConfig {
+    /// The first line of every S1-mini input, e.g.
+    /// `[Styling: semi-formal] [Structure: prose] [Context: general]`.
+    pub fn control_line(&self) -> String {
+        let styling = match self.styling {
+            S1Styling::Casual => "casual",
+            S1Styling::SemiCasual => "semi-casual",
+            S1Styling::SemiFormal => "semi-formal",
+            S1Styling::Formal => "formal",
+        };
+        let structure = match self.structure {
+            S1Structure::Prose => "prose",
+            S1Structure::Lists => "lists",
+        };
+        let context = match self.context {
+            S1Context::General => "general",
+            S1Context::Email => "email",
+        };
+        format!("[Styling: {styling}] [Structure: {structure}] [Context: {context}]")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -229,7 +329,7 @@ impl Default for PolishConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: PolishProvider::OpenAi,
+            provider: PolishProvider::S1Mini,
             base_url: String::new(),
             model: String::new(),
             api_key_env: String::new(),
@@ -240,13 +340,17 @@ impl Default for PolishConfig {
             timeout_ms: 0,
             timeout_per_word_ms: 15,
             min_words: 4,
+            s1_mini: S1MiniConfig::default(),
         }
     }
 }
 
 impl PolishConfig {
+    /// The server's base URL. For `s1-mini` this is decided at run time (a free local port),
+    /// and the setting is ignored.
     pub fn base_url(&self) -> &str {
         match (self.base_url.as_str(), self.provider) {
+            (_, PolishProvider::S1Mini) => "",
             ("", PolishProvider::OpenAi) => "http://localhost:11434/v1",
             ("", PolishProvider::Anthropic) => "https://api.anthropic.com",
             (url, _) => url,
@@ -255,15 +359,18 @@ impl PolishConfig {
 
     pub fn model(&self) -> &str {
         match (self.model.as_str(), self.provider) {
+            (_, PolishProvider::S1Mini) => "s1-mini",
             ("", PolishProvider::OpenAi) => "qwen2.5:3b",
             ("", PolishProvider::Anthropic) => "claude-haiku-5-5",
             (model, _) => model,
         }
     }
 
-    /// The environment variable the key is read from, if any.
+    /// The environment variable the key is read from, if any. `s1-mini` gets a random key
+    /// per server start instead.
     pub fn api_key_var(&self) -> Option<&str> {
         match (self.api_key_env.as_str(), self.provider) {
+            (_, PolishProvider::S1Mini) => None,
             ("", PolishProvider::OpenAi) => None,
             ("", PolishProvider::Anthropic) => Some("ANTHROPIC_API_KEY"),
             (var, _) => Some(var),
@@ -272,6 +379,9 @@ impl PolishConfig {
 
     /// `api_key` if set, else the (non-empty) variable named by [`Self::api_key_var`].
     pub fn api_key(&self) -> Option<String> {
+        if self.provider == PolishProvider::S1Mini {
+            return None;
+        }
         let key = match self.api_key.trim() {
             "" => std::env::var(self.api_key_var()?).ok()?,
             key => key.to_owned(),
@@ -284,7 +394,7 @@ impl PolishConfig {
     /// the provider default: cloud round trips have a slower tail than a local server.
     pub fn timeout(&self, words: usize) -> std::time::Duration {
         let base = match (self.timeout_ms, self.provider) {
-            (0, PolishProvider::OpenAi) => 2000,
+            (0, PolishProvider::S1Mini | PolishProvider::OpenAi) => 2000,
             (0, PolishProvider::Anthropic) => 3000,
             (ms, _) => ms,
         };
@@ -315,6 +425,7 @@ impl std::fmt::Debug for PolishConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("timeout_per_word_ms", &self.timeout_per_word_ms)
             .field("min_words", &self.min_words)
+            .field("s1_mini", &self.s1_mini)
             .finish()
     }
 }
@@ -538,6 +649,12 @@ mod tests {
     fn polish_defaults_depend_on_provider() {
         let c = Config::default().polish;
         assert!(!c.enabled);
+        assert_eq!(c.provider, PolishProvider::S1Mini);
+        assert_eq!(c.model(), "s1-mini");
+        assert_eq!(c.timeout(0), std::time::Duration::from_millis(2000));
+        let c = Config::parse("[polish]\nprovider = \"openai\"\n")
+            .unwrap()
+            .polish;
         assert_eq!(c.base_url(), "http://localhost:11434/v1");
         assert_eq!(c.model(), "qwen2.5:3b");
         assert_eq!(c.api_key_var(), None);
@@ -560,8 +677,44 @@ mod tests {
     }
 
     #[test]
+    fn s1_mini_is_one_line_to_enable_and_has_simple_keys() {
+        let c = Config::parse("[polish]\nenabled = true\n").unwrap().polish;
+        assert!(c.enabled);
+        assert_eq!(c.provider, PolishProvider::S1Mini);
+        assert_eq!(
+            c.s1_mini.control_line(),
+            "[Styling: semi-formal] [Structure: prose] [Context: general]"
+        );
+        let c = Config::parse(
+            "[polish]\nenabled = true\n[polish.s1-mini]\nstyling = \"semi-casual\"\nstructure = \"lists\"\ncontext = \"email\"\ndevice = \"cpu\"\n",
+        )
+        .unwrap()
+        .polish;
+        assert_eq!(
+            c.s1_mini.control_line(),
+            "[Styling: semi-casual] [Structure: lists] [Context: email]"
+        );
+        assert_eq!(c.s1_mini.device, S1Device::Cpu);
+        // Values S1-mini wasn't trained on are config errors, not garbage output.
+        assert!(Config::parse("[polish.s1-mini]\nstyling = \"pirate\"").is_err());
+        assert!(Config::parse("[polish.s1-mini]\ncontext = \"chat\"").is_err());
+        assert!(Config::parse("[polish.s1-mini]\ntypo = 1").is_err());
+        // Settings for the other providers don't leak into the managed server.
+        let c = Config::parse(
+            "[polish]\nprovider = \"s1-mini\"\nbase_url = \"http://x\"\napi_key = \"k\"\nmodel = \"m\"",
+        )
+        .unwrap()
+        .polish;
+        assert_eq!(
+            (c.base_url(), c.model(), c.api_key()),
+            ("", "s1-mini", None)
+        );
+    }
+
+    #[test]
     fn polish_api_key_is_never_debug_printed() {
-        let c = Config::parse("[polish]\napi_key = \" sk-secret \"").unwrap();
+        let c =
+            Config::parse("[polish]\nprovider = \"openai\"\napi_key = \" sk-secret \"").unwrap();
         assert_eq!(c.polish.api_key().as_deref(), Some("sk-secret"));
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret") && dbg.contains("<redacted>"));
