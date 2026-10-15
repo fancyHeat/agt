@@ -1,0 +1,11 @@
+[package]
+name = "agt-telemetry"
+description = "AGT telemetry: sessions, per-dictation metrics, events and daily percentile rollups in a local SQLite database."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# `bundled`: SQLite is compiled in, so there is no system library to depend on.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }

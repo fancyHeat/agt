@@ -24,9 +24,10 @@ pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
     r#"# AGT configuration. Restart AGT after editing.
-# If this file has an error, AGT starts with defaults (updates off) and logs the error.
+# If this file has an error, AGT starts with defaults (updates off) and records the error.
 
-# Log verbosity: "error", "warn", "info", "debug" or "trace".
+# Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
+# or "trace".
 log_level = "info"
 
 [hotkey]
@@ -570,14 +571,74 @@ impl UpdateConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Io(io::Error),
-    Parse(toml::de::Error),
+    /// Only toml's message and where (1-based line and column): its full error quotes the
+    /// offending line, which may hold an API key, and this error is recorded in agt.db.
+    Parse {
+        message: String,
+        at: Option<(usize, usize)>,
+    },
+}
+
+/// Removes the values serde/toml quote in their messages (`invalid type: string "..."`,
+/// ``unknown variant `...` ``): a key typed into the wrong field must not end up in
+/// agt.db. Keys and the expected values stay.
+fn redact_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    loop {
+        let next = [("string \"", '"'), ("variant `", '`')]
+            .into_iter()
+            .filter_map(|(open, close)| rest.find(open).map(|i| (i, open, close)))
+            .min_by_key(|&(i, ..)| i);
+        let Some((i, open, close)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str(&open[..open.len() - 1]);
+        out.push_str("(redacted)");
+        // The value ends at the closing quote; `"` strings are Debug-escaped (`\"`).
+        let value = &rest[i + open.len()..];
+        let mut escaped = false;
+        let end = value.char_indices().find(|&(_, c)| {
+            let done = c == close && !escaped;
+            escaped = c == '\\' && !escaped;
+            done
+        });
+        rest = match end {
+            Some((j, c)) => &value[j + c.len_utf8()..],
+            None => "",
+        };
+    }
+}
+
+impl ConfigError {
+    fn parse(e: toml::de::Error, text: &str) -> Self {
+        let at = e.span().map(|span| {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            (line, column)
+        });
+        Self::Parse {
+            message: redact_values(e.message().trim()),
+            at,
+        }
+    }
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "config I/O error: {e}"),
-            Self::Parse(e) => write!(f, "invalid config.toml: {e}"),
+            Self::Parse {
+                message,
+                at: Some((line, column)),
+            } => write!(
+                f,
+                "invalid config.toml at line {line}, column {column}: {message}"
+            ),
+            Self::Parse { message, at: None } => write!(f, "invalid config.toml: {message}"),
         }
     }
 }
@@ -590,11 +651,12 @@ impl Config {
     /// turns polish off ([`Config::polish_error`] says why) and keeps the rest of the
     /// user's settings. Anything wrong elsewhere fails the whole file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut table: toml::Table = toml::from_str(text).map_err(ConfigError::Parse)?;
+        let mut table: toml::Table =
+            toml::from_str(text).map_err(|e| ConfigError::parse(e, text))?;
         let polish = table.remove("polish");
         let mut config: Self = toml::Value::Table(table)
             .try_into()
-            .map_err(ConfigError::Parse)?;
+            .map_err(|e| ConfigError::parse(e, text))?;
         if let Some(mut polish) = polish {
             // Written before `s1-mini` became the default: `base_url` without a provider
             // meant the OpenAI-compatible one (a server the user runs).
@@ -626,7 +688,8 @@ impl Config {
                 Err(e) => {
                     config.polish = PolishConfig::default();
                     config.polish.enabled = false;
-                    config.polish_error = Some(format!("[polish]: {}", e.message().trim()));
+                    config.polish_error =
+                        Some(format!("[polish]: {}", redact_values(e.message().trim())));
                 }
             }
         }
@@ -689,6 +752,54 @@ mod tests {
         assert!(polish_error("[polish]\ntypo = 1"));
     }
 
+    #[test]
+    fn parse_errors_never_quote_the_file() {
+        // A key with a missing closing quote, and an error on the line after one.
+        for text in [
+            "[polish]\napi_key = \"sk-ant-SECRET123\n",
+            "[polish]\napi_key = \"sk-ant-SECRET123\"\n= 1\n",
+            "log_level = \"info\"\n[polish]\napi_key = \"sk-ant-SECRET123\" x\n",
+        ] {
+            let e = Config::parse(text).unwrap_err().to_string();
+            assert!(!e.contains("SECRET"), "{e}");
+            assert!(e.contains("line "), "{e}");
+        }
+        let e = Config::parse("a = 1\n\n  b = \"x\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("invalid config.toml at line 3, column "),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn errors_never_echo_values() {
+        // A key in a numeric field, an enum field, and outside [polish] (fails the file).
+        for (text, field) in [
+            ("[polish]\ntimeout_ms = \"sk-SECRET\\\"x\"\n", "polish"),
+            ("[polish]\nprovider = \"sk-SECRET\"\n", "polish"),
+            ("[polish.s1-mini]\nstyling = \"sk-SECRET\"\n", "polish"),
+            ("[stt]\nengine = \"sk-SECRET\"\n", "file"),
+            ("[hotkey]\nmin_hold_ms = \"sk-SECRET\"\n", "file"),
+        ] {
+            let e = match Config::parse(text) {
+                Ok(c) => c.polish_error.expect(text),
+                Err(e) => e.to_string(),
+            };
+            assert!(!e.contains("SECRET"), "{field}: {e}");
+            assert!(e.contains("(redacted)"), "{field}: {e}");
+        }
+        assert_eq!(
+            redact_values("unknown variant `x`, expected one of `openai`, `anthropic`"),
+            "unknown variant (redacted), expected one of `openai`, `anthropic`"
+        );
+        assert_eq!(
+            redact_values(r#"invalid type: string "a\"b", expected u64"#),
+            "invalid type: string (redacted), expected u64"
+        );
+    }
+
     /// Parses, and says whether `[polish]` was rejected (with polish then off).
     fn polish_error(text: &str) -> bool {
         let c = Config::parse(text).unwrap();
@@ -705,7 +816,7 @@ mod tests {
         assert!(!c.polish.enabled);
         let err = c.polish_error.as_deref().unwrap();
         assert!(
-            err.contains("[polish]") && err.contains("something-unknown"),
+            err.contains("[polish]") && !err.contains("something-unknown"),
             "{err}"
         );
         assert_eq!((c.hotkey.key.as_str(), c.hotkey.min_hold_ms), ("F13", 300));

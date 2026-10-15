@@ -33,21 +33,11 @@ struct State {
 impl Reach {
     /// `base`: the server's base URL (`http(s)://host[:port]/...`).
     pub fn new(base: &str) -> Self {
-        let (rest, port) = match base.split_once("://") {
-            Some(("https", rest)) => (rest, 443),
-            Some((_, rest)) => (rest, 80),
-            None => (base, 80),
-        };
-        let host = rest.split(['/', '?']).next().unwrap_or_default();
-        let has_port = match host.rfind(']') {
-            Some(end) => host[end..].contains(':'),
-            None => host.contains(':'),
-        };
-        let authority = if has_port {
-            host.to_owned()
-        } else {
-            format!("{host}:{port}")
-        };
+        // Host and port only: never the userinfo (this is logged when unreachable).
+        let authority = url::Url::parse(base)
+            .ok()
+            .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)))
+            .unwrap_or_else(|| crate::INVALID_URL.into());
         Self {
             authority,
             state: Arc::default(),
@@ -127,6 +117,10 @@ mod tests {
             ("http://127.0.0.1/v1", "127.0.0.1:80"),
             ("http://[::1]:8080/v1", "[::1]:8080"),
             ("http://[::1]/v1", "[::1]:80"),
+            (
+                "https://user:tok@proxy.example/v1?key=s",
+                "proxy.example:443",
+            ),
         ] {
             assert_eq!(Reach::new(base).authority, want, "{base}");
         }

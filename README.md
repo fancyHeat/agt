@@ -88,6 +88,9 @@ fixes punctuation; off by default, and it runs locally unless you point it at a 
   local AI clean-up, it also downloads llama.cpp (12–32 MB) once to run it.
 - The one exception is opt-in: if you configure the optional clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
+- Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:
+  `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), never audio or text. `agt stats` sums it up;
+  raw rows are kept 180 days (events 30, sessions 365), daily summaries for good.
 
 ## Building from source
 
