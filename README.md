@@ -40,14 +40,11 @@ Good to know:
 
 ## macOS
 
-AGT asks for three permissions on first launch, one after another:
+AGT asks for two permissions on first launch, one after the other:
 
 - **Microphone**: to hear you. Click Allow.
-- **Input Monitoring** ("receive keystrokes from any application"): to notice the hotkey. Click
-  Open System Settings and switch AGT on; macOS then offers to quit and reopen AGT, which it
-  needs before the hotkey works.
-- **Accessibility** (called **Device Control** from macOS 27 on): to paste with Cmd+V. Switch AGT
-  on in the same way; this one takes effect right away.
+- **Accessibility** (called **Device Control** from macOS 27 on): to notice the hotkey and paste
+  with Cmd+V. Click Open System Settings and switch AGT on; it takes effect right away.
 
 Until everything is granted, the menu-bar item says which permission is missing, and its
 "Privacy & Security settings..." item opens the right page.

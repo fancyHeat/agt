@@ -10,9 +10,9 @@
 //!   and are pasted in order (nothing is dropped). Long recordings are chunked by `agt-stt`.
 //!   With `polish.enabled`, each transcript is then cleaned up by an LLM (`agt-polish`),
 //!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted.
-//! - `permissions` (macOS, only while something is missing): asks for the Microphone, Input
-//!   Monitoring and Accessibility permissions at start-up, then re-checks every
-//!   [`PERMISSION_POLL`] until all are granted, so no restart is needed.
+//! - `permissions` (macOS, only while something is missing): asks for the Microphone and
+//!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
+//!   both are granted, so no restart is needed.
 //! - `paste`: saves the clipboard when a recording starts (on a helper thread, with a
 //!   deadline, so a hung clipboard owner can't block pasting), pastes, and restores the
 //!   clipboard `paste.restore_clipboard_ms` later. If that save is what keeps the clipboard

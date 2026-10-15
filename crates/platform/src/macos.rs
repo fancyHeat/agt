@@ -3,12 +3,13 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkey (listen-only event tap) | Input Monitoring |
-//! | Swallowing F13-F20 (active event tap), sending Cmd+V | Accessibility |
+//! | Seeing the hotkey (event tap), swallowing F13-F20, sending Cmd+V | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
 //!
-//! None of them needs a restart once granted: the hotkey thread retries creating its tap every
-//! second until it works, and the others are checked when used.
+//! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
+//! Monitoring (which macOS only applies after quitting and reopening the app). Neither needs a
+//! restart once granted: the hotkey thread retries creating its tap every second until it
+//! works, and the others are checked when used.
 
 use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
 use block2::RcBlock;
@@ -24,9 +25,8 @@ use objc2_core_foundation::{
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
     CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType,
-    CGPreflightListenEventAccess, CGPreflightPostEventAccess, CGRequestListenEventAccess,
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowLayer,
-    kCGWindowNumber, kCGWindowOwnerPID,
+    CGPreflightListenEventAccess, CGPreflightPostEventAccess, CGWindowListCopyWindowInfo,
+    CGWindowListOption, kCGNullWindowID, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString};
 use std::{
@@ -174,11 +174,7 @@ fn run_tap_thread(shared: Arc<Shared>) {
             if !waiting {
                 tracing::warn!(
                     "hotkey: cannot watch the keyboard yet (needs {}); retrying every second",
-                    if shared.swallow {
-                        format!("Input Monitoring and {}", accessibility_name())
-                    } else {
-                        "Input Monitoring".to_owned()
-                    }
+                    accessibility_name()
                 );
                 waiting = true;
             }
@@ -214,16 +210,16 @@ fn run_tap_thread(shared: Arc<Shared>) {
 }
 
 fn create_tap(shared: &Arc<Shared>) -> Option<CFRetained<CFMachPort>> {
-    // Without the permission a listen-only tap is still created, but never gets a keyboard
-    // event: don't settle for one.
-    if !listen_access() || (shared.swallow && !post_access()) {
+    // Without a permission a listen-only tap is still created, but never gets a keyboard
+    // event: don't settle for one. Input Monitoring is enough for a listen-only tap (someone
+    // may have granted only that); swallowing takes Accessibility.
+    if !(post_access() || (!shared.swallow && listen_access())) {
         return None;
     }
     let mask = (1u64 << CGEventType::KeyDown.0)
         | (1u64 << CGEventType::KeyUp.0)
         | (1u64 << CGEventType::FlagsChanged.0);
-    // Listen-only (Input Monitoring) unless the key must be swallowed, which takes an active
-    // tap (Accessibility too).
+    // Listen-only unless the key must be swallowed, which takes an active tap.
     let options = if shared.swallow {
         CGEventTapOptions::Default
     } else {
@@ -549,9 +545,6 @@ pub fn missing_permissions() -> Vec<Permission> {
     if mic_access() != MicAccess::Authorized {
         missing.push(Permission::Microphone);
     }
-    if !listen_access() {
-        missing.push(Permission::InputMonitoring);
-    }
     if !post_access() {
         missing.push(Permission::Accessibility);
     }
@@ -585,8 +578,8 @@ fn request_accessibility() {
 }
 
 // `CGPreflightListenEventAccess` / `CGPreflightPostEventAccess` keep answering "no" for the
-// rest of the process after a grant (seen on macOS 27), so a grant would need a restart. These
-// two ask TCC on every call.
+// rest of the process after a grant (seen on macOS 27), so a grant would need a restart.
+// `AXIsProcessTrusted` asks TCC on every call.
 
 /// Input Monitoring.
 fn listen_access() -> bool {
@@ -633,9 +626,9 @@ pub fn accessibility_name() -> &'static str {
     *NAME
 }
 
-/// Asks for the Microphone first and for the others only once it's answered: while the
-/// Microphone dialog is up, macOS doesn't show the Input Monitoring prompt but records it as
-/// denied right away (seen on macOS 27).
+/// Asks for the Microphone first and for Accessibility only once it's answered: two prompts
+/// at once don't work (while the Microphone dialog was up, macOS 27 recorded the other
+/// permission as denied without showing its prompt).
 pub fn request_permissions(missing: &[Permission]) {
     let rest: Vec<Permission> = missing
         .iter()
@@ -665,9 +658,6 @@ fn request_event_access(missing: &[Permission]) {
     for p in missing {
         match p {
             Permission::Microphone => {}
-            Permission::InputMonitoring => {
-                CGRequestListenEventAccess();
-            }
             Permission::Accessibility => request_accessibility(),
         }
     }
@@ -676,7 +666,6 @@ fn request_event_access(missing: &[Permission]) {
 pub fn open_permission_settings(permission: Permission) {
     let pane = match permission {
         Permission::Microphone => "Privacy_Microphone",
-        Permission::InputMonitoring => "Privacy_ListenEvent",
         Permission::Accessibility => "Privacy_Accessibility",
     };
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
