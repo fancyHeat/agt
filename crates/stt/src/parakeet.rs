@@ -11,6 +11,11 @@
 //! Only the encoder runs on the configured device; the preprocessor and the per-step
 //! decoder are tiny and run on the CPU (a GPU round-trip per decoding step costs more than
 //! it saves).
+//!
+//! A GPU encoder can be built for a fixed input window ([`fixed_window`]): static shapes let
+//! the GPU compile the graph once instead of on every call. The features are zero-padded to
+//! the window (the encoder masks by `length`) and the engine reports the window as its
+//! [`SttEngine::max_input_secs`], so `agt-stt`'s chunker never passes more.
 
 use crate::{
     models::{self, ModelFile, Progress},
@@ -25,7 +30,10 @@ use ort::{
     session::{Session, builder::GraphOptimizationLevel},
     value::TensorRef,
 };
-use std::{path::Path, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 macro_rules! hf {
     ($repo:literal, $rev:literal, $name:literal, $size:literal, $sha:literal) => {
@@ -123,39 +131,167 @@ pub fn files(cfg: &SttConfig) -> Result<&'static [ModelFile]> {
     })
 }
 
-/// Engine-name marker when the configured GPU device could not be used.
-pub const FALLBACK_SUFFIX: &str = "cpu; GPU unavailable";
-
 pub struct Parakeet {
     name: String,
+    /// Model and precision, e.g. `parakeet-tdt-0.6b-v2 int8`.
+    label: String,
     preprocessor: Session,
-    encoder: Session,
+    encoder: Encoder,
     decoder: Session,
     vocab: Vec<String>,
     blank: usize,
     /// Prediction-network LSTM state shape, e.g. `[2, 1, 640]`.
     state_shape: [usize; 3],
-    /// Fixed encoder input length (feature frames) if the encoder has static shapes.
+    /// What a CPU fallback needs to rebuild the encoder.
+    env: Environment,
+    encoder_path: PathBuf,
+    threads: usize,
+    /// `stt.device` named a device (not "auto"): a fallback is shown to the user.
+    explicit: bool,
+    /// The device the encoder fell back to the CPU from, if it did.
+    fell_back_from: Option<Device>,
+    notice: Option<String>,
+}
+
+/// The encoder session and how to feed it.
+struct Encoder {
+    session: Session,
+    device: Device,
+    /// Fixed input length in feature frames, if the session was built for a fixed window
+    /// (see [`fixed_window`]): shorter features are zero-padded to it.
     fixed_frames: Option<usize>,
 }
 
-/// What `stt.device = "auto"` runs the encoder on (falling back to the CPU if it can't be
-/// used). Windows: DirectML (see docs/benchmarks.md). macOS: the CPU; CoreML is unproven
-/// (CI runners have no GPU/Neural Engine to measure it on).
+impl Encoder {
+    fn new(env: &Environment, path: &Path, device: Device, threads: usize) -> Result<Self> {
+        let fixed_frames = fixed_window(device);
+        Ok(Self {
+            session: session(env, path, device, threads, fixed_frames)?,
+            device,
+            fixed_frames,
+        })
+    }
+}
+
+/// What `stt.device = "auto"` tries first. Windows: DirectML, kept only if it isn't slower
+/// than the CPU (see [`Parakeet::load`]). macOS: the CPU for now (Phase 4 adds Core ML).
 const AUTO_DEVICE: Device = if cfg!(windows) {
     Device::DirectMl
 } else {
     Device::Cpu
 };
 
+/// Under `auto`, the GPU is kept if its time for [`PROBE_SECS`] of audio is at most this
+/// many times the CPU's. A short clip is the CPU's best case: a fixed-window GPU encoder costs
+/// the same for any length up to its window, the CPU's cost grows with the length (3.4 s:
+/// 142 vs 152 ms; 10.7 s: 162 vs 407 ms on an RTX 2080 Ti and an i9-9900K). So near-parity
+/// on 3 s still means the GPU wins for everything longer; an integrated GPU that pays a 25 s
+/// window for every dictation shows up as several times slower and loses.
+const AUTO_GPU_TOLERANCE: f64 = 1.25;
+/// Length of the warmup/probe audio (the typical short dictation).
+const PROBE_SECS: f32 = 3.0;
+
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
 const ENCODER_FP32: &str = "encoder-model.onnx";
-/// DirectML encoder input length: the longest chunk [`crate::load`] passes (25 s = 2501
-/// feature frames at 100 per second), rounded up.
-pub const DML_FRAMES: usize = (crate::CHUNK_SECS as usize) * 100 + 11;
+
+/// Feature frames the preprocessor makes from `secs` of audio, rounded up: one per 10 ms hop,
+/// plus one (centered frames).
+pub const fn window_frames(secs: f32) -> usize {
+    let hops = secs * 100.0;
+    let whole = hops as usize;
+    if (whole as f32) < hops {
+        whole + 2
+    } else {
+        whole + 1
+    }
+}
+
+/// Seconds of audio that fit in `frames` feature frames (inverse of [`window_frames`]).
+fn window_secs(frames: usize) -> f32 {
+    (frames - 1) as f32 / 100.0
+}
+
+/// DirectML encoder window: the longest chunk [`crate::load`] passes (25 s = 2501 frames).
+pub const DML_FRAMES: usize = window_frames(crate::CHUNK_SECS);
+// A full chunk fits (the chunker cuts at `(CHUNK_SECS * SAMPLE_RATE) as usize` samples; the
+// preprocessor makes one frame per 160 samples, plus one).
+const _: () = assert!((crate::CHUNK_SECS * SAMPLE_RATE as f32) as usize / 160 < DML_FRAMES);
+
+/// The fixed encoder input window (feature frames) a session on `device` is built for, if
+/// any. Static shapes let a GPU compile the graph once; the features are zero-padded to the
+/// window and `length` masks the padding. The engine reports the window as its
+/// `max_input_secs`, so the chunker never passes more.
+fn fixed_window(device: Device) -> Option<usize> {
+    match device {
+        Device::DirectMl => Some(DML_FRAMES),
+        _ => None,
+    }
+}
+
+/// A device this build can't run the encoder on at all (as opposed to one that failed).
+#[derive(Debug)]
+struct Unsupported(&'static str);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
+/// The encoder session failed while running (not the CPU preprocessor or decoder).
+#[derive(Debug)]
+struct EncoderFailed(String);
+
+impl std::fmt::Display for EncoderFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EncoderFailed {}
+
+fn device_name(d: Device) -> &'static str {
+    match d {
+        Device::Auto => "auto",
+        Device::Cpu => "cpu",
+        Device::DirectMl => "directml",
+        Device::Cuda => "cuda",
+        Device::CoreMl => "coreml",
+        Device::Vulkan => "vulkan",
+        Device::Metal => "metal",
+    }
+}
+
+fn device_title(d: Device) -> &'static str {
+    match d {
+        Device::DirectMl => "DirectML",
+        Device::Cuda => "CUDA",
+        Device::CoreMl => "Core ML",
+        _ => "the GPU",
+    }
+}
+
+/// Faint noise: exercises every graph, including a few decoder steps.
+fn probe_audio(secs: f32) -> Vec<f32> {
+    let mut x = 0x1234_5678u32;
+    (0..(secs * SAMPLE_RATE as f32) as usize)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32 - 0.5) * 1e-3
+        })
+        .collect()
+}
 
 impl Parakeet {
-    /// Downloads missing files, then loads the three sessions.
+    /// Downloads missing files, then loads the three sessions. A GPU encoder is run once
+    /// here (which also compiles it), so a GPU that can create a session but not run it
+    /// (driver bug, device removed, out of VRAM) falls back to the CPU instead of failing.
+    /// Under `stt.device = "auto"` the GPU is only kept if it isn't slower than the CPU on
+    /// a short clip (see [`AUTO_GPU_TOLERANCE`]).
     pub fn load(cfg: &SttConfig, progress: &mut dyn FnMut(Progress)) -> Result<Self> {
         let files = files(cfg)?;
         let dir = cfg.models_path().join(&cfg.model);
@@ -167,25 +303,39 @@ impl Parakeet {
             .iter()
             .position(|t| t == "<blk>")
             .ok_or("vocab.txt has no <blk> token")?;
-        let enc_file = match cfg.precision {
+        let encoder_path = dir.join(match cfg.precision {
             Precision::Int8 => ENCODER_INT8,
             Precision::Fp32 => ENCODER_FP32,
-        };
+        });
         let env = ort::init().with_name("agt").build()?;
-        let preprocessor = session(&env, &dir.join("nemo128.onnx"), Device::Cpu, cfg.threads)?;
+        let preprocessor = session(
+            &env,
+            &dir.join("nemo128.onnx"),
+            Device::Cpu,
+            cfg.threads,
+            None,
+        )?;
         let wanted = match cfg.device {
             Device::Auto => AUTO_DEVICE,
             d => d,
         };
-        let (encoder, device) = match session(&env, &dir.join(enc_file), wanted, cfg.threads) {
-            Ok(s) => (s, wanted),
-            // No usable GPU (no D3D12 adapter, some RDP/VM sessions, broken driver): run on
-            // the CPU rather than fail, and (unless the device was "auto") say so in the
-            // engine name.
+        let explicit = cfg.device != Device::Auto;
+        let mut notice = None;
+        let mut fell_back_from = None;
+        let encoder = match Encoder::new(&env, &encoder_path, wanted, cfg.threads) {
+            Ok(e) => e,
+            // No usable GPU (no D3D12 adapter, some RDP/VM sessions, broken driver) or a
+            // device this build doesn't have: run on the CPU rather than fail.
             Err(e) if wanted != Device::Cpu => {
-                tracing::warn!("{e}; falling back to the CPU");
-                let s = session(&env, &dir.join(enc_file), Device::Cpu, cfg.threads)?;
-                (s, Device::Cpu)
+                tracing::warn!("{e}; running the encoder on the CPU instead");
+                if explicit {
+                    notice = Some(match e.downcast_ref::<Unsupported>() {
+                        Some(why) => format!("on the CPU: {why}"),
+                        None => format!("on the CPU, {} unavailable", device_title(wanted)),
+                    });
+                }
+                fell_back_from = Some(wanted);
+                Encoder::new(&env, &encoder_path, Device::Cpu, cfg.threads)?
             }
             Err(e) => return Err(e),
         };
@@ -194,6 +344,7 @@ impl Parakeet {
             &dir.join("decoder_joint-model.int8.onnx"),
             Device::Cpu,
             1,
+            None,
         )?;
 
         let state_dims = decoder
@@ -209,44 +360,151 @@ impl Parakeet {
             _ => return Err(format!("unexpected decoder state shape {state_dims:?}").into()),
         };
 
-        let name = format!(
-            "{} {} ({})",
-            cfg.model,
-            match cfg.precision {
-                Precision::Int8 => "int8",
-                Precision::Fp32 => "fp32",
-            },
-            match (cfg.device, device) {
-                (Device::Cpu | Device::Auto, Device::Cpu) => "cpu",
-                (_, Device::Cpu) => FALLBACK_SUFFIX,
-                (_, Device::DirectMl) => "directml",
-                (_, Device::Cuda) => "cuda",
-                (_, Device::CoreMl) => "coreml",
-                (_, Device::Auto | Device::Vulkan | Device::Metal) => {
-                    unreachable!("rejected by session()")
+        let mut p = Self {
+            name: String::new(),
+            label: format!(
+                "{} {}",
+                cfg.model,
+                match cfg.precision {
+                    Precision::Int8 => "int8",
+                    Precision::Fp32 => "fp32",
                 }
-            }
-        );
-        tracing::info!("loaded {name} in {:.2} s", start.elapsed().as_secs_f64());
-        Ok(Self {
-            name,
+            ),
             preprocessor,
             encoder,
             decoder,
             vocab,
             blank,
             state_shape,
-            fixed_frames: (device == Device::DirectMl).then_some(DML_FRAMES),
-        })
+            env,
+            encoder_path,
+            threads: cfg.threads,
+            explicit,
+            fell_back_from,
+            notice,
+        };
+        p.update_name();
+        if p.encoder.device != Device::Cpu {
+            p.check_gpu(!explicit)?;
+        }
+        tracing::info!(
+            "loaded {} in {:.2} s",
+            p.name,
+            start.elapsed().as_secs_f64()
+        );
+        Ok(p)
+    }
+
+    /// Runs the GPU encoder once (falling back to the CPU if that fails) and, if `auto`,
+    /// keeps it only if it is not slower than the CPU.
+    fn check_gpu(&mut self, auto: bool) -> Result<()> {
+        let probe = probe_audio(PROBE_SECS);
+        let gpu = self.encoder.device;
+        let gpu_ms = match self.time(&probe) {
+            Ok(t) => t,
+            Err(e) => {
+                return self.fall_back(&format!(
+                    "the encoder failed its first run on {}: {e}",
+                    device_title(gpu)
+                ));
+            }
+        };
+        if !auto {
+            tracing::info!(
+                "{}: {gpu_ms:.0} ms for {PROBE_SECS} s of audio",
+                device_title(gpu)
+            );
+            return Ok(());
+        }
+        let cpu = match Encoder::new(&self.env, &self.encoder_path, Device::Cpu, self.threads) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("stt.device \"auto\": can't compare with the CPU ({e})");
+                return Ok(());
+            }
+        };
+        let gpu_encoder = std::mem::replace(&mut self.encoder, cpu);
+        let cpu_ms = self.time(&probe)?;
+        let keep_gpu = gpu_ms <= cpu_ms * AUTO_GPU_TOLERANCE;
+        tracing::info!(
+            "stt.device \"auto\": {} {gpu_ms:.0} ms, CPU {cpu_ms:.0} ms for {PROBE_SECS} s of audio; using {}",
+            device_title(gpu),
+            if keep_gpu {
+                device_title(gpu)
+            } else {
+                "the CPU"
+            }
+        );
+        if keep_gpu {
+            self.encoder = gpu_encoder; // drops the CPU session
+        } else {
+            drop(gpu_encoder); // frees the VRAM
+            self.update_name();
+        }
+        Ok(())
+    }
+
+    /// Best of two runs on `audio`, in ms, after one untimed run (which compiles a GPU
+    /// encoder's kernels).
+    fn time(&mut self, audio: &[f32]) -> Result<f64> {
+        self.run(audio)?;
+        let mut best = f64::MAX;
+        for _ in 0..2 {
+            let t = Instant::now();
+            self.run(audio)?;
+            best = best.min(ms(t.elapsed()));
+        }
+        Ok(best)
+    }
+
+    /// Rebuilds the encoder on the CPU after the GPU one failed.
+    fn fall_back(&mut self, why: &str) -> Result<()> {
+        let from = self.encoder.device;
+        tracing::warn!("{why}; running the encoder on the CPU from now on");
+        self.encoder = Encoder::new(&self.env, &self.encoder_path, Device::Cpu, self.threads)?;
+        self.fell_back_from = Some(from);
+        if self.explicit {
+            self.notice = Some(format!("on the CPU, {} unavailable", device_title(from)));
+        }
+        self.update_name();
+        Ok(())
+    }
+
+    fn update_name(&mut self) {
+        self.name = match (self.encoder.device, self.fell_back_from) {
+            (Device::Cpu, Some(from)) => {
+                format!("{} (cpu; {} unavailable)", self.label, device_name(from))
+            }
+            (d, _) => format!("{} ({})", self.label, device_name(d)),
+        };
     }
 }
 
-fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Result<Session> {
+fn session(
+    env: &Environment,
+    path: &Path,
+    device: Device,
+    threads: usize,
+    fixed_frames: Option<usize>,
+) -> Result<Session> {
     let mut b = Session::builder(env)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| e.to_string())?;
     if threads > 0 {
         b = b.with_intra_threads(threads).map_err(|e| e.to_string())?;
+    }
+    if let Some(frames) = fixed_frames {
+        // Fixed encoder input shape (see `fixed_window`). The names are the export's dynamic
+        // axes: batch (both inputs) and time.
+        for (axis, size) in [
+            ("audio_signal_dynamic_axes_1", 1),
+            ("length_dynamic_axes_1", 1),
+            ("audio_signal_dynamic_axes_2", frames as i64),
+        ] {
+            b = b
+                .with_dimension_override(axis, size)
+                .map_err(|e| e.to_string())?;
+        }
     }
     match device {
         Device::Cpu => {
@@ -260,25 +518,24 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
         }
         #[cfg(windows)]
         Device::DirectMl => {
-            // DirectML requires sequential execution and no memory-pattern optimization.
-            let dml = ort::ep::DirectML::default().build().error_on_failure();
-            if path.ends_with(ENCODER_INT8) || path.ends_with(ENCODER_FP32) {
+            use ort::ep::directml::PerformancePreference;
+            // The high-performance adapter: the discrete GPU on a hybrid laptop (the default
+            // preference lets Windows pick, usually the integrated one).
+            let dml = ort::ep::DirectML::default()
+                .with_performance_preference(PerformancePreference::HighPerformance)
+                .build()
+                .error_on_failure();
+            if fixed_frames.is_some() {
                 // With dynamic shapes DirectML re-creates its operators on every run: a
-                // ~250 ms floor per call, however short the audio. A fixed input length lets
-                // it compile them once (the features are zero-padded to DML_FRAMES; `length`
-                // masks the padding). DirectML's whole-graph fusion of the static graph gives
+                // ~250 ms floor per call, however short the audio. The fixed window lets it
+                // compile them once. DirectML's whole-graph fusion of the static graph gives
                 // wrong output (empty transcripts), so it's off; op by op it's still ~2.5x
                 // faster than dynamic shapes. See docs/benchmarks.md.
                 b = b
-                    .with_dimension_override("audio_signal_dynamic_axes_1", 1)
-                    .map_err(|e| e.to_string())?
-                    .with_dimension_override("audio_signal_dynamic_axes_2", DML_FRAMES as i64)
-                    .map_err(|e| e.to_string())?
-                    .with_dimension_override("length_dynamic_axes_1", 1)
-                    .map_err(|e| e.to_string())?
                     .with_config_entry("ep.dml.disable_graph_fusion", "1")
                     .map_err(|e| e.to_string())?;
             }
+            // DirectML requires sequential execution and no memory-pattern optimization.
             b = b.with_memory_pattern(false).map_err(|e| e.to_string())?;
             b = b
                 .with_parallel_execution(false)
@@ -288,7 +545,7 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
                 .map_err(|e| e.to_string())?;
         }
         #[cfg(not(windows))]
-        Device::DirectMl => return Err("device \"directml\" is only available on Windows".into()),
+        Device::DirectMl => return Err(Unsupported("DirectML is only available on Windows").into()),
         #[cfg(feature = "cuda")]
         Device::Cuda => {
             let cuda = ort::ep::CUDA::default().build().error_on_failure();
@@ -297,25 +554,13 @@ fn session(env: &Environment, path: &Path, device: Device, threads: usize) -> Re
                 .map_err(|e| e.to_string())?;
         }
         #[cfg(not(feature = "cuda"))]
-        Device::Cuda => {
-            return Err("device \"cuda\" needs a build with the `cuda` feature".into());
-        }
-        #[cfg(target_os = "macos")]
+        Device::Cuda => return Err(Unsupported("this build doesn't include CUDA support").into()),
+        // Core ML (fixed 10 s window, fp32) comes with the macOS work (Phase 4, issue #9).
         Device::CoreMl => {
-            use ort::ep::coreml::{ComputeUnits, ModelFormat};
-            let coreml = ort::ep::CoreML::default()
-                .with_model_format(ModelFormat::MLProgram)
-                .with_compute_units(ComputeUnits::All)
-                .build()
-                .error_on_failure();
-            b = b
-                .with_execution_providers([coreml])
-                .map_err(|e| e.to_string())?;
+            return Err(Unsupported("this build doesn't include Core ML support").into());
         }
-        #[cfg(not(target_os = "macos"))]
-        Device::CoreMl => return Err("device \"coreml\" is only available on macOS".into()),
         Device::Auto | Device::Vulkan | Device::Metal => {
-            return Err(format!("the parakeet engine can't use device {device:?}").into());
+            return Err(Unsupported("the parakeet engine can't use this device").into());
         }
     }
     b.commit_from_file(path)
@@ -345,21 +590,36 @@ impl SttEngine for Parakeet {
     }
 
     fn warmup(&mut self) -> Result<()> {
-        // Two seconds of faint noise: exercises every graph, including a few decoder steps.
-        let mut x = 0x1234_5678u32;
-        let audio: Vec<f32> = (0..2 * SAMPLE_RATE)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 17;
-                x ^= x << 5;
-                (x as f32 / u32::MAX as f32 - 0.5) * 1e-3
-            })
-            .collect();
-        self.transcribe(&audio, &TranscribeOpts::default())?;
+        self.transcribe(&probe_audio(PROBE_SECS), &TranscribeOpts::default())?;
         Ok(())
     }
 
+    fn max_input_secs(&self) -> Option<f32> {
+        self.encoder.fixed_frames.map(window_secs)
+    }
+
+    fn notice(&self) -> Option<String> {
+        self.notice.clone()
+    }
+
     fn transcribe(&mut self, audio: &[f32], _opts: &TranscribeOpts) -> Result<Transcript> {
+        match self.run(audio) {
+            // A GPU that worked at load can still fail later (driver reset/TDR, device
+            // removed, out of VRAM): switch to the CPU for good and retry this audio once.
+            Err(e) if self.encoder.device != Device::Cpu && e.is::<EncoderFailed>() => {
+                self.fall_back(&format!(
+                    "the encoder failed on {}: {e}",
+                    device_title(self.encoder.device)
+                ))?;
+                self.run(audio)
+            }
+            r => r,
+        }
+    }
+}
+
+impl Parakeet {
+    fn run(&mut self, audio: &[f32]) -> Result<Transcript> {
         if audio.is_empty() {
             return Ok(Transcript::default());
         }
@@ -374,17 +634,20 @@ impl SttEngine for Parakeet {
         let t1 = Instant::now();
 
         // 2. Encoder: [1, D, T'] (channels first).
-        // A static-shape (DirectML) encoder takes exactly `fixed_frames` frames: zero-pad.
+        // A fixed-window encoder takes exactly `fixed_frames` frames: zero-pad.
         let padded;
-        let (feat_shape, feats) = match self.fixed_frames {
+        let (feat_shape, feats) = match self.encoder.fixed_frames {
             Some(n) => {
                 let (c, t) = (feat_shape[1] as usize, feat_shape[2] as usize);
                 if t > n {
-                    return Err(format!("{t} feature frames exceed the encoder's fixed {n}").into());
+                    return Err(format!(
+                        "{t} feature frames exceed the encoder's fixed {n} (chunking bug)"
+                    )
+                    .into());
                 }
                 let mut p = vec![0f32; c * n];
-                for ch in 0..c {
-                    p[ch * n..ch * n + t].copy_from_slice(&feats[ch * t..(ch + 1) * t]);
+                for (dst, src) in p.chunks_exact_mut(n).zip(feats.chunks_exact(t)) {
+                    dst[..t].copy_from_slice(src);
                 }
                 padded = p;
                 (
@@ -394,10 +657,14 @@ impl SttEngine for Parakeet {
             }
             None => (feat_shape.clone(), feats),
         };
-        let enc = self.encoder.run(ort::inputs![
-            "audio_signal" => TensorRef::from_array_view((feat_shape, feats))?,
-            "length" => TensorRef::from_array_view(([1usize], feat_lens))?,
-        ])?;
+        let enc = self
+            .encoder
+            .session
+            .run(ort::inputs![
+                "audio_signal" => TensorRef::from_array_view((feat_shape, feats))?,
+                "length" => TensorRef::from_array_view(([1usize], feat_lens))?,
+            ])
+            .map_err(|e| EncoderFailed(e.to_string()))?;
         let (enc_shape, enc_out) = enc["outputs"].try_extract_tensor::<f32>()?;
         let (_, enc_lens) = enc["encoded_lengths"].try_extract_tensor::<i64>()?;
         let (dim, frames) = (enc_shape[1] as usize, enc_shape[2] as usize);
@@ -490,5 +757,96 @@ impl Joint for OnnxJoint<'_> {
 
     fn accept(&mut self) {
         std::mem::swap(&mut self.state, &mut self.next_state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_frames_round_up() {
+        assert_eq!(window_frames(25.0), 2501);
+        assert_eq!(window_frames(10.0), 1001);
+        assert_eq!(window_frames(22.5), 2251);
+        assert_eq!(window_frames(22.505), 2252);
+        assert_eq!(window_secs(window_frames(25.0)), 25.0);
+        assert_eq!(window_secs(window_frames(10.0)), 10.0);
+    }
+
+    /// Zero-padding the features to a fixed window (what a static-shape GPU encoder gets) must
+    /// not change the transcript: `length` masks the padding. Runs on the CPU, with the v2 int8
+    /// model (in `AGT_TEST_MODELS`, else the default models folder) and a real speech clip
+    /// (`AGT_TEST_CLIP`, else `eval-data/clips/ls-clean-short-01.wav`; see
+    /// `scripts/prepare_eval.py`). Skipped when either is missing (CI): nothing is downloaded.
+    #[test]
+    fn padding_does_not_change_the_transcript() {
+        let mut cfg = SttConfig {
+            device: Device::Cpu,
+            ..SttConfig::default()
+        };
+        if let Some(d) = std::env::var_os("AGT_TEST_MODELS") {
+            cfg.models_dir = d.to_string_lossy().into_owned();
+        }
+        let dir = cfg.models_path().join(&cfg.model);
+        if let Some(f) = files(&cfg)
+            .unwrap()
+            .iter()
+            .find(|f| !dir.join(f.name).exists())
+        {
+            eprintln!("skipped: {} not found", dir.join(f.name).display());
+            return;
+        }
+        let clip = std::env::var_os("AGT_TEST_CLIP").map_or_else(
+            || {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../eval-data/clips/ls-clean-short-01.wav")
+            },
+            PathBuf::from,
+        );
+        let Ok(mut wav) = hound::WavReader::open(&clip) else {
+            eprintln!("skipped: {} not found", clip.display());
+            return;
+        };
+        let spec = wav.spec();
+        assert_eq!(
+            (spec.sample_rate, spec.channels, spec.bits_per_sample),
+            (SAMPLE_RATE, 1, 16),
+            "16 kHz mono 16-bit clip expected"
+        );
+        let audio: Vec<f32> = wav
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+
+        let mut p = Parakeet::load(&cfg, &mut |_| {}).unwrap();
+        assert_eq!(p.max_input_secs(), None);
+        let opts = TranscribeOpts::default();
+        let plain = p.transcribe(&audio, &opts).unwrap().text;
+        assert!(plain.split_whitespace().count() >= 3, "{plain:?}");
+
+        // The same CPU encoder with the DirectML window: features zero-padded to 25 s.
+        p.encoder = Encoder {
+            session: session(
+                &p.env,
+                &p.encoder_path,
+                Device::Cpu,
+                p.threads,
+                Some(DML_FRAMES),
+            )
+            .unwrap(),
+            device: Device::Cpu,
+            fixed_frames: Some(DML_FRAMES),
+        };
+        assert_eq!(p.max_input_secs(), Some(crate::CHUNK_SECS));
+        assert_eq!(p.transcribe(&audio, &opts).unwrap().text, plain);
+
+        // A full chunk (the longest audio the chunker passes) fits the window. (Not the same
+        // text: trailing silence in the *audio* changes the per-utterance feature
+        // normalization, unlike padding the features.)
+        let mut full = audio.clone();
+        full.resize((crate::CHUNK_SECS * SAMPLE_RATE as f32) as usize, 0.0);
+        let text = p.transcribe(&full, &opts).unwrap().text;
+        assert!(text.split_whitespace().count() >= 3, "{text:?}");
     }
 }
