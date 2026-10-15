@@ -14,6 +14,12 @@
 //! ```
 //!
 //! Engine-agnostic: it only uses `agt_stt::load` and the `SttEngine` trait.
+//!
+//! `agt-bench polish [options] <transcripts.txt>` instead runs the LLM clean-up (`[polish]`)
+//! over each non-empty line of a text file and prints latency, the guard outcome and the
+//! result (see [`polish`]).
+
+mod polish;
 
 use agt_core::{
     Config,
@@ -43,6 +49,9 @@ fn run() -> Result<(), String> {
         .with_max_level(level.unwrap_or(tracing::Level::WARN))
         .with_writer(std::io::stderr)
         .init();
+    if std::env::args().nth(1).as_deref() == Some("polish") {
+        return polish::run(std::env::args().skip(2));
+    }
     let mut cfg = SttConfig::default();
     let (mut runs, mut warmup, mut dir) = (3usize, true, None);
     let mut args = std::env::args().skip(1);
