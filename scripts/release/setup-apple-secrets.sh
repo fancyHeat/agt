@@ -46,17 +46,24 @@ gh api "repos/$REPO/environments/$ENVIRONMENT" --jq .name >/dev/null 2>&1 \
   || die "can't read the '$ENVIRONMENT' environment of $REPO (wrong account or missing admin rights?)"
 
 step "Looking for \"$IDENTITY\""
-# SHA-1 of the identity, from all identities (any policy, valid or not) in the login keychain.
-ALL_IDENTITIES="$(security find-identity "$LOGIN_KEYCHAIN" | awk '/Matching identities/{m=1;next} /identities found/{m=0} m && /^ *[0-9]+\)/')" || true
-IDENTITY_HASH="$(printf '%s\n' "$ALL_IDENTITIES" | awk -v id="\"$IDENTITY\"" 'index($0, id) {print $2; exit}')"
-[ -n "$IDENTITY_HASH" ] || die "identity not found in $LOGIN_KEYCHAIN (security find-identity)"
-VALID_CODESIGNING="$(security find-identity -v -p codesigning "$LOGIN_KEYCHAIN")"
-case "$VALID_CODESIGNING" in
-  *"$IDENTITY_HASH"*) ;;
-  *) die "identity $IDENTITY_HASH is not valid for code signing (expired or revoked?)" ;;
-esac
-# `security export` can't select one identity: it exports every identity in the keychain.
-IDENTITY_COUNT="$(printf '%s\n' "$ALL_IDENTITIES" | awk 'NF' | awk '{print $2}' | sort -u | wc -l | tr -d ' ')"
+# SHA-1 hashes of the valid (unexpired, trusted) code-signing identities with exactly that name.
+VALID_HASHES="$(security find-identity -v -p codesigning "$LOGIN_KEYCHAIN" \
+  | awk -v id="\"$IDENTITY\"" '/^ *[0-9]+\)/ && substr($0, index($0, "\"")) == id {print $2}' | sort -u)"
+[ -n "$VALID_HASHES" ] || die "no valid \"$IDENTITY\" in $LOGIN_KEYCHAIN (missing, expired or revoked?)"
+if [ "$(printf '%s\n' "$VALID_HASHES" | wc -l | tr -d ' ')" != 1 ]; then
+  echo "error: more than one valid \"$IDENTITY\":" >&2
+  printf '%s\n' "$VALID_HASHES" | while read -r h; do
+    echo "    $h, $(security find-certificate -a -c "$IDENTITY" -Z -p "$LOGIN_KEYCHAIN" \
+      | awk -v h="$h" '/^SHA-1 hash:/ {m = ($3 == h)} m' | sed -n '/BEGIN CERT/,/END CERT/p' \
+      | openssl x509 -noout -enddate)" >&2
+  done
+  die "keep only the one to use (Keychain Access -> login -> My Certificates; delete the other) and rerun"
+fi
+IDENTITY_HASH="$VALID_HASHES"
+# `security export` can't select one identity: it exports every identity in the keychain (any
+# policy, valid or not), so it's only usable when this is the only one.
+IDENTITY_COUNT="$(security find-identity "$LOGIN_KEYCHAIN" \
+  | awk '/Matching identities/{m=1;next} /identities found/{m=0} m && /^ *[0-9]+\)/ {print $2}' | sort -u | wc -l | tr -d ' ')"
 echo "    found $IDENTITY_HASH; the login keychain holds $IDENTITY_COUNT identit$([ "$IDENTITY_COUNT" = 1 ] && echo y || echo ies) in total"
 
 VALID_ANY="$(security find-identity -v "$LOGIN_KEYCHAIN")"
@@ -86,11 +93,17 @@ fi
 umask 077
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/agt-signing.XXXXXX")"
 CHECK_KEYCHAIN="$WORK/check.keychain-db"
-ORIGINAL_SEARCH_LIST="$(security list-keychains -d user | tr -d '"')"
+# The user keychain search list, one path per element (paths may contain spaces).
+ORIGINAL_SEARCH_LIST=()
+while IFS= read -r kc; do
+  kc="${kc#*\"}"; ORIGINAL_SEARCH_LIST+=("${kc%\"*}")
+done < <(security list-keychains -d user)
+restore_search_list() {
+  security list-keychains -d user -s ${ORIGINAL_SEARCH_LIST[@]+"${ORIGINAL_SEARCH_LIST[@]}"}
+}
 cleanup() {
   security delete-keychain "$CHECK_KEYCHAIN" >/dev/null 2>&1 || true
-  # shellcheck disable=SC2086 # one keychain path per word
-  security list-keychains -d user -s $ORIGINAL_SEARCH_LIST >/dev/null 2>&1 || true
+  restore_search_list >/dev/null 2>&1 || true
   # APFS on an SSD can't be securely overwritten in place; overwrite anyway, then delete.
   if [ -f "$WORK/agt.p12" ]; then
     dd if=/dev/urandom of="$WORK/agt.p12" bs=1k count=16 conv=notrunc >/dev/null 2>&1 || true
@@ -113,7 +126,8 @@ if [ "$IDENTITY_COUNT" = 1 ]; then
 else
   step "Your login keychain holds more than one identity, so export it by hand:"
   echo "    1. Open Keychain Access -> login -> My Certificates."
-  echo "    2. Right-click \"$IDENTITY\" (only that one) -> Export..."
+  echo "    2. Right-click \"$IDENTITY\" with SHA-1 fingerprint $IDENTITY_HASH"
+  echo "       (only that one) -> Export..."
   echo "    3. Format: Personal Information Exchange (.p12). Save it as:"
   echo "         $P12"
   echo "       (in the save dialog press Cmd+Shift+G and paste the folder: $WORK)"
@@ -128,8 +142,7 @@ step "Checking that the .p12 contains exactly that identity"
 # Import into a throwaway keychain, as CI does, and list what came out.
 CHECK_PASSWORD="$(openssl rand -hex 16)"
 security create-keychain -p "$CHECK_PASSWORD" "$CHECK_KEYCHAIN"
-# shellcheck disable=SC2086 # create-keychain may add the new keychain to the search list
-security list-keychains -d user -s $ORIGINAL_SEARCH_LIST
+restore_search_list # create-keychain may add the new keychain to the search list
 security unlock-keychain -p "$CHECK_PASSWORD" "$CHECK_KEYCHAIN"
 security import "$P12" -k "$CHECK_KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" >/dev/null \
   || die "the .p12 couldn't be imported (wrong password?)"

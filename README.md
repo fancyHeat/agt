@@ -353,18 +353,26 @@ export), checks that the `.p12` holds exactly that identity, sets the secrets th
 deletes the `.p12` and prints only the secret names. With `--with-apple-id` it also asks for the
 Apple ID and an app-specific password (hidden) and checks them with `notarytool` first. Create an
 app-specific password at <https://account.apple.com> → *Sign-In and Security* → *App-Specific
-Passwords* → *+* (e.g. "AGT notarization"). `security export` exports *every* identity in the
-keychain; if there's more than one, the script walks you through exporting just this one from
-Keychain Access instead.
+Passwords* → *+* (e.g. "AGT notarization"). The script uses the one valid (unexpired) identity
+with that name; if there are several (e.g. old and new certificate during a rotation), it lists them
+with their expiry dates and stops, so delete the one you don't want first. `security export`
+exports *every* identity in the keychain; if there's more than one of any kind, the script walks you
+through exporting just this one from Keychain Access instead.
 
 How `package-macos` uses them (it enters `release` on tag pushes and `workflow_dispatch`, never on PRs):
 1. Downloads the files `build` staged and checks they are exactly `agt`, `Info.plist` and
-   `agt.entitlements`, with no entitlement other than `com.apple.security.device.audio-input`.
-2. Imports the `.p12` into a throwaway keychain (key usable by `codesign` only) and stores the
-   notarization credentials in it. Only this step sees the certificate, its password, the Apple ID
-   and the app-specific password.
-3. Runs `vpk pack`, which signs, notarizes (`notarytool submit --wait`) and staples.
-4. Verifies the result: `codesign --verify --deep --strict`, our Team ID, hardened runtime and
+   `agt.entitlements`, with no entitlement other than `com.apple.security.device.audio-input`,
+   and with bundle id `io.notics.agt` and executable `agt`.
+2. Imports the `.p12` into a throwaway keychain and stores the notarization credentials in it. The
+   key is imported non-extractable (`-x`): `codesign` and other Apple-signed tools (partition list
+   `apple-tool:,apple:`) can sign with it without a prompt, but nothing can export it again. Only
+   this step sees the certificate, its password, the Apple ID and the app-specific password, and it
+   runs before any downloaded tooling (.NET, vpk), since `security` and `notarytool` take the
+   passwords on their command line.
+3. Installs .NET and vpk, and runs `vpk pack`, which signs, notarizes (`notarytool submit --wait`)
+   and staples.
+4. Verifies the result, both the app in the portable zip and the one in the `-full.nupkg` that
+   installed apps update to: `codesign --verify --deep --strict`, our Team ID, hardened runtime and
    timestamp, `xcrun stapler validate`, and `spctl -a -t exec` reporting
    `source=Notarized Developer ID`. Any failure fails the job.
 5. Deletes the keychain (always, even after a failure). The runner is discarded afterwards anyway.
@@ -391,13 +399,17 @@ PR dry runs are always unsigned.
   enters `release` can exfiltrate it, not just sign one build, and the same tag loophole as for
   Windows applies (see below): anyone with write access can tag any commit `v*`. A required
   reviewer on the environment closes that; so would moving signing to a hardware-backed
-  service, which Apple doesn't offer for Developer ID.
+  service, which Apple doesn't offer for Developer ID. (The `-x` import protects the key from the
+  tooling the *legitimate* workflow runs; a modified workflow simply reads the secret.)
+- .NET and vpk run while the keychain is unlocked, so a compromised vpk could sign other code
+  during that job, but can't extract the key or read the passwords.
 - The Developer ID identity is NOTICS's single team identity and is shared with other NOTICS apps.
 - Notarization uses one person's Apple ID. An App Store Connect API key (team key, "Developer" role)
   would decouple it from a personal account; `notarytool` and vpk support both.
 - `build` stages `Info.plist` and the entitlements alongside the binary, so a compromised
   dependency build script could alter them. That's no worse than altering the binary, which it
-  can also do; the entitlement allowlist stops the riskiest change (opening the app to injection).
+  can also do; the entitlement allowlist and the bundle id check stop the riskiest changes
+  (opening the app to injection, or taking over another app's permissions).
 
 ### Windows signing (Azure Artifact Signing)
 
