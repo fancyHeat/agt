@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agt"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "agt-audio",
  "agt-core",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "agt-audio"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "agt-core",
  "cpal",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agt-bench"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "agt-audio",
  "agt-core",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agt-core"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde",
  "toml 1.1.8+spec-1.1.0",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agt-fetch"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "sha2",
  "tracing",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "agt-overlay"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agt-platform"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "tracing",
  "windows-sys 0.61.2",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "agt-polish"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "agt-core",
  "agt-fetch",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "agt-stt"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "agt-core",
  "agt-fetch",
