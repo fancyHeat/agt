@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 agt-core.workspace = true
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "tracing-log"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std", "tracing-log"] }
 tracing-appender = "0.2"
 tray-icon = "0.26"
 velopack = "1.2"
