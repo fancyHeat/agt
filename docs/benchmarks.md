@@ -206,7 +206,7 @@ uv run scripts/prepare_eval.py                      # eval-data/clips, ~5 min
 cargo build --release -p agt-bench                  # Parakeet: auto, cpu, directml (Windows)
 target/release/agt-bench --device directml eval-data/clips
 cargo build --release -p agt-bench --features cuda  # + CUDA 13 / cuDNN 9 DLLs on PATH
-cargo build --release -p agt-bench --features whisper-vulkan   # see README "Build"
+cargo build --release -p agt-bench --features whisper-vulkan   # needs CMake, libclang, Vulkan headers (see below)
 target/release/agt-bench --engine whisper --model whisper-large-v3-turbo-q5_0 --device vulkan eval-data/clips
 ```
 
