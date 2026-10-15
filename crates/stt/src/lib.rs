@@ -7,6 +7,8 @@ pub mod chunk;
 pub mod models;
 pub mod parakeet;
 pub mod tdt;
+#[cfg(feature = "whisper")]
+pub mod whisper;
 
 use agt_core::{
     config::{Engine, SttConfig},
@@ -24,8 +26,16 @@ pub const CHUNK_SEARCH_SECS: f32 = 5.0;
 pub fn load(cfg: &SttConfig, progress: &mut dyn FnMut(Progress)) -> Result<Box<dyn SttEngine>> {
     let engine: Box<dyn SttEngine> = match cfg.engine {
         Engine::Parakeet => Box::new(parakeet::Parakeet::load(cfg, progress)?),
+        #[cfg(feature = "whisper")]
+        Engine::Whisper => Box::new(whisper::Whisper::load(cfg, progress)?),
+        #[cfg(not(feature = "whisper"))]
+        Engine::Whisper => {
+            return Err("this build has no whisper engine (cargo feature `whisper`)".into());
+        }
     };
     // Parakeet: 20-25 s chunks keep full attention cheap (RTF stays ~0.05 at any length).
+    // An engine with a fixed input window (a static-shape GPU encoder) gets chunks that fit
+    // it: see `SttEngine::max_input_secs`.
     Ok(Box::new(chunk::Chunked::new(
         engine,
         CHUNK_SECS,

@@ -59,7 +59,7 @@ const BUSY_SAVE_WAIT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
     Loading(String),
-    /// Ready, possibly with a note (e.g. "GPU unavailable, using the CPU").
+    /// Ready, possibly with a note (e.g. "on the CPU, DirectML unavailable").
     Ready(Option<String>),
     Recording,
     Transcribing,
@@ -547,9 +547,7 @@ fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
         Ok(engine) => {
             let name = engine.name();
             tracing::info!("{name} ready ({:.1} s)", t.elapsed().as_secs_f64());
-            let note = name
-                .contains(agt_stt::parakeet::FALLBACK_SUFFIX)
-                .then(|| "GPU unavailable, using the CPU".to_owned());
+            let note = engine.notice();
             hub.update(|s| s.engine = Engine::Ready(note));
             Some(engine)
         }
@@ -589,8 +587,14 @@ fn stt_thread(
             continue;
         };
         let stt_start = Instant::now();
+        let notice = engine.notice();
         let result = engine.transcribe(&job.audio, &opts);
         let stt_end = Instant::now();
+        if engine.notice() != notice {
+            // E.g. the GPU failed and the engine switched to the CPU.
+            let note = engine.notice();
+            hub.update(|s| s.engine = Engine::Ready(note));
+        }
         let audio_secs = job.audio.len() as f64 / SAMPLE_RATE as f64;
         match result {
             Ok(t) => {
@@ -1189,8 +1193,8 @@ mod tests {
     fn status_text() {
         assert_eq!(Status::Ready(None).to_string(), "Ready");
         assert_eq!(
-            Status::Ready(Some("GPU unavailable, using the CPU".into())).to_string(),
-            "Ready (GPU unavailable, using the CPU)"
+            Status::Ready(Some("on the CPU, DirectML unavailable".into())).to_string(),
+            "Ready (on the CPU, DirectML unavailable)"
         );
     }
 }

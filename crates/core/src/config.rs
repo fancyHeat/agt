@@ -27,14 +27,20 @@ min_hold_ms = 150
 keep_mic_open = false
 
 [stt]
-# Speech-to-text engine. Currently only "parakeet" (NVIDIA Parakeet TDT via ONNX Runtime).
+# Speech-to-text engine: "parakeet" (NVIDIA Parakeet TDT via ONNX Runtime), or "whisper"
+# (whisper.cpp; only in builds with the `whisper` feature, not in releases).
 engine = "parakeet"
-# "parakeet-tdt-0.6b-v2" (English) or "parakeet-tdt-0.6b-v3" (25 European languages).
+# Parakeet: "parakeet-tdt-0.6b-v2" (English) or "parakeet-tdt-0.6b-v3" (25 European languages).
+# Whisper: "whisper-large-v3-turbo" (or -q8_0, -q5_0), "whisper-small.en" (or -q8_0).
 model = "parakeet-tdt-0.6b-v2"
-# "int8" (650 MB, fast on CPU) or "fp32" (2.5 GB; use with a GPU).
+# Parakeet encoder weights: "int8" (650 MB) or "fp32" (2.5 GB download and RAM/VRAM; a bit
+# faster and more accurate on a GPU).
 precision = "int8"
-# Where inference runs: "cpu", or "directml" (any DirectX 12 GPU; Windows only).
-device = "cpu"
+# Where inference runs. "auto": on Windows the GPU (DirectML) if a quick check at start-up
+# finds it no slower than the CPU, else the CPU; on macOS the CPU. "cpu"; "directml" (Windows,
+# any DirectX 12 GPU; holds ~1.1 GB of VRAM while AGT runs); "cuda" (NVIDIA; builds with the
+# `cuda` feature); "vulkan" / "metal" (whisper). A GPU that can't be used falls back to the CPU.
+device = "auto"
 # CPU threads for inference; 0 = automatic.
 threads = 0
 # Where models are downloaded to; "" = the default location (see README).
@@ -143,6 +149,7 @@ pub struct SttConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     Parakeet,
+    Whisper,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -152,12 +159,19 @@ pub enum Precision {
     Fp32,
 }
 
-/// ONNX Runtime execution provider. Phase 2 adds `cuda` and `coreml`.
+/// Where inference runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Device {
+    /// The engine's best device on this platform, falling back to the CPU.
+    Auto,
     Cpu,
     DirectMl,
+    Cuda,
+    /// Apple's Core ML. Parsed, but no engine supports it yet (the macOS work, issue #9).
+    CoreMl,
+    Vulkan,
+    Metal,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -358,7 +372,7 @@ impl Default for SttConfig {
             engine: Engine::Parakeet,
             model: "parakeet-tdt-0.6b-v2".into(),
             precision: Precision::Int8,
-            device: Device::Cpu,
+            device: Device::Auto,
             threads: 0,
             models_dir: String::new(),
         }
@@ -483,7 +497,20 @@ mod tests {
         assert_eq!(c.stt.device, Device::DirectMl);
         assert_eq!(c.stt.precision, Precision::Fp32);
         assert!(Config::parse("[stt]\ndevice = \"gpu\"").is_err());
-        assert!(Config::parse("[stt]\nengine = \"whisper\"").is_err());
+        assert!(Config::parse("[stt]\nengine = \"vosk\"").is_err());
+        let c = Config::parse("[stt]\nengine = \"whisper\"\ndevice = \"vulkan\"").unwrap();
+        assert_eq!(
+            (c.stt.engine, c.stt.device),
+            (Engine::Whisper, Device::Vulkan)
+        );
+        for d in [
+            "auto", "cpu", "directml", "cuda", "coreml", "vulkan", "metal",
+        ] {
+            assert!(
+                Config::parse(&format!("[stt]\ndevice = \"{d}\"")).is_ok(),
+                "{d}"
+            );
+        }
     }
 
     #[test]

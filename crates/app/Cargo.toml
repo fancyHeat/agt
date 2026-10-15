@@ -23,3 +23,10 @@ tracing-appender = "0.2"
 tray-icon = "0.26"
 velopack = "1.2"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+[features]
+# Optional STT engines/backends; see agt-stt's Cargo.toml and docs/benchmarks.md.
+cuda = ["agt-stt/cuda"]
+whisper = ["agt-stt/whisper"]
+whisper-vulkan = ["agt-stt/whisper-vulkan"]
+whisper-metal = ["agt-stt/whisper-metal"]
