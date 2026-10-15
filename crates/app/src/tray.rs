@@ -1,17 +1,22 @@
-//! Tray icon: a status line, a polish on/off line, "Copy last transcript", "Open config
-//! folder" and "Quit".
+//! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, "Copy last
+//! transcript", "Update now", "Open config folder" and "Quit".
 
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
 };
 
+/// Label of the "Update now" item when it's idle.
+pub const UPDATE_NOW: &str = "Update now";
+
 pub struct Tray {
     icon: TrayIcon,
     title: String,
     status: MenuItem,
     copy_last_item: MenuItem,
+    update_item: MenuItem,
     pub copy_last: MenuId,
+    pub update: MenuId,
     pub open_config: MenuId,
     pub quit: MenuId,
 }
@@ -19,18 +24,25 @@ pub struct Tray {
 impl Tray {
     /// `config_error`: shown as a disabled menu line so a broken config is noticeable.
     /// `polish`: a disabled info line, e.g. "Polish: off".
+    /// `installed`: whether this is a Velopack install (else "Update now" is disabled).
     pub fn new(
         version: &str,
         config_error: bool,
         polish: &str,
+        installed: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let title = format!("AGT {version}");
         let title_item = MenuItem::new(&title, false, None);
         let status = MenuItem::new("Starting...", false, None);
-        let warning = MenuItem::new("Config error (updates off) - see log", false, None);
+        let warning = MenuItem::new("Config error (auto-updates off) - see log", false, None);
         let polish = MenuItem::new(polish, false, None);
         // Recovery path when a paste failed; enabled once there is a transcript.
         let copy_last = MenuItem::new("Copy last transcript", false, None);
+        let update = if installed {
+            MenuItem::new(UPDATE_NOW, true, None)
+        } else {
+            MenuItem::new("Update now (not installed)", false, None)
+        };
         let open_config = MenuItem::new("Open config folder", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::with_items(&[
@@ -42,7 +54,7 @@ impl Tray {
         if config_error {
             menu.append(&warning)?;
         }
-        menu.append_items(&[&copy_last, &open_config, &quit])?;
+        menu.append_items(&[&copy_last, &update, &open_config, &quit])?;
 
         let builder = TrayIconBuilder::new()
             .with_tooltip(&title)
@@ -59,6 +71,8 @@ impl Tray {
             status,
             copy_last: copy_last.id().clone(),
             copy_last_item: copy_last,
+            update: update.id().clone(),
+            update_item: update,
             open_config: open_config.id().clone(),
             quit: quit.id().clone(),
         })
@@ -68,6 +82,12 @@ impl Tray {
         if self.copy_last_item.is_enabled() != enabled {
             self.copy_last_item.set_enabled(enabled);
         }
+    }
+
+    /// Shows update progress or a result on the "Update now" item; clickable only when idle.
+    pub fn set_update(&self, text: &str, enabled: bool) {
+        self.update_item.set_text(text);
+        self.update_item.set_enabled(enabled);
     }
 
     /// Shows `status` in the menu and the tooltip.

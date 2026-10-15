@@ -9,14 +9,15 @@ mod update;
 use agt_core::{Config, config::OverlayPosition, paths};
 use std::{
     fs::{File, TryLockError},
+    thread,
     time::Instant,
 };
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
-use velopack::{UpdateManager, VelopackApp};
+use velopack::{UpdateManager, VelopackApp, VelopackAsset};
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::WindowId,
 };
 
@@ -28,6 +29,16 @@ enum AppEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Pipeline(pipeline::Event),
+    Update(UpdateEvent),
+}
+
+/// Progress of an "Update now" check, from its worker thread.
+#[derive(Debug)]
+enum UpdateEvent {
+    /// Found this version; downloading it.
+    Downloading(String),
+    /// The update ready to apply (`None`: up to date), or the error.
+    Done(Result<Option<VelopackAsset>, String>),
 }
 
 fn main() {
@@ -102,7 +113,10 @@ fn main() {
 
     let mut app = App {
         tray: None,
+        proxy: event_loop.create_proxy(),
         updater,
+        dictating: false,
+        restart_with: None,
         config_error,
         polish_info,
         status: status.map(|s| s.to_string()),
@@ -147,7 +161,13 @@ fn acquire_instance_lock() -> Option<Option<File>> {
 
 struct App {
     tray: Option<tray::Tray>,
+    proxy: EventLoopProxy<AppEvent>,
+    /// `None` if this isn't a Velopack install.
     updater: Option<UpdateManager>,
+    /// Recording, or a recording not yet pasted: an update restart waits for this to clear.
+    dictating: bool,
+    /// A downloaded update to restart into once `dictating` clears ("Update now").
+    restart_with: Option<VelopackAsset>,
     config_error: bool,
     /// Tray line about LLM polish.
     polish_info: String,
@@ -167,7 +187,8 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
-            match tray::Tray::new(VERSION, self.config_error, &self.polish_info) {
+            let installed = self.updater.is_some();
+            match tray::Tray::new(VERSION, self.config_error, &self.polish_info, installed) {
                 Ok(t) => {
                     if let Some(s) = &self.status {
                         t.set_status(s);
@@ -190,16 +211,29 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        // Already restarting into an update (or quitting): don't hand Velopack a second job.
+        if event_loop.exiting() {
+            return;
+        }
         if let AppEvent::Pipeline(e) = &event {
             match e {
                 pipeline::Event::Status(s, failures) => {
                     // Overlay first: it's what the user is looking at on key down.
                     self.update_overlay(s, *failures);
+                    self.dictating = matches!(
+                        s,
+                        pipeline::Status::Recording | pipeline::Status::Transcribing
+                    );
                     let s = s.to_string();
                     if let Some(tray) = &self.tray {
                         tray.set_status(&s);
                     }
                     self.status = Some(s);
+                    if !self.dictating
+                        && let Some(asset) = self.restart_with.take()
+                    {
+                        self.restart_into(asset, event_loop);
+                    }
                 }
                 pipeline::Event::Rejected => {
                     if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
@@ -221,12 +255,29 @@ impl ApplicationHandler<AppEvent> for App {
                     p.copy_last_transcript();
                 }
             }
+            AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if e.id == tray.quit => {
                 if let Some(um) = &self.updater {
                     update::apply_pending_on_exit(um);
                 }
                 event_loop.exit();
+            }
+            AppEvent::Update(UpdateEvent::Downloading(version)) => {
+                tray.set_update(&format!("Downloading update {version}..."), false);
+            }
+            AppEvent::Update(UpdateEvent::Done(Ok(Some(asset)))) => {
+                self.restart_into(asset, event_loop)
+            }
+            AppEvent::Update(UpdateEvent::Done(Ok(None))) => {
+                tray.set_update(
+                    &format!("{} - up to date ({VERSION})", tray::UPDATE_NOW),
+                    true,
+                );
+            }
+            AppEvent::Update(UpdateEvent::Done(Err(e))) => {
+                tracing::error!("update failed: {e}");
+                tray.set_update("Update failed - see log", true);
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
             AppEvent::Menu(_) | AppEvent::Pipeline(_) => {}
@@ -257,6 +308,57 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
+    /// "Update now": restarts into an already downloaded update, else checks and downloads on
+    /// a worker thread, which reports back as [`AppEvent::Update`].
+    fn update_now(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(um), Some(tray)) = (&self.updater, &self.tray) else {
+            return;
+        };
+        if let Some(asset) = um.get_update_pending_restart() {
+            return self.restart_into(asset, event_loop);
+        }
+        tray.set_update("Checking for updates...", false);
+        let (um, proxy) = (um.clone(), self.proxy.clone());
+        let spawned = thread::Builder::new()
+            .name("update-now".into())
+            .spawn(move || {
+                let result = update::check_now(&um, |version| {
+                    let _ = proxy
+                        .send_event(AppEvent::Update(UpdateEvent::Downloading(version.into())));
+                });
+                let result = result.map_err(|e| e.to_string());
+                let _ = proxy.send_event(AppEvent::Update(UpdateEvent::Done(result)));
+            });
+        if let Err(e) = spawned {
+            tracing::error!("cannot start update check: {e}");
+            tray.set_update("Update failed - see log", true);
+        }
+    }
+
+    /// Applies `asset` and exits so Velopack restarts into it, or, mid-dictation, waits until
+    /// the pipeline is idle (see `dictating`) so a recording or pending paste isn't lost.
+    fn restart_into(&mut self, asset: VelopackAsset, event_loop: &ActiveEventLoop) {
+        let (Some(um), Some(tray)) = (&self.updater, &self.tray) else {
+            return;
+        };
+        if self.dictating {
+            tray.set_update(
+                &format!("Restarting into {} after dictation...", asset.Version),
+                false,
+            );
+            self.restart_with = Some(asset);
+            return;
+        }
+        tray.set_update(&format!("Restarting into {}...", asset.Version), false);
+        match update::apply_and_restart(um, &asset) {
+            Ok(()) => event_loop.exit(),
+            Err(e) => {
+                tracing::error!("failed to start updater: {e}");
+                tray.set_update("Update failed - see log", true);
+            }
+        }
+    }
+
     fn update_overlay(&mut self, status: &pipeline::Status, failures: u64) {
         use agt_overlay::Mode;
         use pipeline::Status;

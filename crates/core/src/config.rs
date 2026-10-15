@@ -97,7 +97,8 @@ enabled = true
 position = "bottom"
 
 [update]
-# Check GitHub Releases for updates on startup and periodically.
+# Check GitHub Releases for updates on startup and periodically (tray "Update now" works
+# either way).
 enabled = true
 # Minutes between update checks (minimum 30).
 check_interval_minutes = 240
