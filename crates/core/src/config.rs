@@ -143,6 +143,12 @@ pub struct Config {
     pub polish: PolishConfig,
     pub overlay: OverlayConfig,
     pub update: UpdateConfig,
+    /// Why `[polish]` couldn't be used (see [`Config::parse`]); polish is then off.
+    #[serde(skip)]
+    pub polish_error: Option<String>,
+    /// Something about `[polish]` worth a warning in the log (see [`Config::parse`]).
+    #[serde(skip)]
+    pub polish_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -471,6 +477,8 @@ impl Default for Config {
             polish: PolishConfig::default(),
             overlay: OverlayConfig::default(),
             update: UpdateConfig::default(),
+            polish_error: None,
+            polish_notice: None,
         }
     }
 }
@@ -551,8 +559,52 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
+    /// Parses the file. `[polish]` is parsed on its own: a problem there (an unknown key, or
+    /// a value this version doesn't know, such as a provider added in a later release) only
+    /// turns polish off ([`Config::polish_error`] says why) and keeps the rest of the
+    /// user's settings. Anything wrong elsewhere fails the whole file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(ConfigError::Parse)
+        let mut table: toml::Table = toml::from_str(text).map_err(ConfigError::Parse)?;
+        let polish = table.remove("polish");
+        let mut config: Self = toml::Value::Table(table)
+            .try_into()
+            .map_err(ConfigError::Parse)?;
+        if let Some(mut polish) = polish {
+            // Written before `s1-mini` became the default: `base_url` without a provider
+            // meant the OpenAI-compatible one (a server the user runs).
+            if let Some(t) = polish.as_table_mut()
+                && !t.contains_key("provider")
+                && t.get("base_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| !u.trim().is_empty())
+            {
+                t.insert("provider".into(), "openai".into());
+                config.polish_notice = Some(
+                    "[polish] has base_url but no provider: using provider = \"openai\" (write it into config.toml to silence this)".into(),
+                );
+            }
+            match polish.try_into::<PolishConfig>() {
+                Ok(p) => {
+                    let ignored = p.provider == PolishProvider::S1Mini
+                        && (!p.base_url.is_empty()
+                            || !p.model.is_empty()
+                            || !p.api_key.is_empty()
+                            || !p.api_key_env.is_empty());
+                    if ignored {
+                        config.polish_notice = Some(
+                            "[polish] provider = \"s1-mini\" ignores base_url, model and api_key*; for your own server use provider = \"openai\"".into(),
+                        );
+                    }
+                    config.polish = p;
+                }
+                Err(e) => {
+                    config.polish = PolishConfig::default();
+                    config.polish.enabled = false;
+                    config.polish_error = Some(format!("[polish]: {}", e.message().trim()));
+                }
+            }
+        }
+        Ok(config)
     }
 
     /// Load `path`, writing [`DEFAULT_CONFIG`] there first if it does not exist.
@@ -607,6 +659,65 @@ mod tests {
     fn unknown_keys_are_rejected() {
         assert!(Config::parse("typo = 1").is_err());
         assert!(Config::parse("[stt]\ntypo = 1").is_err());
+        // ...except in [polish], where they only turn polish off (see below).
+        assert!(polish_error("[polish]\ntypo = 1"));
+    }
+
+    /// Parses, and says whether `[polish]` was rejected (with polish then off).
+    fn polish_error(text: &str) -> bool {
+        let c = Config::parse(text).unwrap();
+        assert!(c.polish_error.is_none() || !c.polish.enabled);
+        c.polish_error.is_some()
+    }
+
+    /// A [polish] value this version doesn't know (e.g. a provider from a newer release)
+    /// turns polish off and keeps everything else, including updates.
+    #[test]
+    fn bad_polish_section_only_disables_polish() {
+        let text = "[hotkey]\nkey = \"F13\"\nmin_hold_ms = 300\n\n[stt]\ndevice = \"cpu\"\n\n[polish]\nenabled = true\nprovider = \"something-unknown\"\n\n[overlay]\nposition = \"top\"\n\n[update]\nenabled = false\n";
+        let c = Config::parse(text).unwrap();
+        assert!(!c.polish.enabled);
+        let err = c.polish_error.as_deref().unwrap();
+        assert!(
+            err.contains("[polish]") && err.contains("something-unknown"),
+            "{err}"
+        );
+        assert_eq!((c.hotkey.key.as_str(), c.hotkey.min_hold_ms), ("F13", 300));
+        assert_eq!(c.stt.device, Device::Cpu);
+        assert_eq!(c.overlay.position, OverlayPosition::Top);
+        assert!(!c.update.enabled);
+        // A good [polish] has no error; a broken file elsewhere still fails as a whole.
+        assert_eq!(
+            Config::parse("[polish]\nenabled = true")
+                .unwrap()
+                .polish_error,
+            None
+        );
+        assert!(Config::parse("[polish]\nprovider = \"x\"\n[stt]\ntypo = 1").is_err());
+        assert!(Config::parse("polish = 3").unwrap().polish_error.is_some());
+    }
+
+    #[test]
+    fn base_url_without_provider_means_openai() {
+        let c = Config::parse("[polish]\nenabled = true\nbase_url = \"http://localhost:8080/v1\"")
+            .unwrap();
+        assert_eq!(c.polish.provider, PolishProvider::OpenAi);
+        assert_eq!(c.polish.base_url(), "http://localhost:8080/v1");
+        assert!(c.polish_notice.is_some());
+        let c = Config::parse("[polish]\nprovider = \"s1-mini\"\nmodel = \"x\"").unwrap();
+        assert!(c.polish_notice.unwrap().contains("ignores"));
+        assert!(
+            Config::parse("[polish]\nenabled = true")
+                .unwrap()
+                .polish_notice
+                .is_none()
+        );
+        assert!(
+            Config::parse(DEFAULT_CONFIG)
+                .unwrap()
+                .polish_notice
+                .is_none()
+        );
     }
 
     #[test]
@@ -672,8 +783,8 @@ mod tests {
         );
         let c = Config::parse("[polish]\nprovider = \"anthropic\"\ntimeout_ms = 1000\n").unwrap();
         assert_eq!(c.polish.timeout(0), std::time::Duration::from_millis(1000));
-        assert!(Config::parse("[polish]\nprovider = \"gemini\"").is_err());
-        assert!(Config::parse("[polish]\nstyle = \"pirate\"").is_err());
+        assert!(polish_error("[polish]\nprovider = \"gemini\""));
+        assert!(polish_error("[polish]\nstyle = \"pirate\""));
     }
 
     #[test]
@@ -696,9 +807,9 @@ mod tests {
         );
         assert_eq!(c.s1_mini.device, S1Device::Cpu);
         // Values S1-mini wasn't trained on are config errors, not garbage output.
-        assert!(Config::parse("[polish.s1-mini]\nstyling = \"pirate\"").is_err());
-        assert!(Config::parse("[polish.s1-mini]\ncontext = \"chat\"").is_err());
-        assert!(Config::parse("[polish.s1-mini]\ntypo = 1").is_err());
+        assert!(polish_error("[polish.s1-mini]\nstyling = \"pirate\""));
+        assert!(polish_error("[polish.s1-mini]\ncontext = \"chat\""));
+        assert!(polish_error("[polish.s1-mini]\ntypo = 1"));
         // Settings for the other providers don't leak into the managed server.
         let c = Config::parse(
             "[polish]\nprovider = \"s1-mini\"\nbase_url = \"http://x\"\napi_key = \"k\"\nmodel = \"m\"",

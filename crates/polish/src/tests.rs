@@ -208,10 +208,36 @@ fn unreachable_server_falls_back_quickly() {
         .local_addr()
         .unwrap()
         .port();
-    let cfg = openai(&format!("http://127.0.0.1:{port}"));
-    let (text, outcome) = polish_or_raw(load_remote(&cfg).unwrap().as_ref(), RAW, &cfg);
+    let cfg = openai(&format!("http://localhost:{port}"));
+    let p = Llm::new(&cfg, Api::OpenAi, &cfg.base_url, None);
+    // The first request finds out (on Windows that takes ~2 s per address)...
+    let (text, outcome) = polish_or_raw(&p, RAW, &cfg);
     assert_eq!(text, RAW);
     assert!(matches!(outcome, Outcome::Fallback(_)));
+    p.reach.wait_for_check();
+    assert!(p.reach.is_down());
+    // ...later ones don't wait at all.
+    let t = Instant::now();
+    let (text, outcome) = polish_or_raw(&p, RAW, &cfg);
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(text, RAW);
+    let Outcome::Fallback(why) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(why.contains("unreachable"), "{why}");
+    // Once something listens again, a request's background check notices.
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
+        return; // the port was taken meanwhile; nothing more to test
+    };
+    p.reach.wait_for_check();
+    let _ = polish_or_raw(&p, RAW, &cfg);
+    p.reach.wait_for_check();
+    assert!(!p.reach.is_down());
+    drop(listener);
 }
 
 #[test]

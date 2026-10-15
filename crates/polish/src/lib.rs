@@ -22,7 +22,10 @@ use agt_core::{
     polish::{PolishCtx, Polisher, Result},
 };
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+mod reach;
+use reach::Reach;
 
 pub use guard::{Outcome, polish_or_raw};
 pub use managed::{Env, Status};
@@ -98,6 +101,7 @@ struct Llm {
     url: String,
     key: Option<String>,
     agent: ureq::Agent,
+    reach: Arc<Reach>,
 }
 
 impl Llm {
@@ -124,6 +128,7 @@ impl Llm {
             api,
             key,
             agent,
+            reach: Arc::new(Reach::new(base)),
         }
     }
 }
@@ -154,6 +159,9 @@ const WARMUP_TEXT: &str = "um so this is uh a test";
 
 impl Llm {
     fn request(&self, text: &str, timeout: Duration) -> Result<String> {
+        // A server known to be unreachable: fail now instead of after the deadline (on
+        // Windows even a refused local connection takes ~2 s of retries).
+        self.reach.ready()?;
         let p = prompt::build(&self.cfg, text);
         // Cleaned text is about as long as the input. UTF-8 bytes / 2 leaves ~2x headroom for
         // English (~4 bytes per token) and still enough for CJK (3 bytes per char, ~1 token
@@ -205,7 +213,9 @@ impl Llm {
             }
         };
         tracing::trace!("polish request to {}: {body}", self.url);
-        let mut resp = req.send(body.to_string())?;
+        let mut resp = req
+            .send(body.to_string())
+            .inspect_err(|_| self.reach.check())?;
         let status = resp.status();
         let body = resp.body_mut().read_to_string()?;
         if !status.is_success() {

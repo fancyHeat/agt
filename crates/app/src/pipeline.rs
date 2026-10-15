@@ -299,6 +299,13 @@ pub fn start(
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
 /// so a local server loads its model before the first dictation. Returns the tray line.
 fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, String) {
+    if let Some(e) = &config.polish_error {
+        tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
+        return (None, "Polish: off (config error, see log)".into());
+    }
+    if let Some(notice) = &config.polish_notice {
+        tracing::warn!("{notice}");
+    }
     if !config.polish.enabled {
         return (None, "Polish: off".into());
     }
