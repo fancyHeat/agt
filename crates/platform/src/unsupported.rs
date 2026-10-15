@@ -32,6 +32,10 @@ pub fn key_down(_key: Key) -> Option<bool> {
     None
 }
 
+pub fn foreground_window() -> Option<usize> {
+    None
+}
+
 pub fn snapshot_clipboard() -> Result<ClipboardSnapshot, Error> {
     Err(format!("clipboard access {MSG}").into())
 }

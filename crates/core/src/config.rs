@@ -83,6 +83,13 @@ timeout_per_word_ms = 15
 # Transcripts with fewer words than this are pasted as they are.
 min_words = 4
 
+[overlay]
+# Show a small bar with a live waveform while recording and an animation while transcribing.
+# It never takes focus or catches clicks.
+enabled = true
+# "bottom" or "top" of the screen with the focused window (horizontally centered).
+position = "bottom"
+
 [update]
 # Check GitHub Releases for updates on startup and periodically.
 enabled = true
@@ -102,6 +109,7 @@ pub struct Config {
     pub stt: SttConfig,
     pub paste: PasteConfig,
     pub polish: PolishConfig,
+    pub overlay: OverlayConfig,
     pub update: UpdateConfig,
 }
 
@@ -292,6 +300,29 @@ impl std::fmt::Debug for PolishConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct OverlayConfig {
+    pub enabled: bool,
+    pub position: OverlayPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayPosition {
+    Bottom,
+    Top,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: OverlayPosition::Bottom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
     pub enabled: bool,
     check_interval_minutes: u64,
@@ -306,6 +337,7 @@ impl Default for Config {
             stt: SttConfig::default(),
             paste: PasteConfig::default(),
             polish: PolishConfig::default(),
+            overlay: OverlayConfig::default(),
             update: UpdateConfig::default(),
         }
     }
@@ -452,6 +484,14 @@ mod tests {
         assert_eq!(c.stt.precision, Precision::Fp32);
         assert!(Config::parse("[stt]\ndevice = \"gpu\"").is_err());
         assert!(Config::parse("[stt]\nengine = \"whisper\"").is_err());
+    }
+
+    #[test]
+    fn overlay_settings() {
+        let c = Config::parse("[overlay]\nenabled = false\nposition = \"top\"\n").unwrap();
+        assert!(!c.overlay.enabled);
+        assert_eq!(c.overlay.position, OverlayPosition::Top);
+        assert!(Config::parse("[overlay]\nposition = \"left\"").is_err());
     }
 
     #[test]

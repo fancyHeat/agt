@@ -29,9 +29,9 @@ use windows_sys::Win32::{
             VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
-            PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+            CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, HC_ACTION, HHOOK,
+            KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+            UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
         },
     },
 };
@@ -151,6 +151,11 @@ pub fn start_hotkey(
     let thread_id = rx.recv().map_err(|_| "hotkey thread died")??;
     tracing::info!("hotkey: hold {} to dictate", key.name);
     Ok(HotkeyHandle { thread_id })
+}
+
+pub fn foreground_window() -> Option<usize> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    (!hwnd.is_null()).then_some(hwnd as usize)
 }
 
 pub fn key_down(key: Key) -> Option<bool> {

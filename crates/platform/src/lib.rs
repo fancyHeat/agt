@@ -138,6 +138,12 @@ pub fn key_down(key: Key) -> Option<bool> {
     imp::key_down(key)
 }
 
+/// Identifies the window that has keyboard focus (where a paste would go), if known. Only
+/// meant for comparing: "is it still the same window?".
+pub fn foreground_window() -> Option<usize> {
+    imp::foreground_window()
+}
+
 /// A saved copy of the clipboard, to put back after pasting.
 pub struct ClipboardSnapshot(imp::ClipboardSnapshot);
 

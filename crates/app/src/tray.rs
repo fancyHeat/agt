@@ -1,4 +1,5 @@
-//! Tray icon: a status line, a polish on/off line, "Open config folder" and "Quit".
+//! Tray icon: a status line, a polish on/off line, "Copy last transcript", "Open config
+//! folder" and "Quit".
 
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -9,6 +10,8 @@ pub struct Tray {
     icon: TrayIcon,
     title: String,
     status: MenuItem,
+    copy_last_item: MenuItem,
+    pub copy_last: MenuId,
     pub open_config: MenuId,
     pub quit: MenuId,
 }
@@ -26,6 +29,8 @@ impl Tray {
         let status = MenuItem::new("Starting...", false, None);
         let warning = MenuItem::new("Config error (updates off) - see log", false, None);
         let polish = MenuItem::new(polish, false, None);
+        // Recovery path when a paste failed; enabled once there is a transcript.
+        let copy_last = MenuItem::new("Copy last transcript", false, None);
         let open_config = MenuItem::new("Open config folder", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::with_items(&[
@@ -37,7 +42,7 @@ impl Tray {
         if config_error {
             menu.append(&warning)?;
         }
-        menu.append_items(&[&open_config, &quit])?;
+        menu.append_items(&[&copy_last, &open_config, &quit])?;
 
         let builder = TrayIconBuilder::new()
             .with_tooltip(&title)
@@ -52,9 +57,17 @@ impl Tray {
             icon: builder.build()?,
             title,
             status,
+            copy_last: copy_last.id().clone(),
+            copy_last_item: copy_last,
             open_config: open_config.id().clone(),
             quit: quit.id().clone(),
         })
+    }
+
+    pub fn set_copy_enabled(&self, enabled: bool) {
+        if self.copy_last_item.is_enabled() != enabled {
+            self.copy_last_item.set_enabled(enabled);
+        }
     }
 
     /// Shows `status` in the menu and the tooltip.
