@@ -10,6 +10,9 @@
 //!   and are pasted in order (nothing is dropped). Long recordings are chunked by `agt-stt`.
 //!   With `polish.enabled`, each transcript is then cleaned up by an LLM (`agt-polish`),
 //!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted.
+//! - `permissions` (macOS, only while something is missing): asks for the Microphone, Input
+//!   Monitoring and Accessibility permissions at start-up, then re-checks every
+//!   [`PERMISSION_POLL`] until all are granted, so no restart is needed.
 //! - `paste`: saves the clipboard when a recording starts (on a helper thread, with a
 //!   deadline, so a hung clipboard owner can't block pasting), pastes, and restores the
 //!   clipboard `paste.restore_clipboard_ms` later. If that save is what keeps the clipboard
@@ -25,7 +28,9 @@ use agt_core::{
     polish::Polisher,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
-use agt_platform::{ClipboardSnapshot, HotkeyEvent, HotkeyHandle, HotkeyReset, Key, PasteToken};
+use agt_platform::{
+    ClipboardSnapshot, HotkeyEvent, HotkeyHandle, HotkeyReset, Key, PasteToken, Permission,
+};
 use agt_polish::Outcome;
 use std::{
     fmt,
@@ -48,6 +53,9 @@ pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 /// what they meant to dictate (at most ~250 ms of extra audio). The hook is then re-installed.
 const RELEASE_POLL: Duration = Duration::from_millis(250);
 
+/// While a permission is missing (macOS), how often it's checked again.
+const PERMISSION_POLL: Duration = Duration::from_secs(1);
+
 /// How long a paste may wait for the clipboard snapshot that started at key down.
 const SNAPSHOT_WAIT: Duration = Duration::from_millis(100);
 
@@ -64,6 +72,8 @@ pub enum Status {
     Recording,
     Transcribing,
     Error(String),
+    /// Privacy permissions the user still has to grant (macOS).
+    NeedsPermission(Vec<Permission>),
 }
 
 impl fmt::Display for Status {
@@ -75,6 +85,11 @@ impl fmt::Display for Status {
             Status::Recording => write!(f, "Recording..."),
             Status::Transcribing => write!(f, "Transcribing..."),
             Status::Error(e) => write!(f, "Error: {e}"),
+            Status::NeedsPermission(missing) => write!(
+                f,
+                "Needs permission: {} (System Settings > Privacy & Security)",
+                list(missing)
+            ),
         }
     }
 }
@@ -105,6 +120,8 @@ struct HubState {
     pending: usize,
     /// Latest microphone/paste error, cleared by the next successful dictation.
     error: Option<String>,
+    /// Permissions not granted yet (macOS); shown until they are.
+    missing: Vec<Permission>,
     /// How many times `error` was set: tells a new failure from a still-shown old one.
     failures: u64,
     last: Option<Status>,
@@ -132,6 +149,8 @@ impl Hub {
             Status::Recording
         } else if s.pending > 0 {
             Status::Transcribing
+        } else if !s.missing.is_empty() {
+            Status::NeedsPermission(s.missing.clone())
         } else {
             match (&s.engine, &s.error) {
                 (Engine::Loading(what), _) => Status::Loading(what.clone()),
@@ -161,6 +180,10 @@ impl Hub {
 
     fn engine_failed(&self) -> bool {
         matches!(self.state.lock().unwrap().engine, Engine::Failed(_))
+    }
+
+    fn missing(&self, p: Permission) -> bool {
+        self.state.lock().unwrap().missing.contains(&p)
     }
 }
 
@@ -231,12 +254,15 @@ pub fn start(
             recording: false,
             pending: 0,
             error: None,
+            missing: Vec::new(),
             failures: 0,
             last: None,
         })),
         notify: Arc::new(notify),
     };
     let key = Key::parse(&config.hotkey.key)?;
+    // Before the audio thread starts: it doesn't open the microphone without the permission.
+    watch_permissions(&hub);
 
     let (to_audio, audio_rx) = mpsc::channel::<HotkeyEvent>();
     let hotkey = agt_platform::start_hotkey(key, move |ev| {
@@ -309,6 +335,41 @@ fn load_polisher(config: &Config) -> (Option<Arc<dyn Polisher>>, String) {
     }
 }
 
+/// macOS: asks for whatever permission is missing (the system prompts appear once each), shows
+/// it in the status line and re-checks every [`PERMISSION_POLL`] until everything is granted.
+/// Nothing to do on Windows.
+fn watch_permissions(hub: &Hub) {
+    let missing = agt_platform::missing_permissions();
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!("missing permissions: {}; asking for them", list(&missing));
+    agt_platform::request_permissions(&missing);
+    hub.update(|s| s.missing = missing.clone());
+    let hub = hub.clone();
+    spawn("permissions", move || {
+        let mut last = missing;
+        while !last.is_empty() {
+            thread::sleep(PERMISSION_POLL);
+            let now = agt_platform::missing_permissions();
+            if now != last {
+                if now.is_empty() {
+                    tracing::info!("all permissions granted");
+                } else {
+                    tracing::info!("still missing permissions: {}", list(&now));
+                }
+                hub.update(|s| s.missing = now.clone());
+                last = now;
+            }
+        }
+    });
+}
+
+fn list(permissions: &[Permission]) -> String {
+    let names: Vec<String> = permissions.iter().map(ToString::to_string).collect();
+    names.join(", ")
+}
+
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
     thread::Builder::new()
         .name(name.into())
@@ -376,7 +437,11 @@ struct AudioThread {
 impl AudioThread {
     fn run(self, events: Receiver<HotkeyEvent>, level: Level) {
         let mut recorder = Recorder::new(self.config.audio.keep_mic_open, level);
-        if let Err(e) = recorder.prepare() {
+        // Without the Microphone permission (macOS) the stream would be built on a device
+        // that delivers silence; it's built on the first recording after the grant instead.
+        if self.hub.missing(Permission::Microphone) {
+            tracing::info!("microphone permission not granted yet; not opening the microphone");
+        } else if let Err(e) = recorder.prepare() {
             tracing::warn!("microphone not available yet: {e}");
         }
         let mut down_at: Option<Instant> = None;
@@ -461,6 +526,15 @@ impl AudioThread {
             }
             tracing::info!(
                 "{} pressed but the model isn't ready; ignoring",
+                self.key.name
+            );
+            self.hub.reject();
+            return None;
+        }
+        if self.hub.missing(Permission::Microphone) {
+            // macOS would record silence. The status line already says what to do.
+            tracing::info!(
+                "{} pressed but the Microphone permission isn't granted; ignoring",
                 self.key.name
             );
             self.hub.reject();
@@ -715,7 +789,7 @@ fn set_clipboard_retrying<T>(
     set()
 }
 
-/// Whether Ctrl+V may be sent. Between key release and paste there can be seconds
+/// Whether the paste keystroke may be sent. Between key release and paste there can be seconds
 /// (transcription, LLM polish, a busy clipboard), and the user may have switched to another
 /// app meanwhile: the dictation must not land there. So only paste if the window that had
 /// focus at release (`at_release`) still has it (`now`; a `None` now means focus is in
@@ -861,7 +935,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
                 let result = match set {
                     None => Err(PasteError::WindowChanged),
                     Some(Err(e)) => Err(PasteError::ClipboardBusy(e)),
-                    // Checked again right before Ctrl+V: setting the clipboard can take seconds.
+                    // Checked again right before pasting: setting the clipboard can take seconds.
                     Some(Ok(token)) if !may_paste(target, agt_platform::foreground_window()) => {
                         // Don't leave the user's clipboard replaced by text that went nowhere.
                         undo_clipboard(&mut saver, &token, &mut pending_restore);
@@ -968,7 +1042,8 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>) {
 enum PasteError {
     /// Another app is holding the clipboard open (or a hung app never closed it).
     ClipboardBusy(agt_platform::Error),
-    /// Ctrl+V could not be sent, typically because the focused app runs as administrator.
+    /// The paste keystroke could not be sent: on Windows typically because the focused app runs
+    /// as administrator, on macOS because AGT lacks the Accessibility permission.
     Blocked(agt_platform::Error),
     /// Pasting was delayed and the user switched windows meanwhile.
     WindowChanged,
@@ -979,6 +1054,9 @@ impl PasteError {
         let what = match self {
             PasteError::ClipboardBusy(_) => {
                 "clipboard busy (another app is holding it); not pasted"
+            }
+            PasteError::Blocked(_) if cfg!(target_os = "macos") => {
+                "paste blocked (Accessibility permission?); clipboard restored"
             }
             PasteError::Blocked(_) => "paste blocked (admin window?); clipboard restored",
             PasteError::WindowChanged => "not pasted: focus moved to another window",
@@ -991,7 +1069,7 @@ impl fmt::Display for PasteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PasteError::ClipboardBusy(e) => write!(f, "cannot put the text on the clipboard: {e}"),
-            PasteError::Blocked(e) => write!(f, "cannot send Ctrl+V: {e}"),
+            PasteError::Blocked(e) => write!(f, "cannot send the paste keystroke: {e}"),
             PasteError::WindowChanged => write!(
                 f,
                 "another window got focus since the key was released; not pasting there"
@@ -1029,6 +1107,18 @@ mod tests {
         assert_eq!(finish_text("   ", true), "");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_watch_trusts_the_hardware_state_on_macos() {
+        // The poll reads the HID state, which our injected Cmd+V never changes.
+        for name in ["RightOption", "RightCommand", "Fn", "F13"] {
+            let w = ReleaseWatch::new(Key::parse(name).unwrap(), 5);
+            assert!(w.missed(Some(false), 6), "{name}");
+            assert!(!w.missed(Some(true), 6), "{name}");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn release_watch_ignores_our_own_paste() {
         let k = |n| Key::parse(n).unwrap();
@@ -1188,6 +1278,11 @@ mod tests {
     #[test]
     fn status_text() {
         assert_eq!(Status::Ready(None).to_string(), "Ready");
+        assert_eq!(
+            Status::NeedsPermission(vec![Permission::Microphone, Permission::Accessibility])
+                .to_string(),
+            "Needs permission: Microphone, Accessibility (System Settings > Privacy & Security)"
+        );
         assert_eq!(
             Status::Ready(Some("GPU unavailable, using the CPU".into())).to_string(),
             "Ready (GPU unavailable, using the CPU)"

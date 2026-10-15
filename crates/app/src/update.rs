@@ -7,12 +7,20 @@
 //! and no API rate limit). That release's feed lists its full package plus the delta from the
 //! previous version; installs further behind fall back to the full package.
 //! Every request has a hard timeout, so a dead connection can't stall the updater thread.
+//!
+//! Testing: `AGT_UPDATE_FEED` replaces the feed with another URL or a local directory (e.g. the
+//! `Releases` folder `vpk pack` wrote), so an update can be tried without publishing.
 
 use agt_core::config::UpdateConfig;
 use std::{thread, time::Duration};
-use velopack::{HttpOptions, UpdateCheck, UpdateManager, sources::HttpSource};
+use velopack::{
+    HttpOptions, UpdateCheck, UpdateManager,
+    sources::{FileSource, HttpSource, UpdateSource},
+};
 
 const FEED_URL: &str = "https://github.com/fancyHeat/agt/releases/latest/download";
+/// Overrides [`FEED_URL`]: a URL, or a local directory (for testing updates).
+const FEED_ENV: &str = "AGT_UPDATE_FEED";
 /// Whole-request timeout (connect + transfer) for the feed and each package download.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -27,8 +35,18 @@ pub fn start(cfg: &UpdateConfig) -> Option<UpdateManager> {
         TimeoutMilliseconds: REQUEST_TIMEOUT.as_millis() as u64,
         ..Default::default()
     };
-    let source = HttpSource::new_with_options(FEED_URL, options);
-    let um = match UpdateManager::new(source, None, None) {
+    let source: Box<dyn UpdateSource> = match std::env::var(FEED_ENV) {
+        Ok(feed) if !feed.contains("://") => {
+            tracing::warn!("{FEED_ENV} is set: updates come from the directory {feed}");
+            Box::new(FileSource::new(feed))
+        }
+        Ok(feed) => {
+            tracing::warn!("{FEED_ENV} is set: updates come from {feed}");
+            Box::new(HttpSource::new_with_options(feed, options))
+        }
+        Err(_) => Box::new(HttpSource::new_with_options(FEED_URL, options)),
+    };
+    let um = match UpdateManager::new_boxed(source, None, None) {
         Ok(um) => um,
         Err(e) => {
             tracing::info!("not running from a Velopack install ({e}); updates disabled");
