@@ -190,10 +190,15 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
 /// attach to the one we were started from (output then interleaves with the shell's prompt,
 /// which doesn't wait for GUI programs; `agt stats | more` or `> file` avoids that).
 fn print_stats() {
+    // Only without a stdout already (redirected to a file or pipe, or a debug build).
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-        AttachConsole(ATTACH_PARENT_PROCESS);
+        use windows_sys::Win32::System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+        };
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
     }
     let path = paths::db_file();
     match agt_telemetry::stats::report(&path) {
