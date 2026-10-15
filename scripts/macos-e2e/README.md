@@ -17,9 +17,10 @@ signing you'd have to grant it again after every build.
 ## Permissions
 
 - The driver needs **Accessibility** (posting keyboard events). `--prompt-only` asks for it and
-  exits; turn it on in System Settings > Privacy & Security > Accessibility.
-- AGT needs Microphone, Input Monitoring and Accessibility as usual (`packaging/macos/dev-app.sh`
-  builds a signed AGT.app).
+  exits; turn it on in System Settings > Privacy & Security > Accessibility ("Device Control"
+  from macOS 27 on).
+- AGT needs Microphone and Accessibility as usual (`packaging/macos/dev-app.sh` builds a signed
+  AGT.app).
 
 Launch apps with `open` so they're their own "responsible process" for TCC.
 
