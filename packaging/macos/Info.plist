@@ -18,7 +18,7 @@
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>
     <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
+    <string>13.4</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <!-- Menu-bar app: no Dock icon or app menu. -->

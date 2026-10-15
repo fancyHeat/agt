@@ -1,6 +1,6 @@
 # AGT — Actually Good Transcription
 
-Local, fast, hold-to-talk dictation for Windows and Apple Silicon macOS, written in Rust.
+Local, fast, hold-to-talk dictation for Windows and Apple Silicon macOS (13.4+), written in Rust.
 Hold a hotkey, speak, release: the text is transcribed on-device and pasted into the focused app.
 
 > Status: Phase 1. Dictation works on Windows (hold **Right Ctrl**). On macOS the app runs
