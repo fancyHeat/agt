@@ -41,52 +41,82 @@ pub enum HotkeyEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     pub name: &'static str,
-    /// Windows virtual-key code.
+    /// Platform key code (Windows: virtual-key code).
     #[cfg_attr(not(windows), allow(dead_code))]
-    vk: u16,
+    code: u16,
+    kind: KeyKind,
 }
 
-/// Supported hotkey keys (names are case-insensitive) and their Windows virtual-key codes.
+/// How a hotkey key behaves. Platform-independent: each platform's [`KEYS`] table says which
+/// of its keys is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// A modifier passed through to apps that does nothing when held alone (Ctrl, Shift).
+    Modifier,
+    /// A modifier passed through to apps that the OS reacts to when pressed alone (Win: the
+    /// Start menu, and every key typed while holding it is a system shortcut). Only allowed
+    /// in a chord with a [`KeyKind::Modifier`]; see [`CHORD_ONLY_WHY`].
+    ChordOnly,
+    /// Not a modifier, so passing it through would act in the focused app: the hook swallows
+    /// it (F13-F24). At most one per chord.
+    Swallowed,
+}
+
+use KeyKind::{ChordOnly, Modifier, Swallowed};
+
+/// Supported hotkey keys (names are case-insensitive), their Windows virtual-key codes and
+/// kinds.
 ///
 /// - Ctrl and Shift are passed through to apps (holding them alone does nothing), and their
 ///   state can be polled to catch a release the hook missed.
-/// - Win is passed through too, but only allowed in a chord with Ctrl or Shift (see
-///   [`Hotkey::parse`]).
+/// - Win is passed through too, but only allowed in a chord with Ctrl or Shift.
 /// - F13-F24 (typically mapped to spare mouse/keyboard buttons) are swallowed: apps never
 ///   see them while AGT runs.
 ///
 /// Deliberately absent: Alt (releasing it alone opens the menu bar), and CapsLock, F1-F12,
 /// Insert, Pause (they would have to be swallowed, taking them away from apps).
-pub const KEYS: &[(&str, u16)] = &[
-    ("RightCtrl", 0xA3),
-    ("LeftCtrl", 0xA2),
-    ("RightShift", 0xA1),
-    ("LeftShift", 0xA0),
-    ("LeftWin", 0x5B),
-    ("RightWin", 0x5C),
-    ("F13", 0x7C),
-    ("F14", 0x7D),
-    ("F15", 0x7E),
-    ("F16", 0x7F),
-    ("F17", 0x80),
-    ("F18", 0x81),
-    ("F19", 0x82),
-    ("F20", 0x83),
-    ("F21", 0x84),
-    ("F22", 0x85),
-    ("F23", 0x86),
-    ("F24", 0x87),
+pub const KEYS: &[(&str, u16, KeyKind)] = &[
+    ("RightCtrl", 0xA3, Modifier),
+    ("LeftCtrl", 0xA2, Modifier),
+    ("RightShift", 0xA1, Modifier),
+    ("LeftShift", 0xA0, Modifier),
+    ("LeftWin", 0x5B, ChordOnly),
+    ("RightWin", 0x5C, ChordOnly),
+    ("F13", 0x7C, Swallowed),
+    ("F14", 0x7D, Swallowed),
+    ("F15", 0x7E, Swallowed),
+    ("F16", 0x7F, Swallowed),
+    ("F17", 0x80, Swallowed),
+    ("F18", 0x81, Swallowed),
+    ("F19", 0x82, Swallowed),
+    ("F20", 0x83, Swallowed),
+    ("F21", 0x84, Swallowed),
+    ("F22", 0x85, Swallowed),
+    ("F23", 0x86, Swallowed),
+    ("F24", 0x87, Swallowed),
 ];
 
+/// Why a [`KeyKind::ChordOnly`] key can't be the hotkey on its own (goes with [`KEYS`]).
+pub const CHORD_ONLY_WHY: &str = "on its own, a tap of Win could no longer open the Start menu and every key typed while holding it would trigger a Windows shortcut";
+
+/// An example chord for error messages (goes with [`KEYS`]).
+const CHORD_EXAMPLE: &str = "LeftCtrl+LeftWin";
+
 fn key_names() -> String {
-    KEYS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+    KEYS.iter()
+        .map(|&(n, _, kind)| match kind {
+            ChordOnly => format!("{n} (in a chord only)"),
+            _ => n.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Key {
     pub fn parse(name: &str) -> Result<Self, String> {
         KEYS.iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
-            .map(|&(name, vk)| Key { name, vk })
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(name.trim()))
+            .map(|&(name, code, kind)| Key { name, code, kind })
             .ok_or_else(|| {
                 format!(
                     "unknown key {:?}; expected one of {}",
@@ -96,19 +126,15 @@ impl Key {
             })
     }
 
+    pub fn kind(&self) -> KeyKind {
+        self.kind
+    }
+
     /// Whether the hook swallows this key: it's not a modifier, so passing it through would
     /// act in the focused app.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn swallowed(&self) -> bool {
-        !is_modifier(self.vk as u32)
-    }
-
-    fn is_win(&self) -> bool {
-        matches!(self.vk, 0x5B | 0x5C)
-    }
-
-    fn is_ctrl_or_shift(&self) -> bool {
-        matches!(self.vk, 0xA0..=0xA3)
+        self.kind == Swallowed
     }
 }
 
@@ -126,13 +152,13 @@ pub struct Hotkey {
 impl Hotkey {
     /// Parses `"RightCtrl"` or a `+`-separated chord such as `"LeftCtrl+LeftWin"` (names are
     /// case-insensitive; left and right keys are distinct). A chord has 1-3 distinct keys, at
-    /// most one of which is not a modifier (F13-F24); Win is only allowed together with Ctrl
-    /// or Shift.
+    /// most one of which is [`KeyKind::Swallowed`] (F13-F24); [`KeyKind::ChordOnly`] keys
+    /// (Win) need a [`KeyKind::Modifier`] (Ctrl, Shift) in the chord.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let names: Vec<&str> = spec.split('+').map(str::trim).collect();
         if names.iter().any(|n| n.is_empty()) {
             return Err(format!(
-                "invalid hotkey {spec:?}: expected a key name or a chord like \"LeftCtrl+LeftWin\" (keys: {})",
+                "invalid hotkey {spec:?}: expected a key name or a chord like \"{CHORD_EXAMPLE}\" (keys: {})",
                 key_names()
             ));
         }
@@ -152,14 +178,26 @@ impl Hotkey {
             }
             keys.push(key);
         }
-        if keys.iter().filter(|k| k.swallowed()).count() > 1 {
+        let of_kind = |kind| keys.iter().filter(move |k| k.kind == kind);
+        if of_kind(Swallowed).count() > 1 {
+            let names: Vec<_> = of_kind(Swallowed).map(|k| k.name).collect();
             return Err(format!(
-                "invalid hotkey {spec:?}: a chord can have only one non-modifier key (F13-F24), combined with Ctrl/Shift"
+                "invalid hotkey {spec:?}: a chord can have only one key that isn't a modifier ({})",
+                names.join(", ")
             ));
         }
-        if keys.iter().any(Key::is_win) && !keys.iter().any(Key::is_ctrl_or_shift) {
+        if let Some(k) = of_kind(ChordOnly).next()
+            && of_kind(Modifier).next().is_none()
+        {
+            let partners: Vec<_> = KEYS
+                .iter()
+                .filter(|(_, _, kind)| *kind == Modifier)
+                .map(|(n, _, _)| *n)
+                .collect();
             return Err(format!(
-                "invalid hotkey {spec:?}: Win only works in a chord with Ctrl or Shift (e.g. \"LeftCtrl+LeftWin\"); on its own, a tap of Win could no longer open the Start menu and every key typed while holding it would trigger a Windows shortcut"
+                "invalid hotkey {spec:?}: {} only works in a chord with one of {} (e.g. \"{CHORD_EXAMPLE}\"): {CHORD_ONLY_WHY}",
+                k.name,
+                partners.join(", ")
             ));
         }
         Ok(Hotkey { keys })
@@ -169,16 +207,10 @@ impl Hotkey {
         &self.keys
     }
 
-    /// Which chord key `vk` is, if any.
+    /// Which chord key the platform key `code` is, if any.
     #[cfg_attr(not(windows), allow(dead_code))]
-    fn index_of(&self, vk: u32) -> Option<usize> {
-        self.keys.iter().position(|k| k.vk as u32 == vk)
-    }
-
-    /// Whether the chord includes a Win key.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    fn has_win(&self) -> bool {
-        self.keys.iter().any(Key::is_win)
+    fn index_of(&self, code: u32) -> Option<usize> {
+        self.keys.iter().position(|k| k.code as u32 == code)
     }
 }
 
@@ -192,12 +224,6 @@ impl std::fmt::Display for Hotkey {
         }
         Ok(())
     }
-}
-
-/// Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_modifier(vk: u32) -> bool {
-    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
 }
 
 /// Keeps the global hotkey alive; dropping it removes the hook.
@@ -270,25 +296,31 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
 /// still held from a `LeftCtrl+LeftWin` chord doesn't turn it into Win+Ctrl+V). Returns once
 /// the keystrokes are queued; the target app reads the clipboard asynchronously, so wait a
 /// bit before restoring it. Fails e.g. when the focused app runs elevated.
+///
+/// To avoid that release altogether, wait until the hotkey's keys are up first (see
+/// [`paste_may_release`]).
 pub fn send_paste() -> Result<(), Error> {
-    PASTES.fetch_add(1, Ordering::SeqCst);
-    imp::send_paste()
+    // Counted before the keystrokes go out, so a poll can never see a fake release that
+    // isn't counted yet.
+    imp::send_paste(|| {
+        PASTES.fetch_add(1, Ordering::SeqCst);
+    })
 }
 
 static PASTES: AtomicU64 = AtomicU64::new(0);
 
-/// How many times [`send_paste`] has been called. With [`paste_may_release`], lets a caller
-/// tell a real release of the hotkey from our own injected key-ups.
+/// How many times [`send_paste`] released a modifier that was held down (and so could have
+/// made a hotkey key look released). With [`paste_may_release`], lets a caller tell a real
+/// release of the hotkey from our own injected key-ups.
 pub fn paste_count() -> u64 {
     PASTES.load(Ordering::SeqCst)
 }
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
-/// physically held: it injects key-ups for held Shift and Win keys, and a Ctrl-up that maps
-/// to Left Ctrl. Right Ctrl is never touched.
+/// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
+/// that maps to Left Ctrl; Right Ctrl is never touched).
 pub fn paste_may_release(key: Key) -> bool {
-    // LeftShift, RightShift, LeftCtrl, LeftWin, RightWin
-    matches!(key.vk, 0xA0..=0xA2 | 0x5B | 0x5C)
+    imp::paste_may_release(key)
 }
 
 /// Identifies the clipboard state [`set_clipboard_text`] created.
@@ -429,6 +461,11 @@ impl HoldDetector {
         }
     }
 
+    /// Whether chord key `i` is believed to be down.
+    pub(crate) fn is_down(&self, i: usize) -> bool {
+        self.down & (1 << i) != 0
+    }
+
     /// Forget any hold in progress.
     pub(crate) fn reset(&mut self) {
         self.state = Hold::Idle;
@@ -446,19 +483,15 @@ mod tests {
     #[test]
     fn parse_keys() {
         assert_eq!(Key::parse("rightctrl").unwrap().name, "RightCtrl");
-        assert_eq!(Key::parse(" F13 ").unwrap().vk, 0x7C);
+        assert_eq!(Key::parse(" F13 ").unwrap().code, 0x7C);
         assert!(Key::parse("Hyper").is_err());
         for gone in ["RightAlt", "CapsLock", "F5", "Insert", "Pause"] {
             assert!(Key::parse(gone).is_err(), "{gone} should not be allowed");
         }
         assert!(!Key::parse("LeftShift").unwrap().swallowed());
         assert!(!Key::parse("LeftWin").unwrap().swallowed());
+        assert_eq!(Key::parse("LeftWin").unwrap().kind(), ChordOnly);
         assert!(Key::parse("F24").unwrap().swallowed());
-        assert!(!paste_may_release(Key::parse("RightCtrl").unwrap()));
-        assert!(paste_may_release(Key::parse("LeftCtrl").unwrap()));
-        assert!(paste_may_release(Key::parse("RightShift").unwrap()));
-        assert!(paste_may_release(Key::parse("LeftWin").unwrap()));
-        assert!(paste_may_release(Key::parse("RightWin").unwrap()));
     }
 
     #[test]
@@ -492,13 +525,18 @@ mod tests {
         assert!(err("LeftCtrl++LeftWin").contains("chord like"));
         assert!(err("LeftCtrl+leftctrl").contains("twice"));
         assert!(err("LeftCtrl+LeftShift+LeftWin+RightCtrl").contains("at most 3"));
-        assert!(err("F13+F14").contains("only one non-modifier"));
-        assert!(err("LeftCtrl+F13+F14").contains("only one non-modifier"));
+        assert!(err("F13+F14").contains("only one key that isn't a modifier (F13, F14)"));
+        assert!(err("LeftCtrl+F13+F14").contains("only one key that isn't a modifier"));
         for win_only in ["LeftWin", "RightWin", "LeftWin+RightWin", "LeftWin+F13"] {
-            assert!(err(win_only).contains("Start menu"), "{win_only}");
+            let e = err(win_only);
+            assert!(e.contains("Start menu"), "{win_only}: {e}");
+            assert!(e.contains("one of RightCtrl, LeftCtrl"), "{win_only}: {e}");
         }
-        assert!(Hotkey::parse("LeftCtrl+LeftWin").unwrap().has_win());
-        assert!(!Hotkey::parse("LeftCtrl+F13").unwrap().has_win());
+        assert!(
+            err("Hyper").contains("LeftWin (in a chord only), RightWin (in a chord only), F13"),
+            "{}",
+            err("Hyper")
+        );
     }
 
     #[test]

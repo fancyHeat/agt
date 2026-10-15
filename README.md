@@ -35,12 +35,19 @@ clicks.
   once every key is down, in any order, and stops as soon as any of them is released; to
   dictate again, release all of them first. Win only works in a chord with Ctrl or Shift: on
   its own a tap could no longer open the Start menu, and every key typed while holding it
-  would be a Windows shortcut. AGT keeps a Win chord from opening the Start menu on release,
-  and releases a still-held Win before pasting (Win+Ctrl+V would open the sound settings).
+  would be a Windows shortcut. AGT keeps a Win chord from opening the Start menu on release.
+  If a Shift, Left Ctrl or Win hotkey key is still held when the text is ready (you let go of
+  Ctrl but not yet of Win, or are already holding the chord for the next dictation), the
+  paste waits until you release it (pastes stay in order; after 10 s it pastes anyway), so it
+  never turns into e.g. Win+Ctrl+V (the sound output panel).
 - Pressing any other non-modifier key while holding (Esc, or a shortcut like Right Ctrl+C)
   cancels the dictation; with a chord, shortcuts such as Ctrl+Win+Left/Right (switch
-  desktop) or Ctrl+Win+D still do their thing and simply cancel. Pressing another key while
-  only part of a chord is down (Ctrl+C, then Win) doesn't start a dictation either.
+  desktop) or Ctrl+Win+D still do their thing and simply cancel. Careful with
+  `LeftCtrl+LeftWin`: Ctrl+Win+Enter turns on Narrator, Ctrl+Win+O opens the on-screen
+  keyboard and Ctrl+Win+C toggles color filters (if enabled), so don't hit Enter, O or C
+  while dictating. Pressing another key while only part of a chord is down (Ctrl+C, then
+  Win) doesn't start a dictation either. On AltGr keyboard layouts, AltGr never counts as
+  Left Ctrl.
 - If the release is missed (it happened on the UAC / Ctrl+Alt+Del screen), AGT notices within
   250 ms that a Ctrl/Shift/Win hotkey key is up and finishes the dictation normally; for
   F13-F24 the stale recording is discarded on the next press.

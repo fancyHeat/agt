@@ -28,6 +28,10 @@ pub fn start_hotkey(
     Err(format!("global hotkey {MSG}").into())
 }
 
+pub fn paste_may_release(_key: Key) -> bool {
+    false
+}
+
 pub fn key_down(_key: Key) -> Option<bool> {
     None
 }
@@ -48,7 +52,7 @@ pub fn set_clipboard_text(_text: &str) -> Result<PasteToken, Error> {
     Err(format!("clipboard access {MSG}").into())
 }
 
-pub fn send_paste() -> Result<(), Error> {
+pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
     Err(format!("pasting {MSG}").into())
 }
 
