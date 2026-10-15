@@ -110,8 +110,8 @@ styling = "semi-formal"
 structure = "prose"
 # "general", or "email": lays the text out as an email (greeting line, body, sign-off).
 context = "general"
-# "auto": on the GPU (Metal on a Mac, Vulkan on Windows; ~0.6 GB of VRAM) if there is one,
-# else the CPU. "cpu": always on the CPU (slower: ~0.25 s for a short sentence).
+# "auto": on the GPU (Metal on a Mac, Vulkan on Windows; ~0.85 GB of VRAM) if there is one,
+# else the CPU. "cpu": always on the CPU (slower: ~0.5 s instead of 0.08 s for a sentence).
 device = "auto"
 
 [overlay]
