@@ -1,6 +1,6 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, HotkeyEvent, Key};
+use crate::{Error, HoldDetector, HotkeyEvent, Key, is_modifier};
 use std::{
     cell::RefCell,
     ptr::{null, null_mut},
@@ -18,7 +18,9 @@ use windows_sys::Win32::{
         LibraryLoader::GetModuleHandleW,
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::CF_UNICODETEXT,
-        Threading::GetCurrentThreadId,
+        Threading::{
+            GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        },
     },
     UI::{
         Input::KeyboardAndMouse::{
@@ -27,9 +29,9 @@ use windows_sys::Win32::{
             VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
+            CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
             PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-            WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+            WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
         },
     },
 };
@@ -37,11 +39,19 @@ use windows_sys::Win32::{
 /// `dwExtraInfo` tag on the keystrokes we synthesize, so our own hook ignores them.
 const INJECTED_MARK: usize = 0x4147_5421; // "AGT!"
 
+/// Unassigned virtual key, injected before releasing a held Alt/Win so the release doesn't
+/// open the menu bar / Start menu (the same trick AutoHotkey uses).
+const VK_MASK: u16 = 0xE8;
+
+/// Posted to the hotkey thread: re-install the hook and forget any hold.
+const WM_RESET_HOOK: u32 = WM_APP + 1;
+
 // ---------------------------------------------------------------------------------------
 // Hotkey
 
 struct HookState {
     vk: u32,
+    swallow: bool,
     detector: HoldDetector,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 }
@@ -54,10 +64,33 @@ pub struct HotkeyHandle {
     thread_id: u32,
 }
 
+#[derive(Clone)]
+pub struct HotkeyReset {
+    thread_id: u32,
+}
+
+impl HotkeyHandle {
+    pub fn resetter(&self) -> HotkeyReset {
+        HotkeyReset {
+            thread_id: self.thread_id,
+        }
+    }
+}
+
+impl HotkeyReset {
+    pub fn reset(&self) {
+        unsafe { PostThreadMessageW(self.thread_id, WM_RESET_HOOK, 0, 0) };
+    }
+}
+
 impl Drop for HotkeyHandle {
     fn drop(&mut self) {
         unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
     }
+}
+
+fn install_hook() -> HHOOK {
+    unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), GetModuleHandleW(null()), 0) }
 }
 
 pub fn start_hotkey(
@@ -68,17 +101,19 @@ pub fn start_hotkey(
     thread::Builder::new()
         .name("hotkey".into())
         .spawn(move || {
+            // Windows silently removes a low-level hook that misses LowLevelHooksTimeout; keep
+            // this thread ahead of the inference threads.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
             HOOK.with(|h| {
                 *h.borrow_mut() = Some(HookState {
                     vk: key.vk as u32,
+                    swallow: key.swallowed(),
                     detector: HoldDetector::default(),
                     on_event,
                 })
             });
             // The hook runs on this thread, inside GetMessageW; it needs this message loop.
-            let hook = unsafe {
-                SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), GetModuleHandleW(null()), 0)
-            };
+            let mut hook = install_hook();
             if hook.is_null() {
                 let _ = tx.send(Err(format!(
                     "SetWindowsHookExW failed (error {})",
@@ -89,6 +124,23 @@ pub fn start_hotkey(
             let _ = tx.send(Ok(unsafe { GetCurrentThreadId() }));
             let mut msg: MSG = unsafe { std::mem::zeroed() };
             while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
+                if msg.message == WM_RESET_HOOK {
+                    unsafe { UnhookWindowsHookEx(hook) };
+                    HOOK.with(|h| {
+                        if let Some(s) = h.borrow_mut().as_mut() {
+                            s.detector.reset();
+                        }
+                    });
+                    hook = install_hook();
+                    if hook.is_null() {
+                        tracing::error!("cannot re-install keyboard hook (error {})", unsafe {
+                            GetLastError()
+                        });
+                    } else {
+                        tracing::info!("keyboard hook re-installed");
+                    }
+                    continue;
+                }
                 unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -101,11 +153,13 @@ pub fn start_hotkey(
     Ok(HotkeyHandle { thread_id })
 }
 
-fn is_modifier(vk: u32) -> bool {
-    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
+pub fn key_down(key: Key) -> Option<bool> {
+    // A swallowed key never updates the system's key state.
+    (!key.swallowed()).then(|| vk_down(key.vk))
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let mut swallow = false;
     if code == HC_ACTION as i32 {
         let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         if kb.dwExtraInfo != INJECTED_MARK {
@@ -115,11 +169,13 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     && let Some(s) = h.as_mut()
                 {
                     let is_hotkey = kb.vkCode == s.vk;
+                    swallow = is_hotkey && s.swallow;
                     // Other modifiers don't cancel: they're part of a shortcut only together
                     // with a non-modifier key, which does cancel. (This also ignores the
                     // fake LeftCtrl that AltGr layouts send with RightAlt.)
                     if (is_hotkey || !is_modifier(kb.vkCode))
-                        && let Some(ev) = s.detector.on_key(is_hotkey, down, Instant::now())
+                        && let Some(ev) =
+                            s.detector.on_key(is_hotkey, down, kb.time, Instant::now())
                     {
                         (s.on_event)(ev);
                     }
@@ -127,7 +183,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             });
         }
     }
-    // Never swallow the key.
+    if swallow {
+        // F13-F24 hotkeys: apps never see them.
+        return 1;
+    }
+    // Ctrl/Shift hotkeys and every other key pass through.
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
@@ -136,6 +196,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 
 pub struct ClipboardSnapshot {
     formats: Vec<(u32, Vec<u8>)>,
+    /// Clipboard sequence number the snapshot corresponds to.
+    sequence: u32,
 }
 
 pub struct PasteToken {
@@ -181,6 +243,8 @@ const MAX_SNAPSHOT_BYTES: usize = 256 << 20;
 
 pub fn snapshot_clipboard() -> Result<ClipboardSnapshot, Error> {
     let _open = Open::new()?;
+    // Nobody can change the clipboard while we hold it open.
+    let sequence = unsafe { GetClipboardSequenceNumber() };
     let mut formats = Vec::new();
     let mut total = 0;
     let mut format = 0;
@@ -216,7 +280,12 @@ pub fn snapshot_clipboard() -> Result<ClipboardSnapshot, Error> {
             total >> 20
         );
     }
-    Ok(ClipboardSnapshot { formats })
+    Ok(ClipboardSnapshot { formats, sequence })
+}
+
+pub fn is_stale(snapshot: &ClipboardSnapshot) -> bool {
+    let now = unsafe { GetClipboardSequenceNumber() };
+    now != snapshot.sequence
 }
 
 /// Copies `bytes` into a new HGLOBAL and hands it to the (open) clipboard.
@@ -258,36 +327,46 @@ fn mark_transient() {
     }
 }
 
-pub fn paste_text(text: &str) -> Result<PasteToken, Error> {
+pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     let utf16: Vec<u8> = text
         .encode_utf16()
         .chain([0])
         .flat_map(u16::to_le_bytes)
         .collect();
-    let sequence = {
-        let _open = Open::new()?;
-        if unsafe { EmptyClipboard() } == 0 {
-            return Err(format!("EmptyClipboard failed (error {})", unsafe {
-                GetLastError()
-            })
-            .into());
-        }
-        set_data(CF_UNICODETEXT as u32, &utf16)?;
-        mark_transient();
-        drop(_open);
-        unsafe { GetClipboardSequenceNumber() }
-    };
+    let _open = Open::new()?;
+    if unsafe { EmptyClipboard() } == 0 {
+        return Err(format!("EmptyClipboard failed (error {})", unsafe {
+            GetLastError()
+        })
+        .into());
+    }
+    set_data(CF_UNICODETEXT as u32, &utf16)?;
+    mark_transient();
+    drop(_open);
+    Ok(PasteToken {
+        sequence: unsafe { GetClipboardSequenceNumber() },
+    })
+}
 
-    let mut inputs = Vec::with_capacity(10);
+pub fn send_paste() -> Result<(), Error> {
+    let mut inputs = Vec::with_capacity(12);
     // Modifiers that are down would change the shortcut (Ctrl+Shift+V pastes without
-    // formatting in many apps, Ctrl+Alt+V is something else); release them. This also covers a
-    // RightAlt/RightShift hotkey already held again for the next dictation (our hook ignores
+    // formatting in many apps, Ctrl+Alt+V is something else); release them (our hook ignores
     // these injected key-ups). A held Ctrl is harmless: we press Ctrl anyway.
-    for vk in [VK_LSHIFT, VK_RSHIFT, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN] {
-        if key_down(vk) {
-            tracing::debug!("releasing held modifier {vk:#x} before pasting");
-            inputs.push(key_input(vk, true));
-        }
+    let held: Vec<u16> = [VK_LSHIFT, VK_RSHIFT, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN]
+        .into_iter()
+        .filter(|&vk| vk_down(vk))
+        .collect();
+    if held
+        .iter()
+        .any(|vk| [VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN].contains(vk))
+    {
+        // A lone Alt/Win release would open the menu bar / Start menu: mask it.
+        inputs.extend([key_input(VK_MASK, false), key_input(VK_MASK, true)]);
+    }
+    for vk in held {
+        tracing::debug!("releasing held modifier {vk:#x} before pasting");
+        inputs.push(key_input(vk, true));
     }
     inputs.extend([
         key_input(VK_CONTROL, false),
@@ -311,10 +390,10 @@ pub fn paste_text(text: &str) -> Result<PasteToken, Error> {
         )
         .into());
     }
-    Ok(PasteToken { sequence })
+    Ok(())
 }
 
-fn key_down(vk: u16) -> bool {
+fn vk_down(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
 }
 

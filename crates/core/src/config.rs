@@ -12,9 +12,9 @@ pub const DEFAULT_CONFIG: &str = r#"# AGT configuration. Restart AGT after editi
 log_level = "info"
 
 [hotkey]
-# Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightAlt,
-# RightShift, LeftShift, RightWin, CapsLock, ScrollLock, Pause, Insert, F1-F24.
-# The key is not swallowed. Pressing any other key while holding it (e.g. Esc) cancels.
+# Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
+# LeftShift (still work normally in apps), or F13-F24 (e.g. a remapped mouse button; AGT
+# takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
 key = "RightCtrl"
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
