@@ -1,10 +1,11 @@
 # Release: push a `vX.Y.Z` tag on a commit that is on `main` and whose Cargo version is X.Y.Z.
-# preflight (checks + fmt/clippy/test) -> build (+ macOS package) -> package-windows (signs, no
-# compiling) -> publish one GitHub Release, which installed apps then update from.
+# preflight (checks + fmt/clippy/test) -> build (compiles, no secrets) -> package-windows and
+# package-macos (sign, no checkout or compiling) -> publish one GitHub Release, which installed apps
+# then update from.
 #
 # Dry run: on PRs touching this file or packaging/ the same build + package runs without signing
 # and without publishing. Via workflow_dispatch from main it also signs (when configured), still
-# without publishing; from other branches package-windows fails (the `release` environment only
+# without publishing; from other branches the package jobs fail (the `release` environment only
 # admits main and v* tags).
 name: Release
 
@@ -60,9 +61,9 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
-  # Compiles and stages the app. No environment and no `id-token`: the build scripts of every
-  # dependency run here, so nothing in this job can reach the Windows signer. macOS is packaged
-  # (and signed with its secrets) here as before; Windows is packaged in `package-windows`.
+  # Compiles and stages the app. No environment, no secrets and no `id-token`: the build scripts
+  # of every dependency run here, so nothing in this job can reach a signer. Packaging happens in
+  # `package-windows` and `package-macos`.
   build:
     needs: preflight
     strategy:
@@ -86,103 +87,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: stable
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-        if: runner.os == 'macOS'
-        with:
-          dotnet-version: 9.0.x
-      - if: runner.os == 'macOS'
-        run: dotnet tool install -g vpk --version "$VPK_VERSION"
       - run: cargo build --release --locked -p agt
 
       - name: Stage files
         run: |
-          mkdir publish && cp "target/release/${{ matrix.exe }}" publish/
+          mkdir -p stage/publish && cp "target/release/${{ matrix.exe }}" stage/publish/
           # Windows: ONNX Runtime's DirectML build imports DirectML.dll (copied next to the exe by
           # the ort build); the copy in System32 may be older than ONNX Runtime needs.
-          if [ "$RUNNER_OS" = Windows ]; then cp target/release/DirectML.dll publish/; fi
-          if [ "$IS_RELEASE" = true ] && [ "$RUNNER_OS" = macOS ]; then
-            # The previous release lets vpk build a delta package (public repo: no token needed).
-            vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --channel "$CHANNEL" -o Releases \
-              || echo "No previous release; skipping delta."
+          if [ "$RUNNER_OS" = Windows ]; then cp target/release/DirectML.dll stage/publish/; fi
+          # macOS: package-macos doesn't check out the repo, so the bundle's Info.plist (version
+          # stamped here) and the entitlements travel with the binary.
+          if [ "$RUNNER_OS" = macOS ]; then
+            mkdir stage/macos
+            sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > stage/macos/Info.plist
+            cp packaging/macos/agt.entitlements stage/macos/
           fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: runner.os == 'Windows'
         with:
-          name: publish-win-x64
-          path: publish
+          name: publish-${{ matrix.channel }}
+          path: stage
           if-no-files-found: error
-
-      - name: Check for macOS signing secrets
-        id: signing
-        if: runner.os == 'macOS'
-        env:
-          HAS_CERT: ${{ secrets.APPLE_CERT_P12_BASE64 != '' }}
-          HAS_NOTARY: ${{ secrets.APPLE_ID != '' }}
-        run: |
-          SIGN=false; NOTARIZE=false
-          if [ "$HAS_CERT" = true ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            SIGN=true; NOTARIZE="$HAS_NOTARY"
-          fi
-          echo "sign=$SIGN" >> "$GITHUB_OUTPUT"
-          echo "notarize=$NOTARIZE" >> "$GITHUB_OUTPUT"
-          echo "sign=$SIGN notarize=$NOTARIZE"
-
-      - name: Set up macOS signing keychain
-        if: steps.signing.outputs.sign == 'true'
-        env:
-          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          NOTARIZE: ${{ steps.signing.outputs.notarize }}
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/agt.keychain-db"
-          KEYCHAIN_PW="$(uuidgen)"
-          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          rm "$RUNNER_TEMP/cert.p12"
-          if [ "$NOTARIZE" = true ]; then
-            xcrun notarytool store-credentials agt-notary --apple-id "$APPLE_ID" \
-              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$KEYCHAIN"
-          fi
-          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
-
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        env:
-          SIGN: ${{ steps.signing.outputs.sign }}
-          NOTARIZE: ${{ steps.signing.outputs.notarize }}
-          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
-          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
-        run: |
-          sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > "$RUNNER_TEMP/Info.plist"
-          ARGS=(--plist "$RUNNER_TEMP/Info.plist" --signEntitlements packaging/macos/agt.entitlements)
-          if [ "$SIGN" = true ]; then
-            ARGS+=(--keychain "$KEYCHAIN" --signAppIdentity "$APPLE_SIGN_IDENTITY")
-            # A .pkg installer needs a "Developer ID Installer" identity; without it, ship only the .zip.
-            if [ -n "$APPLE_INSTALLER_IDENTITY" ]; then
-              ARGS+=(--signInstallIdentity "$APPLE_INSTALLER_IDENTITY")
-            else
-              ARGS+=(--noInst)
-            fi
-            if [ "$NOTARIZE" = true ]; then ARGS+=(--notaryProfile agt-notary); fi
-          fi
-          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
-            --packDir publish --mainExe agt --channel "$CHANNEL" --runtime "$CHANNEL" \
-            -o Releases "${ARGS[@]}"
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: runner.os == 'macOS'
-        with:
-          name: releases-${{ matrix.channel }}
-          path: Releases
 
   # Packages and signs Windows from the files `build` staged. It never checks out or compiles
   # code, so while an Azure-trusted OIDC token can be minted only pinned actions, vpk and signtool
@@ -224,15 +149,20 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: publish-win-x64
-          path: publish
+          path: stage
 
       # vpk signs every unsigned binary in --packDir, so only the expected files may be there, and
       # DirectML.dll must keep its Microsoft signature (otherwise it would get signed as ours).
       - name: Check staged files
         shell: pwsh
         run: |
-          $names = (Get-ChildItem -Recurse -Force publish | ForEach-Object Name | Sort-Object) -join ','
-          if ($names -ne 'agt.exe,DirectML.dll') { Write-Output "::error::Unexpected staged files: $names"; exit 1 }
+          $root = (Resolve-Path stage).Path
+          $names = (Get-ChildItem -Recurse -Force stage |
+            ForEach-Object { $_.FullName.Substring($root.Length + 1).Replace('\', '/') } | Sort-Object) -join ','
+          if ($names -cne 'publish,publish/agt.exe,publish/DirectML.dll') {
+            Write-Output "::error::Unexpected staged files: $names"; exit 1
+          }
+          Move-Item stage/publish publish
           $sig = Get-AuthenticodeSignature publish/DirectML.dll
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
             Write-Output "::error::DirectML.dll is not validly Microsoft-signed ($($sig.Status))"; exit 1
@@ -283,10 +213,171 @@ jobs:
           name: releases-win-x64
           path: Releases
 
+  # Packages, signs and notarizes macOS from the files `build` staged, the same way: no checkout,
+  # no compiling. The Apple credentials are secrets of the `release` environment, which this job
+  # enters on tag pushes and workflow_dispatch (never on PRs), and only the steps that need them
+  # see them. The Developer ID identity lives in a throwaway keychain that's deleted at the end.
+  package-macos:
+    needs: [preflight, build]
+    runs-on: macos-14
+    environment: ${{ github.event_name != 'pull_request' && 'release' || '' }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      CHANNEL: osx-arm64
+    steps:
+      - name: Check for macOS signing configuration
+        id: macsign
+        env:
+          # Secrets of the `release` environment (empty outside it, e.g. on PR dry runs).
+          HAS_CERT: >-
+            ${{ secrets.APPLE_CERT_P12_BASE64 != '' && secrets.APPLE_CERT_PASSWORD != ''
+            && secrets.APPLE_SIGN_IDENTITY != '' }}
+          HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+        run: |
+          SIGN=false; NOTARIZE=false
+          if [ "$HAS_CERT" = true ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            SIGN=true; NOTARIZE="$HAS_NOTARY"
+          fi
+          # Installed apps auto-update from releases, and Gatekeeper blocks anything not signed
+          # and notarized: never ship such a macOS build.
+          if [ "$IS_RELEASE" = true ] && { [ "$SIGN" != true ] || [ "$NOTARIZE" != true ]; }; then
+            echo "::error::macOS signing/notarization is not configured (secrets of the release environment: sign=$SIGN notarize=$NOTARIZE); refusing to release"
+            exit 1
+          fi
+          echo "sign=$SIGN" >> "$GITHUB_OUTPUT"
+          echo "notarize=$NOTARIZE" >> "$GITHUB_OUTPUT"
+          echo "KEYCHAIN=$RUNNER_TEMP/agt-signing.keychain-db" >> "$GITHUB_ENV"
+          echo "sign=$SIGN notarize=$NOTARIZE"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publish-osx-arm64
+          path: stage
+
+      # vpk bundles and signs everything in --packDir: only the binary may be there. The
+      # entitlements come from `build` too, so allow only the ones AGT needs (see the file).
+      - name: Check staged files
+        run: |
+          NAMES="$(cd stage && find . -mindepth 1 | sort | tr '\n' ' ')"
+          EXPECTED="./macos ./macos/Info.plist ./macos/agt.entitlements ./publish ./publish/agt "
+          if [ "$NAMES" != "$EXPECTED" ]; then echo "::error::Unexpected staged files: $NAMES"; exit 1; fi
+          ENTITLEMENTS="$(plutil -convert json -o - stage/macos/agt.entitlements | jq -r 'keys | join(" ")')"
+          if [ "$ENTITLEMENTS" != com.apple.security.device.audio-input ]; then
+            echo "::error::Unexpected entitlements: $ENTITLEMENTS"; exit 1
+          fi
+          plutil -lint stage/macos/Info.plist
+          mv stage/publish publish
+          chmod +x publish/agt # artifacts don't keep file modes
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 9.0.x
+      - run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      - name: Download previous release (delta)
+        if: env.IS_RELEASE == 'true'
+        run: |
+          # The previous release lets vpk build a delta package (public repo: no token needed).
+          vpk download github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --channel "$CHANNEL" -o Releases \
+            || echo "No previous release; skipping delta."
+
+      - name: Set up signing keychain
+        if: steps.macsign.outputs.sign == 'true'
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          NOTARIZE: ${{ steps.macsign.outputs.notarize }}
+        run: |
+          KEYCHAIN_PW="$(uuidgen)"
+          P12="$RUNNER_TEMP/agt-signing.p12"
+          trap 'rm -f "$P12"' EXIT
+          printf '%s' "$APPLE_CERT_P12_BASE64" | base64 --decode > "$P12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Only codesign (and Apple's own tools, via the partition list) may use the key.
+          security import "$P12" -P "$APPLE_CERT_PASSWORD" -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          if [ "$NOTARIZE" = true ]; then
+            xcrun notarytool store-credentials agt-notary --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$KEYCHAIN"
+          fi
+
+      - name: Package (macOS)
+        env:
+          SIGN: ${{ steps.macsign.outputs.sign }}
+          NOTARIZE: ${{ steps.macsign.outputs.notarize }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+        run: |
+          ARGS=(--plist stage/macos/Info.plist --signEntitlements stage/macos/agt.entitlements)
+          if [ "$SIGN" = true ]; then
+            # Hardened runtime, secure timestamp; with a notary profile vpk also notarizes and
+            # staples the app.
+            ARGS+=(--keychain "$KEYCHAIN" --signAppIdentity "$APPLE_SIGN_IDENTITY")
+            # A .pkg installer needs a "Developer ID Installer" identity; without it, ship only the .zip.
+            if [ -n "$APPLE_INSTALLER_IDENTITY" ]; then
+              ARGS+=(--signInstallIdentity "$APPLE_INSTALLER_IDENTITY")
+            else
+              ARGS+=(--noInst)
+            fi
+            if [ "$NOTARIZE" = true ]; then ARGS+=(--notaryProfile agt-notary); fi
+          fi
+          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
+            --packDir publish --mainExe agt --channel "$CHANNEL" --runtime "$CHANNEL" \
+            -o Releases "${ARGS[@]}"
+
+      # Check the app as a user's Mac would: signed by our team with the hardened runtime and,
+      # when notarized, accepted by Gatekeeper with the ticket stapled.
+      - name: Verify signature and notarization
+        if: steps.macsign.outputs.sign == 'true'
+        env:
+          NOTARIZE: ${{ steps.macsign.outputs.notarize }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ZIPS=(Releases/*-Portable.zip)
+          if [ "${#ZIPS[@]}" != 1 ] || [ ! -f "${ZIPS[0]}" ]; then echo "::error::No single portable zip in Releases"; exit 1; fi
+          DIR="$RUNNER_TEMP/verify"; mkdir -p "$DIR"
+          ditto -x -k "${ZIPS[0]}" "$DIR"
+          APPS=("$DIR"/*.app)
+          if [ "${#APPS[@]}" != 1 ] || [ ! -d "${APPS[0]}" ]; then echo "::error::No single .app in ${ZIPS[0]}"; exit 1; fi
+          APP="${APPS[0]}"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          INFO="$(codesign -dv --verbose=4 "$APP" 2>&1)"; echo "$INFO"
+          grep -q "^TeamIdentifier=$APPLE_TEAM_ID\$" <<<"$INFO" || { echo "::error::Not signed by team $APPLE_TEAM_ID"; exit 1; }
+          grep -q '^CodeDirectory .*flags=.*(runtime)' <<<"$INFO" || { echo "::error::Hardened runtime is off"; exit 1; }
+          grep -q '^Timestamp=' <<<"$INFO" || { echo "::error::No secure timestamp"; exit 1; }
+          if [ "$NOTARIZE" = true ]; then
+            xcrun stapler validate "$APP"
+            # spctl accepts anything when assessments are disabled, so also require the source.
+            ASSESS="$(spctl -a -vvv -t exec "$APP" 2>&1)"; echo "$ASSESS"
+            grep -q 'source=Notarized Developer ID' <<<"$ASSESS" \
+              || { echo "::error::Gatekeeper doesn't accept the app as notarized"; exit 1; }
+          fi
+
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then security delete-keychain "$KEYCHAIN"; fi
+          rm -f "$RUNNER_TEMP/agt-signing.p12"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: releases-osx-arm64
+          path: Releases
+
   # One job uploads both channels to a draft, then publishes it once, so the release never
   # appears half-populated and the two builds never race to create it.
   publish:
-    needs: [build, package-windows]
+    needs: [package-windows, package-macos]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
