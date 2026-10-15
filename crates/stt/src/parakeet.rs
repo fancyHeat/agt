@@ -123,6 +123,9 @@ pub fn files(cfg: &SttConfig) -> Result<&'static [ModelFile]> {
     })
 }
 
+/// Engine-name marker when the configured GPU device could not be used.
+pub const FALLBACK_SUFFIX: &str = "cpu; GPU unavailable";
+
 pub struct Parakeet {
     name: String,
     preprocessor: Session,
@@ -153,7 +156,17 @@ impl Parakeet {
         };
         let env = ort::init().with_name("agt").build()?;
         let preprocessor = session(&env, &dir.join("nemo128.onnx"), Device::Cpu, cfg.threads)?;
-        let encoder = session(&env, &dir.join(enc_file), cfg.device, cfg.threads)?;
+        let (encoder, device) = match session(&env, &dir.join(enc_file), cfg.device, cfg.threads) {
+            Ok(s) => (s, cfg.device),
+            // No usable GPU (no D3D12 adapter, some RDP/VM sessions, broken driver): run on
+            // the CPU rather than fail, and say so in the engine name.
+            Err(e) if cfg.device != Device::Cpu => {
+                tracing::warn!("{e}; falling back to the CPU");
+                let s = session(&env, &dir.join(enc_file), Device::Cpu, cfg.threads)?;
+                (s, Device::Cpu)
+            }
+            Err(e) => return Err(e),
+        };
         let decoder = session(
             &env,
             &dir.join("decoder_joint-model.int8.onnx"),
@@ -181,9 +194,10 @@ impl Parakeet {
                 Precision::Int8 => "int8",
                 Precision::Fp32 => "fp32",
             },
-            match cfg.device {
-                Device::Cpu => "cpu",
-                Device::DirectMl => "directml",
+            match (cfg.device, device) {
+                (Device::Cpu, _) => "cpu",
+                (_, Device::Cpu) => FALLBACK_SUFFIX,
+                (Device::DirectMl, _) => "directml",
             }
         );
         tracing::info!("loaded {name} in {:.2} s", start.elapsed().as_secs_f64());

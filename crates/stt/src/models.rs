@@ -80,6 +80,32 @@ fn download(
     let dest = dir.join(f.name);
     let part = part_path(&dest);
     tracing::info!("downloading {} ({:.1} MB)", f.url, f.size as f64 / 1e6);
+    // Any failure (network, full disk, bad hash) removes the partial file: it can be GBs.
+    let n = match fetch(agent, f, &part, progress) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    fs::rename(&part, &dest).map_err(|e| format!("cannot move {} into place: {e}", f.name))?;
+    let secs = start.elapsed().as_secs_f64();
+    tracing::info!(
+        "{} verified ({:.1} MB in {secs:.1} s, {:.1} MB/s)",
+        f.name,
+        n as f64 / 1e6,
+        n as f64 / 1e6 / secs.max(1e-3)
+    );
+    Ok(())
+}
+
+/// Streams `f` into `part`, hashing as it goes; returns the size once verified.
+fn fetch(
+    agent: &ureq::Agent,
+    f: &ModelFile,
+    part: &Path,
+    progress: &mut dyn FnMut(u64),
+) -> Result<u64> {
     let fail = |what: &str, e: &dyn std::fmt::Display| format!("{what} {}: {e}", f.name);
 
     let resp = agent
@@ -91,7 +117,7 @@ fn download(
         .call()
         .map_err(|e| fail("cannot download", &e))?;
     let mut body = resp.into_body().into_reader();
-    let mut out = fs::File::create(&part).map_err(|e| fail("cannot create", &e))?;
+    let mut out = fs::File::create(part).map_err(|e| fail("cannot create", &e))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     let (mut n, mut last_report) = (0u64, Instant::now());
@@ -100,11 +126,7 @@ fn download(
             Ok(0) => break,
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                drop(out);
-                let _ = fs::remove_file(&part);
-                return Err(fail("download failed for", &e).into());
-            }
+            Err(e) => return Err(fail("download failed for", &e).into()),
         };
         hasher.update(&buf[..read]);
         out.write_all(&buf[..read])
@@ -121,22 +143,13 @@ fn download(
 
     let hash = hex(&hasher.finalize());
     if n != f.size || hash != f.sha256 {
-        let _ = fs::remove_file(&part);
         return Err(format!(
             "{} failed verification: got {n} bytes, sha256 {hash}; expected {} bytes, sha256 {}",
             f.name, f.size, f.sha256
         )
         .into());
     }
-    fs::rename(&part, &dest).map_err(|e| fail("cannot move into place", &e))?;
-    let secs = start.elapsed().as_secs_f64();
-    tracing::info!(
-        "{} verified ({:.1} MB in {secs:.1} s, {:.1} MB/s)",
-        f.name,
-        n as f64 / 1e6,
-        n as f64 / 1e6 / secs.max(1e-3)
-    );
-    Ok(())
+    Ok(n)
 }
 
 fn part_path(dest: &Path) -> PathBuf {
@@ -159,6 +172,52 @@ mod tests {
             hex(&Sha256::digest(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// Serves `body` over HTTP to each connection, on 127.0.0.1; returns the base URL.
+    fn serve(body: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn download_verifies_and_never_leaves_partial_files() {
+        let base: &'static str = Box::leak(serve(b"abc").into_boxed_str());
+        let url: &'static str = Box::leak(format!("{base}/x.bin").into_boxed_str());
+        let dir = std::env::temp_dir().join(format!("agt-dl-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let good = ModelFile {
+            name: "x.bin",
+            url,
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        let bad = ModelFile {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..good
+        };
+        let err = ensure(&dir, &[bad], &mut |_| {}).unwrap_err().to_string();
+        assert!(err.contains("failed verification"), "{err}");
+        assert!(!dir.join("x.bin").exists());
+        assert!(!dir.join("x.bin.part").exists());
+
+        ensure(&dir, &[good], &mut |_| {}).unwrap();
+        assert_eq!(fs::read(dir.join("x.bin")).unwrap(), b"abc");
+        assert!(!dir.join("x.bin.part").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
