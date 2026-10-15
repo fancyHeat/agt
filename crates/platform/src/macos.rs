@@ -555,26 +555,38 @@ pub fn missing_permissions() -> Vec<Permission> {
     missing
 }
 
+/// Asks for the Microphone first and for the others only once it's answered: while the
+/// Microphone dialog is up, macOS doesn't show the Input Monitoring prompt but records it as
+/// denied right away (seen on macOS 27).
 pub fn request_permissions(missing: &[Permission]) {
+    let rest: Vec<Permission> = missing
+        .iter()
+        .copied()
+        .filter(|p| *p != Permission::Microphone)
+        .collect();
+    if missing.contains(&Permission::Microphone)
+        && mic_access() == MicAccess::NotDetermined
+        && let Some(cls) = AnyClass::get(c"AVCaptureDevice")
+    {
+        // The answer is also picked up by polling `missing_permissions`.
+        let done = RcBlock::new(move |granted: Bool| {
+            tracing::info!("microphone permission granted: {}", granted.as_bool());
+            request_event_access(&rest);
+        });
+        let _: () = unsafe {
+            msg_send![cls, requestAccessForMediaType: AVMediaTypeAudio, completionHandler: &*done]
+        };
+        return;
+    }
+    // Microphone denied or restricted: macOS won't ask again; only System Settings can change
+    // it.
+    request_event_access(&rest);
+}
+
+fn request_event_access(missing: &[Permission]) {
     for p in missing {
         match p {
-            Permission::Microphone => match mic_access() {
-                MicAccess::NotDetermined => {
-                    let Some(cls) = AnyClass::get(c"AVCaptureDevice") else {
-                        continue;
-                    };
-                    // The answer is picked up by polling `missing_permissions`.
-                    let done = RcBlock::new(|granted: Bool| {
-                        tracing::info!("microphone permission granted: {}", granted.as_bool());
-                    });
-                    let _: () = unsafe {
-                        msg_send![cls, requestAccessForMediaType: AVMediaTypeAudio, completionHandler: &*done]
-                    };
-                }
-                // macOS won't ask again; only System Settings can change it.
-                MicAccess::Denied | MicAccess::Restricted => {}
-                MicAccess::Authorized => {}
-            },
+            Permission::Microphone => {}
             Permission::InputMonitoring => {
                 CGRequestListenEventAccess();
             }
