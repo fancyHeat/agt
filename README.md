@@ -127,7 +127,7 @@ on ONNX Runtime.
 |---|---|---|
 | `stt.model` | `parakeet-tdt-0.6b-v2` | or `parakeet-tdt-0.6b-v3` |
 | `stt.precision` | `int8` | encoder weights; `fp32` is 2.5 GB (decoder is always int8) |
-| `stt.device` | `auto` | `auto` = DirectML on Windows, CPU on macOS, falling back to the CPU if no GPU is usable. `cpu`, `directml` (any DX12 GPU, Windows), `coreml` (macOS), `cuda` (builds with the `cuda` feature): an explicit GPU device that can't be used also falls back to the CPU, with a note in the tray |
+| `stt.device` | `auto` | `auto`: on Windows, DirectML on the high-performance GPU if a check at start-up finds it no slower than the CPU (it times both on 3 s of audio and logs the result), else the CPU; on macOS the CPU (for now). `cpu`; `directml` (any DX12 GPU, Windows); `cuda` (builds with the `cuda` feature). A GPU that fails, at start-up or later, falls back to the CPU; for an explicitly configured device the tray says so |
 | `stt.threads` | `0` (auto) | CPU threads for inference |
 
 Warm latency on an i9-9900K + RTX 2080 Ti (v2 int8, p50 over short / medium / long clips
@@ -136,6 +136,10 @@ DirectML 142 / 162 / 362 ms, CPU 152 / 407 / 1335 ms. On DirectML the encoder ru
 fixed 25 s input shape (shorter audio is zero-padded), which is ~2.5x faster than letting
 the shape vary. With `precision = "fp32"` DirectML takes 101 / 120 / 284 ms but holds 2.6 GB
 of VRAM instead of 1.1 GB. Details and other engines: [docs/benchmarks.md](docs/benchmarks.md).
+
+On the GPU, the default holds about **1.1 GB of VRAM for as long as AGT runs** (the model
+stays loaded so dictation is instant). If you need it back, e.g. for games,
+`device = "cpu"` frees it at the cost of slower dictations over a few seconds.
 
 `stt.engine = "whisper"` (builds with the `whisper` feature only) runs whisper.cpp:
 `stt.model` is one of `whisper-large-v3-turbo`, `-turbo-q8_0`, `-turbo-q5_0`,

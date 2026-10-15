@@ -148,9 +148,24 @@ static-shape encoder, falling back to the CPU when there is no usable DirectX 12
   p90 is tighter too (147 vs 206 ms short). Only CUDA is faster.
 - Accuracy: same model and WER as the Phase 1 default (best on real speech of everything tried).
 - Size: nothing new to ship (DirectML is already in the release), same 650 MB model.
-- Cost: 1.1 GB of VRAM while AGT runs (and ~1 GB RAM, as on the CPU). Not measured on
-  integrated GPUs, where DirectML may be slower than the CPU; `stt.device = "cpu"` is one line.
-  Existing configs keep the `device = "cpu"` written on their first run.
+- Cost: 1.1 GB of VRAM while AGT runs (and ~1 GB RAM, as on the CPU). Existing configs keep
+  the `device = "cpu"` written on their first run.
+- Guards, since `auto` is now what every new Windows install runs:
+  - DirectML asks for the **high-performance adapter** (the discrete GPU on a hybrid laptop;
+    the default preference usually gets the integrated one).
+  - At start-up, `auto` transcribes 3 s of audio on DirectML and on the CPU (best of two,
+    after one untimed run) and keeps DirectML only if it takes at most 1.25x the CPU's time.
+    Logged; here: `stt.device "auto": DirectML 142 ms, CPU 150 ms for 3 s of audio; using
+    DirectML`. 3 s is the CPU's best case: the padded DirectML encoder costs the same for
+    any length up to 25 s, the CPU's grows with the length, so a GPU that is roughly even at
+    3 s is far ahead at 10 s (row 6 vs row 1), and one that pays several times the CPU's time
+    for a 25 s window (an integrated GPU, a software adapter) loses. Not measured on an
+    integrated GPU (this machine's is disabled), which is why it's a check in the code rather
+    than a docs caveat. Cost: loading takes ~6 s instead of ~2.7 s (a second encoder session
+    and six probe runs; in the background at start-up, before the tray says "Ready").
+  - A GPU that fails to run (not only to load: driver reset, device removed, out of VRAM),
+    at start-up or on any later dictation, is replaced by the CPU once and for good; logged,
+    and noted in the tray only if `device` named the GPU explicitly.
 - Options documented: `precision = "fp32"` for ~40 ms less on a GPU with VRAM to spare (2.5 GB
   download, 2.6 GB VRAM); the `cuda` build for NVIDIA power users (not shipped: +1.4 GB).
   A future option is a downloadable "CUDA pack" (the DLLs fetched like a model on first use of
@@ -158,27 +173,37 @@ static-shape encoder, falling back to the CPU when there is no usable DirectX 12
 - Whisper stays an optional cargo feature (`whisper`, `whisper-vulkan`, `whisper-metal`) for
   languages Parakeet doesn't cover; it is not in release builds.
 
-**macOS best guess (unmeasured on real hardware): Parakeet v2 int8 on the CPU** (`auto` = CPU
-on macOS). Apple Silicon CPUs run ONNX Runtime's int8 kernels well and it needs no extra
-shipping; its latency on an M-series Mac is likely close to or better than the i9 numbers above.
-The Phase 4 (macOS) work measured on a real M4 that Core ML with a fixed encoder window (the
-same trick as DirectML here) runs the fp32 encoder on the GPU in ~76 ms per 10 s vs ~330 ms on
-the CPU, so `auto` on macOS should likely become that once it lands; that decision belongs to
-Phase 4, which has the hardware. Candidates:
+### macOS
 
-- ONNX Runtime CoreML EP (`stt.device = "coreml"`, wired up; ships in the existing ORT build).
-  Parakeet's encoder has dynamic shapes and int64 ops, so CoreML may only take part of the
-  graph; fp32 + MLProgram is the variant to try, and a fixed input shape (as for DirectML) is
-  likely needed for the Neural Engine.
-- whisper.cpp with Metal (`whisper-metal` feature): the standard fast path on Macs.
-- `.github/workflows/bench.yml` runs the bench on GitHub's macos-14 runner (M1, virtualized;
-  manual or when the workflow changes). MACOSRESULTS
+Not decided here: this spike had no Apple Silicon hardware. For now `auto` is the CPU on
+macOS (Parakeet v2 int8). The macOS default belongs to the Phase 4 work (issue #9), and the
+full real-speech benchmark on a Mac to issue #11.
+
+What there is: Phase 4 measured Parakeet v2 on a real **Apple M4** (Mac mini, 16 GB), warm
+median of 5 runs, with **synthetic clips made with `say`** (0% WER everywhere, so they say
+nothing about accuracy on real speech):
+
+| Clip | Core ML (fp32, fixed 10 s window, GPU) | CPU int8 |
+|---|---|---|
+| 2.75 s | 74 ms | 75 ms |
+| 9.1 s | 84 ms | 190 ms |
+| 28.3 s | 320 ms | 600 ms |
+
+Core ML there uses the same fixed-window trick as DirectML here (with dynamic shapes it was
+no faster than the CPU) and needs the fp32 encoder (2.4 GB download, ~3 GB peak memory, vs
+0.65 GB / 1.2 GB for CPU int8). The fixed window is shared code: an engine reports its window
+as `SttEngine::max_input_secs` (DirectML 25 s; Core ML will report 10 s) and the chunker cuts
+audio to fit it.
+
+`.github/workflows/bench.yml` (manual only) runs the CPU and whisper.cpp Metal rows on
+GitHub's macos-14 runner, a VM without GPU or Neural Engine access; its numbers are not used
+for decisions.
 
 ## Reproducing
 
 ```sh
 uv run scripts/prepare_eval.py                      # eval-data/clips, ~5 min
-cargo build --release -p agt-bench                  # Parakeet: cpu, directml (Windows), coreml (macOS)
+cargo build --release -p agt-bench                  # Parakeet: auto, cpu, directml (Windows)
 target/release/agt-bench --device directml eval-data/clips
 cargo build --release -p agt-bench --features cuda  # + CUDA 13 / cuDNN 9 DLLs on PATH
 cargo build --release -p agt-bench --features whisper-vulkan   # see README "Build"
