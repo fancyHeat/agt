@@ -14,15 +14,23 @@ clipboard, which it restores afterwards). The tray menu shows the state: loading
 the model, ready, recording, transcribing, or an error.
 
 - Holds shorter than `hotkey.min_hold_ms` (150 ms) are ignored, so a stray tap never pastes.
+- Hotkeys (`hotkey.key`): `RightCtrl` (default), `LeftCtrl`, `RightShift`, `LeftShift` keep
+  working normally in apps; `F13`-`F24` (handy for a remapped mouse or keyboard button) are
+  taken over by AGT, so apps never see them. Alt, Win, CapsLock, F1-F12 etc. are not offered:
+  they would either open menus on release or have to be taken away from apps.
 - Pressing any other non-modifier key while holding (Esc, or a shortcut like Right Ctrl+C)
-  cancels the dictation. The hotkey itself is never swallowed.
+  cancels the dictation.
+- If the release is missed (it happened on the UAC / Ctrl+Alt+Del screen), AGT notices within
+  250 ms that a Ctrl/Shift hotkey is up and finishes the dictation normally; for F13-F24 the
+  stale recording is discarded on the next press.
+- Long dictations are fine: audio over 25 s is transcribed in chunks split at pauses, so time
+  and memory grow linearly (a 5-minute recording takes ~12 s on an i9-9900K).
 - Dictating again while the previous one is still being transcribed is fine: they're
   transcribed and pasted in order.
 - The first run downloads the model (~670 MB) with progress in the tray; it's SHA-256 verified.
   If you're offline the tray shows an error; press the hotkey to retry.
-- Pasting into apps running as administrator doesn't work unless AGT runs elevated too.
-- With a Win or Alt hotkey, releasing it may open the Start menu / focus a menu bar; prefer
-  Right Ctrl, CapsLock, F13–F24, etc.
+- Pasting into apps running as administrator doesn't work unless AGT runs elevated too; AGT
+  then puts your clipboard back, shows an error in the tray and writes the transcript to the log.
 
 ## Layout
 
@@ -62,6 +70,9 @@ it), which is why models live in a separate `AGT-models` folder. `stt.models_dir
 models location. Set `AGT_HOME` to put everything (config, logs, lock, models) in one other
 directory (handy for testing).
 
+**Uninstalling does not remove downloaded models** (0.7-3.1 GB): delete `%LOCALAPPDATA%\AGT-models`
+(macOS: `~/Library/Application Support/AGT/models`) by hand if you no longer need them.
+
 A commented default config is written on first run; the tray menu has "Open config folder".
 AGT never rewrites an existing config. If the file has an error (including an unknown key), AGT
 logs it, shows "Config error" in the tray menu, and runs with defaults **with updates off**, so a
@@ -81,7 +92,7 @@ on ONNX Runtime.
 |---|---|---|
 | `stt.model` | `parakeet-tdt-0.6b-v2` | or `parakeet-tdt-0.6b-v3` |
 | `stt.precision` | `int8` | encoder weights; `fp32` is 2.5 GB (decoder is always int8) |
-| `stt.device` | `cpu` | `directml` runs the encoder on any DX12 GPU (Windows) |
+| `stt.device` | `cpu` | `directml` runs the encoder on any DX12 GPU (Windows); falls back to the CPU (with a note in the tray) if no GPU is usable |
 | `stt.threads` | `0` (auto) | CPU threads for inference |
 
 Every dictation logs its timings at info level, e.g.
