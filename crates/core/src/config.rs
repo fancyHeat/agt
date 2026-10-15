@@ -47,6 +47,41 @@ trailing_space = true
 # Too short and slow apps may paste the old clipboard instead of the transcript.
 restore_clipboard_ms = 500
 
+[polish]
+# Optional clean-up of each transcript by an LLM before pasting: punctuation, capitalization,
+# filler words ("um", "you know") and false starts. Off by default. Adds latency (typically
+# 0.2-1 s), and the transcript is sent to the configured server (local or cloud). On any
+# error, timeout or suspicious output, the raw transcript is pasted instead.
+enabled = false
+# "openai": any OpenAI-compatible chat completions server: Ollama, LM Studio, llama.cpp's
+# llama-server (all local), or a cloud provider. "anthropic": the Claude API.
+provider = "openai"
+# "" = provider default: "http://localhost:11434/v1" (Ollama) for openai,
+# "https://api.anthropic.com" for anthropic. LM Studio: "http://localhost:1234/v1",
+# llama-server: "http://localhost:8080/v1".
+base_url = ""
+# "" = provider default: "qwen2.5:3b" for openai, "claude-haiku-5-5" for anthropic.
+model = ""
+# Name of an environment variable holding the API key. "" = provider default:
+# ANTHROPIC_API_KEY for anthropic, none for openai (local servers need no key).
+api_key_env = ""
+# Or the API key itself (takes precedence over api_key_env). This file is local to your
+# machine; never share or commit it with a key in it.
+api_key = ""
+# "light": punctuation, capitalization, fillers and false starts; keeps your wording.
+# "formal": also tidies grammar and phrasing for written text.
+style = "light"
+# Replaces the built-in instructions (the system prompt) and examples; "" = use the style.
+prompt = ""
+# The user message; {text} is replaced by the transcript. "" = the transcript between
+# <transcript> tags. For models that expect a specific input format (see README: S1-mini).
+user_message = ""
+# Give up and paste the raw transcript after timeout_ms + timeout_per_word_ms per word.
+timeout_ms = 2000
+timeout_per_word_ms = 15
+# Transcripts with fewer words than this are pasted as they are.
+min_words = 4
+
 [update]
 # Check GitHub Releases for updates on startup and periodically.
 enabled = true
@@ -65,6 +100,7 @@ pub struct Config {
     pub audio: AudioConfig,
     pub stt: SttConfig,
     pub paste: PasteConfig,
+    pub polish: PolishConfig,
     pub update: UpdateConfig,
 }
 
@@ -122,6 +158,132 @@ pub struct PasteConfig {
     pub restore_clipboard_ms: u64,
 }
 
+/// `[polish]`: optional LLM clean-up of transcripts (see `agt-polish`).
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolishConfig {
+    pub enabled: bool,
+    pub provider: PolishProvider,
+    /// As written ("" = provider default); use [`PolishConfig::base_url`].
+    pub base_url: String,
+    /// As written ("" = provider default); use [`PolishConfig::model`].
+    pub model: String,
+    pub api_key_env: String,
+    /// Never log this; use [`PolishConfig::api_key`].
+    pub api_key: String,
+    pub style: PolishStyle,
+    pub prompt: String,
+    pub user_message: String,
+    pub timeout_ms: u64,
+    pub timeout_per_word_ms: u64,
+    pub min_words: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolishProvider {
+    /// OpenAI-compatible `/chat/completions` (Ollama, LM Studio, llama-server, cloud).
+    OpenAi,
+    /// Anthropic Messages API.
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolishStyle {
+    Light,
+    Formal,
+}
+
+impl Default for PolishConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: PolishProvider::OpenAi,
+            base_url: String::new(),
+            model: String::new(),
+            api_key_env: String::new(),
+            api_key: String::new(),
+            style: PolishStyle::Light,
+            prompt: String::new(),
+            user_message: String::new(),
+            timeout_ms: 2000,
+            timeout_per_word_ms: 15,
+            min_words: 4,
+        }
+    }
+}
+
+impl PolishConfig {
+    pub fn base_url(&self) -> &str {
+        match (self.base_url.as_str(), self.provider) {
+            ("", PolishProvider::OpenAi) => "http://localhost:11434/v1",
+            ("", PolishProvider::Anthropic) => "https://api.anthropic.com",
+            (url, _) => url,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match (self.model.as_str(), self.provider) {
+            ("", PolishProvider::OpenAi) => "qwen2.5:3b",
+            ("", PolishProvider::Anthropic) => "claude-haiku-5-5",
+            (model, _) => model,
+        }
+    }
+
+    /// The environment variable the key is read from, if any.
+    pub fn api_key_var(&self) -> Option<&str> {
+        match (self.api_key_env.as_str(), self.provider) {
+            ("", PolishProvider::OpenAi) => None,
+            ("", PolishProvider::Anthropic) => Some("ANTHROPIC_API_KEY"),
+            (var, _) => Some(var),
+        }
+    }
+
+    /// `api_key` if set, else the (non-empty) variable named by [`Self::api_key_var`].
+    pub fn api_key(&self) -> Option<String> {
+        let key = match self.api_key.trim() {
+            "" => std::env::var(self.api_key_var()?).ok()?,
+            key => key.to_owned(),
+        };
+        let key = key.trim();
+        (!key.is_empty()).then(|| key.to_owned())
+    }
+
+    /// The time budget for polishing a transcript of `words` words.
+    pub fn timeout(&self, words: usize) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.timeout_ms
+                .saturating_add(self.timeout_per_word_ms.saturating_mul(words as u64)),
+        )
+    }
+}
+
+/// Hand-written so the API key can't end up in a log through `{:?}`.
+impl std::fmt::Debug for PolishConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = if self.api_key.is_empty() {
+            ""
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("PolishConfig")
+            .field("enabled", &self.enabled)
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &key)
+            .field("style", &self.style)
+            .field("prompt", &self.prompt)
+            .field("user_message", &self.user_message)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("timeout_per_word_ms", &self.timeout_per_word_ms)
+            .field("min_words", &self.min_words)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -137,6 +299,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             stt: SttConfig::default(),
             paste: PasteConfig::default(),
+            polish: PolishConfig::default(),
             update: UpdateConfig::default(),
         }
     }
@@ -289,6 +452,33 @@ mod tests {
     fn models_dir_override() {
         let c = Config::parse("[stt]\nmodels_dir = 'D:\\models'").unwrap();
         assert_eq!(c.stt.models_path(), PathBuf::from("D:\\models"));
+    }
+
+    #[test]
+    fn polish_defaults_depend_on_provider() {
+        let c = Config::default().polish;
+        assert!(!c.enabled);
+        assert_eq!(c.base_url(), "http://localhost:11434/v1");
+        assert_eq!(c.model(), "qwen2.5:3b");
+        assert_eq!(c.api_key_var(), None);
+        assert_eq!(c.api_key(), None);
+        let c = Config::parse("[polish]\nprovider = \"anthropic\"\nmodel = \"m\"\n")
+            .unwrap()
+            .polish;
+        assert_eq!(c.base_url(), "https://api.anthropic.com");
+        assert_eq!(c.model(), "m");
+        assert_eq!(c.api_key_var(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(c.timeout(100), std::time::Duration::from_millis(3500));
+        assert!(Config::parse("[polish]\nprovider = \"gemini\"").is_err());
+        assert!(Config::parse("[polish]\nstyle = \"pirate\"").is_err());
+    }
+
+    #[test]
+    fn polish_api_key_is_never_debug_printed() {
+        let c = Config::parse("[polish]\napi_key = \" sk-secret \"").unwrap();
+        assert_eq!(c.polish.api_key().as_deref(), Some("sk-secret"));
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("sk-secret") && dbg.contains("<redacted>"));
     }
 
     #[test]
