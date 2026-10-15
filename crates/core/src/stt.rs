@@ -37,4 +37,18 @@ pub trait SttEngine: Send {
 
     /// `audio`: mono f32 samples in [-1, 1] at [`SAMPLE_RATE`].
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOpts) -> Result<Transcript>;
+
+    /// The longest audio (seconds) one `transcribe` call accepts, if the engine has a hard
+    /// limit (e.g. an encoder compiled for a fixed input window). Longer audio must be split
+    /// first (`agt-stt` does that). The limit may go away after load (e.g. a fallback from a
+    /// GPU window to the CPU), but never shrinks.
+    fn max_input_secs(&self) -> Option<f32> {
+        None
+    }
+
+    /// A short note for the user about how the engine runs, if something didn't go as
+    /// configured (e.g. "on the CPU, DirectML unavailable"). May change after a `transcribe`.
+    fn notice(&self) -> Option<String> {
+        None
+    }
 }

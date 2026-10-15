@@ -34,6 +34,8 @@ pub fn load(cfg: &SttConfig, progress: &mut dyn FnMut(Progress)) -> Result<Box<d
         }
     };
     // Parakeet: 20-25 s chunks keep full attention cheap (RTF stays ~0.05 at any length).
+    // An engine with a fixed input window (a static-shape GPU encoder) gets chunks that fit
+    // it: see `SttEngine::max_input_secs`.
     Ok(Box::new(chunk::Chunked::new(
         engine,
         CHUNK_SECS,

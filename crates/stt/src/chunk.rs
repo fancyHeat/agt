@@ -61,20 +61,32 @@ fn quietest_point(region: &[f32]) -> Option<usize> {
 /// Wraps an engine so long audio is transcribed in chunks (see the module docs).
 pub struct Chunked {
     inner: Box<dyn SttEngine>,
-    max_len: usize,
-    search_len: usize,
+    max_secs: f32,
+    search_secs: f32,
 }
 
 impl Chunked {
-    /// Chunks are at most `max_secs` long, cut within the last `search_secs` of each.
+    /// Chunks are at most `max_secs` long, or the engine's [`SttEngine::max_input_secs`] if
+    /// that is shorter, and cut within the last `search_secs` (at most half a chunk) of each.
     pub fn new(inner: Box<dyn SttEngine>, max_secs: f32, search_secs: f32) -> Self {
-        let max_len = (max_secs * SAMPLE_RATE as f32) as usize;
-        let search_len = ((search_secs * SAMPLE_RATE as f32) as usize).clamp(HOP, max_len);
         Self {
             inner,
-            max_len,
-            search_len,
+            max_secs,
+            search_secs,
         }
+    }
+
+    /// `(max_len, search_len)` in samples. Asked on every call: the engine's limit can go
+    /// away after load (a GPU-to-CPU fallback).
+    fn limits(&self) -> (usize, usize) {
+        let secs = self
+            .inner
+            .max_input_secs()
+            .map_or(self.max_secs, |m| m.min(self.max_secs));
+        let max_len = ((secs * SAMPLE_RATE as f32) as usize).max(HOP);
+        let search_len =
+            ((self.search_secs.min(secs / 2.0) * SAMPLE_RATE as f32) as usize).clamp(HOP, max_len);
+        (max_len, search_len)
     }
 }
 
@@ -87,11 +99,16 @@ impl SttEngine for Chunked {
         self.inner.warmup()
     }
 
+    fn notice(&self) -> Option<String> {
+        self.inner.notice()
+    }
+
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOpts) -> Result<Transcript> {
-        if audio.len() <= self.max_len {
+        let (max_len, search_len) = self.limits();
+        if audio.len() <= max_len {
             return self.inner.transcribe(audio, opts);
         }
-        let ranges = split(audio, self.max_len, self.search_len);
+        let ranges = split(audio, max_len, search_len);
         tracing::debug!(
             "transcribing {:.1} s in {} chunks",
             audio.len() as f64 / SAMPLE_RATE as f64,
@@ -213,5 +230,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(long.text, "w2 w3 w4");
+    }
+
+    /// An engine with a fixed input window, like a static-shape GPU encoder.
+    struct Windowed(Vec<usize>, Option<f32>);
+    impl SttEngine for Windowed {
+        fn name(&self) -> String {
+            "windowed".into()
+        }
+        fn warmup(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn transcribe(&mut self, audio: &[f32], _: &TranscribeOpts) -> Result<Transcript> {
+            if let Some(m) = self.1 {
+                assert!(
+                    audio.len() <= (m * S as f32) as usize,
+                    "{} samples",
+                    audio.len()
+                );
+            }
+            self.0.push(audio.len());
+            Ok(Transcript::default())
+        }
+        fn max_input_secs(&self) -> Option<f32> {
+            self.1
+        }
+    }
+
+    #[test]
+    fn chunks_fit_the_engines_window() {
+        // A 10 s window (Core ML) under the 25 s default: 22 s of audio must be split.
+        let mut c = Chunked::new(Box::new(Windowed(Vec::new(), Some(10.0))), 25.0, 5.0);
+        c.transcribe(
+            &speech_with_gaps(22, &[8.0, 17.0]),
+            &TranscribeOpts::default(),
+        )
+        .unwrap();
+        // Exactly the window: one call.
+        let mut c = Chunked::new(Box::new(Windowed(Vec::new(), Some(10.0))), 25.0, 5.0);
+        c.transcribe(&vec![0.1; 10 * S], &TranscribeOpts::default())
+            .unwrap();
+        // A window larger than the chunk size changes nothing.
+        let mut c = Chunked::new(Box::new(Windowed(Vec::new(), Some(30.0))), 25.0, 5.0);
+        let (max_len, _) = c.limits();
+        assert_eq!(max_len, 25 * S);
+        c.transcribe(&vec![0.1; 25 * S], &TranscribeOpts::default())
+            .unwrap();
     }
 }
