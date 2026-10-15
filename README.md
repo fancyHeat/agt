@@ -25,12 +25,14 @@ clicks.
 | ![recording](docs/img/overlay-recording.png) | ![transcribing](docs/img/overlay-transcribing.png) | ![error](docs/img/overlay-error.png) |
 
 - Holds shorter than `hotkey.min_hold_ms` (150 ms) are ignored, so a stray tap never pastes.
-- Hotkeys (`hotkey.key`): `RightCtrl` (default), `LeftCtrl`, `RightShift`, `LeftShift` keep
+- Default hotkey: Left Ctrl + Left Win (`LeftCtrl+LeftWin`) on Windows, Fn (the Globe key,
+  `Fn`) on macOS. A `config.toml` written by an older version keeps its key (`RightCtrl`).
+- Hotkeys (`hotkey.key`): `RightCtrl`, `LeftCtrl`, `RightShift`, `LeftShift` keep
   working normally in apps; `F13`-`F24` (handy for a remapped mouse or keyboard button) are
   taken over by AGT, so apps never see them. Alt, CapsLock, F1-F12 etc. are not offered:
   they would either open menus on release or have to be taken away from apps.
-- Chords: `hotkey.key = "LeftCtrl+LeftWin"` (like Wispr Flow's Ctrl+Win) is the recommended
-  alternative if Right Ctrl is awkward. Up to 3 `+`-separated keys from the list above plus
+- Chords: `hotkey.key = "LeftCtrl+LeftWin"` (like Wispr Flow's Ctrl+Win; the Windows
+  default). Up to 3 `+`-separated keys from the list above plus
   `LeftWin` / `RightWin` (left and right are distinct; at most one F13-F24). Recording starts
   once every key is down, in any order, and stops as soon as any of them is released; to
   dictate again, release all of them first. Win only works in a chord with Ctrl or Shift: on

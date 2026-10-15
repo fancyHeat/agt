@@ -4,8 +4,26 @@
 use serde::Deserialize;
 use std::{fs, io, path::Path, path::PathBuf};
 
+// A macro rather than a const so `concat!` can splice it into `DEFAULT_CONFIG`.
+#[cfg(target_os = "macos")]
+macro_rules! default_hotkey {
+    () => {
+        "Fn"
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! default_hotkey {
+    () => {
+        "LeftCtrl+LeftWin"
+    };
+}
+
+/// Default `hotkey.key`: Fn (the Globe key) on macOS, Left Ctrl + Left Win elsewhere.
+pub const DEFAULT_HOTKEY: &str = default_hotkey!();
+
 /// Written on first run. Kept as text (not serialized) so the comments survive.
-pub const DEFAULT_CONFIG: &str = r#"# AGT configuration. Restart AGT after editing.
+pub const DEFAULT_CONFIG: &str = concat!(
+    r#"# AGT configuration. Restart AGT after editing.
 # If this file has an error, AGT starts with defaults (updates off) and logs the error.
 
 # Log verbosity: "error", "warn", "info", "debug" or "trace".
@@ -15,13 +33,16 @@ log_level = "info"
 # Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
 # LeftShift (still work normally in apps), or F13-F24 (e.g. a remapped mouse button; AGT
 # takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
-# Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (recommended if Right
-# Ctrl is awkward to reach); LeftWin/RightWin only work in a chord with Ctrl or Shift. A
-# chord starts once all its keys are down and ends when any of them is released.
+# Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (the default on
+# Windows); LeftWin/RightWin only work in a chord with Ctrl or Shift. A chord starts once
+# all its keys are down and ends when any of them is released. On macOS the default is "Fn"
+# (the Globe key).
 # With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
 # keys are up: if you already hold the hotkey for the next dictation, the previous text
 # lands when you release it (after 10 s it's pasted anyway).
-key = "RightCtrl"
+key = ""#,
+    default_hotkey!(),
+    r#""
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
 
@@ -108,7 +129,8 @@ position = "bottom"
 enabled = true
 # Minutes between update checks (minimum 30).
 check_interval_minutes = 240
-"#;
+"#
+);
 
 /// Lower bound for `update.check_interval_minutes`.
 pub const MIN_CHECK_INTERVAL_MINUTES: u64 = 30;
@@ -367,7 +389,7 @@ impl Default for Config {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            key: "RightCtrl".into(),
+            key: DEFAULT_HOTKEY.into(),
             min_hold_ms: 150,
         }
     }
