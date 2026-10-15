@@ -178,22 +178,25 @@ mod tests {
     /// A busy child stops using CPU while no guard is held, and runs while one is.
     #[test]
     fn suspends_when_idle_and_resumes_for_requests() {
-        let mut child =
-            Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-                .args(["-NoProfile", "-Command", "while ($true) { }"])
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
+        // A single-threaded busy loop (threads created after a suspend wouldn't be suspended,
+        // so nothing that's still starting up).
+        let mut child = Command::new("C:\\Windows\\System32\\cmd.exe")
+            .args(["/d", "/c", "for /l %i in (0,0,1) do @rem"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         let gate = Gate::for_child(&child);
         let cpu = || cpu_time(&child);
         std::thread::sleep(Duration::from_millis(500));
         drop(gate.enter()); // the supervisor does this once the server is up
         assert!(gate.is_suspended());
+        // Suspension is asynchronous for a thread that's running on a CPU right now.
+        std::thread::sleep(Duration::from_millis(100));
         let c0 = cpu();
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(500));
         assert_eq!(cpu(), c0, "a suspended process must not run");
 
         let awake = gate.enter();
