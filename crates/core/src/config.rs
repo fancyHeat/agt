@@ -70,7 +70,8 @@ precision = "int8"
 device = "auto"
 # CPU threads for inference; 0 = automatic.
 threads = 0
-# Where models are downloaded to; "" = the default location (see README).
+# Where models are downloaded to. "" = the default: %LOCALAPPDATA%\AGT-models on Windows,
+# ~/Library/Application Support/AGT/models on macOS.
 models_dir = ""
 
 [paste]
@@ -88,7 +89,7 @@ restore_clipboard_ms = 500
 enabled = false
 # "s1-mini": S1-mini by Superwhisper, a small model made for exactly this (English only), run
 # by AGT on this machine. On first use AGT downloads it (485 MB) and llama.cpp's llama-server
-# (12-32 MB) to the models folder and starts the server in the background (see README).
+# (12-32 MB) to the models folder and starts the server in the background.
 # "openai": an OpenAI-compatible chat completions server you run yourself: Ollama, LM Studio,
 # llama.cpp's llama-server, or a cloud provider. "anthropic": the Claude API (cloud).
 provider = "s1-mini"

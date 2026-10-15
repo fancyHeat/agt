@@ -4,21 +4,21 @@ Hold a key, speak, let go: your words are typed into whatever app you're using.
 AGT is a small, fast dictation app for Windows and Apple Silicon Macs. Speech is turned into
 text **on your own computer**; your voice never leaves it.
 
+<p align="center">
+  <a href="https://github.com/fancyHeat/agt/releases/latest/download/AGT-win-x64-Setup.exe"><img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0wIDBoMTEuNHYxMS40SDB6TTEyLjYgMEgyNHYxMS40SDEyLjZ6TTAgMTIuNmgxMS40VjI0SDB6TTEyLjYgMTIuNkgyNFYyNEgxMi42eiIvPjwvc3ZnPg%3D%3D"></a>
+  <a href="https://github.com/fancyHeat/agt/releases/latest/download/AGT-osx-arm64-Portable.zip"><img alt="Download for macOS · Apple Silicon" src="https://img.shields.io/badge/Download%20for%20macOS%20%C2%B7%20Apple%20Silicon-000000?style=for-the-badge&logo=apple&logoColor=white"></a>
+</p>
+
+<p align="center">
+  <sub>Always the newest version · <a href="https://github.com/fancyHeat/agt/releases/latest">All releases</a></sub>
+</p>
+
+> **macOS: dictation is not working yet.** The Mac app installs, runs in the menu bar and
+> updates itself, but the dictation hotkey doesn't work there yet. Windows is fully supported.
+> On macOS, only Apple Silicon (M1 and later) Macs running macOS 13.4 or newer are supported;
+> **Intel Macs are not supported.**
+
 ![The AGT overlay while recording](docs/img/overlay-recording.png)
-
-## Download
-
-- **Windows (x64):** [AGT-win-x64-Setup.exe](https://github.com/fancyHeat/agt/releases/latest/download/AGT-win-x64-Setup.exe)
-- **macOS (Apple Silicon):** [AGT-osx-arm64-Portable.zip](https://github.com/fancyHeat/agt/releases/latest/download/AGT-osx-arm64-Portable.zip)
-
-These links always point to the newest version. All releases:
-[github.com/fancyHeat/agt/releases/latest](https://github.com/fancyHeat/agt/releases/latest).
-
-On macOS, only Apple Silicon (M1 and later) Macs running macOS 13.4 or newer are supported.
-**Intel Macs are not supported.**
-
-> **macOS is a work in progress.** The Mac app installs, runs in the menu bar and updates
-> itself, but the dictation hotkey doesn't work there yet. Windows is fully supported.
 
 ## Quick start
 
@@ -28,7 +28,7 @@ On macOS, only Apple Silicon (M1 and later) Macs running macOS 13.4 or newer are
    speech model (about 670 MB) once; the tray menu shows the progress and says "Ready" when
    it's done.
 3. **Dictate.** Click into any text field, then hold the hotkey and speak:
-   - Windows: **Left Ctrl + Left Win**
+   - Windows: **Left Ctrl + Windows key**
    - macOS: **Fn** (the Globe key)
 
    A small bar at the bottom of the screen shows that AGT is listening.
@@ -38,8 +38,6 @@ Good to know:
 
 - Press **Esc** while holding the hotkey to cancel.
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
-- On a Mac, AGT will ask for **Microphone**, **Input Monitoring** and **Accessibility** access
-  (System Settings → Privacy & Security) once dictation ships there.
 
 ## Updates
 
@@ -60,14 +58,15 @@ fixes punctuation; off by default, and it runs locally unless you point it at a 
 ## Privacy
 
 - Transcription runs entirely on your computer. Audio is never saved or uploaded.
-- AGT goes online only to download its models and to check for updates.
+- AGT goes online only to download its models and to check for updates. If you turn on the
+  local AI clean-up, it also downloads llama.cpp (12–32 MB) once to run it.
 - The one exception is opt-in: if you configure the optional clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
 
 ## Building from source
 
-Install [Rust](https://rustup.rs) (on Windows also the MSVC build tools), then run `cargo run`.
+Install [Rust](https://rustup.rs) (on Windows also the MSVC build tools), then run `cargo run -p agt`.
 
 ## License
 
-MIT
+[MIT](LICENSE)

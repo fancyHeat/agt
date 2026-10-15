@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stores AGT's macOS signing certificate as secrets of the GitHub `release` environment (see
-# "macOS signing and notarization" in README.md). Run it in Terminal on the Mac whose login
+# Stores AGT's macOS signing certificate as secrets of the GitHub `release` environment, which
+# the package-macos job in .github/workflows/release.yml uses to sign and notarize. Run it in Terminal on the Mac whose login
 # keychain holds the Developer ID Application identity:
 #
 #   bash setup-apple-secrets.sh                 # export the identity; set APPLE_CERT_P12_BASE64
@@ -69,7 +69,7 @@ echo "    found $IDENTITY_HASH; the login keychain holds $IDENTITY_COUNT identit
 VALID_ANY="$(security find-identity -v "$LOGIN_KEYCHAIN")"
 if [[ "$VALID_ANY" == *'"Developer ID Installer:'* ]]; then
   echo "    note: a Developer ID Installer identity exists, but this script doesn't set"
-  echo "    APPLE_INSTALLER_IDENTITY; releases ship the macOS .zip only (see README)."
+  echo "    APPLE_INSTALLER_IDENTITY; releases ship the macOS .zip only."
 else
   echo "    no Developer ID Installer identity: APPLE_INSTALLER_IDENTITY is skipped (no .pkg, .zip only)"
 fi
