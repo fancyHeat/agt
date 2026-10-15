@@ -2,31 +2,42 @@
 //! SHA-256, and where it puts it:
 //!
 //! ```text
-//! <models dir>/s1-mini/s1-mini-q4_k_m.gguf      485 MB, superwhisper/s1-mini-GGUF
-//! <models dir>/llama.cpp/<build>/llama-server   official llama.cpp release, unpacked
+//! <models dir>/s1-mini/s1-mini-q4_k_m.gguf                485 MB, superwhisper/s1-mini-GGUF
+//! <models dir>/agt-llama-server/<build>/llama-server      from an official llama.cpp release
 //! ```
 //!
 //! llama.cpp builds: Windows x64 uses the Vulkan build (32 MB; any GPU with a Vulkan driver,
 //! which NVIDIA, AMD and Intel drivers include, and the CPU otherwise; it needs no CUDA
 //! runtime, which would be another 400+ MB). macOS arm64 uses the Metal build (12 MB).
 //!
-//! The archive is downloaded (verified, see `agt_fetch`), unpacked with the OS's own `tar`
-//! (bsdtar; it reads zip too, and refuses absolute paths and `..`) into a temporary folder,
-//! renamed into place once complete (marked by [`MARKER`]), and deleted. Older builds in
-//! `llama.cpp/` are removed then, so a pin bump doesn't leave them behind.
+//! The archive is downloaded (verified, see `agt_fetch`) and unpacked with the OS's own
+//! `tar` (bsdtar; it reads zip too, and refuses absolute paths and `..`) into a temporary
+//! folder. Only the server and its libraries (and license files) are kept: they're moved
+//! into a new folder with a manifest ([`MARKER`]: SHA-256, size and mtime of every file),
+//! which is then renamed into place. Before every start the folder is checked against the
+//! manifest ([`Assets::verified_server_exe`]): exactly those files, unchanged (a file whose
+//! size or mtime differs is hashed again), so nothing put there later is ever run.
+//!
+//! The folder name is AGT's own (`stt.models_dir` may be a shared folder that already has
+//! a `llama.cpp`), and AGT only ever deletes what it made there: builds with a manifest,
+//! its staging folders and its archives.
 
 use super::Status;
 use agt_fetch::ModelFile;
+use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::UNIX_EPOCH,
 };
 
 /// Subfolder of the models dir holding the GGUF.
 pub const MODEL_DIR: &str = "s1-mini";
-/// Subfolder of the models dir holding llama.cpp builds.
-pub const LLAMA_DIR: &str = "llama.cpp";
+/// Subfolder of the models dir holding the llama.cpp builds AGT installed.
+pub const LLAMA_DIR: &str = "agt-llama-server";
 /// The pinned llama.cpp release.
 pub const LLAMA_BUILD: &str = "b11669";
 
@@ -61,13 +72,26 @@ const SERVER: Option<ModelFile> = Some(ModelFile {
 )))]
 const SERVER: Option<ModelFile> = None;
 
-/// Written into the unpacked build folder last; without it the folder is incomplete.
-const MARKER: &str = ".agt-complete";
+/// The manifest, written into an installed build folder last.
+const MARKER: &str = ".agt-manifest";
 
 #[cfg(windows)]
 const SERVER_EXE: &str = "llama-server.exe";
 #[cfg(not(windows))]
 const SERVER_EXE: &str = "llama-server";
+
+/// The files of a build that are kept: the server, its libraries, license texts.
+fn wanted(name: &str) -> bool {
+    // Each tool's code lives in a `<tool>-impl` library; only the server's is needed.
+    if name.contains("-impl.") {
+        return name.contains("llama-server-impl.");
+    }
+    name == SERVER_EXE
+        || name.ends_with(".dll")
+        || name.ends_with(".dylib")
+        || name.ends_with(".so")
+        || name.starts_with("LICENSE")
+}
 
 pub(crate) struct Assets {
     /// The models dir.
@@ -116,54 +140,193 @@ impl Assets {
         self.llama_dir().join(self.build)
     }
 
+    #[cfg(test)]
     pub fn server_exe(&self) -> PathBuf {
         self.build_dir().join(SERVER_EXE)
     }
 
-    /// Downloads and unpacks whatever is missing. Cheap when everything is there.
+    /// Downloads and installs whatever is missing. Cheap when everything is there.
     pub fn ensure(&self, report: &mut dyn FnMut(Status)) -> Result<(), String> {
         download(&self.root.join(MODEL_DIR), &self.model, "S1-mini", report)?;
-        if self.build_dir().join(MARKER).is_file() && self.server_exe().is_file() {
-            return Ok(());
+        let build_dir = self.build_dir();
+        if build_dir.exists() {
+            if build_dir.join(MARKER).is_file() {
+                return Ok(());
+            }
+            return Err(format!(
+                "{} exists but wasn't installed by AGT (no {MARKER}); move it away",
+                build_dir.display()
+            ));
         }
         let dir = self.llama_dir();
         download(&dir, &self.server, "llama.cpp", report)?;
         let archive = dir.join(self.server.name);
         let staging = dir.join(format!("{}.unpacking", self.build));
-        let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_dir_all(self.build_dir());
-        fs::create_dir_all(&staging)
-            .map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+        let ready = dir.join(format!("{}.installing", self.build));
+        for d in [&staging, &ready] {
+            let _ = fs::remove_dir_all(d);
+            fs::create_dir_all(d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+        }
         untar(&archive, &staging)?;
         // The archive has the files at its root (Windows) or in one folder (macOS).
         let unpacked = find_exe_dir(&staging)
             .ok_or_else(|| format!("{} has no {SERVER_EXE}", self.server.name))?;
-        fs::write(unpacked.join(MARKER), self.server.sha256)
-            .map_err(|e| format!("cannot write to {}: {e}", unpacked.display()))?;
-        fs::rename(&unpacked, self.build_dir())
-            .map_err(|e| format!("cannot move llama.cpp into place: {e}"))?;
-        // Leftovers: the archive, the staging folder (if the build was in a subfolder) and
-        // builds of earlier pins.
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                if e.file_name() == self.build {
-                    continue;
-                }
-                let p = e.path();
-                let _ = if p.is_dir() {
-                    fs::remove_dir_all(&p)
-                } else {
-                    fs::remove_file(&p)
-                };
+        let entries = fs::read_dir(&unpacked).map_err(|e| e.to_string())?;
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if wanted(&name.to_string_lossy()) {
+                fs::rename(e.path(), ready.join(&name))
+                    .map_err(|e| format!("cannot install {}: {e}", name.to_string_lossy()))?;
             }
         }
+        write_manifest(&ready)?;
+        fs::rename(&ready, &build_dir)
+            .map_err(|e| format!("cannot move llama.cpp into place: {e}"))?;
+        self.clean_up();
         tracing::info!(
-            "llama.cpp {} unpacked to {}",
+            "llama.cpp {} installed in {}",
             self.build,
-            self.build_dir().display()
+            build_dir.display()
         );
         Ok(())
     }
+
+    /// Removes what AGT left in its folder: staging folders, archives, and builds it
+    /// installed (they have a manifest) other than the current one. Nothing else.
+    fn clean_up(&self) {
+        let Ok(entries) = fs::read_dir(self.llama_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let p = e.path();
+            let ours_dir = p.is_dir()
+                && name != self.build
+                && (name.ends_with(".unpacking")
+                    || name.ends_with(".installing")
+                    || p.join(MARKER).is_file());
+            let ours_file = p.is_file()
+                && name.starts_with("llama-b")
+                && [".zip", ".tar.gz", ".zip.part", ".tar.gz.part"]
+                    .iter()
+                    .any(|ext| name.ends_with(ext));
+            if ours_dir {
+                let _ = fs::remove_dir_all(&p);
+            } else if ours_file {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// The server executable, after checking its folder against the manifest written at
+    /// install time: the same files and nothing else, each unchanged.
+    pub fn verified_server_exe(&self) -> Result<PathBuf, String> {
+        let dir = self.build_dir();
+        let bad = |why: String| {
+            format!(
+                "{} doesn't match what AGT installed ({why}); delete that folder to reinstall",
+                dir.display()
+            )
+        };
+        let text = fs::read_to_string(dir.join(MARKER)).map_err(|e| bad(e.to_string()))?;
+        let manifest = parse_manifest(&text).ok_or_else(|| bad("unreadable manifest".into()))?;
+        let entries = fs::read_dir(&dir).map_err(|e| bad(e.to_string()))?;
+        let present: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != MARKER)
+            .collect();
+        if let Some(extra) = present.iter().find(|n| !manifest.contains_key(*n)) {
+            return Err(bad(format!("unexpected file {extra}")));
+        }
+        for (name, want) in &manifest {
+            let path = dir.join(name);
+            let have = stat(&path).map_err(|e| bad(format!("{name}: {e}")))?;
+            if (have.size, have.mtime) != (want.size, want.mtime) {
+                tracing::info!("{name} changed since it was installed; checking its hash");
+                if sha256(&path).map_err(|e| bad(format!("{name}: {e}")))? != want.sha256 {
+                    return Err(bad(format!("{name} was modified")));
+                }
+            }
+        }
+        if !manifest.contains_key(SERVER_EXE) {
+            return Err(bad(format!("no {SERVER_EXE}")));
+        }
+        Ok(dir.join(SERVER_EXE))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct Entry {
+    sha256: String,
+    size: u64,
+    mtime: u128,
+}
+
+fn stat(path: &Path) -> std::io::Result<Entry> {
+    let m = fs::metadata(path)?;
+    let mtime = m
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(Entry {
+        sha256: String::new(),
+        size: m.len(),
+        mtime,
+    })
+}
+
+fn sha256(path: &Path) -> std::io::Result<String> {
+    let mut f = fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match f.read(&mut buf)? {
+            0 => break,
+            n => h.update(&buf[..n]),
+        }
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// One line per file: `sha256 size mtime name` (names have no tabs; separated by tabs).
+fn write_manifest(dir: &Path) -> Result<(), String> {
+    let mut out = String::new();
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for name in names {
+        let path = dir.join(&name);
+        let st = stat(&path).map_err(|e| format!("{name}: {e}"))?;
+        let hash = sha256(&path).map_err(|e| format!("{name}: {e}"))?;
+        out.push_str(&format!("{hash}\t{}\t{}\t{name}\n", st.size, st.mtime));
+    }
+    fs::write(dir.join(MARKER), out).map_err(|e| format!("cannot write the manifest: {e}"))
+}
+
+fn parse_manifest(text: &str) -> Option<BTreeMap<String, Entry>> {
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut f = l.splitn(4, '\t');
+            let sha256 = f.next()?.to_owned();
+            let size = f.next()?.parse().ok()?;
+            let mtime = f.next()?.parse().ok()?;
+            let name = f.next()?.to_owned();
+            Some((
+                name,
+                Entry {
+                    sha256,
+                    size,
+                    mtime,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn download(
@@ -242,8 +405,7 @@ fn untar(archive: &Path, into: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     /// Serves `body` over HTTP to each connection; returns the URL.
     fn serve(body: Vec<u8>) -> &'static str {
@@ -274,18 +436,23 @@ mod tests {
         )
     }
 
-    /// A llama.cpp-like archive (server in a subfolder, as on macOS), made with the same tar.
+    /// A llama.cpp-like archive (server in a subfolder, as on macOS), made with the same tar:
+    /// the server, a library, a license, and a tool that isn't needed.
     fn archive(work: &Path) -> Vec<u8> {
-        let src = work.join("src");
-        fs::create_dir_all(src.join("llama-bX")).unwrap();
-        fs::write(src.join("llama-bX").join(SERVER_EXE), b"exe").unwrap();
-        fs::write(src.join("llama-bX").join("libggml.so"), b"lib").unwrap();
+        let src = work.join("src").join("llama-bX");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join(SERVER_EXE), b"exe").unwrap();
+        fs::write(src.join("libggml.dylib"), b"lib").unwrap();
+        fs::write(src.join("LICENSE"), b"MIT").unwrap();
+        fs::write(src.join("llama-quantize"), b"tool").unwrap();
+        fs::write(src.join("libllama-quantize-impl.dylib"), b"tool").unwrap();
+        fs::write(src.join("libllama-server-impl.dylib"), b"srv").unwrap();
         let tar = work.join("a.tar");
         let ok = Command::new(tar_exe())
             .arg("-cf")
             .arg(&tar)
             .arg("-C")
-            .arg(&src)
+            .arg(work.join("src"))
             .arg("llama-bX")
             .status()
             .unwrap()
@@ -294,8 +461,18 @@ mod tests {
         fs::read(&tar).unwrap()
     }
 
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
     #[test]
-    fn downloads_verifies_unpacks_and_cleans_up() {
+    fn downloads_verifies_installs_and_only_removes_its_own_files() {
         let work = std::env::temp_dir().join(format!("agt-s1-assets-{}", std::process::id()));
         let _ = fs::remove_dir_all(&work);
         let root = work.join("models");
@@ -310,22 +487,27 @@ mod tests {
                 sha256: hex(&gguf),
             },
             server: ModelFile {
-                name: "llama.tar",
+                name: "llama-b2-bin-test.tar.gz",
                 url: serve(tar.clone()),
                 size: tar.len() as u64,
                 sha256: "0000000000000000000000000000000000000000000000000000000000000000",
             },
             build: "b2",
         };
-        // A leftover from an earlier pin, to be removed.
-        fs::create_dir_all(root.join(LLAMA_DIR).join("b1")).unwrap();
+        let dir = root.join(LLAMA_DIR);
+        // An earlier build AGT installed (has a manifest), and things that aren't AGT's.
+        fs::create_dir_all(dir.join("b1")).unwrap();
+        fs::write(dir.join("b1").join(MARKER), "").unwrap();
+        fs::create_dir_all(dir.join("b0-user")).unwrap();
+        fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        fs::create_dir_all(root.join("llama.cpp")).unwrap();
 
-        // A bad hash: nothing is unpacked and nothing partial stays.
+        // A bad hash: nothing is installed and nothing partial stays.
         let mut statuses = Vec::new();
         let err = a.ensure(&mut |s| statuses.push(s)).unwrap_err();
         assert!(err.contains("failed verification"), "{err}");
         assert!(!a.server_exe().exists());
-        assert!(!root.join(LLAMA_DIR).join("llama.tar.part").exists());
+        assert!(!dir.join("llama-b2-bin-test.tar.gz.part").exists());
         assert_eq!(fs::read(a.model_path()).unwrap(), gguf);
         assert!(statuses.contains(&Status::Downloading {
             what: "S1-mini",
@@ -334,25 +516,47 @@ mod tests {
 
         a.server.sha256 = hex(&tar);
         a.ensure(&mut |_| {}).unwrap();
-        assert_eq!(fs::read(a.server_exe()).unwrap(), b"exe");
-        assert!(a.build_dir().join("libggml.so").is_file());
-        let left: Vec<_> = fs::read_dir(root.join(LLAMA_DIR))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(left, ["b2"], "archive, staging and old builds are removed");
+        assert_eq!(
+            names(&a.build_dir()),
+            [
+                MARKER,
+                "LICENSE",
+                "libggml.dylib",
+                "libllama-server-impl.dylib",
+                SERVER_EXE
+            ],
+            "only the server, its libraries and licenses are kept"
+        );
+        assert_eq!(a.verified_server_exe().unwrap(), a.server_exe());
+        assert_eq!(
+            names(&dir),
+            ["b0-user", "b2", "notes.txt"],
+            "archive, staging and AGT's old build removed; nothing else"
+        );
+        assert!(root.join("llama.cpp").is_dir());
 
         // Everything present: no network access.
         a.model.url = "http://127.0.0.1:1/unreachable";
         a.server.url = "http://127.0.0.1:1/unreachable";
         a.ensure(&mut |s| panic!("unexpected {s:?}")).unwrap();
 
-        // An interrupted unpack (no marker) is redone.
-        fs::remove_file(a.build_dir().join(MARKER)).unwrap();
-        a.server.url = serve(tar.clone());
-        a.ensure(&mut |_| {}).unwrap();
-        assert!(a.build_dir().join(MARKER).is_file());
+        // Touched but identical: still fine. Modified, or an extra file: refused.
+        let lib = a.build_dir().join("libggml.dylib");
+        fs::write(&lib, b"lib").unwrap();
+        a.verified_server_exe().unwrap();
+        fs::write(&lib, b"evil").unwrap();
+        assert!(a.verified_server_exe().unwrap_err().contains("modified"));
+        fs::write(&lib, b"lib").unwrap();
+        a.verified_server_exe().unwrap();
+        fs::write(a.build_dir().join("version.dll"), b"x").unwrap();
+        let err = a.verified_server_exe().unwrap_err();
+        assert!(err.contains("unexpected file"), "{err}");
+
+        // A build folder AGT didn't make is never replaced.
+        fs::remove_dir_all(a.build_dir()).unwrap();
+        fs::create_dir_all(a.build_dir()).unwrap();
+        let err = a.ensure(&mut |_| {}).unwrap_err();
+        assert!(err.contains("wasn't installed by AGT"), "{err}");
         fs::remove_dir_all(&work).unwrap();
     }
 }

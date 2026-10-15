@@ -9,13 +9,13 @@
 //! - Unix: started through a tiny `sh` watchdog whose stdin is a pipe from AGT. When AGT
 //!   exits for any reason, the pipe closes, `read` returns, and the watchdog sends the server
 //!   SIGTERM. The watchdog exits with the server's status, so AGT still sees crashes.
-//! - Its output goes to `Env::log_file` (truncated on every start). At its default
+//! - Its output goes to `Env::log_file` (the previous run's kept as `.1`). At its default
 //!   verbosity llama-server logs start-up, devices and per-request timings, never prompts.
 
 use super::{
     Status,
     assets::Assets,
-    gate::Gate,
+    gate::{Gate, IDLE_AFTER},
     supervisor::{Endpoint, Launcher, Server},
 };
 use agt_core::config::S1Device;
@@ -78,6 +78,8 @@ impl LlamaLauncher {
             "--parallel",
             "1",
             "--no-webui",
+            // `GET /slots`, to see whether it's idle before suspending it (see `gate`).
+            "--slots",
             // Never download anything (the model is a local file).
             "--offline",
         ]
@@ -107,7 +109,9 @@ impl Launcher for LlamaLauncher {
     }
 
     fn launch(&mut self) -> Result<Box<dyn Server>, String> {
-        let exe = self.assets.server_exe();
+        // The files are checked against what was verified at download (size + mtime; a
+        // changed file is hashed again), so nothing swapped in later is run.
+        let exe = self.assets.verified_server_exe()?;
         let port = free_port()?;
         let key = random_key();
         let args = self.args(port);
@@ -129,7 +133,7 @@ impl Launcher for LlamaLauncher {
             cmd.current_dir(dir);
         }
         let (stdout, stderr) = match &self.log_file {
-            Some(path) => match fs::File::create(path).and_then(|f| Ok((f.try_clone()?, f))) {
+            Some(path) => match rotate_and_create(path).and_then(|f| Ok((f.try_clone()?, f))) {
                 Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
                 Err(e) => {
                     tracing::warn!("cannot write {}: {e}", path.display());
@@ -140,15 +144,50 @@ impl Launcher for LlamaLauncher {
         };
         cmd.stdout(stdout).stderr(stderr);
         let mut child = spawn(cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+        let root = format!("http://127.0.0.1:{port}");
+        let idle_check = {
+            let (agent, url, key) = (self.health.clone(), format!("{root}/slots"), key.clone());
+            Box::new(move || slots_idle(&agent, &url, &key))
+        };
         Ok(Box::new(LlamaServer {
-            gate: Gate::for_child(&child),
+            gate: Gate::for_child(&child, idle_check, IDLE_AFTER),
             watchdog_pipe: child.stdin.take(),
             child,
-            root: format!("http://127.0.0.1:{port}"),
+            root,
             key,
             health: self.health.clone(),
         }))
     }
+}
+
+/// `GET /slots`: whether no slot is processing (an abandoned request may still be running).
+/// If the endpoint can't be read, the idle period alone has to do.
+fn slots_idle(agent: &ureq::Agent, url: &str, key: &str) -> bool {
+    let slots = agent
+        .get(url)
+        .header("authorization", &format!("Bearer {key}"))
+        .call()
+        .ok()
+        .filter(|r| r.status() == 200)
+        .and_then(|mut r| r.body_mut().read_to_string().ok())
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok());
+    match slots.as_ref().and_then(|v| v.as_array()) {
+        Some(slots) => !slots.iter().any(|s| s["is_processing"] == true),
+        None => {
+            tracing::debug!("cannot read llama-server's /slots; assuming idle");
+            true
+        }
+    }
+}
+
+/// Keeps the previous run's log as `<name>.1` (e.g. the one that says why it crashed).
+fn rotate_and_create(path: &std::path::Path) -> std::io::Result<fs::File> {
+    if path.exists() {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = fs::rename(path, old);
+    }
+    fs::File::create(path)
 }
 
 struct LlamaServer {
@@ -200,10 +239,18 @@ impl Server for LlamaServer {
     }
 
     fn kill(&mut self) {
-        // A suspended server must run again to exit (and handle SIGTERM).
+        // A suspended server must run again to exit.
         self.gate.retire();
-        // Unix: closing the watchdog's stdin makes it stop the server.
+        // Unix: closing the watchdog's stdin makes it stop the server...
         drop(self.watchdog_pipe.take());
+        // ...but one hung in start-up may not act on SIGTERM soon: kill the whole group.
+        #[cfg(unix)]
+        if let Ok(group) = i32::try_from(self.child.id())
+            && group > 1
+        {
+            // SAFETY: plain syscall; a negative pid addresses the watchdog's process group.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -427,19 +474,103 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             is()
         };
-        let gate = Gate::for_child(&child);
-        drop(gate.enter());
+        let gate = Gate::for_child(&child, Box::new(|| true), Duration::from_millis(100));
+        gate.start();
+        assert!(stopped(&pid), "the idle server must be stopped");
         assert!(gate.is_suspended());
-        assert!(stopped(&pid), "the server must be stopped");
-        let awake = gate.enter();
+        let awake = gate.enter().unwrap();
         assert!(!stopped(&pid));
         drop(awake);
+        std::thread::sleep(Duration::from_millis(100));
         assert!(stopped(&pid));
         // Stopping it for good: resumed, then ended by the watchdog.
         gate.retire();
         assert!(!stopped(&pid));
         drop(pipe);
         child.wait().unwrap();
+        let _ = fs::remove_file(&pid_file);
+    }
+
+    /// Run by [`unix_suspended_server_dies_with_a_crashed_agt`] as a stand-in for AGT:
+    /// starts a server, lets it be suspended, writes the server's pid, waits to be killed.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper process for unix_suspended_server_dies_with_a_crashed_agt"]
+    fn fake_agt() {
+        let Some(pid_file) = std::env::var_os("AGT_TEST_FAKE_AGT_PIDFILE") else {
+            return;
+        };
+        let pid_file = PathBuf::from(pid_file);
+        let script = format!("echo $$ > '{}.tmp'; exec sleep 60", pid_file.display());
+        let mut child = spawn(command(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), script],
+        ))
+        .unwrap();
+        let _pipe = child.stdin.take();
+        let tmp = PathBuf::from(format!("{}.tmp", pid_file.display()));
+        while !fs::read_to_string(&tmp).is_ok_and(|s| s.ends_with('\n')) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let gate = Gate::for_child(&child, Box::new(|| true), Duration::from_millis(50));
+        gate.start();
+        while !gate.is_suspended() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::rename(&tmp, &pid_file).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// AGT crashes (SIGKILL) while the server is suspended: the orphaned, stopped process
+    /// group gets SIGHUP + SIGCONT from the kernel, so the server doesn't linger.
+    #[cfg(unix)]
+    #[test]
+    fn unix_suspended_server_dies_with_a_crashed_agt() {
+        use std::time::Instant;
+        let pid_file = std::env::temp_dir().join(format!("agt-orphan-{}", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let mut agt = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "managed::process::tests::fake_agt",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AGT_TEST_FAKE_AGT_PIDFILE", &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let t = Instant::now();
+        let pid = loop {
+            if let Ok(s) = fs::read_to_string(&pid_file) {
+                break s.trim().to_owned();
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "fake AGT never got ready"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let alive = |pid: &str| {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive(&pid));
+        agt.kill().unwrap(); // SIGKILL: no clean-up code runs
+        agt.wait().unwrap();
+        let t = Instant::now();
+        while alive(&pid) {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "the server outlived AGT"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = fs::remove_file(&pid_file);
     }
 

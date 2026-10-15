@@ -13,7 +13,7 @@
 //!
 //! Until the server is ready, and after giving up, [`Polisher::polish`] fails at once, so
 //! dictations are pasted raw. Nothing here ever runs on the hotkey or STT path. Between
-//! requests the server is suspended on Windows, where it would otherwise poll ([`gate`]).
+//! dictations an idle server is suspended, since it would otherwise poll ([`gate`]).
 
 mod assets;
 mod gate;
@@ -131,13 +131,13 @@ impl Polisher for Managed {
     /// Waits for the server (including a first download), then sends one request.
     fn warmup(&self) -> Result<()> {
         let ep = self.shared.wait_ready(READY_TIMEOUT)?;
-        let _awake = ep.gate.enter();
+        let _awake = ep.gate.enter()?;
         self.client(&ep).warmup()
     }
 
     fn polish(&self, text: &str, ctx: &PolishCtx) -> Result<String> {
         let ep = self.shared.endpoint()?;
-        let _awake = ep.gate.enter();
+        let _awake = ep.gate.enter()?;
         self.client(&ep).polish(text, ctx)
     }
 }

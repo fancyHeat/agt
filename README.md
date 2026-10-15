@@ -134,6 +134,9 @@ AGT never rewrites an existing config. If the file has an error (including an un
 logs it, shows "Config error" in the tray menu, and runs with defaults **with automatic update
 checks off**, so a typo can't silently turn back on the checks and downloads you turned off. Tray →
 **Update now** still works, and an update that was already downloaded is still applied.
+The exception is `[polish]`: a problem there (an unknown key, or a value this version doesn't
+know, such as a provider added in a later release) only turns polish off ("Polish: off (config
+error, see log)" in the tray) and the rest of your settings are used.
 
 Only one AGT runs at a time (lock file `agt.lock` in the data dir); a second launch exits.
 
@@ -189,7 +192,9 @@ enabled = true
 That uses the default `provider = "s1-mini"`: [S1-mini](https://huggingface.co/superwhisper/s1-mini)
 by Superwhisper, a 0.6B model (a Qwen3-0.6B fine-tune) trained only for this job, run by AGT
 on your machine. Nothing is sent anywhere. (A config file written by AGT 0.0.6 or older says
-`provider = "openai"`: change that line to `provider = "s1-mini"`, or delete it.)
+`provider = "openai"`: change that line to `provider = "s1-mini"`, or delete it. A `[polish]`
+that sets `base_url` but no `provider` is taken as `provider = "openai"`, with a note in the
+log.)
 
 #### S1-mini (`provider = "s1-mini"`, the default)
 
@@ -203,13 +208,19 @@ meanwhile and is pasted unpolished until S1-mini is ready; the tray shows the pr
 | What | Size | From | To |
 |---|---|---|---|
 | S1-mini Q4_K_M (`s1-mini-q4_k_m.gguf`) | 485 MB | [`superwhisper/s1-mini-GGUF`](https://huggingface.co/superwhisper/s1-mini-GGUF), pinned revision | `<models>/s1-mini/` |
-| llama.cpp `b11669`: Windows x64 Vulkan build / macOS arm64 Metal build | 32 MB / 12 MB (88 / 31 MB unpacked) | [official release](https://github.com/ggml-org/llama.cpp/releases/tag/b11669) | `<models>/llama.cpp/b11669/` |
+| llama.cpp `b11669`: Windows x64 Vulkan build / macOS arm64 Metal build | 32 MB / 12 MB download (82 / ~30 MB installed) | [official release](https://github.com/ggml-org/llama.cpp/releases/tag/b11669) | `<models>/agt-llama-server/b11669/` |
 
 `<models>` is the models folder (`%LOCALAPPDATA%\AGT-models`, macOS
 `~/Library/Application Support/AGT/models`, or `stt.models_dir`), not the install folder,
 so it survives updates and reinstalls. Both downloads are pinned to an immutable URL and
-SHA-256 verified; the llama.cpp archive is unpacked with the OS's own `tar`. Then AGT starts
-`llama-server` itself:
+SHA-256 verified; the llama.cpp archive is unpacked with the OS's own `tar`, and only
+`llama-server` and its libraries (and license files) are kept, with a manifest of their
+hashes. Before every start AGT checks that folder against the manifest (the same files and
+nothing else, none changed; a changed size or date means hashing that file again), so nothing
+put there later is run. AGT only ever deletes what it made in `agt-llama-server` (older builds
+it installed, its archives and temporary folders), never anything else in the models folder.
+Still, if `stt.models_dir` is a shared folder, make sure only you can write to it. Then AGT
+starts `llama-server` itself:
 
 - on `127.0.0.1` only, on a free port, with a random API key, with S1-mini's required
   settings (`--jinja --chat-template-kwargs {"enable_thinking":false} --temp 0`, its exact
@@ -220,11 +231,14 @@ SHA-256 verified; the llama.cpp archive is unpacked with the OS's own `tar`. The
 - with no window (Windows), tied to AGT's lifetime: it's killed when AGT exits **or
   crashes** (Windows: a job object with kill-on-close; macOS: a watchdog that stops it when
   AGT's end of a pipe closes);
-- **suspended between dictations**, so an idle server uses no CPU at all (left alone it
-  wakes up hundreds of times a second, ~1% of a core); resuming takes microseconds;
+- **suspended when idle**: after 8 s without dictations, and once the server itself
+  reports that it has no work in progress (it may still be finishing a request AGT gave up
+  on), so an idle server uses no CPU at all (left alone it wakes up hundreds of times a
+  second, ~1% of a core); resuming for the next dictation takes microseconds;
 - restarted once if it crashes; if it fails again within 10 minutes AGT gives up and the
   tray says "Polish: off (S1-mini failed, see log)" until AGT is restarted. Its own output is
-  in `llama-server.log` next to AGT's logs (start-up, device, timings; never your text).
+  in `llama-server.log` next to AGT's logs (start-up, device, timings; never your text); the
+  previous run's is kept as `llama-server.log.1`.
 
 Why download llama.cpp instead of shipping it: the installer stays small for everyone who
 never enables polish, the signed release package doesn't change, and the llama.cpp build can
@@ -267,12 +281,14 @@ as text in every case tried.
 **License:** S1-mini is Apache 2.0 plus one term: it must keep its name, "S1-mini" by
 "Superwhisper", wherever it's used (see its
 [LICENSE](https://huggingface.co/superwhisper/s1-mini-GGUF/blob/main/LICENSE) and
-[NOTICE](https://huggingface.co/superwhisper/s1-mini-GGUF/blob/main/NOTICE)). AGT doesn't ship
-or redistribute the weights: it downloads them from Superwhisper's repository on your
-machine. llama.cpp is MIT licensed.
+[NOTICE](https://huggingface.co/superwhisper/s1-mini-GGUF/blob/main/NOTICE)). It's built on
+[Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) by Alibaba Cloud (Apache 2.0). AGT
+doesn't ship or redistribute the weights: it downloads them from Superwhisper's repository on
+your machine. llama.cpp is MIT licensed.
 
 **Removing it:** set `enabled = false` (or another provider) and restart AGT; then delete
-`<models>/s1-mini` and `<models>/llama.cpp` (~0.6 GB). Uninstalling AGT doesn't remove them.
+`<models>/s1-mini` and `<models>/agt-llama-server` (~0.6 GB). Uninstalling AGT doesn't remove
+them.
 
 #### How the guards work (all providers)
 
@@ -332,6 +348,10 @@ Requests send `max_tokens` and `temperature = 0`; newer OpenAI reasoning models 
 (they want `max_completion_tokens` and the default temperature), so every polish would fail
 and the raw text be pasted. The warmup line in the log shows such errors at start-up. Over
 plain `http://` to another machine the key travels unencrypted; AGT logs a warning.
+
+If the server can't be reached (e.g. Ollama isn't running), the first dictation finds out
+(on Windows even a refused local connection takes ~2 s), then dictations are pasted raw at
+once, without waiting, until a background check connects again.
 
 **Claude (cloud):** `provider = "anthropic"` uses Claude Haiku 5.5 (`claude-haiku-5-5`) with
 the key from the `ANTHROPIC_API_KEY` environment variable (or the variable named by

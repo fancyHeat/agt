@@ -15,6 +15,7 @@
 //!   --timeout-ms <n>     override polish.timeout_ms
 //!   --runs <n>           polish each line n times (default 3); latency = median
 //!   --hold <secs>        keep running (and the s1-mini server up) this long afterwards
+//!   --pause-ms <n>       wait this long before each line (e.g. to let the server go idle)
 //! ```
 //!
 //! Always polishes (`polish.enabled` is ignored) and warms up first; for s1-mini the warmup
@@ -25,13 +26,13 @@
 use agt_core::{Config, config::PolishConfig, paths};
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
-const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] <transcripts.txt>";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut cfg = PolishConfig::default();
     let mut models_dir = paths::models_dir();
     let mut server_log = std::env::temp_dir().join("agt-bench-llama-server.log");
-    let (mut runs, mut hold, mut file) = (3usize, 0u64, None);
+    let (mut runs, mut hold, mut pause, mut file) = (3usize, 0u64, 0u64, None);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
@@ -54,6 +55,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--timeout-ms" => cfg.timeout_ms = val()?.parse().map_err(|_| "bad --timeout-ms")?,
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
             "--hold" => hold = val()?.parse().map_err(|_| "bad --hold")?,
+            "--pause-ms" => pause = val()?.parse().map_err(|_| "bad --pause-ms")?,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -94,6 +96,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     for line in &lines {
         let mut times = Vec::with_capacity(runs);
         let mut results = Vec::with_capacity(runs);
+        std::thread::sleep(std::time::Duration::from_millis(pause));
         for _ in 0..runs {
             let t = Instant::now();
             let (out, outcome) = agt_polish::polish_or_raw(polisher.as_ref(), line, &cfg);

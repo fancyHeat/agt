@@ -226,8 +226,8 @@ pub(crate) fn run(
                         launched.elapsed().as_secs_f64(),
                         started.elapsed().as_secs_f64(),
                     );
-                    // Idle from now on (suspended where that matters, see `gate`).
-                    drop(ep.gate.enter());
+                    // Suspended whenever it has been idle a while (see `gate`).
+                    ep.gate.start();
                     shared.set(State::Ready(ep));
                     report(&Status::Ready);
                     let exit = server.wait();
