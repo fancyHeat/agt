@@ -1,4 +1,4 @@
-//! Tray icon: a status line, "Open config folder" and "Quit".
+//! Tray icon: a status line, a polish on/off line, "Open config folder" and "Quit".
 
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -15,14 +15,25 @@ pub struct Tray {
 
 impl Tray {
     /// `config_error`: shown as a disabled menu line so a broken config is noticeable.
-    pub fn new(version: &str, config_error: bool) -> Result<Self, Box<dyn std::error::Error>> {
+    /// `polish`: a disabled info line, e.g. "Polish: off".
+    pub fn new(
+        version: &str,
+        config_error: bool,
+        polish: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let title = format!("AGT {version}");
         let title_item = MenuItem::new(&title, false, None);
         let status = MenuItem::new("Starting...", false, None);
         let warning = MenuItem::new("Config error (updates off) - see log", false, None);
+        let polish = MenuItem::new(polish, false, None);
         let open_config = MenuItem::new("Open config folder", true, None);
         let quit = MenuItem::new("Quit", true, None);
-        let menu = Menu::with_items(&[&title_item, &status, &PredefinedMenuItem::separator()])?;
+        let menu = Menu::with_items(&[
+            &title_item,
+            &status,
+            &polish,
+            &PredefinedMenuItem::separator(),
+        ])?;
         if config_error {
             menu.append(&warning)?;
         }

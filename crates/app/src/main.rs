@@ -92,11 +92,16 @@ fn main() {
         pipeline::Status::Error(e)
     });
     let status = pipeline.as_ref().err().cloned();
+    let polish_info = pipeline
+        .as_ref()
+        .map_or("Polish: off", |p| &p.polish_info)
+        .to_owned();
 
     let mut app = App {
         tray: None,
         updater,
         config_error,
+        polish_info,
         status: status.map(|s| s.to_string()),
         _pipeline: pipeline.ok(),
     };
@@ -132,6 +137,8 @@ struct App {
     tray: Option<tray::Tray>,
     updater: Option<UpdateManager>,
     config_error: bool,
+    /// Tray line about LLM polish.
+    polish_info: String,
     /// Latest pipeline status, kept so it can be shown once the tray exists.
     status: Option<String>,
     _pipeline: Option<pipeline::Pipeline>,
@@ -141,7 +148,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
-            match tray::Tray::new(VERSION, self.config_error) {
+            match tray::Tray::new(VERSION, self.config_error, &self.polish_info) {
                 Ok(t) => {
                     if let Some(s) = &self.status {
                         t.set_status(s);

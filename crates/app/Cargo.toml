@@ -15,6 +15,7 @@ agt-core.workspace = true
 agt-audio.workspace = true
 agt-platform.workspace = true
 agt-stt.workspace = true
+agt-polish.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std", "tracing-log"] }
 tracing-appender = "0.2"
