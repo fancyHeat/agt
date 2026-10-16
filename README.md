@@ -6,7 +6,7 @@ text **on your own computer**; your voice never leaves it.
 
 <p align="center">
   <a href="https://github.com/fancyHeat/agt/releases/latest/download/AGT-win-x64-Setup.exe"><img alt="Download for Windows" src="https://img.shields.io/badge/Download%20for%20Windows-0078D4?style=for-the-badge&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0wIDBoMTEuNHYxMS40SDB6TTEyLjYgMEgyNHYxMS40SDEyLjZ6TTAgMTIuNmgxMS40VjI0SDB6TTEyLjYgMTIuNkgyNFYyNEgxMi42eiIvPjwvc3ZnPg%3D%3D"></a>
-  <a href="https://github.com/fancyHeat/agt/releases/latest/download/AGT-osx-arm64-Portable.zip"><img alt="Download for macOS · Apple Silicon" src="https://img.shields.io/badge/Download%20for%20macOS%20%C2%B7%20Apple%20Silicon-000000?style=for-the-badge&logo=apple&logoColor=white"></a>
+  <a href="https://github.com/fancyHeat/agt/releases/latest/download/AGT-osx-arm64-Setup.pkg"><img alt="Download for macOS · Apple Silicon" src="https://img.shields.io/badge/Download%20for%20macOS%20%C2%B7%20Apple%20Silicon-000000?style=for-the-badge&logo=apple&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -20,8 +20,8 @@ text **on your own computer**; your voice never leaves it.
 
 ## Quick start
 
-1. **Install.** Windows: run `AGT-win-x64-Setup.exe`. macOS: unzip and move `AGT.app` to
-   Applications.
+1. **Install.** Windows: run `AGT-win-x64-Setup.exe`. macOS: open `AGT-osx-arm64-Setup.pkg`
+   and follow the installer.
 2. **First launch.** AGT lives in the system tray (macOS: the menu bar). It downloads its
    speech model (about 670 MB) once; the tray menu shows the progress and says "Ready" when
    it's done. On a Mac,

@@ -1,23 +1,27 @@
 #!/bin/bash
-# Stores AGT's macOS signing certificate as secrets of the GitHub `release` environment, which
+# Stores AGT's macOS signing certificates (Developer ID Application, for the app, and Developer ID
+# Installer, for the .pkg) as secrets of the GitHub `release` environment, which
 # the package-macos job in .github/workflows/release.yml uses to sign and notarize. Run it in Terminal on the Mac whose login
-# keychain holds the Developer ID Application identity:
+# keychain holds both identities:
 #
-#   bash setup-apple-secrets.sh                 # export the identity; set APPLE_CERT_P12_BASE64
-#                                               # and APPLE_CERT_PASSWORD
-#   bash setup-apple-secrets.sh --with-apple-id # also (re)set APPLE_SIGN_IDENTITY, APPLE_TEAM_ID,
-#                                               # APPLE_ID and APPLE_APP_PASSWORD (prompts)
+#   bash setup-apple-secrets.sh                 # export both identities; set APPLE_CERT_P12_BASE64,
+#                                               # APPLE_CERT_PASSWORD, APPLE_SIGN_IDENTITY,
+#                                               # APPLE_INSTALLER_IDENTITY and APPLE_TEAM_ID
+#   bash setup-apple-secrets.sh --with-apple-id # also (re)set APPLE_ID and APPLE_APP_PASSWORD
+#                                               # (prompts)
 #   bash setup-apple-secrets.sh --dry-run       # only check the prerequisites; changes nothing
 #
 # Nothing secret is echoed, passed to `gh` on its command line, or written outside a private temp
-# directory that is deleted on exit. macOS asks once to allow the private key export (enter your
-# login password, click "Allow"). The .p12 password is random and only ever stored in GitHub.
+# directory that is deleted on exit. macOS asks to allow the private key export, possibly once per
+# key (enter your login password, click "Allow"). The .p12 password is random and only ever
+# stored in GitHub.
 set -euo pipefail
 
 REPO=fancyHeat/agt
 ENVIRONMENT=release
 TEAM_ID=TAYJMC7G8C
 IDENTITY="Developer ID Application: NOTICS Security LLC ($TEAM_ID)"
+INSTALLER_IDENTITY="Developer ID Installer: NOTICS Security LLC ($TEAM_ID)"
 LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
 DRY_RUN=false
@@ -60,25 +64,32 @@ if [ "$(printf '%s\n' "$VALID_HASHES" | wc -l | tr -d ' ')" != 1 ]; then
   die "keep only the one to use (Keychain Access -> login -> My Certificates; delete the other) and rerun"
 fi
 IDENTITY_HASH="$VALID_HASHES"
-# `security export` can't select one identity: it exports every identity in the keychain (any
-# policy, valid or not), so it's only usable when this is the only one.
+echo "    found $IDENTITY_HASH"
+
+step "Looking for \"$INSTALLER_IDENTITY\""
+# Installer certificates don't match the codesigning policy; list valid identities of any policy.
+INSTALLER_HASHES="$(security find-identity -v "$LOGIN_KEYCHAIN" \
+  | awk -v id="\"$INSTALLER_IDENTITY\"" '/^ *[0-9]+\)/ && substr($0, index($0, "\"")) == id {print $2}' | sort -u)"
+[ -n "$INSTALLER_HASHES" ] || die "no valid \"$INSTALLER_IDENTITY\" in $LOGIN_KEYCHAIN (create one at
+    https://developer.apple.com/account/resources/certificates -> + -> Developer ID Installer)"
+[ "$(printf '%s\n' "$INSTALLER_HASHES" | wc -l | tr -d ' ')" = 1 ] \
+  || die "more than one valid \"$INSTALLER_IDENTITY\"; keep only the one to use and rerun"
+INSTALLER_HASH="$INSTALLER_HASHES"
+WANTED_HASHES="$(printf '%s\n%s\n' "$IDENTITY_HASH" "$INSTALLER_HASH" | sort | tr '\n' ' ')"
+WANTED_HASHES="${WANTED_HASHES% }"
+echo "    found $INSTALLER_HASH"
+
+# `security export` can't select identities: it exports every identity in the keychain (any
+# policy, valid or not), so it's only usable when these two are the only ones.
 IDENTITY_COUNT="$(security find-identity "$LOGIN_KEYCHAIN" \
   | awk '/Matching identities/{m=1;next} /identities found/{m=0} m && /^ *[0-9]+\)/ {print $2}' | sort -u | wc -l | tr -d ' ')"
-echo "    found $IDENTITY_HASH; the login keychain holds $IDENTITY_COUNT identit$([ "$IDENTITY_COUNT" = 1 ] && echo y || echo ies) in total"
-
-VALID_ANY="$(security find-identity -v "$LOGIN_KEYCHAIN")"
-if [[ "$VALID_ANY" == *'"Developer ID Installer:'* ]]; then
-  echo "    note: a Developer ID Installer identity exists, but this script doesn't set"
-  echo "    APPLE_INSTALLER_IDENTITY; releases ship the macOS .zip only."
-else
-  echo "    no Developer ID Installer identity: APPLE_INSTALLER_IDENTITY is skipped (no .pkg, .zip only)"
-fi
+echo "    the login keychain holds $IDENTITY_COUNT identit$([ "$IDENTITY_COUNT" = 1 ] && echo y || echo ies) in total"
 
 EXISTING="$(gh secret list --env "$ENVIRONMENT" --repo "$REPO" --json name --jq '[.[].name | select(startswith("APPLE_"))] | join(" ")')"
 echo "    existing APPLE_* secrets in '$ENVIRONMENT': ${EXISTING:-none}"
 if [ "$WITH_APPLE_ID" = false ]; then
   MISSING=""
-  for name in APPLE_SIGN_IDENTITY APPLE_TEAM_ID APPLE_ID APPLE_APP_PASSWORD; do
+  for name in APPLE_ID APPLE_APP_PASSWORD; do
     case " $EXISTING " in *" $name "*) ;; *) MISSING="$MISSING $name" ;; esac
   done
   [ -z "$MISSING" ] || echo "    warning: missing$MISSING; run again with --with-apple-id to set them"
@@ -116,18 +127,19 @@ trap 'exit 130' INT TERM
 P12="$WORK/agt.p12"
 P12_PASSWORD="$(openssl rand -base64 36 | tr -d '\n/+=')"
 
-if [ "$IDENTITY_COUNT" = 1 ]; then
-  step "Exporting the identity (certificate + private key) to a temporary .p12"
-  echo "    macOS will ask to allow exporting the private key: enter your login password and click Allow."
+if [ "$IDENTITY_COUNT" = 2 ]; then
+  step "Exporting both identities (certificates + private keys) to a temporary .p12"
+  echo "    macOS will ask to allow exporting the private keys: enter your login password and click Allow."
   # The passphrase is visible to `ps` for the moment `security` runs; it only protects a file that
   # is deleted when this script exits.
   security export -k "$LOGIN_KEYCHAIN" -t identities -f pkcs12 -P "$P12_PASSWORD" -o "$P12" >/dev/null \
     || die "export failed (did you click Deny?)"
 else
-  step "Your login keychain holds more than one identity, so export it by hand:"
+  step "Your login keychain holds other identities too, so export these two by hand:"
   echo "    1. Open Keychain Access -> login -> My Certificates."
-  echo "    2. Right-click \"$IDENTITY\" with SHA-1 fingerprint $IDENTITY_HASH"
-  echo "       (only that one) -> Export..."
+  echo "    2. Cmd-click to select exactly these two, then right-click -> Export 2 items...:"
+  echo "         \"$IDENTITY\" (SHA-1 $IDENTITY_HASH)"
+  echo "         \"$INSTALLER_IDENTITY\" (SHA-1 $INSTALLER_HASH)"
   echo "    3. Format: Personal Information Exchange (.p12). Save it as:"
   echo "         $P12"
   echo "       (in the save dialog press Cmd+Shift+G and paste the folder: $WORK)"
@@ -138,7 +150,7 @@ else
   [ -n "$P12_PASSWORD" ] || die "empty password"
 fi
 
-step "Checking that the .p12 contains exactly that identity"
+step "Checking that the .p12 contains exactly those two identities"
 # Import into a throwaway keychain, as CI does, and list what came out.
 CHECK_PASSWORD="$(openssl rand -hex 16)"
 security create-keychain -p "$CHECK_PASSWORD" "$CHECK_KEYCHAIN"
@@ -148,9 +160,10 @@ security import "$P12" -k "$CHECK_KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" >/dev/n
   || die "the .p12 couldn't be imported (wrong password?)"
 # Every identity (valid or not) that the .p12 brought in, space-separated.
 P12_IDENTITIES="$(security find-identity "$CHECK_KEYCHAIN" \
-  | awk '/Matching identities/{m=1;next} /identities found/{m=0} m && /^ *[0-9]+\)/ {printf "%s%s", s, $2; s=" "}')"
-[ "$P12_IDENTITIES" = "$IDENTITY_HASH" ] \
-  || die "the .p12 must contain exactly $IDENTITY_HASH; it contains: ${P12_IDENTITIES:-nothing}"
+  | awk '/Matching identities/{m=1;next} /identities found/{m=0} m && /^ *[0-9]+\)/ {print $2}' | sort -u | tr '\n' ' ')"
+P12_IDENTITIES="${P12_IDENTITIES% }"
+[ "$P12_IDENTITIES" = "$WANTED_HASHES" ] \
+  || die "the .p12 must contain exactly $WANTED_HASHES; it contains: ${P12_IDENTITIES:-nothing}"
 security delete-keychain "$CHECK_KEYCHAIN"
 echo "    OK"
 
@@ -179,9 +192,10 @@ step "Setting secrets of the '$ENVIRONMENT' environment of $REPO"
 set_secret() { gh secret set "$1" --env "$ENVIRONMENT" --repo "$REPO" >/dev/null && echo "    set $1"; }
 base64 -i "$P12" | tr -d '\n' | set_secret APPLE_CERT_P12_BASE64
 printf '%s' "$P12_PASSWORD" | set_secret APPLE_CERT_PASSWORD
+printf '%s' "$IDENTITY" | set_secret APPLE_SIGN_IDENTITY
+printf '%s' "$INSTALLER_IDENTITY" | set_secret APPLE_INSTALLER_IDENTITY
+printf '%s' "$TEAM_ID" | set_secret APPLE_TEAM_ID
 if [ "$WITH_APPLE_ID" = true ]; then
-  printf '%s' "$IDENTITY" | set_secret APPLE_SIGN_IDENTITY
-  printf '%s' "$TEAM_ID" | set_secret APPLE_TEAM_ID
   printf '%s' "$APPLE_ID" | set_secret APPLE_ID
   printf '%s' "$APPLE_APP_PASSWORD" | set_secret APPLE_APP_PASSWORD
   unset APPLE_APP_PASSWORD

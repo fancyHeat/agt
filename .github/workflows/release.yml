@@ -206,7 +206,7 @@ jobs:
           fi
           vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
             --packDir publish --mainExe agt.exe --channel "$CHANNEL" --runtime "$CHANNEL" \
-            --shortcuts StartMenuRoot --framework vcredist143-x64 -o Releases "${ARGS[@]}"
+            --shortcuts StartMenuRoot --framework vcredist143-x64 --noPortable -o Releases "${ARGS[@]}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -235,9 +235,12 @@ jobs:
         env:
           # Secrets of the `release` environment (empty outside it, e.g. on PR dry runs).
           # (APPLE_TEAM_ID is also what the verify step checks the signature against.)
+          # The .pkg installer is the only download, so the "Developer ID Installer" identity is
+          # part of the certificate set.
           HAS_CERT: >-
             ${{ secrets.APPLE_CERT_P12_BASE64 != '' && secrets.APPLE_CERT_PASSWORD != ''
-            && secrets.APPLE_SIGN_IDENTITY != '' && secrets.APPLE_TEAM_ID != '' }}
+            && secrets.APPLE_SIGN_IDENTITY != '' && secrets.APPLE_INSTALLER_IDENTITY != ''
+            && secrets.APPLE_TEAM_ID != '' }}
           HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
         run: |
           SIGN=false; NOTARIZE=false
@@ -251,7 +254,7 @@ jobs:
             exit 1
           fi
           if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$SIGN" != true ]; then
-            echo "::warning::Not signing macOS: needs APPLE_CERT_P12_BASE64, APPLE_CERT_PASSWORD, APPLE_SIGN_IDENTITY and APPLE_TEAM_ID"
+            echo "::warning::Not signing macOS: needs APPLE_CERT_P12_BASE64, APPLE_CERT_PASSWORD, APPLE_SIGN_IDENTITY, APPLE_INSTALLER_IDENTITY and APPLE_TEAM_ID"
           elif [ "$SIGN" = true ] && [ "$NOTARIZE" != true ]; then
             echo "::warning::Not notarizing macOS: needs APPLE_ID and APPLE_APP_PASSWORD"
           fi
@@ -307,7 +310,8 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
           # -x: the private key can't be exported again. codesign may use it without a prompt, and
           # so may Apple-signed tools (partition list), but none can extract it.
-          security import "$P12" -P "$APPLE_CERT_PASSWORD" -x -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          security import "$P12" -P "$APPLE_CERT_PASSWORD" -x -f pkcs12 -k "$KEYCHAIN" \
+            -T /usr/bin/codesign -T /usr/bin/pkgbuild -T /usr/bin/productbuild -T /usr/bin/productsign
           rm -f "$P12"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
           SEARCH=("$KEYCHAIN")
@@ -336,17 +340,13 @@ jobs:
           APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
           APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
         run: |
-          ARGS=(--plist stage/macos/Info.plist --signEntitlements stage/macos/agt.entitlements)
+          # Installer only: no portable .zip.
+          ARGS=(--plist stage/macos/Info.plist --signEntitlements stage/macos/agt.entitlements --noPortable)
           if [ "$SIGN" = true ]; then
-            # Hardened runtime, secure timestamp; with a notary profile vpk also notarizes and
-            # staples the app.
-            ARGS+=(--keychain "$KEYCHAIN" --signAppIdentity "$APPLE_SIGN_IDENTITY")
-            # A .pkg installer needs a "Developer ID Installer" identity; without it, ship only the .zip.
-            if [ -n "$APPLE_INSTALLER_IDENTITY" ]; then
-              ARGS+=(--signInstallIdentity "$APPLE_INSTALLER_IDENTITY")
-            else
-              ARGS+=(--noInst)
-            fi
+            # Hardened runtime, secure timestamp; the .pkg is signed with the Developer ID
+            # Installer identity. With a notary profile vpk also notarizes and staples both.
+            ARGS+=(--keychain "$KEYCHAIN" --signAppIdentity "$APPLE_SIGN_IDENTITY"
+              --signInstallIdentity "$APPLE_INSTALLER_IDENTITY")
             if [ "$NOTARIZE" = true ]; then ARGS+=(--notaryProfile agt-notary); fi
           fi
           vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packTitle AGT --packAuthors Notics \
@@ -354,8 +354,8 @@ jobs:
             -o Releases "${ARGS[@]}"
 
       # Check the app as a user's Mac would: signed by our team with the hardened runtime and,
-      # when notarized, accepted by Gatekeeper with the ticket stapled. Both copies: the portable
-      # zip (new installs) and the full nupkg (what installed apps update to).
+      # when notarized, accepted by Gatekeeper with the ticket stapled. The installer .pkg itself
+      # (new installs), the app inside it, and the full nupkg (what installed apps update to).
       - name: Verify signature and notarization
         if: steps.macsign.outputs.sign == 'true'
         env:
@@ -378,12 +378,28 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          DIR="$RUNNER_TEMP/verify"; mkdir -p "$DIR/portable" "$DIR/nupkg"
+          DIR="$RUNNER_TEMP/verify"; mkdir -p "$DIR/nupkg"
 
-          ZIP="Releases/$PACK_ID-$CHANNEL-Portable.zip"
-          ditto -x -k "$ZIP" "$DIR/portable"
-          APPS=("$DIR"/portable/*.app)
-          if [ "${#APPS[@]}" != 1 ] || [ ! -d "${APPS[0]}" ]; then echo "::error::No single .app in $ZIP"; exit 1; fi
+          PKG="Releases/$PACK_ID-$CHANNEL-Setup.pkg"
+          echo "::group::$PKG"
+          SIG="$(pkgutil --check-signature "$PKG")"; echo "$SIG"
+          grep -q 'Status: signed by a developer certificate issued by Apple for distribution' <<<"$SIG" \
+            || { echo "::error::$PKG: not signed for distribution"; exit 1; }
+          grep -q "Developer ID Installer: .*($APPLE_TEAM_ID)" <<<"$SIG" \
+            || { echo "::error::$PKG: not signed by team $APPLE_TEAM_ID"; exit 1; }
+          if [ "$NOTARIZE" = true ]; then
+            xcrun stapler validate "$PKG"
+            ASSESS="$(spctl -a -vvv -t install "$PKG" 2>&1)"; echo "$ASSESS"
+            grep -q 'source=Notarized Developer ID' <<<"$ASSESS" \
+              || { echo "::error::$PKG: Gatekeeper doesn't accept the installer as notarized"; exit 1; }
+          fi
+          echo "::endgroup::"
+
+          # The app as the installer lays it down.
+          pkgutil --expand-full "$PKG" "$DIR/pkg"
+          APPS=()
+          while IFS= read -r -d '' A; do APPS+=("$A"); done < <(find "$DIR/pkg" -name '*.app' -type d -prune -print0)
+          if [ "${#APPS[@]}" != 1 ]; then echo "::error::Expected one .app in $PKG, found ${#APPS[@]}"; exit 1; fi
           check_app "${APPS[0]}"
 
           # The nupkg holds the bundle's contents under lib/app, with symlinks stored as
@@ -428,6 +444,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Installers only: never publish a portable build.
+          PORTABLE="$(find releases-* -iname '*portable*')"
+          if [ -n "$PORTABLE" ]; then echo "::error::Portable builds in the release: $PORTABLE"; exit 1; fi
           for CHANNEL in win-x64 osx-arm64; do
             vpk upload github --repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --token "$GH_TOKEN" \
               --channel "$CHANNEL" -o "releases-$CHANNEL" --tag "$GITHUB_REF_NAME" \
