@@ -712,7 +712,8 @@ impl AudioThread {
         // Until when the bar stays up after that tap ([`HubState::lingering`]).
         let mut linger: Option<Instant> = None;
         let double_tap = Duration::from_millis(self.config.hotkey.double_tap_ms);
-        let tap = Duration::from_millis(self.config.hotkey.min_hold_ms).max(TAP);
+        let min_hold = Duration::from_millis(self.config.hotkey.min_hold_ms);
+        let tap = min_hold.max(TAP);
 
         loop {
             let hands_free = latch == Latch::On && holding.is_some();
@@ -838,7 +839,10 @@ impl AudioThread {
                     };
                     if held.is_some_and(|h| h < tap) {
                         last_tap = Some(released);
-                        if !double_tap.is_zero() {
+                        // Only for a tap that was dropped: with `min_hold_ms` below TAP, a tap
+                        // that long is transcribed, and the bar should say so.
+                        let dropped = held.is_some_and(|h| h < min_hold);
+                        if dropped && !double_tap.is_zero() {
                             linger = Some(released + double_tap);
                             self.hub.update(|s| s.lingering = true);
                         }

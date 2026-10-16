@@ -68,7 +68,8 @@ Until everything is granted, the menu-bar item says which permission is missing,
 
 The default hotkey is **Fn** (the 🌐 Globe key). While AGT runs, tapping it no longer does
 what System Settings > Keyboard > "Press 🌐 key to" says (by default, opening the emoji
-picker), so a dictation doesn't also open the picker. Fn+key shortcuts still work.
+picker), so a dictation doesn't also open the picker. Fn+key shortcuts still work. If a
+tap still sets off something else, set "Press 🌐 key to" to **Do Nothing**.
 Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
 `"Fn+RightOption"`.
 
