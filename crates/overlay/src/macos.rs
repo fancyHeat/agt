@@ -1,4 +1,5 @@
-//! macOS: a borderless, non-activating `NSPanel` showing the frame in an `NSImageView`.
+//! macOS: a borderless, non-activating `NSPanel` whose layer-backed content view shows each
+//! frame as the layer's contents (a `CGImage` over a copy of the canvas pixels).
 //!
 //! - `NonactivatingPanel` style + `orderFrontRegardless`: showing it never activates AGT or
 //!   takes key focus from the frontmost app.
@@ -8,34 +9,43 @@
 //!   moved by Mission Control, skipped by Cmd+` window cycling.
 //! - `hidesOnDeactivate = false`: panels hide when their app deactivates by default, and AGT
 //!   (an accessory app) is never active.
+//! - Frames: the canvas is premultiplied `0xAARRGGBB`, which is exactly Core Graphics'
+//!   `PremultipliedFirst | ByteOrder32Little`, so a frame is one ~100 KB copy into a `CFData`
+//!   and a new `CGImage` set as `layer.contents` (Core Animation uploads it as is). A new image
+//!   per frame, never a mutated one: AppKit and Core Animation cache image contents.
 //!
 //! The pill goes on `NSScreen.mainScreen`: the screen with the keyboard focus when "Displays
 //! have separate Spaces" is on (the default), otherwise the primary display.
 
 use crate::{Error, Surface, canvas::Canvas};
 use objc2::{
-    AllocAnyThread, MainThreadMarker, MainThreadOnly,
+    MainThreadMarker, MainThreadOnly, msg_send,
     rc::{Retained, autoreleasepool},
+    runtime::AnyObject,
 };
 use objc2_app_kit::{
-    NSBackingStoreType, NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSImage, NSImageScaling,
-    NSImageView, NSPanel, NSScreen, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSPanel, NSScreen, NSStatusWindowLevel, NSView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
+};
+use objc2_core_foundation::{CFData, CFRetained};
+use objc2_core_graphics::{
+    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
+    CGImageByteOrderInfo,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 pub struct Window {
     mtm: MainThreadMarker,
     panel: Retained<NSPanel>,
-    view: Retained<NSImageView>,
+    /// The content view's backing `CALayer` (not retained separately: the view owns it).
+    layer: *mut AnyObject,
+    color_space: CFRetained<CGColorSpace>,
     /// Visible frame (screen minus menu bar and Dock) of the chosen screen, in points.
     screen: NSRect,
     scale: f64,
     margin: f64,
     top: bool,
     frame: Option<NSRect>,
-    /// Reused across frames while the pixel size stays the same.
-    bitmap: Option<(Retained<NSBitmapImageRep>, (usize, usize))>,
     visible: bool,
 }
 
@@ -68,20 +78,24 @@ impl Window {
         panel.setHidesOnDeactivate(false);
         panel.setBecomesKeyOnlyIfNeeded(true);
 
-        let view = NSImageView::new(mtm);
-        view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
-        let content: &NSView = &view;
-        panel.setContentView(Some(content));
+        let view = NSView::new(mtm);
+        view.setWantsLayer(true);
+        let layer: *mut AnyObject = unsafe { msg_send![&*view, layer] };
+        if layer.is_null() {
+            return Err("the overlay view has no layer".into());
+        }
+        panel.setContentView(Some(&view));
+        let color_space = CGColorSpace::new_device_rgb().ok_or("cannot create a color space")?;
         Ok(Self {
             mtm,
             panel,
-            view,
+            layer,
+            color_space,
             screen: rect,
             scale: 2.0,
             margin: 0.0,
             top: false,
             frame: None,
-            bitmap: None,
             visible: false,
         })
     }
@@ -102,7 +116,7 @@ impl Surface for Window {
     }
 
     fn present(&mut self, canvas: &Canvas) {
-        // `setImage` etc. autorelease objects; drain them every frame, not when the run loop
+        // AppKit autoreleases objects here; drain them every frame, not when the run loop
         // gets to it.
         autoreleasepool(|_| self.present_inner(canvas));
     }
@@ -134,54 +148,46 @@ impl Window {
             self.frame = Some(frame);
         }
 
-        // One bitmap (RGBA, premultiplied, alpha last, owning its buffer), reused while the
-        // size stays the same. Phase 4 to verify: if AppKit shows stale frames because it
-        // cached the rep's pixels, create the rep per frame instead.
-        if self.bitmap.as_ref().is_none_or(|(_, size)| *size != (w, h)) {
-            let rep = unsafe {
-                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-                    NSBitmapImageRep::alloc(),
-                    std::ptr::null_mut(),
-                    w as isize,
-                    h as isize,
-                    8,
-                    4,
-                    true,
-                    false,
-                    NSDeviceRGBColorSpace,
-                    (w * 4) as isize,
-                    32,
-                )
-            };
-            let Some(rep) = rep else {
-                tracing::warn!("overlay: cannot create bitmap");
-                return;
-            };
-            self.bitmap = Some((rep, (w, h)));
-        }
-        let Some((rep, _)) = &self.bitmap else { return };
-        let data = rep.bitmapData();
-        if data.is_null() {
+        let Some(image) = self.image(canvas) else {
+            tracing::warn!("overlay: cannot create the frame image");
             return;
-        }
-        let out = unsafe { std::slice::from_raw_parts_mut(data, w * h * 4) };
-        for (px, o) in canvas.pixels().iter().zip(out.as_chunks_mut::<4>().0) {
-            // 0xAARRGGBB (premultiplied) -> R, G, B, A
-            o.copy_from_slice(&[
-                (px >> 16) as u8,
-                (px >> 8) as u8,
-                *px as u8,
-                (px >> 24) as u8,
-            ]);
-        }
-        // A fresh (small) NSImage per frame so the view doesn't keep drawing a cached one.
-        let image = NSImage::initWithSize(NSImage::alloc(), size);
-        image.addRepresentation(rep);
-        self.view.setImage(Some(&image));
+        };
+        let image = CFRetained::as_ptr(&image).as_ptr() as *const AnyObject;
+        // The view's layer disables implicit animations, so this shows at once.
+        let _: () = unsafe { msg_send![self.layer, setContents: image] };
 
         if !self.visible {
             self.panel.orderFrontRegardless();
             self.visible = true;
+        }
+    }
+
+    /// A `CGImage` over a copy of the canvas pixels.
+    fn image(&self, canvas: &Canvas) -> Option<CFRetained<CGImage>> {
+        let (w, h) = (canvas.width(), canvas.height());
+        let pixels = canvas.pixels();
+        // SAFETY: `u32`s viewed as their bytes (little-endian: B, G, R, A).
+        let bytes =
+            unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4) };
+        let data = CFData::from_bytes(bytes);
+        let provider = CGDataProvider::with_cf_data(Some(&data))?;
+        let info = CGBitmapInfo::from_bits_retain(
+            CGImageByteOrderInfo::Order32Little.0 | CGImageAlphaInfo::PremultipliedFirst.0,
+        );
+        unsafe {
+            CGImage::new(
+                w,
+                h,
+                8,
+                32,
+                w * 4,
+                Some(&self.color_space),
+                info,
+                Some(&provider),
+                std::ptr::null(),
+                false,
+                CGColorRenderingIntent::RenderingIntentDefault,
+            )
         }
     }
 }

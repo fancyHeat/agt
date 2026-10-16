@@ -36,8 +36,9 @@ log_level = "info"
 # takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
 # Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (the default on
 # Windows); LeftWin/RightWin only work in a chord with Ctrl or Shift. A chord starts once
-# all its keys are down and ends when any of them is released. On macOS the default is "Fn"
-# (the Globe key).
+# all its keys are down and ends when any of them is released.
+# macOS keys: Fn (the Globe key, the default; set System Settings > Keyboard > "Press 🌐 key
+# to" to "Do Nothing"), RightOption, RightCommand, or F13-F20.
 # With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
 # keys are up: if you already hold the hotkey for the next dictation, the previous text
 # lands when you release it (after 10 s it's pasted anyway).
@@ -66,8 +67,11 @@ model = "parakeet-tdt-0.6b-v2"
 precision = "int8"
 # Where inference runs. "auto": on Windows the GPU (DirectML) if a quick check at start-up
 # finds it no slower than the CPU, else the CPU; on macOS the CPU. "cpu"; "directml" (Windows,
-# any DirectX 12 GPU; holds ~1.1 GB of VRAM while AGT runs); "cuda" (NVIDIA; builds with the
-# `cuda` feature); "vulkan" / "metal" (whisper). A GPU that can't be used falls back to the CPU.
+# any DirectX 12 GPU; holds ~1.1 GB of VRAM while AGT runs); "coreml" (macOS GPU; always the
+# fp32 encoder: 2.4 GB download plus a 2.4 GB compiled copy; the first start compiles the
+# model for this Mac, ~45 s, once; faster than the CPU only for dictations over ~20 s);
+# "cuda" (NVIDIA; builds with the `cuda` feature);
+# "vulkan" / "metal" (whisper). A GPU that can't be used falls back to the CPU.
 device = "auto"
 # CPU threads for inference; 0 = automatic.
 threads = 0
@@ -224,7 +228,7 @@ pub enum Device {
     Cpu,
     DirectMl,
     Cuda,
-    /// Apple's Core ML. Parsed, but no engine supports it yet (the macOS work, issue #9).
+    /// Apple's Core ML: the GPU (macOS only; parakeet).
     CoreMl,
     Vulkan,
     Metal,

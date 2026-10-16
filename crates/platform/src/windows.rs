@@ -1,6 +1,6 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
 use std::{
     cell::RefCell,
     ptr::{null, null_mut},
@@ -541,6 +541,21 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Re
     }
     Ok(true)
 }
+
+// ---------------------------------------------------------------------------------------
+// Permissions: Windows has no per-app prompts for any of this.
+
+pub fn accessibility_name() -> &'static str {
+    "Accessibility"
+}
+
+pub fn missing_permissions() -> Vec<Permission> {
+    Vec::new()
+}
+
+pub fn request_permissions(_missing: &[Permission]) {}
+
+pub fn open_permission_settings(_permission: Permission) {}
 
 #[cfg(test)]
 mod tests {

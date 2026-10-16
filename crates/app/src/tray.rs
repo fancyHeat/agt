@@ -1,5 +1,6 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, "Copy last
-//! transcript", "Update now", "Open config folder", "Open data folder" (where it differs) and
+//! transcript", "Update now", (macOS) "Privacy & Security settings", "Open config folder",
+//! "Open data folder" (where it differs) and
 //! "Quit".
 
 use tray_icon::{
@@ -19,6 +20,8 @@ pub struct Tray {
     update_item: MenuItem,
     pub copy_last: MenuId,
     pub update: MenuId,
+    /// macOS only: opens the System Settings page of the first missing permission.
+    pub privacy: Option<MenuId>,
     pub open_config: MenuId,
     /// "Open data folder" (the usage history, agt.db), when it differs from the config folder.
     pub open_data: Option<MenuId>,
@@ -49,6 +52,8 @@ impl Tray {
         } else {
             MenuItem::new("Update now (not installed)", false, None)
         };
+        let privacy = cfg!(target_os = "macos")
+            .then(|| MenuItem::new("Privacy & Security settings...", true, None));
         let open_config = MenuItem::new("Open config folder", true, None);
         let open_data = data_folder.then(|| MenuItem::new("Open data folder", true, None));
         let quit = MenuItem::new("Quit", true, None);
@@ -61,7 +66,11 @@ impl Tray {
         if config_error {
             menu.append(&warning)?;
         }
-        menu.append_items(&[&copy_last, &update, &open_config])?;
+        menu.append_items(&[&copy_last, &update])?;
+        if let Some(p) = &privacy {
+            menu.append(p)?;
+        }
+        menu.append(&open_config)?;
         if let Some(item) = &open_data {
             menu.append(item)?;
         }
@@ -85,6 +94,7 @@ impl Tray {
             copy_last_item: copy_last,
             update: update.id().clone(),
             update_item: update,
+            privacy: privacy.map(|p| p.id().clone()),
             open_config: open_config.id().clone(),
             open_data: open_data.map(|i| i.id().clone()),
             quit: quit.id().clone(),

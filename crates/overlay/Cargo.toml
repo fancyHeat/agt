@@ -20,6 +20,13 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGColorSpace",
+    "CGDataProvider",
+    "CGImage",
+] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSGeometry",
@@ -29,14 +36,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
-    "NSBitmapImageRep",
-    "NSCell",
     "NSColor",
-    "NSControl",
     "NSGraphics",
-    "NSImage",
-    "NSImageRep",
-    "NSImageView",
     "NSPanel",
     "NSResponder",
     "NSScreen",
@@ -50,3 +51,6 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(not(windows))'.dev-dependencies]
+libc = "0.2"

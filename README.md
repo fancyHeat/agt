@@ -13,10 +13,8 @@ text **on your own computer**; your voice never leaves it.
   <sub>Always the newest version · <a href="https://github.com/fancyHeat/agt/releases/latest">All releases</a></sub>
 </p>
 
-> **macOS: dictation is not working yet.** The Mac app installs, runs in the menu bar and
-> updates itself, but the dictation hotkey doesn't work there yet. Windows is fully supported.
-> On macOS, only Apple Silicon (M1 and later) Macs running macOS 13.4 or newer are supported;
-> **Intel Macs are not supported.**
+> **macOS:** Apple Silicon (M1 and later) Macs running macOS 13.4 or newer. **Intel Macs are
+> not supported.** See [macOS](#macos) for the permissions AGT asks for.
 
 ![The AGT overlay while recording](docs/img/overlay-recording.png)
 
@@ -26,7 +24,8 @@ text **on your own computer**; your voice never leaves it.
    Applications.
 2. **First launch.** AGT lives in the system tray (macOS: the menu bar). It downloads its
    speech model (about 670 MB) once; the tray menu shows the progress and says "Ready" when
-   it's done.
+   it's done. On a Mac,
+   allow the permissions it asks for first (see [macOS](#macos)).
 3. **Dictate.** Click into any text field, then hold the hotkey and speak:
    - Windows: **Left Ctrl + Windows key**
    - macOS: **Fn** (the Globe key)
@@ -38,6 +37,31 @@ Good to know:
 
 - Press **Esc** while holding the hotkey to cancel.
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
+
+## macOS
+
+AGT asks for two permissions on first launch, one after the other:
+
+- **Microphone**: to hear you. Click Allow.
+- **Accessibility** (called **Device Control** from macOS 27 on): to notice the hotkey and paste
+  with Cmd+V. Click Open System Settings and switch AGT on; it takes effect right away.
+
+Until everything is granted, the menu-bar item says which permission is missing, and its
+"Privacy & Security settings..." item opens the right page.
+
+The default hotkey is **Fn** (the 🌐 Globe key). Set System Settings > Keyboard > "Press 🌐 key
+to" to **Do Nothing**, or releasing it also opens the emoji picker or starts Apple's dictation.
+Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
+`"Fn+RightOption"`.
+
+AGT transcribes on the CPU by default: with the usual pauses between dictations it's faster
+than the GPU for anything under ~20 s, and more accurate (see
+[benchmarks](docs/benchmarks.md#results-macos-apple-silicon)). If you mostly dictate for longer than
+that, `device = "coreml"` under `[stt]` in `config.toml` uses the GPU instead, at the cost of a
+2.5 GB download, a 2.4 GB compiled copy and a one-time ~45 s preparation on first start.
+
+Known gap: Cmd+V is sent as the key in the "V" position of a QWERTY keyboard, so with a Dvorak
+or Colemak layout (other than "Dvorak - QWERTY ⌘") the paste may not work.
 
 ## Updates
 

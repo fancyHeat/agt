@@ -10,6 +10,9 @@
 //! previous version; installs further behind fall back to the full package.
 //! Every request has a hard timeout, so a dead connection can't stall the updater thread: a
 //! short one for the feed (a few KB), a long one for packages.
+//!
+//! Testing: `AGT_UPDATE_FEED` replaces the feed with another URL or a local directory (e.g. the
+//! `Releases` folder `vpk pack` wrote), so an update can be tried without publishing.
 
 use agt_core::config::UpdateConfig;
 use std::{
@@ -17,9 +20,14 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use velopack::{HttpOptions, UpdateCheck, UpdateManager, VelopackAsset, sources::HttpSource};
+use velopack::{
+    HttpOptions, UpdateCheck, UpdateManager, VelopackAsset,
+    sources::{FileSource, HttpSource, UpdateSource},
+};
 
 const FEED_URL: &str = "https://github.com/fancyHeat/agt/releases/latest/download";
+/// Overrides [`FEED_URL`]: a URL, or a local directory (for testing updates).
+const FEED_ENV: &str = "AGT_UPDATE_FEED";
 /// Whole-request timeouts (connect + transfer) for the feed and for each package download.
 const FEED_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -42,7 +50,12 @@ fn manager(timeout: Duration) -> Result<UpdateManager, velopack::Error> {
         TimeoutMilliseconds: timeout.as_millis() as u64,
         ..Default::default()
     };
-    UpdateManager::new(HttpSource::new_with_options(FEED_URL, options), None, None)
+    let source: Box<dyn UpdateSource> = match std::env::var(FEED_ENV) {
+        Ok(feed) if !feed.contains("://") => Box::new(FileSource::new(feed)),
+        Ok(feed) => Box::new(HttpSource::new_with_options(feed, options)),
+        Err(_) => Box::new(HttpSource::new_with_options(FEED_URL, options)),
+    };
+    UpdateManager::new_boxed(source, None, None)
 }
 
 /// Returns the updater (for "Update now" and applying on quit), or `None` if the app isn't a
@@ -55,6 +68,9 @@ pub fn start(cfg: &UpdateConfig) -> Option<Updater> {
             return None;
         }
     };
+    if let Ok(feed) = std::env::var(FEED_ENV) {
+        tracing::warn!("{FEED_ENV} is set: updates come from {feed}");
+    }
     let version = updater.um.get_current_version_as_string();
     if !cfg.enabled {
         tracing::info!("automatic updates disabled (current version {version})");

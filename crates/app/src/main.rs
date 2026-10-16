@@ -357,6 +357,16 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
+            AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
+                // The page for the first missing permission (or Accessibility, to review).
+                let missing = agt_platform::missing_permissions();
+                agt_platform::open_permission_settings(
+                    missing
+                        .first()
+                        .copied()
+                        .unwrap_or(agt_platform::Permission::Accessibility),
+                );
+            }
             AppEvent::Menu(e) if Some(&e.id) == tray.open_data.as_ref() => {
                 open_folder(&paths::history_dir())
             }
@@ -512,7 +522,10 @@ impl App {
             // A red flash if this dictation failed. An error from before (still shown in the
             // tray after a cancel, a short tap or "no speech") just hides it.
             Status::Error(_) if failures != self.failures_at_start => Mode::Error,
-            Status::Error(_) | Status::Ready(_) | Status::Loading(_) => Mode::Hidden,
+            Status::Error(_)
+            | Status::Ready(_)
+            | Status::Loading(_)
+            | Status::NeedsPermission(_) => Mode::Hidden,
         };
         overlay.set_mode(mode, pipeline.level.get(), Instant::now());
         if was_hidden

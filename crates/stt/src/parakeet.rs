@@ -16,6 +16,15 @@
 //! the GPU compile the graph once instead of on every call. The features are zero-padded to
 //! the window (the encoder masks by `length`) and the engine reports the window as its
 //! [`SttEngine::max_input_secs`], so `agt-stt`'s chunker never passes more.
+//!
+//! ## Core ML (macOS)
+//!
+//! With dynamic input shapes, ONNX Runtime's Core ML EP can only take about half of the
+//! encoder (291 partitions) and the rest bounces to the CPU: no faster than the CPU alone. With
+//! the time axis fixed to [`COREML_WINDOW_SECS`] the whole graph compiles to one ML Program on
+//! the GPU. Core ML needs the fp32 encoder (the int8 one uses ops it doesn't support). The
+//! compiled model is cached next to the model (`coreml-<frames>/`), so only the first load pays
+//! the ~20 s compile.
 
 use crate::{
     models::{self, ModelFile, Progress},
@@ -125,7 +134,7 @@ pub fn files(cfg: &SttConfig) -> Result<&'static [ModelFile]> {
             .into());
         }
     };
-    Ok(match cfg.precision {
+    Ok(match precision(cfg) {
         Precision::Int8 => &set.0,
         Precision::Fp32 => &set.1,
     })
@@ -173,13 +182,44 @@ impl Encoder {
     }
 }
 
-/// What `stt.device = "auto"` tries first. Windows: DirectML, kept only if it isn't slower
-/// than the CPU (see [`Parakeet::load`]). macOS: the CPU for now (Phase 4 adds Core ML).
-const AUTO_DEVICE: Device = if cfg!(windows) {
-    Device::DirectMl
-} else {
-    Device::Cpu
-};
+/// What `stt.device = "auto"` uses. Windows: DirectML, kept only if it isn't slower than the
+/// CPU (see [`Parakeet::load`]). macOS: the CPU (int8). Core ML is only used when asked for: on
+/// an M4 with real speech and a few seconds between dictations, the CPU's int8 encoder was ~2x
+/// faster for short clips (113 vs 215 ms p50) and faster for 6-20 s ones (239 vs 290 ms),
+/// more accurate (the 10 s window splits longer dictations), needs a quarter of the download
+/// and no ~20 s compile. A warm, back-to-back GPU (what a start-up probe measures) hides the
+/// ~90 ms Core ML pays after the GPU idles for a second or more. See docs/benchmarks.md.
+fn auto_device() -> Device {
+    if cfg!(windows) {
+        Device::DirectMl
+    } else {
+        Device::Cpu
+    }
+}
+
+/// The device `cfg` asks for, with `auto` resolved (before any fallback).
+fn wanted_device(cfg: &SttConfig) -> Device {
+    match cfg.device {
+        Device::Auto => auto_device(),
+        d => d,
+    }
+}
+
+/// The encoder precision actually used: Core ML always runs the fp32 encoder.
+fn precision(cfg: &SttConfig) -> Precision {
+    match wanted_device(cfg) {
+        Device::CoreMl if cfg!(target_os = "macos") => Precision::Fp32,
+        _ => cfg.precision,
+    }
+}
+
+/// Core ML's fixed encoder window (see the module docs): every chunk is padded to it, so it's
+/// a trade-off. Measured on an M4 (GPU): 5 s ≈ 51 ms, 10 s ≈ 76 ms, 15 s ≈ 104 ms, 25 s ≈
+/// 170 ms per encoder call, vs. ~100 ms (3 s) to ~330 ms (10 s) on the CPU. The padding
+/// doesn't change the output; the chunk cuts do: with 10 s, dictations of 10-15 s are cut in
+/// two and real-speech WER is ~1.3 points worse than the CPU's, with 15 s it equals the CPU's
+/// (docs/benchmarks.md, window sweep).
+pub const COREML_WINDOW_SECS: f32 = 10.0;
 
 /// Under `auto`, the GPU is kept if its time for [`PROBE_SECS`] of audio is at most this
 /// many times the CPU's. A short clip is the CPU's best case: a fixed-window GPU encoder costs
@@ -227,6 +267,7 @@ const _: () = assert!((crate::CHUNK_SECS * SAMPLE_RATE as f32) as usize / 160 < 
 fn fixed_window(device: Device) -> Option<usize> {
     match device {
         Device::DirectMl => Some(DML_FRAMES),
+        Device::CoreMl => Some(window_frames(COREML_WINDOW_SECS)),
         _ => None,
     }
 }
@@ -306,7 +347,11 @@ impl Parakeet {
             .iter()
             .position(|t| t == "<blk>")
             .ok_or("vocab.txt has no <blk> token")?;
-        let encoder_path = dir.join(match cfg.precision {
+        let precision = precision(cfg);
+        if precision != cfg.precision {
+            tracing::info!("Core ML uses the fp32 encoder (stt.precision is ignored)");
+        }
+        let encoder_path = dir.join(match precision {
             Precision::Int8 => ENCODER_INT8,
             Precision::Fp32 => ENCODER_FP32,
         });
@@ -318,10 +363,7 @@ impl Parakeet {
             cfg.threads,
             None,
         )?;
-        let wanted = match cfg.device {
-            Device::Auto => AUTO_DEVICE,
-            d => d,
-        };
+        let wanted = wanted_device(cfg);
         let explicit = cfg.device != Device::Auto;
         let mut notice = None;
         let mut fell_back_from = None;
@@ -368,7 +410,7 @@ impl Parakeet {
             label: format!(
                 "{} {}",
                 cfg.model,
-                match cfg.precision {
+                match precision {
                     Precision::Int8 => "int8",
                     Precision::Fp32 => "fp32",
                 }
@@ -558,10 +600,29 @@ fn session(
         }
         #[cfg(not(feature = "cuda"))]
         Device::Cuda => return Err(Unsupported("this build doesn't include CUDA support").into()),
-        // Core ML (fixed 10 s window, fp32) comes with the macOS work (Phase 4, issue #9).
+        #[cfg(target_os = "macos")]
         Device::CoreMl => {
-            return Err(Unsupported("this build doesn't include Core ML support").into());
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            // The cache is keyed by the model path only: the window size goes in the folder
+            // name so a different window never picks up a stale compiled model.
+            let frames = fixed_frames.ok_or("Core ML needs a fixed encoder window")?;
+            let cache = path
+                .with_file_name(format!("coreml-{frames}"))
+                .display()
+                .to_string();
+            // GPU: the Neural Engine took 5x longer on this fp32 graph, and "all" adds nothing.
+            let coreml = ort::ep::CoreML::default()
+                .with_model_format(ModelFormat::MLProgram)
+                .with_compute_units(ComputeUnits::CPUAndGPU)
+                .with_model_cache_dir(cache)
+                .build()
+                .error_on_failure();
+            b = b
+                .with_execution_providers([coreml])
+                .map_err(|e| e.to_string())?;
         }
+        #[cfg(not(target_os = "macos"))]
+        Device::CoreMl => return Err(Unsupported("Core ML is only available on macOS").into()),
         Device::Auto | Device::Vulkan | Device::Metal => {
             return Err(Unsupported("the parakeet engine can't use this device").into());
         }
