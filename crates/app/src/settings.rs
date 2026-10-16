@@ -363,6 +363,12 @@ fn add_polish(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> 
                 },
             ),
         )?;
+        b.check(
+            &polish,
+            "Fast drafting (faster on long text, may differ by a word)",
+            &["polish", "s1-mini", "fast_drafting"],
+            |c| c.polish.s1_mini.fast_drafting,
+        )?;
     } else {
         b.choice(
             &polish,
@@ -783,6 +789,11 @@ mod tests {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
         }
+        // The fast drafting check flips the file's key (off by default).
+        let path: SettingPath = &["polish", "s1-mini", "fast_drafting"];
+        let text = config::with_settings(config::DEFAULT_CONFIG, &[(path, true.into())]).unwrap();
+        let on = Config::parse(&text).unwrap();
+        assert!(on.polish.s1_mini.fast_drafting && !c.polish.s1_mini.fast_drafting);
         // The default hotkey is offered and checked; a custom chord is shown as is.
         let keys = hotkey_choices(config::DEFAULT_HOTKEY);
         assert_eq!(keys.iter().filter(|c| c.checked).count(), 1);

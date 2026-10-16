@@ -156,6 +156,11 @@ context = "general"
 # "auto": on the GPU (Metal on a Mac, Vulkan on Windows; ~0.85 GB of VRAM) if there is one,
 # else the CPU. "cpu": always on the CPU (slower: ~0.5 s instead of 0.08 s for a sentence).
 device = "auto"
+# Draft from the transcript (llama.cpp's speculative decoding): up to 2-3x faster on long
+# dictations, since the cleaned text mostly repeats the transcript (little gain when it
+# rewrites a lot). The trade-off: now and then a word or punctuation mark comes out
+# differently where two choices were nearly tied. Only the S1-mini that AGT runs uses it.
+fast_drafting = false
 
 [overlay]
 # Show a small bar with a live waveform while recording and an animation while transcribing.
@@ -387,6 +392,8 @@ pub struct S1MiniConfig {
     pub structure: S1Structure,
     pub context: S1Context,
     pub device: S1Device,
+    /// Speculative decoding from the prompt (llama-server `--spec-type ngram-simple`).
+    pub fast_drafting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -427,6 +434,7 @@ impl Default for S1MiniConfig {
             structure: S1Structure::Prose,
             context: S1Context::General,
             device: S1Device::Auto,
+            fast_drafting: false,
         }
     }
 }
@@ -1192,7 +1200,7 @@ mod tests {
             "[Styling: semi-formal] [Structure: prose] [Context: general]"
         );
         let c = Config::parse(
-            "[polish]\nenabled = true\n[polish.s1-mini]\nstyling = \"semi-casual\"\nstructure = \"lists\"\ncontext = \"email\"\ndevice = \"cpu\"\n",
+            "[polish]\nenabled = true\n[polish.s1-mini]\nstyling = \"semi-casual\"\nstructure = \"lists\"\ncontext = \"email\"\ndevice = \"cpu\"\nfast_drafting = true\n",
         )
         .unwrap()
         .polish;
@@ -1201,6 +1209,8 @@ mod tests {
             "[Styling: semi-casual] [Structure: lists] [Context: email]"
         );
         assert_eq!(c.s1_mini.device, S1Device::Cpu);
+        assert!(c.s1_mini.fast_drafting);
+        assert!(!S1MiniConfig::default().fast_drafting);
         // Values S1-mini wasn't trained on are config errors, not garbage output.
         assert!(polish_error("[polish.s1-mini]\nstyling = \"pirate\""));
         assert!(polish_error("[polish.s1-mini]\ncontext = \"chat\""));

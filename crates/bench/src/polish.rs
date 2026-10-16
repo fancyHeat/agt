@@ -10,6 +10,7 @@
 //!   --styling <s>        s1-mini: casual | semi-casual | semi-formal | formal
 //!   --context <c>        s1-mini: general | email
 //!   --s1-device <d>      s1-mini: auto | cpu
+//!   --fast-drafting <b>  s1-mini: on | off (polish.s1-mini.fast_drafting)
 //!   --models-dir <dir>   s1-mini: where it's downloaded (default: AGT's models folder)
 //!   --server-log <file>  s1-mini: llama-server's output (default: in the temp folder)
 //!   --timeout-ms <n>     override polish.timeout_ms
@@ -18,13 +19,18 @@
 //!   --pause-ms <n>       wait this long before each line (e.g. to let the server go idle)
 //!   --segments           the file is `agt-bench live --segments` output: compare polishing
 //!                        each dictation whole with polishing its segments one by one
-//!   --refs <dir>         with --segments: `<name>.txt` references there, for WER
+//!   --refs <dir>         `<name>.txt` references there: WER of raw and polished text, with
+//!                        substitutions, deletions and insertions apart
+//!   --save <file>        write each line's polished text (first run) as `name<TAB>text`
+//!   --compare <file>     compare with a run saved by --save: outputs that differ, the WER
+//!                        between the two, and every differing passage
 //! ```
 //!
 //! Always polishes (`polish.enabled` is ignored) and warms up first; for s1-mini the warmup
 //! includes the download and server start. Output per line: median latency, the guard
 //! outcome (polished / skipped / raw: reason) and the text that would be pasted. Lines
-//! starting with `#` are comments.
+//! starting with `#` are comments; a line `name<TAB>text` names its transcript (for --refs,
+//! --save and --compare; otherwise it's `line <n>`).
 //!
 //! **Segments** (`--segments`): the pipeline could polish each finished segment of a long
 //! dictation in the background while the user is still talking, leaving only the tail for
@@ -45,14 +51,14 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] [--segments [--refs dir]] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--fast-drafting on|off] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] [--refs dir] [--save f] [--compare f] [--segments] <transcripts.txt>";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut cfg = PolishConfig::default();
     let mut models_dir = paths::models_dir();
     let mut server_log = std::env::temp_dir().join("agt-bench-llama-server.log");
     let (mut runs, mut hold, mut pause, mut file) = (3usize, 0u64, 0u64, None);
-    let (mut segments, mut refs) = (false, None);
+    let (mut segments, mut refs, mut save, mut compare) = (false, None, None, None);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
@@ -76,8 +82,17 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
             "--hold" => hold = val()?.parse().map_err(|_| "bad --hold")?,
             "--pause-ms" => pause = val()?.parse().map_err(|_| "bad --pause-ms")?,
+            "--fast-drafting" => {
+                cfg.s1_mini.fast_drafting = match val()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--fast-drafting: on or off".into()),
+                }
+            }
             "--segments" => segments = true,
             "--refs" => refs = Some(PathBuf::from(val()?)),
+            "--save" => save = Some(PathBuf::from(val()?)),
+            "--compare" => compare = Some(PathBuf::from(val()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -88,11 +103,22 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     }
     let file = file.ok_or(USAGE)?;
     let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
-    let lines: Vec<String> = text
+    // `name<TAB>text` or just the text (named by its number).
+    let named: Vec<(String, String)> = text
         .lines()
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .enumerate()
+        .map(|(i, l)| {
+            let (name, t) = l.split_once('\t').unwrap_or(("", l));
+            let name = if name.is_empty() {
+                format!("line {}", i + 1)
+            } else {
+                name.to_owned()
+            };
+            (name, t.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
         .collect();
+    let lines: Vec<String> = named.iter().map(|(_, t)| t.clone()).collect();
 
     let t0 = Instant::now();
     let env = agt_polish::Env {
@@ -118,6 +144,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
     // Latency of every request that was actually sent (skipped lines excluded).
     let mut all = Vec::new();
+    // The first run's pasted text per line.
+    let mut firsts = Vec::with_capacity(lines.len());
     for line in &lines {
         let mut times = Vec::with_capacity(runs);
         let mut results = Vec::with_capacity(runs);
@@ -140,6 +168,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             line.split_whitespace().count()
         );
         println!("  in:  {line}");
+        firsts.push(results[0].0.clone());
         // Distinct results only (a model at temperature 0 usually repeats itself).
         results.dedup();
         for (out, outcome) in &results {
@@ -158,6 +187,13 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             all[all.len() - 1]
         );
     }
+    accuracy(
+        &named,
+        &firsts,
+        refs.as_deref(),
+        save.as_deref(),
+        compare.as_deref(),
+    )?;
     if hold > 0 {
         eprintln!("holding for {hold} s");
         std::thread::sleep(std::time::Duration::from_secs(hold));
@@ -167,6 +203,105 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
+}
+
+/// `--refs`, `--save`, `--compare` for plain runs: WER of the raw and polished text against
+/// `<refs>/<name>.txt` with deletions and insertions apart, the outputs saved as
+/// `name<TAB>text`, and the difference from a saved run (WER with the saved output as the
+/// reference, and every differing passage).
+fn accuracy(
+    named: &[(String, String)],
+    outs: &[String],
+    refs: Option<&Path>,
+    save: Option<&Path>,
+    compare: Option<&Path>,
+) -> Result<(), String> {
+    use crate::wer::{Edit, Errors, edit_script};
+    let fmt = |e: &Errors| {
+        format!(
+            "WER {:.2}% (sub {}, del {}, ins {}; {} words)",
+            crate::pct(e.total(), e.words),
+            e.sub,
+            e.del,
+            e.ins,
+            e.words
+        )
+    };
+    if let Some(dir) = refs {
+        let (mut raw, mut polished) = (Errors::default(), Errors::default());
+        for ((name, text), out) in named.iter().zip(outs) {
+            let Ok(r) = std::fs::read_to_string(dir.join(format!("{name}.txt"))) else {
+                continue;
+            };
+            raw.add(Errors::of(&r, text));
+            polished.add(Errors::of(&r, out));
+        }
+        println!("vs reference: raw {}", fmt(&raw));
+        println!("vs reference: polished {}", fmt(&polished));
+    }
+    if let Some(path) = save {
+        let body: String = named
+            .iter()
+            .zip(outs)
+            .map(|((name, _), out)| format!("{name}\t{}\n", out.replace(['\t', '\n'], " ")))
+            .collect();
+        std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if let Some(path) = compare {
+        let saved =
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let saved: std::collections::HashMap<&str, &str> =
+            saved.lines().filter_map(|l| l.split_once('\t')).collect();
+        let (mut diff, mut changed, mut n) = (Errors::default(), 0, 0);
+        println!();
+        for ((name, _), out) in named.iter().zip(outs) {
+            let Some(&before) = saved.get(name.as_str()) else {
+                continue;
+            };
+            n += 1;
+            diff.add(Errors::of(before, out));
+            if before == out.replace(['\t', '\n'], " ") {
+                continue;
+            }
+            changed += 1;
+            // Differing passages, case and punctuation included, with some context.
+            let (a, b): (Vec<&str>, Vec<&str>) = (
+                before.split_whitespace().collect(),
+                out.split_whitespace().collect(),
+            );
+            // Runs of edits: (words of `a` before the run, removed, added).
+            let mut runs: Vec<(usize, Vec<&str>, Vec<&str>)> = Vec::new();
+            let (mut used, mut open) = (0, false);
+            for op in edit_script(&a, &b) {
+                if !open && !matches!(op, Edit::Same(..)) {
+                    runs.push((used, Vec::new(), Vec::new()));
+                }
+                open = !matches!(op, Edit::Same(..));
+                let run = runs.last_mut();
+                match (op, run) {
+                    (Edit::Same(..), _) => used += 1,
+                    (Edit::Sub(i, j), Some(r)) => (r.1.push(a[i]), r.2.push(b[j]), used += 1).2,
+                    (Edit::Del(i), Some(r)) => (r.1.push(a[i]), used += 1).1,
+                    (Edit::Ins(j), Some(r)) => r.2.push(b[j]),
+                    _ => {}
+                }
+            }
+            for (at, from, to) in runs {
+                let ctx = a[at.saturating_sub(5)..at].join(" ");
+                println!(
+                    "  [{name}] ...{ctx} {{{}}} -> {{{}}}",
+                    from.join(" "),
+                    to.join(" ")
+                );
+            }
+        }
+        println!(
+            "vs {}: {changed} of {n} outputs differ; WER between them {}",
+            path.display(),
+            fmt(&diff)
+        );
+    }
+    Ok(())
 }
 
 /// `--segments`: whole-text polish vs polishing ahead of release (see the module docs).

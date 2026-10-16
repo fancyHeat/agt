@@ -19,7 +19,7 @@ use super::{
     gate::{Gate, IDLE_AFTER},
     supervisor::{Endpoint, Launcher, Server},
 };
-use agt_core::config::S1Device;
+use agt_core::config::{S1Device, S1MiniConfig};
 use std::sync::Arc;
 use std::{
     fs,
@@ -38,12 +38,13 @@ const CTX: u32 = 4096;
 pub(crate) struct LlamaLauncher {
     assets: Assets,
     device: S1Device,
+    fast_drafting: bool,
     log_file: Option<PathBuf>,
     health: ureq::Agent,
 }
 
 impl LlamaLauncher {
-    pub fn new(assets: Assets, device: S1Device, log_file: Option<PathBuf>) -> Self {
+    pub fn new(assets: Assets, s1: &S1MiniConfig, log_file: Option<PathBuf>) -> Self {
         let health = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(2)))
@@ -51,7 +52,8 @@ impl LlamaLauncher {
             .new_agent();
         Self {
             assets,
-            device,
+            device: s1.device,
+            fast_drafting: s1.fast_drafting,
             log_file,
             health,
         }
@@ -89,24 +91,31 @@ impl LlamaLauncher {
             // server by ~25 MB per request.
             "--cache-ram",
             "0",
-            // The answer is mostly the transcript again, so draft from the prompt: find the
-            // last 3 tokens earlier in the context and propose the (up to) 24 that followed
-            // them; one batched pass checks them all and keeps what the model would have
-            // written anyway. Up to ~3x faster when the model mostly keeps the (punctuated)
-            // transcript, no faster when it rewrites a lot (unpunctuated input). Batched
-            // checking can flip near-tie choices, so a few outputs differ by a word or a
-            // few (docs/benchmarks.md, "Polish speed").
-            "--spec-type",
-            "ngram-simple",
-            "--spec-ngram-simple-size-n",
-            "3",
-            "--spec-ngram-simple-size-m",
-            "24",
-            "--spec-draft-n-max",
-            "24",
         ]
         .map(String::from)
         .into();
+        if self.fast_drafting {
+            // `polish.s1-mini.fast_drafting`. The answer is mostly the transcript again, so
+            // draft from the prompt: find the last 3 tokens earlier in the context and propose
+            // the (up to) 24 that followed them; one batched pass checks them all and keeps
+            // what the model would have written anyway. Up to ~3x faster when the model
+            // mostly keeps the (punctuated) transcript, no faster when it rewrites a lot.
+            // Batched checking can flip near-tie choices, so now and then a word or a
+            // punctuation mark differs (docs/benchmarks.md, "Polish speed").
+            a.extend(
+                [
+                    "--spec-type",
+                    "ngram-simple",
+                    "--spec-ngram-simple-size-n",
+                    "3",
+                    "--spec-ngram-simple-size-m",
+                    "24",
+                    "--spec-draft-n-max",
+                    "24",
+                ]
+                .map(String::from),
+            );
+        }
         a.extend(
             match self.device {
                 // Windows (Vulkan): read the weights instead of memory-mapping them; they live
@@ -642,7 +651,7 @@ mod tests {
         let dir = std::env::temp_dir().join("agt-args-test");
         let l = LlamaLauncher::new(
             Assets::for_this_platform(&dir).unwrap_or_else(|_| Assets::test(&dir)),
-            S1Device::Auto,
+            &S1MiniConfig::default(),
             None,
         );
         let a = l.args(4242).join(" ");
@@ -651,10 +660,20 @@ mod tests {
             r#"--jinja --chat-template-kwargs {"enable_thinking":false} --temp 0"#,
             "--n-gpu-layers all",
             "--cache-ram 0",
-            "--spec-type ngram-simple",
         ] {
             assert!(a.contains(want), "{a}");
         }
+        // Drafting only when the setting is on.
+        assert!(!a.contains("--spec"), "{a}");
+        let l = LlamaLauncher {
+            fast_drafting: true,
+            ..l
+        };
+        let a = l.args(1).join(" ");
+        assert!(
+            a.contains("--spec-type ngram-simple --spec-ngram-simple-size-n 3"),
+            "{a}"
+        );
         let l = LlamaLauncher {
             device: S1Device::Cpu,
             ..l
