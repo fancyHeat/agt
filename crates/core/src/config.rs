@@ -166,7 +166,9 @@ position = "bottom"
 save_text = false
 # Save the recording as a WAV file (16 kHz mono; about 1.9 MB per minute of speech).
 save_audio = false
-# Delete saved dictations after this many days; 0 = keep them forever.
+# Delete saved dictations after this many days; 0 = keep them forever. Whole days are
+# deleted, so up to one day more may be kept. Each record joins its timings and settings in
+# agt.db, which keeps those 180 days: older records no longer find theirs.
 keep_days = 30
 
 [update]

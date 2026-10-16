@@ -90,13 +90,14 @@ Off by default. Tray menu → **Settings → History** lets AGT keep a copy of e
   on) and the text that was pasted.
 - **Save audio**: the recording, as a WAV file (about 1.9 MB per minute of speech).
 - **Keep for**: 7, 30 (the default) or 90 days, or forever. Older days are deleted
-  automatically.
+  automatically (a whole day at a time, so up to one day more may be kept).
 
 **Open history folder** takes you there: `dictations` next to `agt.db` (Windows:
-`%LOCALAPPDATA%\AGT-data\dictations`), one folder per day with a `dictations.jsonl` file (one
-dictation per line) and the WAV files. They stay on your computer as plain files and are never
-uploaded. Turning saving off keeps what's already there until it's due for deletion;
-uninstalling AGT removes it. In `config.toml` it's the `[history]` section.
+`%LOCALAPPDATA%\AGT-data\dictations`, macOS: `~/Library/Application Support/AGT/dictations`),
+one folder per day with a `dictations.jsonl` file (one dictation per line) and the WAV files.
+They stay on your computer as plain files and are never uploaded. Turning saving off keeps
+what's already there until it's due for deletion. Uninstalling AGT on Windows removes it; on
+macOS, delete the folder yourself. In `config.toml` it's the `[history]` section.
 
 Each line looks like this (fields for what you chose not to save are left out):
 
@@ -108,7 +109,8 @@ Each line looks like this (fields for what you chose not to save are left out):
 was pasted (no speech, or the paste failed). `started_at` matches the `dictations` table in
 `agt.db`, which has that dictation's timings and the settings it ran with (model, device,
 clean-up style, ...), so the two can be joined, e.g. to label data with a bigger model or to
-build a custom dictionary.
+build a custom dictionary. `agt.db` keeps those rows for 180 days: history kept longer than
+that no longer joins.
 
 ## Privacy
 

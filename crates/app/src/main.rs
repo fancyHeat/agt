@@ -74,6 +74,8 @@ enum UpdateEvent {
 
 /// How long exiting waits for the telemetry writer to commit the last records.
 const TELEMETRY_FLUSH: Duration = Duration::from_secs(2);
+/// The same for the dictation history writer.
+const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
 fn main() {
     // `agt stats`: a report from the telemetry database; doesn't start the app.
@@ -212,6 +214,8 @@ fn main() {
     }
     tracing::info!("AGT exiting");
     agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
+    // The last dictation's history record (and WAV) may still be being written.
+    agt_history::flush(HISTORY_FLUSH);
 }
 
 /// The session's non-secret settings. Polish: provider, model, style, S1-mini's options and

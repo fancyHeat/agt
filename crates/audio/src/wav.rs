@@ -43,7 +43,7 @@ pub fn write_16k_mono(path: &Path, samples: &[f32]) -> Result<(), String> {
     let mut writer = hound::WavWriter::create(path, spec).map_err(fail)?;
     let mut w = writer.get_i16_writer(samples.len() as u32);
     for &s in samples {
-        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
     }
     w.flush().map_err(fail)?;
     writer.finalize().map_err(fail)

@@ -9,7 +9,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn line(e: &Entry) -> serde_json::Value {
-    let (line, _) = record(e);
+    let (line, _) = record(e, &LocalTime::at(e.started_at));
     assert!(
         line.ends_with('\n') && line.matches('\n').count() == 1,
         "{line}"
@@ -87,7 +87,7 @@ fn records_hold_only_what_is_saved() {
             .starts_with(&LocalTime::at(started_at).day())
     );
     // Nothing else (settings and timings are in agt.db, joined on started_at), in this order.
-    let (text, _) = record(&e);
+    let (text, _) = record(&e, &LocalTime::at(e.started_at));
     let keys = [
         "started_at",
         "time",
@@ -173,6 +173,34 @@ fn write_appends_lines_and_wavs() {
     let back = agt_audio::wav::read_16k_mono(&wav).unwrap();
     assert_eq!(back.len(), samples.len());
     assert!(samples.iter().zip(&back).all(|(a, b)| (a - b).abs() < 1e-3));
+    // Written under a temporary name, then renamed: none left behind.
+    assert!(
+        fs::read_dir(&day).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp"))
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_line_cut_short_by_a_crash_does_not_swallow_the_next() {
+    let dir = temp_dir("torn");
+    let path = dir.join(RECORDS_FILE);
+    append_line(&path, "{\"a\":1}\n").unwrap();
+    fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap(); // the crash
+    append_line(&path, "{\"c\":3}\n").unwrap();
+    append_line(&path, "{\"d\":4}\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "{\"a\":1}\n{\"b\":\n{\"c\":3}\n{\"d\":4}\n"
+    );
+    // An empty file gets no leading newline.
+    let empty = dir.join("empty.jsonl");
+    fs::write(&empty, "").unwrap();
+    append_line(&empty, "{}\n").unwrap();
+    assert_eq!(fs::read_to_string(&empty).unwrap(), "{}\n");
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -226,14 +254,13 @@ fn keep_days_zero_keeps_everything() {
         text: Some(Text::default()),
         ..Default::default()
     }));
-    drop(h);
-    // The writer exits once the sender is gone; give it a moment to write.
-    let records = dir.join(LocalTime::at(at).day()).join(RECORDS_FILE);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !records.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(records.exists());
+    // On disk once flush returns (as at exit).
+    assert!(flush(Duration::from_secs(5)));
+    assert!(
+        dir.join(LocalTime::at(at).day())
+            .join(RECORDS_FILE)
+            .exists()
+    );
     assert!(dir.join("2001-01-01").exists());
     fs::remove_dir_all(&dir).unwrap();
 }

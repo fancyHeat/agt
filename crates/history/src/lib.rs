@@ -3,8 +3,10 @@
 //! labelling with bigger models, fine-tuning the small ones, or a custom dictionary.
 //!
 //! **Privacy:** plain files in [`agt_core::paths::dictations_dir`], never uploaded. Deleted
-//! after `keep_days`. Telemetry (`agt.db`) still never holds text or audio; a record joins
-//! its metrics and settings there through `started_at`.
+//! by whole local days once older than `keep_days` (so up to `keep_days` + 1 days are kept).
+//! Telemetry (`agt.db`) still never holds text or audio; a record joins its metrics and
+//! settings there through `started_at`, for as long as agt.db keeps the row (180 days, see
+//! `agt_telemetry::RETENTION_DAYS_RAW`).
 //!
 //! **Never on the dictation path.** The pipeline hands each finished dictation (after the
 //! paste) to one `history` writer thread over a channel; the audio is moved, not copied.
@@ -44,15 +46,22 @@ use agt_core::config::HistoryConfig;
 use serde::Serialize;
 use std::{
     fs,
-    io::Write as _,
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// How often old days are pruned while AGT runs (also once at start-up).
-const PRUNE_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// How often the writer checks whether the local date changed, to prune once per day (also
+/// once at start-up). A timer, unlike a 24 h sleep, keeps up with sleep/suspend.
+const PRUNE_CHECK: Duration = Duration::from_secs(3600);
+
+/// Entries handed to the writer and not written yet (see [`flush`]).
+static PENDING: AtomicUsize = AtomicUsize::new(0);
 
 /// The lines of each day folder.
 const RECORDS_FILE: &str = "dictations.jsonl";
@@ -91,13 +100,29 @@ pub struct History {
 impl History {
     /// Hands `entry` to the writer (a channel send, never a disk write).
     pub fn save(&self, entry: Box<Entry>) {
-        let _ = self.tx.send(entry);
+        PENDING.fetch_add(1, SeqCst);
+        if self.tx.send(entry).is_err() {
+            PENDING.fetch_sub(1, SeqCst);
+        }
     }
 }
 
+/// Waits (up to `timeout`) until everything handed to the writer is on disk; call right before
+/// the process exits. Returns whether it all was.
+pub fn flush(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while PENDING.load(SeqCst) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
 /// Starts the writer thread for `dir` ([`agt_core::paths::dictations_dir`]). It prunes days
-/// older than `keep_days` at start-up and daily, also with saving off (once, then it exits).
-/// Returns the sender while saving is on.
+/// older than `keep_days` at start-up and when the local date changes, also with saving off
+/// (once, then it exits). Returns the sender while saving is on.
 pub fn start(config: &HistoryConfig, dir: PathBuf) -> Option<History> {
     let (tx, rx) = mpsc::channel();
     let keep_days = config.keep_days;
@@ -118,22 +143,20 @@ pub fn start(config: &HistoryConfig, dir: PathBuf) -> Option<History> {
 }
 
 fn writer(dir: &Path, keep_days: u64, rx: Receiver<Box<Entry>>) {
-    let mut next_prune = Instant::now();
+    // The local day of the last prune.
+    let mut pruned: Option<i64> = None;
     loop {
-        let entry = if keep_days == 0 {
-            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        } else {
-            if Instant::now() >= next_prune {
-                prune(dir, local_day(now_ms()), keep_days);
-                next_prune = Instant::now() + PRUNE_EVERY;
-            }
-            rx.recv_timeout(next_prune.saturating_duration_since(Instant::now()))
-        };
-        match entry {
+        let today = local_day(now_ms());
+        if keep_days > 0 && pruned != Some(today) {
+            prune(dir, today, keep_days);
+            pruned = Some(today);
+        }
+        match rx.recv_timeout(PRUNE_CHECK) {
             Ok(e) => {
                 if let Err(err) = write(dir, &e) {
                     tracing::warn!("cannot save dictation to history: {err}");
                 }
+                PENDING.fetch_sub(1, SeqCst);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -153,9 +176,9 @@ struct Record<'a> {
     text: Option<&'a Text>,
 }
 
-/// The record's line (with its newline), and the WAV file name if there is audio.
-fn record(e: &Entry) -> (String, Option<String>) {
-    let t = LocalTime::at(e.started_at);
+/// The record's line (with its newline), and the WAV file name if there is audio. `t`:
+/// `e.started_at` in local time.
+fn record(e: &Entry, t: &LocalTime) -> (String, Option<String>) {
     let wav = (!e.audio.is_empty()).then(|| t.file_stem() + ".wav");
     let record = Record {
         started_at: e.started_at,
@@ -169,22 +192,43 @@ fn record(e: &Entry) -> (String, Option<String>) {
     (line, wav)
 }
 
-/// Writes the WAV first, then the line: a line never points at a file that isn't there.
+/// Writes the WAV first, then the line: a line never points at a file that isn't there. The
+/// WAV is written under a temporary name and renamed once complete, so a crash never leaves a
+/// truncated `.wav`.
 fn write(dir: &Path, e: &Entry) -> Result<(), String> {
-    let (line, wav) = record(e);
-    let day = dir.join(LocalTime::at(e.started_at).day());
+    let t = LocalTime::at(e.started_at);
+    let (line, wav) = record(e, &t);
+    let day = dir.join(t.day());
     fs::create_dir_all(&day).map_err(|err| format!("{}: {err}", day.display()))?;
     if let Some(wav) = wav {
-        agt_audio::wav::write_16k_mono(&day.join(wav), &e.audio)?;
+        let path = day.join(wav);
+        let tmp = path.with_extension("wav.tmp");
+        agt_audio::wav::write_16k_mono(&tmp, &e.audio)?;
+        fs::rename(&tmp, &path).map_err(|err| format!("{}: {err}", path.display()))?;
     }
     let path = day.join(RECORDS_FILE);
-    fs::OpenOptions::new()
+    append_line(&path, &line).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// Appends `line` in one write, so a reader never sees half of one. If the file doesn't end
+/// with a newline (a crash cut its last line short), one goes first: the broken line stays
+/// on its own, and this one is intact.
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
-        .open(&path)
-        // One write per line, so a reader never sees half of one.
-        .and_then(|mut f| f.write_all(line.as_bytes()))
-        .map_err(|err| format!("{}: {err}", path.display()))
+        .open(path)?;
+    let mut last = *b"\n";
+    if f.metadata()?.len() > 0 {
+        f.seek(SeekFrom::End(-1))?;
+        f.read_exact(&mut last)?;
+    }
+    if last[0] == b'\n' {
+        f.write_all(line.as_bytes())
+    } else {
+        f.write_all(format!("\n{line}").as_bytes())
+    }
 }
 
 /// Deletes the day folders in `dir` more than `keep_days` before `today` (days since the

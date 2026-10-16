@@ -109,6 +109,33 @@ fn version_1_database_gets_the_new_columns() {
     );
 }
 
+/// `agt stats` opens read-only and can't migrate: a newer `agt stats` must still read a
+/// database an older running AGT created (it only queries version-1 columns).
+#[test]
+fn stats_read_a_never_migrated_v1_database() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO dictations (started_at, outcome, stt_ms, audio_secs, release_to_paste_ms,
+                chars_out, words_out) VALUES (?1, 'pasted', 100, 2, 150, 10, 2)",
+            [now_ms()],
+        )
+        .unwrap();
+    }
+    let report = crate::stats::report(&path).unwrap_or_else(|e| panic!("{e}"));
+    assert!(report.contains("1 dictation"), "{report}");
+    let version: i64 = open_read_only(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1, "read-only: not migrated");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn rtf_is_derived() {
     let conn = memory();
