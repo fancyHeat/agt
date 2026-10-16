@@ -125,7 +125,6 @@ dependencies = [
  "agt-core",
  "agt-fetch",
  "hound",
- "libc",
  "ort",
  "tracing",
  "whisper-rs",

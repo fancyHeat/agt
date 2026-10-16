@@ -1,4 +1,4 @@
-# STT benchmarks (Phase 2 model spike)
+# STT benchmarks (Phase 2 model spike; macOS: issue #11)
 
 Goal: pick the fastest accurate default speech-to-text engine/backend per platform, from real
 numbers. Latency from hotkey release to pasted text matters most, then accuracy, then what it
@@ -50,7 +50,7 @@ This machine has no NPU: the GPU memory counters show no GPU use in any CPU run,
 the CPU rows with `PreferCPU` gave the same latency within noise (e.g. 141-154 ms short, 410-441
 ms medium, both ways).
 
-**Hardware**: Intel i9-9900K (8 cores / 16 threads), 32 GB, NVIDIA RTX 2080 Ti 11 GB (driver
+**Hardware** (Windows; the Mac is described in its own section): Intel i9-9900K (8 cores / 16 threads), 32 GB, NVIDIA RTX 2080 Ti 11 GB (driver
 617.14), Windows 11 Pro 26200. ONNX Runtime 1.31 (pyke prebuilt; DirectML build, CUDA 13
 build for `cuda`), whisper.cpp 1.8.3 (whisper-rs 0.16), CUDA 13.4 / cuDNN 9.27 runtime DLLs.
 
@@ -139,6 +139,158 @@ wrong (here: empty) transcripts while the CPU was correct with the same padding.
   Range/Less/Where chain, which DirectML emulates with 32-bit) is folded or handled wrongly. We
   did not dig further: the unfused static graph is already 2.3-3x faster than dynamic shapes.
 
+## Results (macOS, Apple Silicon)
+
+Issue #11. Same eval set, normalizer and `agt-bench` as above, on a real Mac (Phase 4's Core
+ML path: fixed 10 s encoder window, fp32, GPU; CPU sessions with `PreferCPU`).
+
+**Hardware**: MacBook Air (Mac16,13, fanless), **Apple M4** (4 performance + 6 efficiency
+cores, 10-core GPU), **16 GB**, **macOS 27.0.1** (26A434), on AC power, Low Power Mode off.
+ONNX Runtime 1.31 (pyke prebuilt, Core ML EP), whisper.cpp via whisper-rs 0.16 with Metal.
+The prepared clips matched `eval_manifest.tsv` (same clips and references; some WAV hashes
+differ, i.e. a different decoder/resampler build).
+
+**Method differences from the Windows runs**: every configuration ran in its own process,
+3 processes each, in alternating order (round 2 reversed); numbers are the median over the
+processes of each process's p50/p90. Another session was running interactive latency tests
+of the AGT app on the same Mac at the same time, so the GPU was busy now and then; the
+per-process spread is small (short-clip p50 within ±8 ms for Parakeet, except where noted).
+**Memory**: `/usr/bin/time -l`: "footprint" is the peak *physical footprint* (dirty, private
+memory: what counts against memory pressure), "RSS" the peak resident set, which also counts
+clean, file-backed pages of memory-mapped model files. **Load**: engine construction with
+the model files in the page cache; "first" is the first load ever (Core ML compiles the model
+for this Mac and caches it in `<models>/<model>/coreml-<frames>/`).
+
+### Warm, back to back (what the Windows table measures)
+
+Each clip transcribed 3 times right after one another; ms p50/p90.
+
+| # | Engine, backend | short | medium | long | WER read | WER real | WER all | load | footprint | RSS | download |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| M1 | Parakeet v2 fp32, **Core ML** (10 s window; Phase 4 default) | 102/109 | 187/222 | **438/680** | 1.96 | 5.93 | 4.45 | 5.1 s (3.6-8.9); first 43 s | 0.43 GB | 4.5 GB | 2.5 GB + 2.4 GB compiled |
+| M2 | **Parakeet v2 int8, CPU** | **82/112** | 220/291 | 711/1115 | 2.23 | **4.20** | **3.47** | **1.0 s** | 1.37 GB | 1.4 GB | 0.65 GB |
+| M3 | Parakeet v2 fp32, CPU | 95/105 | 208/261 | 626/1004 | 2.23 | 4.61 | 3.73 | 4.9 s¹ | 2.43 GB | 2.7 GB | 2.5 GB |
+| M4 | Parakeet v3 fp32, Core ML (10 s window) | 92/99 | 185/202 | 427/691 | 2.51 | 5.60 | 4.45 | 6.6 s; first 30 s | 0.72 GB | 6.3 GB | 2.5 GB + 2.4 GB compiled |
+| M5 | Parakeet v3 int8, CPU | 86/117 | 228/292 | 744/1130 | 2.79 | 5.93 | 4.76 | 0.9 s | 1.38 GB | 1.4 GB | 0.67 GB |
+| M6 | Whisper large-v3-turbo q5_0, Metal | 1255/1468 | 1314/1479 | 2738/4196 | **1.82** | 7.49 | 5.39 | 0.35 s | 0.78 GB | 0.75 GB | 0.57 GB |
+| M7 | Whisper small.en q8_0, Metal | 250/270 | 331/379 | 818/1263 | 3.35 | 7.65 | 6.06 | 0.2 s | 0.48 GB | 0.46 GB | 0.26 GB |
+
+¹ ~5 s when another model ran just before it (the 2.5 GB file had left the page cache), 1.1 s
+right after itself. Core ML's cached load varied 3.6-8.9 s between processes (it reads and
+maps the compiled 2.4 GB copy; the other session's GPU use may add to it). Core ML short p50
+was 88-103 ms over five back-to-back processes; M1 shows the median of the matrix's three.
+Whisper turbo's second process was ~7% slower than the other two (1326 vs 1238/1255 ms short;
+probably the other session), the median is unaffected.
+
+WER per source (%; ~250-360 words each, so ±1 point is noise):
+
+| # | ls-clean | ls-other | ted | vox | earn | ami |
+|---|---|---|---|---|---|---|
+| M1 Parakeet v2 Core ML (10 s window) | 3.02 | 0.85 | 4.49 | 3.50 | 5.46 | 11.51 |
+| M1' Parakeet v2 Core ML, 15 s window | 3.30 | 1.14 | 4.21 | 3.18 | 6.48 | 4.76 |
+| M2 Parakeet v2 int8 CPU | 3.30 | 1.14 | 3.93 | 2.87 | 4.78 | 5.56 |
+| M3 Parakeet v2 fp32 CPU | 3.30 | 1.14 | 4.21 | 3.18 | 4.78 | 6.75 |
+| M4 Parakeet v3 Core ML | 3.02 | 1.99 | 3.37 | 4.14 | 8.53 | 7.14 |
+| M5 Parakeet v3 int8 CPU | 1.92 | 3.69 | 3.37 | 2.55 | 8.53 | 10.71 |
+| M6 Whisper turbo q5_0 Metal | 1.65 | 1.99 | 4.21 | 3.50 | 4.10 | 21.03 |
+| M7 Whisper small.en q8_0 Metal | 3.02 | 3.69 | 5.34 | 3.50 | 8.19 | 15.48 |
+
+(The v2 int8 CPU AMI number is 5.6% here vs 10.3% on the i9: ONNX Runtime's int8 kernels
+differ between ARM and x86, and AMI's long clip swings with a few words.)
+
+### With pauses between dictations (what the app sees)
+
+The app's log showed `stt ≈ 200 ms` for 2-2.5 s Core ML dictations while its start-up probe
+measured ~85-90 ms for 3 s of audio. The difference is idle time: the probe's runs are back to
+back, real dictations are seconds apart. `agt-bench --gap-ms N` sleeps N ms before every
+transcription. 8 short clips (2.2-3.1 s; LibriSpeech, TED, VoxPopuli, Earnings-22, AMI),
+per-call p50 in ms, `AGT_LOG=debug` per-stage timings:
+
+| Pause before each call | 0 (back to back) | 1 s | 3 s | 10 s | 30 s | 5 min² |
+|---|---|---|---|---|---|---|
+| Core ML: whole call | 90 | 131 | 186 | 193 | 186 | 192 |
+| Core ML: encoder only | 80 | 108 | 167 | 175 | 171 | 179 |
+| CPU int8: whole call | 63 | 97 | 98 | 98 | 98 | 108 |
+| CPU int8: encoder only | 57 | 86 | 85 | 88 | 86 | 93 |
+
+² One clip, two calls each after 5 minutes without any AGT work (first calls: 212 and 110 ms).
+The Mac wasn't idle as a whole (the other session).
+
+- Core ML pays **~90 ms extra after a pause of 3 s or more**, already +30 ms after 1 s, and
+  that's where it stays: 10 s, 30 s and 5 minutes cost the same. Nothing worse after a long
+  idle (no "GPU wake-up" beyond that). The CPU pays ~35 ms once (the log-mel preprocessor goes
+  from 1.5-3.5 to ~10 ms in both; it's also clock/cache warm-up) and stays flat as well.
+- The pattern matches the GPU clocking down between bursts of work (an 80 ms encoder run is
+  too short to ramp it back up) rather than anything in ORT; confirming it would need
+  `powermetrics` (root). ORT puts 1443 of the encoder's 1458 nodes on Core ML in 5 partitions
+  (the rest are shape ops on the CPU), the same in every run, so it isn't a partitioning
+  change either.
+- The app's start-up probe makes it worse: under `auto` it runs the Core ML encoder, then the
+  CPU one (creating a 2.4 GB fp32 CPU session), then `warmup()` on Core ML again. That first
+  Core ML call after the CPU detour took **660-1420 ms** in the encoder in the app's log.
+
+The full eval set with a 3 s pause before every call (one run per clip, median of two
+processes; Core ML 15 s window: one process):
+
+| Engine | short | medium | long | WER all |
+|---|---|---|---|---|
+| Parakeet v2 Core ML, 10 s window | 215/238 | 290/322 | **506/750** | 4.45 |
+| Parakeet v2 Core ML, 15 s window | 245/261 | 255/270 | 507/758 | 3.73 |
+| **Parakeet v2 int8, CPU** | **113/145** | **239/286** | 668/1002 | **3.47** |
+| Parakeet v2 fp32, CPU | 135/146 | 236/281 | 648/990 | 3.73 |
+
+### Core ML window sweep (does the window change WER or only latency?)
+
+Throwaway builds with `COREML_WINDOW_SECS` = 5 / 10 / 15 (the chunker cuts audio to the
+window); back to back, ms p50/p90:
+
+| Window | short | medium | long | WER read | WER real | WER all | first load |
+|---|---|---|---|---|---|---|---|
+| 5 s | 58/64 | 176/236 | 536/824 | 3.21 | 5.93 | 4.92 | 17 s |
+| 10 s (current) | 88/98 | 177/186 | 392/668 | 1.96 | 5.93 | 4.45 | 43 s |
+| 15 s | 122/134 | 134/141 | 426/670 | 2.23 | 4.61 | 3.73 | 19 s |
+
+- **The padding doesn't hurt accuracy; the chunk cuts do.** With a 15 s window Core ML's WER
+  equals the fp32 CPU's (2.23 / 4.61 / 3.73; per source Earnings-22 is 1.7 points worse and AMI
+  2 points better, i.e. a few words each way). With 10 s, 21 of the
+  36 medium clips (10-15 s) are cut in two and real-speech WER is 1.3 points worse; most of it
+  is the AMI long clip (4 chunks instead of 2: Core ML transcribed cross-talk the headset
+  reference doesn't contain, 49% vs 11% on that clip). With 5 s it's worse still on read speech.
+  fp32 on Core ML's GPU itself is fine.
+- Latency per window follows the encoder cost (~51 / 76 / 104 ms per call for 5 / 10 / 15 s,
+  Phase 4) times the number of chunks.
+- One of three first-ever loads of the 15 s model aborted the process inside Core ML
+  (`MPSGraphTensorData.mm:266: failed assertion 'shape.count = 0 != strides.count = 3'`) during
+  the first encoder run; two re-compiles from scratch and all later loads were fine. An abort
+  can't be caught and turned into a CPU fallback.
+
+### Memory and 8 GB Macs
+
+- **Core ML's private memory is small** (0.39 GB physical footprint while transcribing, peaks
+  0.4-0.8 GB), but it runs from a **2.5 GB memory-mapped compiled model** (clean, file-backed
+  pages, so RSS is 4.5-6.3 GB at its peak while loading, when the ONNX file is mapped too).
+  Under memory pressure macOS evicts those pages instead of swapping, and the next dictation
+  reads them back from disk. Plus 2.4 GB of download and 2.4 GB of compiled cache on disk.
+- CPU int8: 1.2-1.4 GB private memory (ONNX Runtime copies the weights), 0.65 GB on disk.
+  fp32 on the CPU: 2.4 GB.
+- On an 8 GB Mac (with a browser and an editor open), CPU int8's 1.4 GB is the comfortable
+  choice; Core ML's working set is about twice that and degrades silently (page-ins) rather
+  than failing. Not measured on an 8 GB machine.
+
+### What the numbers say (macOS)
+
+- **Core ML only wins back to back.** Warm and back to back it is ~15% faster than the CPU for
+  6-20 s and ~40% for > 20 s, and no faster for short clips. With the pauses real dictation
+  has, the CPU int8 encoder is **~2x faster for short clips** (113 vs 215 ms p50), faster for
+  medium ones too (239 vs 290) and only slower for > 20 s (668 vs 506). Most dictations are short.
+- **CPU int8 is also the most accurate** on real speech here (4.20%, Core ML 5.93%), loads in
+  1 s instead of 4-9 s (plus 20-40 s once to compile), and downloads 0.65 GB instead of 2.5 GB
+  plus 2.4 GB of compiled cache.
+- **Whisper on Metal is out**: large-v3-turbo needs 1.25 s for a 3 s clip on the M4's GPU (it
+  always encodes a 30 s window; the RTX 2080 Ti did it in 126 ms), small.en 250 ms with worse
+  real-speech WER than any Parakeet row.
+- v3 behaves like on Windows: ~0.5-1.5 points worse English WER than v2 for the same latency.
+
 ## Decision
 
 **Windows default: Parakeet TDT 0.6B v2, int8, `stt.device = "auto"`** (= DirectML with the
@@ -175,29 +327,38 @@ static-shape encoder, falling back to the CPU when there is no usable DirectX 12
 
 ### macOS
 
-Not decided here: this spike had no Apple Silicon hardware. For now `auto` is the CPU on
-macOS (Parakeet v2 int8). The macOS default belongs to the Phase 4 work (issue #9), and the
-full real-speech benchmark on a Mac to issue #11.
+**macOS default: Parakeet TDT 0.6B v2, int8, on the CPU** (`stt.device = "auto"` now means
+the CPU on every Mac; no start-up probe). Phase 4 had made `auto` = Core ML on Macs with
+>= 12 GB, kept only if a 3 s probe found it no slower than the CPU. The numbers above say
+otherwise:
 
-What there is: Phase 4 measured Parakeet v2 on a real **Apple M4** (Mac mini, 16 GB), warm
-median of 5 runs, with **synthetic clips made with `say`** (0% WER everywhere, so they say
-nothing about accuracy on real speech):
-
-| Clip | Core ML (fp32, fixed 10 s window, GPU) | CPU int8 |
-|---|---|---|
-| 2.75 s | 74 ms | 75 ms |
-| 9.1 s | 84 ms | 190 ms |
-| 28.3 s | 320 ms | 600 ms |
-
-Core ML there uses the same fixed-window trick as DirectML here (with dynamic shapes it was
-no faster than the CPU) and needs the fp32 encoder (2.4 GB download, ~3 GB peak memory, vs
-0.65 GB / 1.2 GB for CPU int8). The fixed window is shared code: an engine reports its window
-as `SttEngine::max_input_secs` (DirectML 25 s; Core ML will report 10 s) and the chunker cuts
-audio to fit it.
+- Latency as the app sees it (seconds between dictations): CPU int8 113 / 239 / 668 ms p50 for
+  short / medium / long vs Core ML 215 / 290 / 506. Core ML only wins on dictations over ~20 s.
+  Its back-to-back advantage (what Phase 4's `say` clips and the start-up probe measured)
+  disappears after ~1 s of GPU idle.
+- Accuracy: CPU int8 has the best real-speech WER (4.20% vs 5.93% for Core ML's 10 s window).
+- Cost: 0.65 GB download and ~1 s load, vs 2.5 GB + 2.4 GB of compiled cache, a ~45 s first
+  compile and 4-9 s loads.
+- The probe itself was a liability: it measures the GPU warm and back to back (Core ML's best
+  case), costs ~6 s and a temporary 2.4 GB fp32 CPU session at every launch, left the first
+  Core ML dictation at 0.7-1.4 s, and flipped to the CPU (fp32) while this benchmark was using
+  the GPU (app log: "Core ML 149 ms, CPU 105 ms for 3 s of audio; using the CPU"). Windows keeps its DirectML probe for now; whether a discrete GPU loses as much after
+  a pause hasn't been measured (`--gap-ms` makes that a one-line run).
+- **8 GB Macs**: the same default. CPU int8 needs ~1.4 GB; don't switch to Core ML or fp32
+  there (Core ML's working set is ~2.9 GB including the mapped compiled model, and it degrades
+  by paging rather than failing).
+- `device = "coreml"` stays available for people who dictate long passages (> 20 s) on a
+  16 GB+ Mac. Worth doing if it's kept: a 15 s window (same WER as the CPU, medium clips in one
+  chunk; 122 vs 88 ms short back to back). Not changed here; the window sweep was a throwaway
+  build.
+- Existing installs: configs written by earlier builds say `device = "auto"`, so they move to
+  the CPU with this change; the int8 encoder (0.65 GB) is downloaded on the next start if it's
+  missing. The Core ML files stay on disk (`models/<model>/coreml-1001/`, `encoder-model.onnx*`)
+  until deleted by hand.
 
 `.github/workflows/bench.yml` (manual only) runs the CPU and whisper.cpp Metal rows on
-GitHub's macos-14 runner, a VM without GPU or Neural Engine access; its numbers are not used
-for decisions.
+GitHub's macos-14 runner, a VM without GPU or Neural Engine access; its numbers are superseded
+by the section above and not used for decisions.
 
 ## Reproducing
 
@@ -208,6 +369,15 @@ target/release/agt-bench --device directml eval-data/clips
 cargo build --release -p agt-bench --features cuda  # + CUDA 13 / cuDNN 9 DLLs on PATH
 cargo build --release -p agt-bench --features whisper-vulkan   # needs CMake, libclang, Vulkan headers (see below)
 target/release/agt-bench --engine whisper --model whisper-large-v3-turbo-q5_0 --device vulkan eval-data/clips
+
+# macOS (Apple Silicon): `brew install cmake` for whisper-metal
+cargo build --release --locked -p agt-bench
+target/release/agt-bench --device coreml eval-data/clips          # or --device cpu --precision int8
+target/release/agt-bench --device cpu --gap-ms 3000 --runs 1 eval-data/clips   # pauses between calls
+AGT_LOG=debug target/release/agt-bench ...                          # per-stage timings
+cargo build --release --locked -p agt-bench --features whisper-metal --target-dir target/whisper
+target/whisper/release/agt-bench --engine whisper --model whisper-large-v3-turbo-q5_0 --device metal eval-data/clips
+/usr/bin/time -l target/release/agt-bench ...                       # peak RSS and physical footprint
 ```
 
 The CUDA DLLs used here came from NVIDIA's PyPI wheels (`nvidia-cuda-runtime`,

@@ -22,7 +22,6 @@ ort = { version = "=2.0.0-rc.14", default-features = false, features = ["directm
 # macOS: the prebuilt runtime already includes the Core ML EP; this exposes it.
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["coreml"] }
-libc = "0.2"
 
 [features]
 # CUDA EP (`stt.device = "cuda"`). Switches to pyke's CUDA 13 ONNX Runtime build, which needs

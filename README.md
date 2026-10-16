@@ -23,8 +23,8 @@ text **on your own computer**; your voice never leaves it.
 1. **Install.** Windows: run `AGT-win-x64-Setup.exe`. macOS: unzip and move `AGT.app` to
    Applications.
 2. **First launch.** AGT lives in the system tray (macOS: the menu bar). It downloads its
-   speech model once (about 670 MB; 2.4 GB on Macs with more than 8 GB of memory, which run it
-   on the GPU); the tray menu shows the progress and says "Ready" when it's done. On a Mac,
+   speech model (about 670 MB) once; the tray menu shows the progress and says "Ready" when
+   it's done. On a Mac,
    allow the permissions it asks for first (see [macOS](#macos)).
 3. **Dictate.** Click into any text field, then hold the hotkey and speak:
    - Windows: **Left Ctrl + Windows key**
@@ -54,10 +54,11 @@ to" to **Do Nothing**, or releasing it also opens the emoji picker or starts App
 Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
 `"Fn+RightOption"`.
 
-On Macs with more than 8 GB of memory AGT transcribes on the GPU (Core ML), which is about
-twice as fast as the CPU for longer dictations. That needs the larger model (2.4 GB download,
-about 3 GB of memory while AGT runs) and a one-time ~20 s preparation on first start. To use
-the smaller CPU model instead, set `device = "cpu"` under `[stt]` in `config.toml`.
+AGT transcribes on the CPU by default: with the usual pauses between dictations it's faster
+than the GPU for anything under ~20 s, and more accurate (see
+[benchmarks](docs/benchmarks.md#results-macos-apple-silicon)). If you mostly dictate for longer than
+that, `device = "coreml"` under `[stt]` in `config.toml` uses the GPU instead, at the cost of a
+2.5 GB download, a 2.4 GB compiled copy and a one-time ~45 s preparation on first start.
 
 Known gap: Cmd+V is sent as the key in the "V" position of a QWERTY keyboard, so with a Dvorak
 or Colemak layout (other than "Dvorak - QWERTY ⌘") the paste may not work.
