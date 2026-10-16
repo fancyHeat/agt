@@ -48,21 +48,29 @@ pub fn run() {
         Ok(file) => match file.try_lock() {
             Ok(()) => Some(file),
             Err(TryLockError::WouldBlock) => {
-                let pid = fs::read_to_string(&pid_file).ok();
-                if pid
-                    .and_then(|p| p.trim().parse().ok())
-                    .is_some_and(agt_settings_ui::activate)
-                {
-                    return;
+                // The open one may be just starting (no pid file or window yet): retry a
+                // little. Either way, never a second window.
+                for _ in 0..20 {
+                    let pid = fs::read_to_string(&pid_file).ok();
+                    if pid
+                        .and_then(|p| p.trim().parse().ok())
+                        .is_some_and(agt_settings_ui::activate)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                // Not found (it's just exiting): open another.
-                None
+                return;
             }
             Err(TryLockError::Error(_)) => None,
         },
         Err(_) => None,
     };
-    let _ = fs::write(&pid_file, std::process::id().to_string());
+    // Written whole (renamed into place): a reader never sees half a pid.
+    let tmp = pid_file.with_extension("pid.tmp");
+    if fs::write(&tmp, std::process::id().to_string()).is_ok() {
+        let _ = fs::rename(&tmp, &pid_file);
+    }
 
     let model = Model {
         path: paths::config_file(),
@@ -160,7 +168,9 @@ impl agt_settings_ui::Model for Model {
     fn pages(&mut self) -> Vec<Page> {
         self.stamp = self.stamp();
         self.actions.clear();
-        let config = match Config::load_or_create(&self.path) {
+        // Not `load_or_create`: a file deleted while the window is open isn't brought back
+        // with defaults (which AGT would then apply).
+        let config = match Config::load(&self.path) {
             Ok(c) => c,
             Err(e) => {
                 let rows = vec![

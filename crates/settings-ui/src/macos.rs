@@ -75,11 +75,13 @@ define_class!(
     impl Controller {
         #[unsafe(method(toggled:))]
         fn toggled(&self, sender: &NSButton) {
+            self.end_editing();
             self.send(Event::Toggle(tag(sender), sender.state() == NSControlStateValueOn));
         }
 
         #[unsafe(method(chose:))]
         fn chose(&self, sender: &NSPopUpButton) {
+            self.end_editing();
             let index = sender.indexOfSelectedItem();
             if index >= 0 {
                 self.send(Event::Choose(tag(sender), index as usize));
@@ -88,16 +90,18 @@ define_class!(
 
         #[unsafe(method(clicked:))]
         fn clicked(&self, sender: &NSButton) {
+            self.end_editing();
             self.send(Event::Click(tag(sender)));
         }
 
         #[unsafe(method(selectPage:))]
         fn select_page(&self, sender: &NSToolbarItem) {
+            self.end_editing();
             let id = sender.itemIdentifier().to_string();
             let index = self.with(|s| s.pages.iter().position(|p| p.title == id));
             if let Some(index) = index.flatten() {
                 self.with(|s| s.current = index);
-                self.rebuild();
+                self.rebuild(true);
             }
         }
 
@@ -123,7 +127,7 @@ define_class!(
         #[unsafe(method(rebuild))]
         fn rebuild_now(&self) {
             self.with(|s| s.rebuild_pending = false);
-            self.rebuild();
+            self.rebuild(false);
         }
     }
 
@@ -262,8 +266,21 @@ impl Controller {
         }
     }
 
+    /// Commits a text field being edited (clicking a checkbox, pop-up, button or page doesn't
+    /// take the focus from it), before what the click does.
+    fn end_editing(&self) {
+        if self.editing()
+            && let Some(window) = self.with(|s| s.window.clone()).flatten()
+        {
+            window.makeFirstResponder(None);
+        }
+    }
+
     fn send(&self, event: Event) {
-        let Some(result) = self.with(|s| s.model.handle(event)) else {
+        let Some(result) = self.with(|s| {
+            crate::note(&mut s.pages, &event);
+            s.model.handle(event)
+        }) else {
             return;
         };
         if let Err(message) = result {
@@ -300,8 +317,8 @@ impl Controller {
     }
 
     /// Shows the current page afresh from the model, sizing the window to it (its top-left
-    /// corner stays put).
-    fn rebuild(&self) {
+    /// corner stays put). Unless `force`d (another page), only if the pages changed.
+    fn rebuild(&self, force: bool) {
         let mtm = self.mtm();
         let Some(window) = self.with(|s| s.window.clone()).flatten() else {
             return;
@@ -309,7 +326,11 @@ impl Controller {
         let focused = focused_id(&window, self);
         let Some(view) = self.with(|s| {
             s.stale = false;
-            s.pages = s.model.pages();
+            let pages = s.model.pages();
+            if !force && pages == s.pages {
+                return None;
+            }
+            s.pages = pages;
             s.current = s.current.min(s.pages.len().saturating_sub(1));
             s.shown_text.clear();
             s.text_views.clear();
@@ -743,7 +764,7 @@ pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
     window.setTitle(&NSString::from_str(title));
     controller.with(|s| s.window = Some(window.clone()));
 
-    controller.rebuild();
+    controller.rebuild(true);
     window.center();
     bring_forward(&window);
     unsafe {

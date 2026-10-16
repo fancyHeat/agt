@@ -924,7 +924,8 @@ pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Confi
     };
     let out = with_settings(&text, changes)?;
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    let tmp = target.with_extension("toml.tmp");
+    // Per process: the tray and the settings window may both be writing.
+    let tmp = target.with_extension(format!("toml.{}.tmp", std::process::id()));
     let written = fs::write(&tmp, &out).and_then(|()| {
         // Keep the file's permissions (e.g. 0600 for a file holding an API key).
         if let Ok(m) = fs::metadata(&target) {

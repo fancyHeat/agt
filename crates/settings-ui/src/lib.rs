@@ -93,6 +93,28 @@ pub trait Model {
     fn changed_elsewhere(&mut self) -> bool;
 }
 
+/// Records in `pages` what `event` changed, which its control already shows: pages the
+/// model gives afterwards that equal these need no rebuild (and the focus, caret and open
+/// lists stay as they are).
+pub(crate) fn note(pages: &mut [Page], event: &Event) {
+    let id = match event {
+        Event::Toggle(id, _) | Event::Choose(id, _) | Event::Text(id, _) | Event::Click(id) => *id,
+    };
+    let row = pages
+        .iter_mut()
+        .flat_map(|p| &mut p.sections)
+        .flat_map(|s| &mut s.rows)
+        .find(|r| r.id == id);
+    match (row.map(|r| &mut r.control), event) {
+        (Some(Control::Toggle { on, .. }), Event::Toggle(_, new)) => *on = *new,
+        (Some(Control::Choice { selected, .. }), Event::Choose(_, new)) => *selected = *new,
+        (Some(Control::Text { value, .. } | Control::LongText { value }), Event::Text(_, new)) => {
+            *value = new.clone()
+        }
+        _ => {}
+    }
+}
+
 /// Shows the window and runs until it's closed. Must be called on the main thread, once.
 pub fn run(title: &str, model: Box<dyn Model>) -> Result<(), Error> {
     platform::run(title, model)

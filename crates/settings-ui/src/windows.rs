@@ -4,9 +4,9 @@
 //! Per-monitor DPI aware: sizes are in DIPs, scaled by the window's DPI.
 //!
 //! Each control's id is its row's id + [`FIRST_ID`]. Changes are sent to the model as they
-//! happen; the page is then rebuilt from the model on a zero-length timer, whose message comes
-//! after any input still queued (so a click that moved focus out of an edit field, which
-//! reported its text, still reaches the control it was on).
+//! happen (a pop-up's once chosen). If the model's pages then differ, the page is rebuilt on a
+//! zero-length timer, whose message comes after any input still queued (so a click that moved
+//! focus out of an edit field, which reported its text, still reaches the control it was on).
 
 use crate::{Control, Error, Event, Model, Page, Row};
 use std::{
@@ -210,7 +210,7 @@ pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
             })
         });
         set_fonts(dpi);
-        rebuild();
+        rebuild(true);
         place(window, true);
         ShowWindow(window, SW_SHOW);
         SetForegroundWindow(window);
@@ -446,19 +446,24 @@ fn measure(text: &str, width: i32, single: bool) -> i32 {
     }
 }
 
-/// Shows the current page afresh from the model, keeping the focused control focused.
-fn rebuild() {
+/// Shows the current page afresh from the model, keeping the focused control focused. Unless
+/// `force`d (another page, another DPI), only if the pages changed.
+fn rebuild(force: bool) {
     let focused = unsafe { GetFocus() };
-    let Some((pane, focus_id, page, dpi, scroll, titles, current, list)) = with(|s| {
+    let Some(Some((pane, focus_id, page, dpi, scroll, titles, current, list))) = with(|s| {
         let focus_id = s
             .controls
             .contains(&focused)
             .then(|| unsafe { GetDlgCtrlID(focused) });
         s.stale = false;
-        s.pages = s.model.pages();
+        let pages = s.model.pages();
+        if !force && pages == s.pages {
+            return None;
+        }
+        s.pages = pages;
         s.current = s.current.min(s.pages.len().saturating_sub(1));
         let titles: Vec<String> = s.pages.iter().map(|p| p.title.clone()).collect();
-        (
+        Some((
             s.pane,
             focus_id,
             s.pages.get(s.current).cloned(),
@@ -467,7 +472,7 @@ fn rebuild() {
             titles,
             s.current,
             s.list,
-        )
+        ))
     }) else {
         return;
     };
@@ -488,6 +493,11 @@ fn rebuild() {
         }
         NOTES.with(|n| n.borrow_mut().clear());
         let (placed, height) = layout(&page, dpi);
+        // A page that got shorter (rows removed) may no longer scroll that far.
+        let mut client: RECT = zeroed();
+        GetClientRect(pane, &mut client);
+        let scroll = scroll.min((height - client.bottom).max(0));
+        with(|s| s.scroll = scroll);
         let mut controls = Vec::new();
         let mut shown_text = HashMap::new();
         for (item, mut rect) in placed {
@@ -695,7 +705,10 @@ fn schedule_rebuild() {
 }
 
 fn send(event: Event) {
-    let Some(result) = with(|s| s.model.handle(event)) else {
+    let Some(result) = with(|s| {
+        crate::note(&mut s.pages, &event);
+        s.model.handle(event)
+    }) else {
         return;
     };
     if let Err(message) = result {
@@ -739,6 +752,14 @@ fn commit_text(id: usize, hwnd: HWND) {
     }
 }
 
+/// The focused control is being edited or has its list open: a rebuild would undo that.
+fn busy() -> bool {
+    unsafe {
+        let focused = GetFocus();
+        is_edit(focused) || SendMessageW(focused, CB_GETDROPPEDSTATE, 0, 0) != 0
+    }
+}
+
 fn is_edit(hwnd: HWND) -> bool {
     let mut class = [0u16; 16];
     let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
@@ -759,7 +780,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                             s.current = index as usize;
                             s.scroll = 0;
                         });
-                        rebuild();
+                        rebuild(true);
                     }
                 } else if id == IDOK {
                     // Enter in a one-line field: report it now.
@@ -775,18 +796,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_TIMER if wp == REBUILD_TIMER => {
                 KillTimer(hwnd, REBUILD_TIMER);
-                // Not under a held mouse button: the click it belongs to isn't over yet.
-                if GetKeyState(VK_LBUTTON as i32) < 0 {
+                // Not under a held mouse button (the click it belongs to isn't over yet), nor
+                // under an open list.
+                let dropped = SendMessageW(GetFocus(), CB_GETDROPPEDSTATE, 0, 0) != 0;
+                if GetKeyState(VK_LBUTTON as i32) < 0 || dropped {
                     SetTimer(hwnd, REBUILD_TIMER, 50, None);
                 } else {
-                    rebuild();
+                    rebuild(false);
                 }
                 0
             }
             WM_TIMER if wp == POLL_TIMER => {
                 let changed = with(|s| s.model.changed_elsewhere()).unwrap_or(false);
                 if changed || with(|s| s.stale).unwrap_or(false) {
-                    if is_edit(GetFocus()) {
+                    if busy() {
                         with(|s| s.stale = true);
                     } else {
                         schedule_rebuild();
@@ -808,7 +831,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     suggested.bottom - suggested.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                rebuild();
+                rebuild(true);
                 place(hwnd, false);
                 0
             }
@@ -857,10 +880,14 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         send(Event::Toggle(row, on));
                     }
                     (Some(Control::Button(_)), BN_CLICKED) => send(Event::Click(row)),
-                    (Some(Control::Choice { .. }), CBN_SELCHANGE) => {
+                    // Once the choice is made (the list closes on it, or the focus moves on
+                    // after arrowing through it), not on every step through the list.
+                    (Some(Control::Choice { selected, .. }), CBN_SELENDOK | CBN_KILLFOCUS) => {
                         let index = SendMessageW(control, CB_GETCURSEL, 0, 0);
-                        if index >= 0 {
+                        if index >= 0 && index as usize != selected {
                             send(Event::Choose(row, index as usize));
+                        } else if with(|s| s.stale).unwrap_or(false) {
+                            schedule_rebuild();
                         }
                     }
                     (Some(Control::Text { .. } | Control::LongText { .. }), EN_KILLFOCUS) => {
