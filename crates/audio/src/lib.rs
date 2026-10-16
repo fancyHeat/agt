@@ -13,8 +13,11 @@
 //!   are prepended, so even a word started slightly before the key is caught; the cost is the
 //!   mic indicator being permanently on (and a few % of one core for resampling).
 //!
-//! The stream is rebuilt automatically if it fails (device unplugged) or if the default input
-//! device changed since it was built.
+//! The device is `audio.device` (by name), or the system default input device if that's
+//! empty or not connected. The stream is rebuilt automatically if it fails (device
+//! unplugged) or, when on the default device, if the default changed since it was built; on
+//! the fallback, each recording checks whether the chosen device is back (an enumeration, a
+//! few ms) and switches to it.
 
 pub mod resample;
 pub mod wav;
@@ -75,10 +78,16 @@ struct Capture {
 struct Live {
     stream: cpal::Stream,
     device_id: Option<String>,
+    /// Built on the chosen `audio.device` (not the default as a fallback).
+    chosen: bool,
 }
 
 pub struct Recorder {
     keep_open: bool,
+    /// `audio.device`: "" = the default input device.
+    device: String,
+    /// The chosen device's absence was logged (once, not on every recording).
+    missing_logged: bool,
     live: Option<Live>,
     capture: Arc<Mutex<Capture>>,
     failed: Arc<AtomicBool>,
@@ -86,10 +95,13 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// `device`: an input device name from [`input_device_names`], or "" for the default.
     /// `level` is updated with the input level while the stream runs (see [`Level`]).
-    pub fn new(keep_open: bool, level: Level) -> Self {
+    pub fn new(keep_open: bool, device: String, level: Level) -> Self {
         Self {
             keep_open,
+            device,
+            missing_logged: false,
             live: None,
             capture: Arc::new(Mutex::new(Capture {
                 recording: false,
@@ -115,23 +127,22 @@ impl Recorder {
     /// Builds the input stream (and starts it, in keep-open mode). Call once at start-up so
     /// the first dictation doesn't pay for it; `start` calls it again when needed.
     pub fn prepare(&mut self) -> Result<(), Error> {
+        let healthy = self.live.is_some() && !self.failed.load(Ordering::Relaxed);
+        // The chosen device, running: nothing to check (no enumeration on every key press).
+        if healthy && self.live.as_ref().is_some_and(|l| l.chosen) {
+            return Ok(());
+        }
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or("no microphone (default input device) found")?;
+        let (device, chosen) = self.pick_device(&host)?;
         let device_id = device.id().ok().map(|id| id.to_string());
-        if self.live.as_ref().is_some_and(|l| l.device_id == device_id)
-            && !self.failed.load(Ordering::Relaxed)
-        {
+        if healthy && self.live.as_ref().is_some_and(|l| l.device_id == device_id) {
             return Ok(());
         }
         self.live = None; // drops (closes) any previous stream first
 
         let t = Instant::now();
         let config = device.default_input_config()?;
-        let name = device
-            .description()
-            .map_or_else(|_| "?".into(), |d| d.name().to_owned());
+        let name = device_name(&device).unwrap_or_else(|| "?".into());
         let stream_config = config.config();
         {
             let mut c = self.capture.lock().unwrap();
@@ -157,8 +168,38 @@ impl Recorder {
             t.elapsed().as_secs_f64() * 1e3,
             if self.keep_open { " (kept open)" } else { "" }
         );
-        self.live = Some(Live { stream, device_id });
+        self.live = Some(Live {
+            stream,
+            device_id,
+            chosen,
+        });
         Ok(())
+    }
+
+    /// The chosen device if it's connected (`true`), else the default input device.
+    fn pick_device(&mut self, host: &cpal::Host) -> Result<(cpal::Device, bool), Error> {
+        if !self.device.is_empty() {
+            match host.input_devices() {
+                Ok(mut all) => {
+                    if let Some(d) = all.find(|d| device_name(d).as_deref() == Some(&self.device)) {
+                        self.missing_logged = false;
+                        return Ok((d, true));
+                    }
+                }
+                Err(e) => tracing::warn!("cannot list microphones: {e}"),
+            }
+            if !self.missing_logged {
+                tracing::warn!(
+                    "microphone \"{}\" not found; using the default input device",
+                    self.device
+                );
+                self.missing_logged = true;
+            }
+        }
+        let device = host
+            .default_input_device()
+            .ok_or("no microphone (default input device) found")?;
+        Ok((device, false))
     }
 
     fn build<T>(
@@ -282,6 +323,28 @@ impl Recorder {
     }
 }
 
+/// The names of the connected input devices, as `audio.device` takes them (duplicates once).
+pub fn input_device_names() -> Vec<String> {
+    let devices = match cpal::default_host().input_devices() {
+        Ok(devices) => devices,
+        Err(e) => {
+            tracing::warn!("cannot list microphones: {e}");
+            return Vec::new();
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in devices.filter_map(|d| device_name(&d)) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn device_name(device: &cpal::Device) -> Option<String> {
+    device.description().ok().map(|d| d.name().to_owned())
+}
+
 pub struct Recording {
     /// 16 kHz mono.
     pub samples: Vec<f32>,
@@ -309,7 +372,7 @@ mod tests {
     #[ignore]
     fn records_from_default_microphone() {
         for keep_open in [false, true] {
-            let mut r = Recorder::new(keep_open, Level::default());
+            let mut r = Recorder::new(keep_open, String::new(), Level::default());
             let t = Instant::now();
             r.prepare().expect("prepare");
             let built = t.elapsed();
@@ -331,6 +394,25 @@ mod tests {
             assert!(n > SAMPLE_RATE as usize * 9 / 10, "too few samples: {n}");
             assert!(rec.samples.iter().any(|&x| x != 0.0), "all-zero audio");
         }
+    }
+
+    /// Needs a real microphone: `cargo test -p agt-audio -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn records_from_named_microphone() {
+        let names = input_device_names();
+        println!("input devices: {names:?}");
+        let name = names.first().expect("no input devices");
+        let mut r = Recorder::new(false, name.clone(), Level::default());
+        r.prepare().expect("prepare");
+        assert!(r.live.as_ref().unwrap().chosen, "not built on {name}");
+        r.start().expect("start");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(r.stop().samples.len() > SAMPLE_RATE as usize * 4 / 10);
+        // Unknown: falls back to the default device.
+        let mut r = Recorder::new(false, "no such mic".into(), Level::default());
+        r.prepare().expect("prepare");
+        assert!(!r.live.as_ref().unwrap().chosen);
     }
 
     #[test]

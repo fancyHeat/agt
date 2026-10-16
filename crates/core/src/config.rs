@@ -54,6 +54,10 @@ key = ""#,
 min_hold_ms = 150
 
 [audio]
+# Microphone to record from, by name as the Settings menu lists it. "": the system's default
+# input device (and whichever device that later becomes). A named microphone that isn't
+# connected falls back to the default.
+device = ""
 # Keep the microphone stream running all the time. Off: the stream is only started while the
 # hotkey is held, so the OS "microphone in use" indicator is off when you're not dictating
 # (start-up takes a few milliseconds, measured on the first dictation and logged).
@@ -235,6 +239,8 @@ pub struct HotkeyConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
+    /// Input device name; "" = the system default.
+    pub device: String,
     pub keep_mic_open: bool,
 }
 

@@ -504,7 +504,11 @@ struct AudioThread {
 
 impl AudioThread {
     fn run(self, events: Receiver<HotkeyEvent>, level: Level) {
-        let mut recorder = Recorder::new(self.config.audio.keep_mic_open, level);
+        let mut recorder = Recorder::new(
+            self.config.audio.keep_mic_open,
+            self.config.audio.device.clone(),
+            level,
+        );
         // Without the Microphone permission (macOS) the stream would be built on a device
         // that delivers silence; it's built on the first recording after the grant instead.
         if self.hub.missing(Permission::Microphone) {
