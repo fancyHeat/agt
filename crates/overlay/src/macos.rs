@@ -28,7 +28,7 @@ use crate::{
     scene,
 };
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    DefinedClass, Encode, Encoding, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::{Retained, autoreleasepool},
     runtime::AnyObject,
     sel,
@@ -45,6 +45,7 @@ use objc2_core_graphics::{
     CGImageAlphaInfo, CGImageByteOrderInfo,
 };
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
+use std::panic::AssertUnwindSafe;
 
 pub struct Window {
     mtm: MainThreadMarker,
@@ -259,7 +260,10 @@ define_class!(
 
         #[unsafe(method(agtCopyClicked:))]
         fn clicked(&self, _sender: Option<&AnyObject>) {
-            (self.ivars().on_click)();
+            // A panic mustn't unwind into AppKit's event dispatch.
+            if std::panic::catch_unwind(AssertUnwindSafe(&self.ivars().on_click)).is_err() {
+                tracing::error!("the notice's Copy handler panicked");
+            }
         }
     }
 );
@@ -285,6 +289,22 @@ pub struct Notice {
     button: Retained<CopyButton>,
     /// Where the notice is centered, in screen points (kept when it shrinks to "Copied").
     center: NSPoint,
+}
+
+/// A `CGColorRef` argument. Not passed as an object: debug builds check message argument types
+/// against the method's (`^{CGColor=}`), and an object (`@`) fails that.
+#[repr(transparent)]
+struct ColorRef(*const CGColor);
+
+impl ColorRef {
+    fn of(c: &CFRetained<CGColor>) -> Self {
+        Self(CFRetained::as_ptr(c).as_ptr())
+    }
+}
+
+// SAFETY: a pointer to an opaque `CGColor` struct, as CALayer's color setters take.
+unsafe impl Encode for ColorRef {
+    const ENCODING: Encoding = Encoding::Pointer(&Encoding::Struct("CGColor", &[]));
 }
 
 fn cg_color(c: Rgba) -> CFRetained<CGColor> {
@@ -315,8 +335,8 @@ impl Notice {
         // The same pill as the overlay's: background, hairline border, round ends.
         let (bg, border) = (cg_color(scene::BG), cg_color(scene::BORDER));
         unsafe {
-            let _: () = msg_send![layer, setBackgroundColor: CFRetained::as_ptr(&bg).as_ptr() as *const AnyObject];
-            let _: () = msg_send![layer, setBorderColor: CFRetained::as_ptr(&border).as_ptr() as *const AnyObject];
+            let _: () = msg_send![layer, setBackgroundColor: ColorRef::of(&bg)];
+            let _: () = msg_send![layer, setBorderColor: ColorRef::of(&border)];
             let _: () = msg_send![layer, setBorderWidth: 1.0 as CGFloat];
             let _: () = msg_send![layer, setCornerRadius: (NOTICE_HEIGHT / 2.0) as CGFloat];
         }
@@ -373,9 +393,9 @@ impl Notice {
 }
 
 impl NoticeSurface for Notice {
-    fn show(&mut self, margin: f32, top: bool) {
+    fn show(&mut self, margin: f32, top: bool) -> bool {
         let Some((s, _)) = main_screen(self.mtm) else {
-            return;
+            return false;
         };
         // On the pill's center line.
         let half_pill = scene::HEIGHT as f64 / 2.0;
@@ -392,6 +412,7 @@ impl NoticeSurface for Notice {
         self.button.setHidden(false);
         self.layout();
         self.panel.orderFrontRegardless();
+        true
     }
 
     fn copied(&mut self) {

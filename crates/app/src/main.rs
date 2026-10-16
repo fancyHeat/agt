@@ -469,10 +469,13 @@ impl ApplicationHandler<AppEvent> for App {
                 pipeline::Event::NotInTextBox => {
                     if let Some(o) = &mut self.overlay {
                         o.show_notice(Instant::now());
+                        // Not idle while it's up: a restart would take the Copy button away.
+                        // (If it didn't show, the restart timer armed on `Ready` still stands.)
+                        if o.notice_visible() {
+                            self.changes += 1;
+                            self.changed_at = Instant::now();
+                        }
                     }
-                    // Not idle while it's up: a restart would take the Copy button away.
-                    self.changes += 1;
-                    self.changed_at = Instant::now();
                 }
                 pipeline::Event::Copied => {
                     if let Some(o) = &mut self.overlay {
@@ -507,13 +510,14 @@ impl ApplicationHandler<AppEvent> for App {
         {
             return self.settings_action(action.clone(), event_loop);
         }
+        if let AppEvent::NoticeCopy = event {
+            if let Some(p) = &self.pipeline {
+                p.copy_last_transcript();
+            }
+            return;
+        }
         let Some(tray) = &self.tray else { return };
         match event {
-            AppEvent::NoticeCopy => {
-                if let Some(p) = &self.pipeline {
-                    p.copy_last_transcript();
-                }
-            }
             AppEvent::Menu(e) if e.id == tray.copy_last => {
                 if let Some(p) = &self.pipeline {
                     p.copy_last_transcript();
@@ -563,7 +567,10 @@ impl ApplicationHandler<AppEvent> for App {
                 tray.set_update("Update failed - see log", true);
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
-            AppEvent::Menu(_) | AppEvent::Pipeline(_) | AppEvent::ConfigFile => {}
+            AppEvent::Menu(_)
+            | AppEvent::Pipeline(_)
+            | AppEvent::ConfigFile
+            | AppEvent::NoticeCopy => {}
         }
     }
 
@@ -646,7 +653,8 @@ impl App {
     /// transcript can still be copied: it may be a failed paste's, and a restart would lose it
     /// (for settings the user just changed, on an error anyway: a bad setting may be the
     /// error). Never while loading: a restart would start a model download over. Clicking
-    /// "Install update X now" / "Restart now to apply" restarts regardless.
+    /// "Install update X now" / "Restart now to apply" restarts regardless. Not while the "not in
+    /// a text box" notice is up (at most 12 s): a restart would take its Copy button away.
     fn idle(&self) -> bool {
         use pipeline::Status;
         if self.overlay.as_ref().is_some_and(|o| o.notice_visible()) {

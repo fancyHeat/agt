@@ -366,16 +366,19 @@ pub fn foreground_window() -> Option<usize> {
 }
 
 /// Whether keyboard focus is in something that takes typed text (a text field or area, an
-/// editable part of a web page), so a paste has somewhere to land. `None` if that can't be
-/// told (no permission, the app didn't answer in time, a platform without the check): treat
-/// it as yes. Asks the focused app, so it can take up to a quarter second.
+/// editable part of a web page), so a paste has somewhere to land. `Some(false)` only when
+/// focus is clearly elsewhere (a web page, a link, a button, a list, the Finder's desktop).
+/// `None` if that can't be told (an app that draws its own text, no permission, the app didn't
+/// answer in time, a platform without the check): treat it as yes. Asks the focused app, a
+/// quarter second at most per request.
 pub fn focus_takes_text() -> Option<bool> {
     imp::focus_takes_text()
 }
 
 /// Gets the frontmost app ready for [`focus_takes_text`]: Chromium-based apps (Slack, VS Code,
 /// Notion...) only describe their contents to assistive apps that ask for it, and building
-/// that takes them a moment. Call it well before the check (at key down). Ignored by others.
+/// that takes them a moment. Call it well before the check (at key down). Asks each app once
+/// (the switch stays on until it quits). Ignored by others.
 pub fn prepare_focus_check() {
     imp::prepare_focus_check()
 }

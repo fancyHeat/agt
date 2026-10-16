@@ -1556,6 +1556,8 @@ fn paste_thread(
 ) {
     let restore_after = Duration::from_millis(config.paste.restore_clipboard_ms);
     let restore = !restore_after.is_zero();
+    // Only the overlay shows the "not in a text box" notice: without it, don't ask apps.
+    let check_focus = config.overlay.enabled;
     let mut saver = Saver::default();
     // Our paste that still has to be undone, and when.
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
@@ -1575,13 +1577,16 @@ fn paste_thread(
         };
         match msg {
             Ok(ToPaste::Snapshot) => {
-                // Here, not on the audio thread: it asks the frontmost app, which may be slow.
-                agt_platform::prepare_focus_check();
                 // While our transcript is still on the clipboard, the saved snapshot already
                 // holds the user's data; saving now would save our own text instead.
                 if restore && pending_restore.is_none() {
                     saver.saved = None;
                     save_for_paste = saver.start();
+                }
+                // After starting the save (it runs on its own thread), and here, not on the
+                // audio thread: it asks the frontmost app, which may be slow.
+                if check_focus {
+                    agt_platform::prepare_focus_check();
                 }
             }
             Ok(ToPaste::Paste {
@@ -1676,12 +1681,6 @@ fn paste_thread(
                         Err(e) => s.fail(&e.tray_text()),
                     }
                 });
-                // Pasted anyway (the check can be wrong, and an app may take a paste outside
-                // a text field, like a design canvas), so this only offers a way out.
-                if result.is_ok() && agt_platform::focus_takes_text() == Some(false) {
-                    tracing::info!("pasted, but focus isn't in a text box; offering Copy");
-                    hub.not_in_text_box();
-                }
                 // Everything below is bookkeeping after the paste: off the latency path.
                 let chars = text.chars().count();
                 d.chars_out = Some(chars as i64);
@@ -1709,6 +1708,14 @@ fn paste_thread(
                             pending_restore = Some((token, pasted + restore_after));
                         }
                         telemetry::global().dictation(d, Ended::Pasted);
+                        // Last, once the restore is scheduled: it asks the focused app, which
+                        // may take up to a second while it handles the paste. Pasted anyway
+                        // (the check can be wrong, and an app may take a paste outside a text
+                        // field, like a design canvas), so this only offers a way out.
+                        if check_focus && agt_platform::focus_takes_text() == Some(false) {
+                            tracing::info!("pasted, but focus isn't in a text box; offering Copy");
+                            hub.not_in_text_box();
+                        }
                     }
                     Err(e) => {
                         tracing::error!("paste failed ({chars} chars not pasted): {e}");

@@ -73,8 +73,9 @@ trait Surface {
 /// The OS window the "not in a text box" notice is shown in.
 trait NoticeSurface {
     /// Shows the message and the Copy button, centered where the pill goes (`margin` from the
-    /// bottom or top edge of the screen with the keyboard focus).
-    fn show(&mut self, margin: f32, top: bool);
+    /// bottom or top edge of the screen with the keyboard focus). `false` if it couldn't be
+    /// shown (no screen).
+    fn show(&mut self, margin: f32, top: bool) -> bool;
     /// Swaps the message and button for "Copied", in place.
     fn copied(&mut self);
     fn hide(&mut self);
@@ -167,8 +168,8 @@ impl Overlay {
     }
 
     /// Shows "You weren't in a text box" with a Copy button where the pill was: for a
-    /// dictation pasted where nothing takes text. Only while the pill is hidden (a new
-    /// recording has moved on); it hides after [`NOTICE_FOR`] or when the pill comes back.
+    /// dictation pasted where nothing takes text. Not over the pill (a new recording has
+    /// already started); it hides after [`NOTICE_FOR`] or when the pill comes back.
     pub fn show_notice(&mut self, now: Instant) {
         if self.mode != Mode::Hidden {
             return;
@@ -176,8 +177,9 @@ impl Overlay {
         let Some(notice) = &mut self.notice else {
             return;
         };
-        notice.show(scene::MARGIN, self.position == Position::Top);
-        self.notice_until = Some(now + NOTICE_FOR);
+        if notice.show(scene::MARGIN, self.position == Position::Top) {
+            self.notice_until = Some(now + NOTICE_FOR);
+        }
     }
 
     /// The notice's text was copied: it says so, then hides after [`COPIED_FOR`].
@@ -240,7 +242,8 @@ impl Overlay {
         );
     }
 
-    /// When [`Overlay::tick`] should next be called; `None` while hidden (no timer needed).
+    /// When [`Overlay::tick`] should next be called; `None` while the pill and the notice are
+    /// hidden (no timer needed). While only the notice is up, just when it hides.
     pub fn next_frame(&self) -> Option<Instant> {
         [self.next, self.notice_until].into_iter().flatten().min()
     }
@@ -301,6 +304,8 @@ mod tests {
         presents: usize,
         visible: bool,
         notice: Option<&'static str>,
+        /// The notice's `show` fails.
+        no_screen: bool,
     }
 
     struct Fake(Rc<RefCell<Log>>);
@@ -322,8 +327,13 @@ mod tests {
     }
 
     impl NoticeSurface for Fake {
-        fn show(&mut self, _: f32, _: bool) {
-            self.0.borrow_mut().notice = Some("not in a text box");
+        fn show(&mut self, _: f32, _: bool) -> bool {
+            let mut log = self.0.borrow_mut();
+            if log.no_screen {
+                return false;
+            }
+            log.notice = Some("not in a text box");
+            true
         }
         fn copied(&mut self) {
             self.0.borrow_mut().notice = Some("copied");
@@ -458,5 +468,51 @@ mod tests {
         assert_eq!(log.borrow().notice, None, "the next recording hides it");
         assert!(!o.notice_visible());
         assert_eq!(o.next_frame(), Some(t + FRAME * 2));
+    }
+
+    #[test]
+    fn notice_shown_again_starts_over() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.show_notice(t);
+        o.notice_copied(t + FRAME);
+        let later = t + Duration::from_secs(5);
+        o.show_notice(later);
+        assert_eq!(
+            log.borrow().notice,
+            Some("not in a text box"),
+            "the button is back"
+        );
+        assert_eq!(o.next_frame(), Some(later + NOTICE_FOR));
+    }
+
+    #[test]
+    fn notice_survives_status_churn_but_not_an_error() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.show_notice(t);
+        // Already hidden (e.g. polish finishing after the paste): the notice stays.
+        o.set_mode(Mode::Hidden, 0.0, t + FRAME);
+        assert!(o.notice_visible());
+        o.flash_error(0.0, t + FRAME * 2);
+        assert_eq!(log.borrow().notice, None);
+        assert!(!o.notice_visible());
+    }
+
+    #[test]
+    fn notice_that_cannot_show_is_not_up() {
+        let (mut o, log) = overlay();
+        log.borrow_mut().no_screen = true;
+        o.show_notice(Instant::now());
+        assert!(
+            !o.notice_visible(),
+            "nothing on screen: don't hold off a restart"
+        );
+        assert_eq!(o.next_frame(), None);
+
+        let log = Rc::new(RefCell::new(Log::default()));
+        let mut o = Overlay::with_surfaces(Box::new(Fake(log)), None, Position::Bottom);
+        o.show_notice(Instant::now());
+        assert!(!o.notice_visible(), "no notice on this platform");
     }
 }
