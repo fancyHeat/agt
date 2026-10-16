@@ -178,10 +178,16 @@ fn check_and_download(
 
 /// Hands `asset` to the Velopack updater, which applies it once this process exits and then
 /// starts the new version. Call right before exiting.
+///
+/// Not silent on macOS: the .pkg installer leaves the bundle owned by root, and a silent
+/// updater can't ask for an admin password to replace it, so it gave up and relaunched the old
+/// version (offering the same update again). This runs on a click, so a prompt is expected; the
+/// new bundle Velopack moves in is the user's, so later updates don't need one.
 pub fn apply_and_restart(um: &UpdateManager, asset: &VelopackAsset) -> Result<(), velopack::Error> {
     tracing::info!("applying update {} and restarting", asset.Version);
     let t = Instant::now();
-    let result = um.wait_exit_then_apply_updates(asset, true, true, Vec::<String>::new());
+    let silent = !cfg!(target_os = "macos");
+    let result = um.wait_exit_then_apply_updates(asset, silent, true, Vec::<String>::new());
     record("apply", Some(&asset.Version), t, &result, "ok");
     result
 }
