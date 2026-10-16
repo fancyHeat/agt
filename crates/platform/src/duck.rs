@@ -130,15 +130,16 @@ struct Entry {
     /// The last volume we set (as read back).
     ducked: f32,
     id: String,
-    /// Read from the marker file at start: a previous run died, maybe in the middle of a fade.
-    from_file: bool,
+    /// The live session's entry: if AGT is killed, it may be in the middle of a fade, so
+    /// anything between `ducked` and `original` counts as ours. A lost device's entry is
+    /// exact: it's at the volume we left it at, or the user changed it.
+    wide: bool,
 }
 
 impl Entry {
-    /// Whether a volume of `v` is still ours to restore: exactly the ducked one, or for an
-    /// entry from the file, anything between it and the original (a fade cut short).
+    /// Whether a volume of `v` is still ours to restore (see [`Entry::wide`]).
     fn ours(&self, v: f32) -> bool {
-        if self.from_file {
+        if self.wide {
             v >= self.ducked - TOLERANCE && v <= self.original + TOLERANCE
         } else {
             (v - self.ducked).abs() <= TOLERANCE
@@ -146,7 +147,8 @@ impl Entry {
     }
 }
 
-/// The marker file: one [`Entry`] per line, `original ducked id` (`None` in tests: no file).
+/// The marker file: one [`Entry`] per line, `original ducked wide|exact id`, oldest first
+/// (`None` in tests: no file).
 struct Marker(Option<PathBuf>);
 
 impl Marker {
@@ -154,7 +156,10 @@ impl Marker {
         let Some(p) = &self.0 else { return };
         let text: String = entries
             .into_iter()
-            .map(|e| format!("{} {} {}\n", e.original, e.ducked, e.id))
+            .map(|e| {
+                let range = if e.wide { "wide" } else { "exact" };
+                format!("{} {} {range} {}\n", e.original, e.ducked, e.id)
+            })
             .collect();
         let saved = if text.is_empty() {
             match fs::remove_file(p) {
@@ -173,18 +178,25 @@ impl Marker {
         let Some(text) = self.0.as_ref().and_then(|p| fs::read_to_string(p).ok()) else {
             return Vec::new();
         };
-        text.lines()
+        let mut entries: Vec<Entry> = text
+            .lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(3, ' ');
+                let mut parts = line.splitn(4, ' ');
                 Some(Entry {
                     original: parts.next()?.parse().ok()?,
                     ducked: parts.next()?.parse().ok()?,
+                    wide: match parts.next()? {
+                        "wide" => true,
+                        "exact" => false,
+                        _ => return None,
+                    },
                     id: parts.next().filter(|id| !id.is_empty())?.to_owned(),
-                    from_file: true,
                 })
             })
-            .take(MAX_LOST)
-            .collect()
+            .collect();
+        // The newest last (the session's): keep those.
+        entries.drain(..entries.len().saturating_sub(MAX_LOST));
+        entries
     }
 }
 
@@ -287,7 +299,7 @@ impl<D: Devices> Duck<D> {
 
     fn save(&self) {
         let session = self.session.as_ref().map(|s| &s.entry);
-        self.marker.save(session.into_iter().chain(&self.lost));
+        self.marker.save(self.lost.iter().chain(session));
     }
 
     /// Restores each lost device that is back. One that's back with a volume that isn't ours
@@ -363,7 +375,7 @@ impl<D: Devices> Duck<D> {
                 original,
                 ducked: original * level, // until the fade down is done: then as read back
                 id,
-                from_file: false,
+                wide: true,
             },
             set: v,
         });
@@ -471,7 +483,7 @@ impl<D: Devices> Duck<D> {
             // Restored only if it comes back at exactly the volume we left it at.
             self.lost.push(Entry {
                 ducked: s.set,
-                from_file: false,
+                wide: false,
                 ..s.entry
             });
         }
@@ -890,13 +902,13 @@ mod tests {
                 original: 0.75,
                 ducked: 0.075,
                 id: "{0.0.0.00000000}.{guid}".into(),
-                from_file: true,
+                wide: false,
             },
             Entry {
                 original: 0.5,
                 ducked: 0.0,
                 id: "AppleUSBAudioEngine:My Headset:1".into(),
-                from_file: true,
+                wide: true,
             },
         ];
         m.save(&entries);
@@ -904,9 +916,64 @@ mod tests {
         m.save([]);
         assert!(!path.exists());
         assert!(m.load().is_empty());
-        // Lines without an ID (an older format) can't be restored: dropped.
-        fs::write(&path, "0.5 0.05\n0.5 0.05 \n0.7 0.07 x\n").unwrap();
+        // Lines without an ID or a range can't be used: dropped.
+        fs::write(
+            &path,
+            "0.5 0.05 wide\n0.5 0.05 exact \n0.5 0.05 x\n0.7 0.07 wide x\n",
+        )
+        .unwrap();
         assert_eq!(m.load().len(), 1);
+        // More than fit: the newest (last) are kept.
+        let many: Vec<Entry> = (0..=MAX_LOST)
+            .map(|i| Entry {
+                id: i.to_string(),
+                ..entries[0].clone()
+            })
+            .collect();
+        m.save(&many);
+        assert_eq!(m.load(), many[1..]);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_device_lost_before_a_restart_is_still_restored_only_at_our_volume() {
+        let path = temp_marker("lost-restart");
+        let marker = || Marker(Some(path.clone()));
+        let headset = Fake::new("headset", 0.6);
+        let speakers = Fake::new("speakers", 0.5);
+        let devices = || FakeDevices::new(vec![headset.clone(), speakers.clone()]);
+        let now = Instant::now();
+        let mut d = Duck::new(devices(), marker(), Duration::ZERO, Duration::ZERO);
+        d.duck(0.1, now);
+        headset.s().gone = true;
+        d.restore(now);
+        drop(d);
+        // Back after a restart, turned up by the user to 0.3: theirs, not restored.
+        headset.s().gone = false;
+        headset.user_sets(0.3);
+        drop(Duck::new(
+            devices(),
+            marker(),
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        assert_eq!(headset.get(), 0.3);
+        assert!(!path.exists());
+        // At exactly the volume we left it at: restored.
+        let mut d = Duck::new(devices(), marker(), Duration::ZERO, Duration::ZERO);
+        headset.user_sets(0.6);
+        d.duck(0.1, now);
+        headset.s().gone = true;
+        d.restore(now);
+        drop(d);
+        headset.s().gone = false;
+        drop(Duck::new(
+            devices(),
+            marker(),
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        assert!(close(headset.get(), 0.6));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
