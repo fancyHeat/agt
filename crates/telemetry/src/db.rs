@@ -49,7 +49,6 @@ pub const ROLLUP_METRICS: &[&str] = &[
     "audio_secs",
     "chars_out",
     "words_out",
-    "words_raw",
 ];
 
 /// Schema migrations; `PRAGMA user_version` = how many have been applied. Append only.
