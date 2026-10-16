@@ -448,7 +448,9 @@ has to stand out from the noise (tested down to ~25 dB peak to noise), and at lo
 -70 dB clamp can take the end of the last syllable (~0.1 s) for the start of a pause. The floor
 is learned from whatever comes first, so a recording that starts mid-sentence at a low level
 can learn the speech itself as the floor; that's why nothing is trimmed before speech has been
-heard (the worst case is transcribing some noise, never dropping speech; unit-tested). On this
+heard (the usual worst case is transcribing some noise rather than dropping speech; unit-tested.
+Still possible: a loud burst at the very start running gaplessly into quiet speech can still be
+learned as the floor; real speech's word gaps normally set the floor first). On this
 set it finds all 78 inserted pauses over 1.1 s and 33 natural 1 s pauses inside the
 utterances (`agt-bench live --cuts-only`). `CutConfig::live` is the setting recommended below.
 

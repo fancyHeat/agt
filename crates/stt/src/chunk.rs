@@ -690,8 +690,8 @@ mod tests {
 
     #[test]
     fn quiet_speech_from_the_first_sample_is_kept() {
-        // Already talking when recording starts, peaks ~24 dB over the room noise: the floor
-        // first learned is the speech's own; none of it may be dropped as silence. (At this
+        // Already talking when recording starts, quietly (noise is scaled with the speech, so
+        // this tests a low level, not a low SNR): the floor first learned is the speech's own; none of it may be dropped as silence. (At this
         // level the end of the last syllable, ~0.1 s, may be taken for the start of the pause.)
         let audio: Vec<f32> = talk(6.5, &[(0.0, 6.0)]).iter().map(|x| x * 0.03).collect();
         let segs = cut_all(CutConfig::live(25.0), &audio);
