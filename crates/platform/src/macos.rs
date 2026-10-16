@@ -220,8 +220,9 @@ fn create_tap(shared: &Arc<Shared>) -> Option<CFRetained<CFMachPort>> {
     let mask = (1u64 << CGEventType::KeyDown.0)
         | (1u64 << CGEventType::KeyUp.0)
         | (1u64 << CGEventType::FlagsChanged.0);
-    // Listen-only unless the key must be swallowed, which takes an active tap.
-    let options = if shared.swallow {
+    // Active whenever Accessibility allows it: the hotkey may have to be swallowed (F13-F20),
+    // and so may Esc while it ends a hands-free recording ([`crate::arm_escape`]).
+    let options = if post_access() {
         CGEventTapOptions::Default
     } else {
         CGEventTapOptions::ListenOnly
@@ -284,15 +285,24 @@ unsafe extern "C-unwind" fn tap_callback(
     let Ok(mut st) = shared.state.lock() else {
         return pass;
     };
-    let e = st
-        .detector
-        .on_key(chord_key, down, now_ms(), Instant::now())
-        .or_else(|| (down && code == KVK_ESCAPE).then(|| st.detector.on_escape())?);
+    let modifiers = CGEventFlags::MaskShift
+        | CGEventFlags::MaskControl
+        | CGEventFlags::MaskAlternate
+        | CGEventFlags::MaskCommand;
+    let armed = crate::escape_armed() && !CGEvent::flags(Some(ev)).intersects(modifiers);
+    let (e, swallow_esc) = st.detector.on_hook_key(
+        chord_key,
+        code == KVK_ESCAPE,
+        armed,
+        down,
+        now_ms(),
+        Instant::now(),
+    );
     if let Some(e) = e {
         (st.on_event)(e);
     }
-    if chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
-        // F13-F20: apps never see them.
+    if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
+        // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
         return null_mut();
     }
     pass

@@ -10,7 +10,7 @@
 
 use std::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Instant,
 };
 
@@ -48,8 +48,9 @@ pub enum HotkeyEvent {
     /// or the hold turned out to be stale (a chord key was pressed again long after its
     /// release was missed): the hold is not a dictation. No `Up` follows.
     Cancel,
-    /// Esc was pressed while the hotkey wasn't held (with it held, that's a `Cancel`): ends a
-    /// hands-free recording. Every such press is reported; ignore it otherwise.
+    /// Esc (no modifier) was pressed while the hotkey wasn't held (with it held, that's a
+    /// `Cancel`) and [`arm_escape`] was on: ends a hands-free recording. The focused app
+    /// doesn't see that Esc.
     Escape,
 }
 
@@ -405,6 +406,20 @@ pub fn send_paste() -> Result<(), Error> {
 
 static PASTES: AtomicU64 = AtomicU64::new(0);
 
+static ESCAPE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// While armed, an Esc press with no modifier and no hotkey key down is reported as
+/// [`HotkeyEvent::Escape`] and kept from the focused app (macOS: if the event tap could be an
+/// active one, i.e. with Accessibility). Disarmed, Esc is left alone.
+pub fn arm_escape(armed: bool) {
+    ESCAPE_ARMED.store(armed, Ordering::Relaxed);
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn escape_armed() -> bool {
+    ESCAPE_ARMED.load(Ordering::Relaxed)
+}
+
 /// How many times [`send_paste`] released a modifier that was held down (and so could have
 /// made a hotkey key look released). With [`paste_may_release`], lets a caller tell a real
 /// release of the hotkey from our own injected key-ups.
@@ -459,6 +474,8 @@ pub(crate) struct HoldDetector {
     down: u8,
     /// Event time (ms, wrapping) of each chord key's last transition.
     last_ms: [u32; MAX_CHORD],
+    /// The last Esc press was reported as `Escape`: its release is kept from the app too.
+    escape_down: bool,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -481,6 +498,7 @@ impl HoldDetector {
             state: Hold::Idle,
             down: 0,
             last_ms: [0; MAX_CHORD],
+            escape_down: false,
         }
     }
 
@@ -567,10 +585,32 @@ impl HoldDetector {
         self.down & (1 << i) != 0 && self.state != Hold::Idle
     }
 
-    /// After [`Self::on_key`] returned nothing for an Esc press: [`HotkeyEvent::Escape`] if no
-    /// chord key is down (with the hotkey held, Esc was a `Cancel`).
-    pub(crate) fn on_escape(&self) -> Option<HotkeyEvent> {
-        (self.state == Hold::Idle && self.down == 0).then_some(HotkeyEvent::Escape)
+    /// What the hooks call for every key event: [`Self::on_key`], plus Esc. `esc`: the key is
+    /// Esc; `armed`: [`arm_escape`] is on and no modifier is held. An armed Esc press with no
+    /// chord key down is [`HotkeyEvent::Escape`] (with the hotkey held, Esc is a `Cancel`).
+    /// Also returns whether to keep the key from the focused app: an Esc reported as `Escape`,
+    /// and its release.
+    pub(crate) fn on_hook_key(
+        &mut self,
+        chord_key: Option<usize>,
+        esc: bool,
+        armed: bool,
+        down: bool,
+        time_ms: u32,
+        now: Instant,
+    ) -> (Option<HotkeyEvent>, bool) {
+        let ev = self.on_key(chord_key, down, time_ms, now);
+        if !esc {
+            return (ev, false);
+        }
+        if !down {
+            return (ev, std::mem::take(&mut self.escape_down));
+        }
+        if ev.is_none() && armed && self.state == Hold::Idle && self.down == 0 {
+            self.escape_down = true;
+            return (Some(HotkeyEvent::Escape), true);
+        }
+        (ev, false)
     }
 
     /// Forget any hold in progress.
@@ -701,27 +741,47 @@ mod tests {
     }
 
     #[test]
-    fn escape_is_reported_only_without_a_hold() {
+    fn escape_is_reported_only_when_armed_and_without_a_hold() {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
-        // Esc while the hotkey is up: ends a hands-free recording.
-        assert_eq!(d.on_key(OTHER, true, 0, t), None);
-        assert_eq!(d.on_escape(), Some(HotkeyEvent::Escape));
-        // Esc while it's held is the hold's cancel, not an Escape too.
-        assert_eq!(d.on_key(HOT, true, 10, t), Some(HotkeyEvent::Down(t)));
-        assert_eq!(d.on_key(OTHER, true, 20, t), Some(HotkeyEvent::Cancel));
+        let esc =
+            |d: &mut HoldDetector, armed, down, ms| d.on_hook_key(OTHER, true, armed, down, ms, t);
+        // Disarmed (not hands-free, or a modifier held): Esc is the app's.
+        assert_eq!(esc(&mut d, false, true, 0), (None, false));
+        assert_eq!(esc(&mut d, false, false, 5), (None, false));
+        // Armed with the hotkey up: ends a hands-free recording, and the app sees neither the
+        // press nor its release (even if disarmed in between).
         assert_eq!(
-            d.on_escape(),
-            None,
+            esc(&mut d, true, true, 10),
+            (Some(HotkeyEvent::Escape), true)
+        );
+        assert_eq!(esc(&mut d, false, false, 15), (None, true));
+        // Esc while the hotkey is held is the hold's cancel, not an Escape too.
+        assert_eq!(d.on_key(HOT, true, 20, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            esc(&mut d, true, true, 30),
+            (Some(HotkeyEvent::Cancel), false)
+        );
+        assert_eq!(esc(&mut d, true, false, 35), (None, false));
+        assert_eq!(
+            esc(&mut d, true, true, 40),
+            (None, false),
             "still waiting for the hotkey's release"
         );
-        assert_eq!(d.on_key(HOT, false, 30, t), None);
-        assert_eq!(d.on_escape(), Some(HotkeyEvent::Escape));
+        assert_eq!(d.on_key(HOT, false, 50, t), None);
+        assert_eq!(
+            esc(&mut d, true, true, 60),
+            (Some(HotkeyEvent::Escape), true)
+        );
+        // Other keys are never kept from the app.
+        assert_eq!(
+            d.on_hook_key(OTHER, false, true, true, 70, t),
+            (None, false)
+        );
         // Part of a chord down: a shortcut, not an Escape.
         let mut d = HoldDetector::new(2);
         d.on_key(HOT, true, 0, t);
-        assert_eq!(d.on_key(OTHER, true, 10, t), None);
-        assert_eq!(d.on_escape(), None);
+        assert_eq!(esc(&mut d, true, true, 10), (None, false));
     }
 
     #[test]
