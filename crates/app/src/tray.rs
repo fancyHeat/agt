@@ -1,8 +1,9 @@
-//! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, "Copy last
-//! transcript", "Update now", (macOS) "Privacy & Security settings", "Open config folder",
-//! "Open data folder" (where it differs) and
-//! "Quit".
+//! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, a config
+//! error line (while there is one), "Copy last transcript", "Update now", "Settings" (see
+//! [`crate::settings`]), (macOS) "Privacy & Security settings", "Open config folder", "Open
+//! data folder" (where it differs) and "Quit".
 
+use crate::settings::Settings;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
@@ -11,11 +12,18 @@ use tray_icon::{
 /// Label of the "Update now" item when it's idle.
 pub const UPDATE_NOW: &str = "Update now";
 
+/// Where the config error line goes: after the title, status, polish line and separator.
+const WARNING_AT: usize = 4;
+
 pub struct Tray {
     icon: TrayIcon,
+    menu: Menu,
     title: String,
     status: MenuItem,
     polish: MenuItem,
+    warning: MenuItem,
+    warning_shown: bool,
+    pub settings: Settings,
     copy_last_item: MenuItem,
     update_item: MenuItem,
     pub copy_last: MenuId,
@@ -29,13 +37,12 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// `config_error`: shown as a disabled menu line so a broken config is noticeable.
     /// `polish`: a disabled info line, e.g. "Polish: off".
     /// `installed`: whether this is a Velopack install (else "Update now" is disabled).
     /// `data_folder`: whether to offer "Open data folder".
+    /// The Settings submenu starts empty: fill it with [`Settings::show`].
     pub fn new(
         version: &str,
-        config_error: bool,
         polish: &str,
         installed: bool,
         data_folder: bool,
@@ -43,7 +50,7 @@ impl Tray {
         let title = format!("AGT {version}");
         let title_item = MenuItem::new(&title, false, None);
         let status = MenuItem::new("Starting...", false, None);
-        let warning = MenuItem::new("Config error (auto-updates off) - see log", false, None);
+        let warning = MenuItem::new("", false, None);
         let polish = MenuItem::new(polish, false, None);
         // Recovery path when a paste failed; enabled once there is a transcript.
         let copy_last = MenuItem::new("Copy last transcript", false, None);
@@ -52,6 +59,7 @@ impl Tray {
         } else {
             MenuItem::new("Update now (not installed)", false, None)
         };
+        let settings = Settings::new();
         let privacy = cfg!(target_os = "macos")
             .then(|| MenuItem::new("Privacy & Security settings...", true, None));
         let open_config = MenuItem::new("Open config folder", true, None);
@@ -63,10 +71,7 @@ impl Tray {
             &polish,
             &PredefinedMenuItem::separator(),
         ])?;
-        if config_error {
-            menu.append(&warning)?;
-        }
-        menu.append_items(&[&copy_last, &update])?;
+        menu.append_items(&[&copy_last, &update, &settings.menu])?;
         if let Some(p) = &privacy {
             menu.append(p)?;
         }
@@ -78,7 +83,7 @@ impl Tray {
 
         let builder = TrayIconBuilder::new()
             .with_tooltip(&title)
-            .with_menu(Box::new(menu));
+            .with_menu(Box::new(menu.clone()));
         // macOS: monochrome template (the system tints it for light/dark menu bars).
         #[cfg(target_os = "macos")]
         let builder = builder.with_icon_templated(icon(Style::Template)?);
@@ -87,9 +92,13 @@ impl Tray {
         let builder = builder.with_icon(icon(Style::Color)?);
         Ok(Self {
             icon: builder.build()?,
+            menu,
             title,
             status,
             polish,
+            warning,
+            warning_shown: false,
+            settings,
             copy_last: copy_last.id().clone(),
             copy_last_item: copy_last,
             update: update.id().clone(),
@@ -99,6 +108,26 @@ impl Tray {
             open_data: open_data.map(|i| i.id().clone()),
             quit: quit.id().clone(),
         })
+    }
+
+    /// Shows a disabled line about a config problem so it's noticeable, or removes it.
+    pub fn set_warning(&mut self, warning: Option<&str>) {
+        let result = match (warning, self.warning_shown) {
+            (Some(text), shown) => {
+                self.warning.set_text(text);
+                if shown {
+                    Ok(())
+                } else {
+                    self.menu.insert(&self.warning, WARNING_AT)
+                }
+            }
+            (None, true) => self.menu.remove(&self.warning),
+            (None, false) => Ok(()),
+        };
+        match result {
+            Ok(()) => self.warning_shown = warning.is_some(),
+            Err(e) => tracing::debug!("cannot update the config error line: {e}"),
+        }
     }
 
     /// Replaces the polish info line (the managed S1-mini reports its progress there).

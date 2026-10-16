@@ -26,7 +26,7 @@
 //!
 //! | Table | One row per | Kept |
 //! |---|---|---|
-//! | `app_sessions` | AGT run: version, OS, non-secret settings (polish: provider, model, style, S1-mini options; never its key or URL), the engine and device that actually ran (`stt_backend`, `stt_notice` on a GPU → CPU fallback), model download / load / warmup times, `exit_reason`: `quit`, `update_restart`, `error`, `crash` (its last event was a panic) or `unknown` (killed, logoff, power loss) | 365 days |
+//! | `app_sessions` | AGT run: version, OS, non-secret settings (polish: provider, model, style, S1-mini options; never its key or URL), the engine and device that actually ran (`stt_backend`, `stt_notice` on a GPU → CPU fallback), model download / load / warmup times, `exit_reason`: `quit`, `update_restart`, `settings_restart`, `error`, `crash` (its last event was a panic) or `unknown` (killed, logoff, power loss) | 365 days |
 //! | `dictations` | hotkey press: `outcome` (see [`Outcome`]), `latency_ms` (release → paste, minus `hotkey_wait_ms`: the headline), `release_to_paste_ms` (wall time), `hold_ms`, `audio_secs`, `rms`, `key_down_to_mic_ms`, `first_audio_ms`, `queue_wait_ms`, `stt_ms`, `rtf`, `polish_ms` + `polish_outcome`, `hotkey_wait_ms`, `clipboard_save_ms`, `paste_ms`, `chars_out`, `words_out`, `missed_release`, `stt_backend` | 180 days |
 //! | `events` | event (what the log file had): `level`, `target`, `message`; the app's `log_level` sets which are recorded; the home directory is replaced by `~` | 30 days (DEBUG/TRACE 7) |
 //! | `updates` | update check, download or apply: versions, `result`, `error`, `duration_ms` | 180 days |
@@ -209,6 +209,8 @@ pub enum ExitReason {
     Quit,
     /// Restarting into an update.
     UpdateRestart,
+    /// Restarting to apply settings changed in config.toml (or the tray's Settings).
+    SettingsRestart,
     /// The event loop failed or the tray couldn't be created.
     Error,
 }
@@ -218,6 +220,7 @@ impl ExitReason {
         match self {
             ExitReason::Quit => "quit",
             ExitReason::UpdateRestart => "update_restart",
+            ExitReason::SettingsRestart => "settings_restart",
             ExitReason::Error => "error",
         }
     }

@@ -59,7 +59,7 @@ CREATE TABLE app_sessions (
     id INTEGER PRIMARY KEY,
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
-    -- quit | update_restart | error | crash (panicked) | unknown (killed, power loss, ...)
+    -- quit | update_restart | settings_restart | error | crash (panicked) | unknown (killed, power loss, ...)
     exit_reason TEXT,
     app_version TEXT NOT NULL,
     os TEXT NOT NULL,

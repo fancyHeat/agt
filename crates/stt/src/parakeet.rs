@@ -122,6 +122,9 @@ const V3: ([ModelFile; 4], [ModelFile; 5]) = parakeet_files!(
     encoder_fp32_data: (2435420160, "9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36"),
 );
 
+/// The models [`files`] knows.
+pub const MODELS: &[&str] = &["parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v3"];
+
 /// The files `cfg` needs, or an error for an unknown model name.
 pub fn files(cfg: &SttConfig) -> Result<&'static [ModelFile]> {
     let set = match cfg.model.as_str() {
