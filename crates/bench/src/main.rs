@@ -11,6 +11,8 @@
 //!   --threads <n>       override stt.threads
 //!   --models-dir <dir>  override stt.models_dir
 //!   --runs <n>          transcribe each file n times (default 3); latency = median
+//!   --gap-ms <n>        sleep n ms before every transcription (default 0: back to back), to see
+//!                       what an idle GPU/CPU costs the next call (clock-down, wake-up)
 //!   --no-warmup         skip warmup, so the first run shows the cold-start cost
 //!   --quiet             no per-file lines, only the summary
 //! ```
@@ -43,7 +45,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--no-warmup] [--quiet] <dir>";
+const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--no-warmup] [--quiet] <dir>";
 
 fn main() -> ExitCode {
     match run() {
@@ -82,6 +84,7 @@ fn run() -> Result<(), String> {
     }
     let mut cfg = SttConfig::default();
     let (mut runs, mut warmup, mut quiet, mut dir) = (3usize, true, false, None);
+    let mut gap = std::time::Duration::ZERO;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -98,6 +101,9 @@ fn run() -> Result<(), String> {
             "--threads" => cfg.threads = val()?.parse().map_err(|_| "bad --threads")?,
             "--models-dir" => cfg.models_dir = val()?,
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
+            "--gap-ms" => {
+                gap = std::time::Duration::from_millis(val()?.parse().map_err(|_| "bad --gap-ms")?)
+            }
             "--no-warmup" => warmup = false,
             "--quiet" => quiet = true,
             "-h" | "--help" => {
@@ -156,6 +162,7 @@ fn run() -> Result<(), String> {
         let mut times = Vec::with_capacity(runs);
         let mut text = String::new();
         for _ in 0..runs {
+            std::thread::sleep(gap);
             let t = Instant::now();
             text = engine
                 .transcribe(&audio, &opts)

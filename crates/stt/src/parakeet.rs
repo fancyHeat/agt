@@ -183,42 +183,18 @@ impl Encoder {
 }
 
 /// What `stt.device = "auto"` tries first, kept only if it isn't slower than the CPU (see
-/// [`Parakeet::load`]). Windows: DirectML. macOS: Core ML if the Mac has at least
-/// [`AUTO_COREML_MIN_RAM`] (it needs the fp32 encoder: ~3 GB of memory and a 2.4 GB download,
-/// vs ~1.2 GB and 0.65 GB for the CPU's int8 one), else the CPU.
+/// [`Parakeet::load`]). Windows: DirectML. macOS: the CPU (int8). Core ML is only used when
+/// asked for: on an M4 with real speech and a few seconds between dictations, the CPU's int8
+/// encoder was ~2x faster for short clips (113 vs 215 ms p50) and as fast for 6-20 s ones,
+/// more accurate (the 10 s window splits longer dictations), needs a quarter of the download
+/// and no ~20 s compile. A warm, back-to-back GPU (what a start-up probe measures) hides the
+/// ~90 ms Core ML pays after the GPU idles for a second or more. See docs/benchmarks.md.
 fn auto_device() -> Device {
     if cfg!(windows) {
         Device::DirectMl
-    } else if cfg!(target_os = "macos") && physical_memory() >= AUTO_COREML_MIN_RAM {
-        Device::CoreMl
     } else {
         Device::Cpu
     }
-}
-
-/// See [`auto_device`]: an 8 GB Mac gets the CPU.
-const AUTO_COREML_MIN_RAM: u64 = 12 << 30;
-
-#[cfg(target_os = "macos")]
-fn physical_memory() -> u64 {
-    let mut bytes = 0u64;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: `hw.memsize` is a u64; `bytes`/`len` describe a buffer of that size.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 { bytes } else { 0 }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn physical_memory() -> u64 {
-    0
 }
 
 /// The device `cfg` asks for, with `auto` resolved (before any fallback).
@@ -229,8 +205,7 @@ fn wanted_device(cfg: &SttConfig) -> Device {
     }
 }
 
-/// The encoder precision actually used: Core ML always runs the fp32 encoder (also under
-/// `auto`; if Core ML then loses the timing check, the CPU runs fp32 too).
+/// The encoder precision actually used: Core ML always runs the fp32 encoder.
 fn precision(cfg: &SttConfig) -> Precision {
     match wanted_device(cfg) {
         Device::CoreMl => Precision::Fp32,
@@ -240,7 +215,10 @@ fn precision(cfg: &SttConfig) -> Precision {
 
 /// Core ML's fixed encoder window (see the module docs): every chunk is padded to it, so it's
 /// a trade-off. Measured on an M4 (GPU): 5 s ≈ 51 ms, 10 s ≈ 76 ms, 15 s ≈ 104 ms, 25 s ≈
-/// 170 ms per encoder call, vs. ~100 ms (3 s) to ~330 ms (10 s) on the CPU.
+/// 170 ms per encoder call, vs. ~100 ms (3 s) to ~330 ms (10 s) on the CPU. The padding
+/// doesn't change the output; the chunk cuts do: with 10 s, dictations of 10-15 s are cut in
+/// two and real-speech WER is ~1.3 points worse than the CPU's, with 15 s it equals the CPU's
+/// (docs/benchmarks.md, window sweep).
 pub const COREML_WINDOW_SECS: f32 = 10.0;
 
 /// Under `auto`, the GPU is kept if its time for [`PROBE_SECS`] of audio is at most this
