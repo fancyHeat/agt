@@ -213,6 +213,9 @@ fn main() {
         app.exit_reason = agt_telemetry::ExitReason::Error;
     }
     tracing::info!("AGT exiting");
+    if let Some(p) = &app.pipeline {
+        p.shutdown(); // quit or restart mid-dictation: put a ducked volume back
+    }
     agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
     // The last dictation's history record (and WAV) may still be being written.
     agt_history::flush(HISTORY_FLUSH);
@@ -231,6 +234,8 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         hotkey: config.hotkey.key.clone(),
         min_hold_ms: config.hotkey.min_hold_ms as i64,
         keep_mic_open: config.audio.keep_mic_open,
+        duck: config.audio.duck,
+        duck_level: config.audio.duck_level().into(),
         stt_engine: lower(&config.stt.engine),
         stt_model: config.stt.model.clone(),
         stt_precision: lower(&config.stt.precision),

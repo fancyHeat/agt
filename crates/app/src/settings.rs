@@ -100,6 +100,17 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
         "Microphone",
         microphone_choices(&c.audio.device, agt_audio::input_device_names()),
     )?;
+    b.check(
+        menu,
+        "Lower other audio while dictating",
+        &["audio", "duck"],
+        |c| c.audio.duck,
+    )?;
+    b.choice(
+        menu,
+        "Lower other audio to",
+        duck_levels(c.audio.duck_level()),
+    )?;
 
     // Speech-to-text.
     let stt = b.submenu(menu, "Speech-to-text")?;
@@ -544,6 +555,33 @@ fn numbers(
         .collect()
 }
 
+/// `audio.duck_level` presets (percent of the volume kept), plus the level in use if it's
+/// another one. `current`: the clamped level ([`agt_core::config::AudioConfig::duck_level`]).
+fn duck_levels(current: f32) -> Vec<Choice> {
+    let pct = |v: f32| (f64::from(v) * 100.0).round();
+    let mut choices: Vec<Choice> = [0, 10, 25, 50]
+        .into_iter()
+        .map(|p| {
+            let label = if p == 0 {
+                "Silent".into()
+            } else {
+                format!("{p}%")
+            };
+            let value = SettingValue::from(f64::from(p) / 100.0);
+            Choice::set(
+                &["audio", "duck_level"],
+                label,
+                value,
+                pct(current) == f64::from(p),
+            )
+        })
+        .collect();
+    if !choices.iter().any(|c| c.checked) {
+        choices.push(Choice::current(&format!("{}%", pct(current))));
+    }
+    choices
+}
+
 fn ms(n: u64) -> String {
     format!("{n} ms")
 }
@@ -740,6 +778,7 @@ mod tests {
             vec![r#"Mic "A" \ (USB)"#.into(), "Headset".into()],
         ));
         all.extend(keep_days(c.history.keep_days));
+        all.extend(duck_levels(c.audio.duck_level()));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
@@ -769,5 +808,20 @@ mod tests {
         // A custom history retention is kept; "Forever" is 0.
         let days: Vec<_> = keep_days(14).into_iter().map(|c| c.label).collect();
         assert_eq!(days, ["Forever", "7 days", "14 days", "30 days", "90 days"]);
+        // The default duck level is a preset; another one is shown as is.
+        let levels = duck_levels(c.audio.duck_level());
+        assert_eq!(levels.iter().filter(|c| c.checked).count(), 1);
+        assert!(levels.iter().any(|c| c.checked && c.label == "10%"));
+        let levels = duck_levels(0.3);
+        assert!(levels.last().unwrap().checked && levels.last().unwrap().changes.is_empty());
+        // What's shown is the level in use: out of range clamped, NaN the default.
+        let shown = |v: &str| {
+            let c = Config::parse(&format!("[audio]\nduck_level = {v}\n")).unwrap();
+            let levels = duck_levels(c.audio.duck_level());
+            levels.into_iter().find(|c| c.checked).unwrap().label
+        };
+        assert_eq!(shown("3"), "100% (from config.toml)");
+        assert_eq!(shown("nan"), "10%");
+        assert_eq!(shown("-1"), "Silent");
     }
 }

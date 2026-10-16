@@ -4,6 +4,8 @@
 //! - Windows: low-level keyboard hook, Win32 clipboard, `SendInput`.
 //! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone and Accessibility
 //!   permissions (see [`missing_permissions`]).
+//! - Ducking other audio while dictating ([`Ducker`]): the default output device's volume
+//!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL).
 //! - Anything else returns [`Error`]s saying it's unsupported.
 
 use std::{
@@ -26,6 +28,9 @@ use macos as imp;
 mod unsupported;
 #[cfg(not(any(windows, target_os = "macos")))]
 use unsupported as imp;
+
+mod duck;
+pub use duck::{Ducked, Ducker};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 

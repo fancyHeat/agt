@@ -71,3 +71,34 @@ pub fn missing_permissions() -> Vec<Permission> {
 pub fn request_permissions(_missing: &[Permission]) {}
 
 pub fn open_permission_settings(_permission: Permission) {}
+
+/// No volume control here: ducking does nothing.
+pub struct OutputVolume;
+
+pub fn init_volume_thread() {}
+
+impl OutputVolume {
+    pub fn open_default() -> Result<Option<Self>, Error> {
+        Ok(None)
+    }
+
+    pub fn open(_id: &str) -> Result<Option<Self>, Error> {
+        Ok(None)
+    }
+
+    pub fn id(&self) -> &str {
+        ""
+    }
+
+    pub fn volume(&self) -> Result<f32, Error> {
+        Err(format!("volume control {MSG}").into())
+    }
+
+    pub fn set_volume(&self, _v: f32) -> Result<(), Error> {
+        Err(format!("volume control {MSG}").into())
+    }
+
+    pub fn muted(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
+}

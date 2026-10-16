@@ -177,6 +177,11 @@ ALTER TABLE app_sessions ADD COLUMN history_keep_days INTEGER;
 ALTER TABLE dictations ADD COLUMN words_raw INTEGER;
 ALTER TABLE dictations ADD COLUMN history_saved INTEGER NOT NULL DEFAULT 0;
 "#,
+    // 3: audio.duck and audio.duck_level.
+    r#"
+ALTER TABLE app_sessions ADD COLUMN duck INTEGER;
+ALTER TABLE app_sessions ADD COLUMN duck_level REAL;
+"#,
 ];
 
 /// Opens (creating if needed) and migrates the database. A file that isn't a database or is
@@ -278,9 +283,11 @@ pub(crate) fn insert_session(
             s1_styling, s1_structure, s1_context, s1_device, audio_device, overlay_position,
             polish_timeout_ms,
             polish_timeout_per_word_ms, polish_min_words, polish_custom_prompt,
-            polish_custom_user_message, history_save_text, history_save_audio, history_keep_days)
+            polish_custom_user_message, history_save_text, history_save_audio, history_keep_days,
+            duck, duck_level)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
+            ?37, ?38)",
         params![
             at,
             s.app_version,
@@ -318,6 +325,8 @@ pub(crate) fn insert_session(
             s.history_save_text,
             s.history_save_audio,
             s.history_keep_days,
+            s.duck,
+            s.duck_level,
         ],
     )?;
     Ok(conn.last_insert_rowid())

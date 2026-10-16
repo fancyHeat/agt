@@ -673,3 +673,196 @@ pub fn open_permission_settings(permission: Permission) {
         tracing::error!("cannot open {url}: {e}");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Output volume (ducking): the default output device's volume through the CoreAudio HAL.
+
+#[repr(C)]
+struct PropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+#[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {
+    fn AudioObjectHasProperty(id: u32, address: *const PropertyAddress) -> u8;
+    fn AudioObjectIsPropertySettable(
+        id: u32,
+        address: *const PropertyAddress,
+        settable: *mut u8,
+    ) -> i32;
+    fn AudioObjectGetPropertyData(
+        id: u32,
+        address: *const PropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: *mut u32,
+        data: *mut c_void,
+    ) -> i32;
+    fn AudioObjectSetPropertyData(
+        id: u32,
+        address: *const PropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: u32,
+        data: *const c_void,
+    ) -> i32;
+}
+
+const fn fourcc(s: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*s)
+}
+
+const SYSTEM_OBJECT: u32 = 1; // kAudioObjectSystemObject
+const SCOPE_GLOBAL: u32 = fourcc(b"glob");
+const SCOPE_OUTPUT: u32 = fourcc(b"outp");
+const ELEMENT_MAIN: u32 = 0;
+const DEFAULT_OUTPUT_DEVICE: u32 = fourcc(b"dOut");
+/// `kAudioHardwareServiceDeviceProperty_VirtualMainVolume`: the menu bar's volume slider,
+/// which also covers devices that only have per-channel volumes.
+const VIRTUAL_MAIN_VOLUME: u32 = fourcc(b"vmvc");
+/// `kAudioDevicePropertyVolumeScalar`.
+const VOLUME_SCALAR: u32 = fourcc(b"volm");
+const MUTE: u32 = fourcc(b"mute");
+/// `kAudioDevicePropertyDeviceUID`.
+const DEVICE_UID: u32 = fourcc(b"uid ");
+/// `kAudioHardwarePropertyTranslateUIDToDevice`.
+const TRANSLATE_UID_TO_DEVICE: u32 = fourcc(b"uidd");
+
+fn output_address(selector: u32) -> PropertyAddress {
+    PropertyAddress {
+        selector,
+        scope: SCOPE_OUTPUT,
+        element: ELEMENT_MAIN,
+    }
+}
+
+/// Reads a fixed-size property.
+fn get_property<T: Copy>(id: u32, address: &PropertyAddress, mut value: T) -> Result<T, Error> {
+    let mut size = size_of::<T>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            (&raw mut value).cast(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("AudioObjectGetPropertyData failed (OSStatus {status})").into());
+    }
+    Ok(value)
+}
+
+/// An output device's volume control.
+pub struct OutputVolume {
+    device: u32,
+    /// [`VIRTUAL_MAIN_VOLUME`] or [`VOLUME_SCALAR`].
+    selector: u32,
+    /// The device's UID (stable across reconnects, unlike its `AudioDeviceID`), to find it
+    /// again ([`OutputVolume::open`]).
+    uid: String,
+}
+
+pub fn init_volume_thread() {}
+
+fn global_address(selector: u32) -> PropertyAddress {
+    PropertyAddress {
+        selector,
+        scope: SCOPE_GLOBAL,
+        element: ELEMENT_MAIN,
+    }
+}
+
+impl OutputVolume {
+    /// `Ok(None)`: no output device, or its volume can't be set (HDMI/DisplayPort outputs).
+    pub fn open_default() -> Result<Option<Self>, Error> {
+        let device = get_property(SYSTEM_OBJECT, &global_address(DEFAULT_OUTPUT_DEVICE), 0u32)?;
+        Self::for_device(device)
+    }
+
+    /// The device with this [`OutputVolume::id`]. `Ok(None)`: it's not connected now.
+    pub fn open(uid: &str) -> Result<Option<Self>, Error> {
+        let uid = CFString::from_str(uid);
+        let qualifier: *const CFString = &*uid;
+        let mut device = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &global_address(TRANSLATE_UID_TO_DEVICE),
+                size_of::<*const CFString>() as u32,
+                (&raw const qualifier).cast(),
+                &mut size,
+                (&raw mut device).cast(),
+            )
+        };
+        if status != 0 {
+            return Err(format!("translating a device UID failed (OSStatus {status})").into());
+        }
+        Self::for_device(device)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.uid
+    }
+
+    fn for_device(device: u32) -> Result<Option<Self>, Error> {
+        if device == 0 {
+            return Ok(None); // kAudioObjectUnknown
+        }
+        for selector in [VIRTUAL_MAIN_VOLUME, VOLUME_SCALAR] {
+            let address = output_address(selector);
+            let mut settable = 0u8;
+            if unsafe { AudioObjectHasProperty(device, &address) } != 0
+                && unsafe { AudioObjectIsPropertySettable(device, &address, &mut settable) } == 0
+                && settable != 0
+            {
+                let uid: *const CFString =
+                    get_property(device, &global_address(DEVICE_UID), std::ptr::null())?;
+                let uid = NonNull::new(uid.cast_mut()).ok_or("the device has no UID")?;
+                // A copy we own (the property's rule for CFString values).
+                let uid = unsafe { CFRetained::from_raw(uid) }.to_string();
+                return Ok(Some(Self {
+                    device,
+                    selector,
+                    uid,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The volume slider's position, 0..=1.
+    pub fn volume(&self) -> Result<f32, Error> {
+        get_property(self.device, &output_address(self.selector), 0f32)
+    }
+
+    pub fn set_volume(&self, v: f32) -> Result<(), Error> {
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                self.device,
+                &output_address(self.selector),
+                0,
+                std::ptr::null(),
+                size_of::<f32>() as u32,
+                (&raw const v).cast(),
+            )
+        };
+        if status != 0 {
+            return Err(format!("AudioObjectSetPropertyData failed (OSStatus {status})").into());
+        }
+        Ok(())
+    }
+
+    pub fn muted(&self) -> Result<bool, Error> {
+        let address = output_address(MUTE);
+        if unsafe { AudioObjectHasProperty(self.device, &address) } == 0 {
+            return Ok(false);
+        }
+        Ok(get_property(self.device, &address, 0u32)? != 0)
+    }
+}
