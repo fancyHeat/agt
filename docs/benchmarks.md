@@ -761,58 +761,91 @@ With 3 s idle before each request, which separates the close ones (two runs each
 | n 3, m 48 | - | 1153/2062/2574 |
 | n 3, m 16 + `ngram-mod` | 1005/2413/2943 | - |
 
-**What ships** (this change: `--spec-type ngram-simple --spec-ngram-simple-size-n 3
---spec-ngram-simple-size-m 24 --spec-draft-n-max 24 --cache-ram 0`), 3 s idle before each:
+**Fast drafting as shipped** (opt-in: `polish.s1-mini.fast_drafting = true` adds
+`--spec-type ngram-simple --spec-ngram-simple-size-n 3 --spec-ngram-simple-size-m 24
+--spec-draft-n-max 24`; `--cache-ram 0` is always on). Same tool, same server build and device,
+off and on back to back (`agt-bench polish --runs 1 --fast-drafting off|on`), p50/p90/max ms:
 
-| | Windows (Vulkan) | Mac (Metal) |
+| | off | on |
 |---|---|---|
-| long, today | 1342/2318/2380 ms, 308 tokens/s | 2459/4753/4787 ms, 154 tokens/s |
-| long, this change (sweep script) | 720/1089/1343 ms, 601 tokens/s | 954/1672/2141 ms, 438 tokens/s |
-| long, this change (`agt-bench polish`, AGT's client and guard) | 519/900/1178 ms | 975/1676/2127 ms |
-| long, outputs identical to today | 11 of 12 (9 words differ in 3,807) | 10 of 12 (10 words) |
-| clips 2-60 s, today | 116/203/614 ms | 192/333/1181 ms |
-| clips 2-60 s, this change | 71/130/338 ms | 108/183/525 ms |
-| clips, outputs identical to today | 77 of 78 (one comma) | 77 of 78 (comma vs period) |
-| Windows CPU (`s1_mini.device = "cpu"`), long, back to back | 10075/20448/22268 -> 5556/9330/12098 ms (37 -> 84 tokens/s) | - |
+| Windows Vulkan, long, 3 s idle (two rounds) | 1177/2222/2233, 1131/2125/2174 | 519/873/1178, 512/897/1171 |
+| Windows Vulkan, clips 2-60 s, 3 s idle (two rounds) | 123/201/662, 122/207/587 | 61/129/331, 61/125/348 |
+| Windows CPU device, long, back to back | 9740/22263/22907 | 5552/9670/12227 |
+| Windows CPU device, clips, back to back | 578/1012/4165 | 314/590/2124 |
+| Mac Metal, long, back to back | 2480/4629/4699 | 973/1662/2079 |
+| Mac Metal, clips, back to back | 174/309/1152 | 84/162/489 |
+| Mac CPU device, long, back to back | 4120/9155/9164 | 4434/8027/9310 |
+| Mac CPU device, clips, back to back | 232/423/1730 | 209/354/1359 |
 
-The two Windows "today" rows (1200 vs 1342 ms p50) and the two "this change" rows (720 vs
-519 ms) are the same setup on different runs: how fast the RTX 2080 Ti clocks back up after 3 s
-idle varies with what else the desktop is doing (see "Idle and suspension" below). Each pair
-was measured back to back, so compare within a row pair, not across.
-
-**Output identity.** Greedy decoding with drafts is meant to give the same text, but checking
-24 drafted tokens in one batch runs different kernels than one token at a time, and where
-two tokens are nearly tied the rounding difference can pick the other one. The output is
-deterministic per setup (the same on every server start for a new text; only a repeat of the
-same text on a running server, which hits the prompt cache, sometimes differs), so every
-difference below comes from drafting:
-
-- Parakeet's punctuated transcripts: Windows 1 of 12 long outputs differ (9 words: a garbled
-  passage with quotes, `...opposition to the project. The EU is a 50-year-old attempted
-  answer...` vs `...opposition to the EU as a 50-year-old attempt...`), the Mac 2 of 12 (the
-  same passage plus a comma, 10 words; there today's output already had the `EU as` wording
-  and drafting picked the other one); clips 1 of 78 on each (a comma; a comma vs a period).
-- The CPU device: 7 of 12 long outputs differ, by 7 words in all (`doll,`/`doll`,
-  `Tonight`/`To night`, `nine`/`9`, a repeated `Smallpox.` dropped) plus whitespace.
-- Heavy rewrites (the review of this change, Windows, the references as input: lowercase,
-  no punctuation): 2-4 of 12 long outputs differ (9-12 words), on the CPU 4 of 5. Most are
-  near-tie wording and punctuation (`a infrared`/`an infrared`, the case of `Securities and
-  Exchange Commission`), but some are a few words: `would like to remind, allow me to remind
-  you` became `would like to remind you`, `find out what features a user` became `find out
-  what are the features which a user`.
-
-That is the same kind of difference as changing backends: the CUDA build's output, without
-drafts, differs from Vulkan's on 5 of 12 long transcripts (28 words). Polish output isn't
-ground truth, and both versions read as plausible clean-ups, but drafting can change a few
-words, not only punctuation.
+The CPU rows ran with `--timeout-ms 120000`: at the default deadline (2 s + 15 ms a word)
+drafting-off timed out on several long dictations on the Windows CPU and they were pasted raw;
+with drafting on, none did.
 
 **Speed depends on how much the model copies.** Drafts are accepted only where the output
-repeats the input. On Parakeet's punctuated transcripts 50-80% are accepted (above); on the
-review's runs with already-polished text as input 86% (1116/2308 -> 330/556 ms, 3.4x), with
-lowercase unpunctuated input only 13-22%: 1081/2048 -> 1053/1772 ms and 1118/2228 ->
-1235-1674/1824-1977 ms on Windows (no faster, sometimes slower), no faster on the CPU
-(4320 -> 4333 ms p50). Parakeet and Whisper both punctuate, so AGT's input is near the good
-end, but the speed-up is "up to", not a constant.
+repeats the input. On Parakeet's punctuated transcripts 50-80% are accepted (above); in the
+review of this change, with already-polished text as input, 86% (1116/2308 -> 330/556 ms,
+3.4x); with lowercase unpunctuated input only 13-22%: 1081/2048 -> 1053/1772 ms and 1118/2228
+-> 1235-1674/1824-1977 ms on Windows (no faster, sometimes slower), no faster on the CPU (4320
+-> 4333 ms p50). The Mac's CPU device gains little even on Parakeet's text (p50 slower, p90
+12% faster). Parakeet and Whisper both punctuate, so AGT's input is near the good end, but the
+speed-up is "up to", not a constant.
+
+**Accuracy: drafting on vs off.** Same build, device and inputs; the polished text scored
+against the eval set's references with the WER normalizer above (case and punctuation
+ignored), substitutions, deletions (dropped words) and insertions (added words) apart; then the
+two outputs scored against each other (`agt-bench polish --refs --save`, then `--compare`). The
+long set is the 12 long dictations (3,855 reference words), the clips the 78 clips of the
+regular set (1,931 words; 2 are under `min_words` and not polished):
+
+| Device, set | raw STT WER | polished, off: WER (sub/del/ins) | polished, on: WER (sub/del/ins) | outputs that differ | WER between off and on (sub/del/ins) |
+|---|---|---|---|---|---|
+| Windows Vulkan, long | 7.19% | 7.91% (163/77/65) | 8.04% (165/80/65) | 1 of 12 | 0.13% (2/3/0) |
+| Windows Vulkan, clips | 4.04% | 5.02% (44/40/13) | 5.02% (44/40/13) | 1 of 78 | 0.00% (punctuation only) |
+| Windows CPU, long | 7.19% | 7.96% (167/75/65) | 8.02% (168/76/65) | 3 of 12 | 0.10% (1/2/1) |
+| Windows CPU, clips | 4.04% | 4.97% (42/40/14) | 5.02% (44/40/13) | 2 of 78 | 0.10% (1/1/0) |
+| Mac Metal, long | 7.19% | 8.04% (165/80/65) | 7.91% (163/77/65) | 2 of 12 | 0.13% (2/0/3) |
+| Mac Metal, clips | 4.04% | 5.02% (44/40/13) | 5.02% (44/40/13) | 1 of 78 | 0.00% (punctuation only) |
+| Mac CPU, long | 7.19% | 7.91% (163/77/65) | 8.09% (166/81/65) | 6 of 12 | 0.39% (9/5/1) |
+| Mac CPU, clips | 4.04% | 4.97% (44/40/12) | 4.97% (45/39/12) | 2 of 78 | 0.05% (0/0/1) |
+
+Every differing passage (off -> on; `{}` = nothing):
+
+- Windows Vulkan: vox-dict-02 `saying no, no, no,` -> `saying, "No, no, no,"`; `opposition to
+  the project. The EU is a 50-year-old attempted answer` -> `opposition to the EU as a
+  50-year-old attempt`; clips earn-medium-04 `prices,` -> `prices`.
+- Windows CPU: ami-dict-02 `doll,` -> `doll`; ls-clean-dict-01 `Tonight,` -> `To night,`;
+  ted-dict-01 `So I there better be a nine` -> `So I better be a 9`, `And why is it true?
+  Smallpox. Smallpox killed` -> `And why is it true? Smallpox killed`, `trying stuff out,` ->
+  `trying stuff out`; clips ami-long-01 `go to bed at night, no,` -> `go to bed at night,`;
+  ami-short-03 `used to buying batteries,` -> `used to buying battery`.
+- Mac Metal: the vox-dict-02 passage the other way round (on the Mac drafting-off already
+  wrote `the EU as a 50-year-old attempt`); earn-dict-02 `measures,` -> `measures`; clips
+  ls-other-medium-03 `after dinner, only` -> `after dinner. Only`.
+- Mac CPU: ami-dict-02 `at a far off distance, at remote distance.` -> `at a far off
+  distance.`, `one of the feature` -> `one of the features`, `the TV, television.` -> `the
+  TV.`; earn-dict-02 `3rd quarter` -> `Third Quarter`; ls-clean-dict-01 `Mr. Harry Cresswell,
+  and his sister, John Taylor,` -> `Mr. Harry Cresswell, Mr. John Taylor, Mr. John Taylor,`
+  (the input: "mister Harry Cresswell and his sister, John Taylor and his sister"); ls-clean-dict-02
+  `Five` -> `5`; ls-other-dict-02 `Miss` -> `Mrs.` (4 times; the input says "misses"), `said`
+  -> `Said`; vox-dict-01 `continually reinterpreted, misinterpreted,` -> `continually
+  misinterpreted`; clips earn-medium-04 `prices` -> `prices,`, earn-medium-06 `bookings up
+  126%,` -> `bookings up 126% sequential,`.
+
+On the GPUs drafting costs no accuracy measurable here: the WER moves by 0.13 points one way on
+Windows and the same 0.13 points the other way on the Mac (it is one passage that flips), and
+clips are identical in words. On the CPU devices it changes more: 3 and 6 of 12 long outputs,
++0.06 and +0.18 points of WER, and on the Mac CPU two real content errors (a name list rewritten
+into `Mr. John Taylor, Mr. John Taylor`, `reinterpreted` dropped) next to ones that are as good
+or better (`Mrs.` for "misses", `features`). Where the model rewrites a lot (the review's runs
+with lowercase unpunctuated input, Windows Vulkan) drafting changed 2-4 of 12 long outputs
+(9-12 words), e.g. `would like to remind, allow me to remind you` -> `would like to remind
+you`, `find out what features a user` -> `find out what are the features which a user`; on the
+CPU 4 of 5. Why outputs differ at all: checking 24 drafted tokens in one batch runs different
+kernels than one token at a time, and where two tokens are nearly tied the rounding difference
+can pick the other one. The model's own run-to-run behavior is not the
+noise floor here (each setup is deterministic); a different backend is: CUDA vs Vulkan without
+drafting already differ on 5 of 12 long outputs. Within that, drafting is a small but real
+source of different words, more so on the CPU, so it is a setting, off by default.
 
 **Other flags** (Windows, long, 3 s idle, with the drafting above; 516/903/1183 ms without
 them): flash attention off 581/1028/1765, forced on 689/1095/1384; q8_0 KV cache 823/1500/3175
@@ -843,7 +876,8 @@ depends on what else the desktop is doing. Mac: back to back 100 ms, 10 s idle 1
 suspended 139 ms. Resuming the server at key-down would save microseconds; a wake-up request at
 key-down didn't help in the state measured, and can't keep the GPU up through a long dictation.
 
-**Polishing ahead of release** (`agt-bench polish --segments --pause-ms 3000`, drafting on):
+**Polishing ahead of release** (`agt-bench polish --segments --pause-ms 3000 --fast-drafting
+on`; without drafting every request here takes about twice as long):
 the pipeline could polish while the user is still talking, leaving only the end for release.
 Two ways, both against polishing the whole text at release (the 12 long dictations, 104 STT
 segments, 92 segment boundaries):
@@ -894,19 +928,23 @@ same.
 - **Prompt-lookup drafting makes polish up to ~3x faster when the model mostly keeps the
   transcript, which is the normal case with a punctuating recognizer.** On Parakeet's
   transcripts n-gram drafting accepts 50-80% of what it proposes: long dictations go from
-  1.2-1.3 s to 0.5-0.7 s p50 and 2.2-2.3 s to 0.9-1.1 s p90 on Windows, 2.5 s to 1.0 s p50
-  and 4.8 s to 1.7 s p90 on the Mac; 2-60 s clips ~40% faster; the Windows CPU fallback 1.8x.
-  Where the model rewrites a lot (lowercase unpunctuated input) only 13-22% is accepted and
-  it is no faster (1.0-1.15x, sometimes slower). No model, download, VRAM or RAM is added.
+  1.1-1.2 s to 0.5 s p50 and 2.1-2.2 s to 0.9 s p90 on Windows, 2.5 s to 1.0 s p50 and 4.6 s
+  to 1.7 s p90 on the Mac; 2-60 s clips about twice as fast; the Windows CPU device 1.8x, the
+  Mac's CPU device hardly at all. Where the model rewrites a lot (lowercase unpunctuated
+  input) only 13-22% is accepted and it is no faster (1.0-1.15x, sometimes slower). No model,
+  download, VRAM or RAM is added.
   Short lookups (n = 3) recover fastest after an edit; 24-token drafts were best on both
   machines (m = 16 is as good on Windows, 35% slower on the Mac; 32-48 waste more work on
   rejected drafts).
-- **The output is deterministic and mostly the same text, but not always.** With Parakeet's
-  transcripts 88 of 90 outputs are byte-identical to today's on Windows and 87 of 90 on the
-  Mac; the CPU device changes 7 of 12 long ones (7 words), and heavy rewrites change 2-4 of
-  12 (sometimes a few words, e.g. a repeated `allow me to remind` dropped). The changes are
-  near-tie choices of the kind a backend change already makes (CUDA vs Vulkan: 5 of 12), on
-  a step whose output is not ground truth: acceptable, but not "identical".
+- **On the GPUs drafting costs no measurable accuracy; on the CPU devices it changes more,
+  and sometimes for the worse.** With Parakeet's transcripts, Vulkan and Metal outputs are
+  byte-identical on 88 and 87 of 90, the WER against the references moves by ±0.13 points
+  (the same passage, opposite ways on the two machines) and the clips are word-identical.
+  The CPU devices change 3 and 6 of 12 long outputs (+0.06 and +0.18 WER points), including a
+  duplicated name and a dropped word on the Mac CPU, and heavy rewrites change 2-4 of 12 on
+  the GPU too. Each setup is deterministic, so these are drafting's, not noise; they are the
+  kind of near-tie change a backend switch already makes (CUDA vs Vulkan: 5 of 12), on a step
+  whose output isn't ground truth. Small, but real: hence off by default.
 - **`--cache-ram` holds memory AGT never uses.** With b11669's default the server keeps
   earlier prompts' KV state in RAM up to 8 GiB (+1.2 GB after ~45 long dictations), and with
   one slot and a new transcript each time AGT never hits it. Off, with no latency cost.
@@ -935,9 +973,14 @@ same.
 
 ### Recommendation (polish speed)
 
-- **Ship now** (this change): `--spec-type ngram-simple --spec-ngram-simple-size-n 3
-  --spec-ngram-simple-size-m 24 --spec-draft-n-max 24` and `--cache-ram 0` in the managed
-  server's arguments. Same pinned build, no new download.
+- **Ship now** (this change): `--cache-ram 0` always, and fast drafting as an opt-in setting,
+  **off by default**: `polish.s1-mini.fast_drafting` (tray: Settings > Polish > "Fast
+  drafting"; like every setting, a click restarts AGT and with it the managed server, now with
+  `--spec-type ngram-simple --spec-ngram-simple-size-n 3 --spec-ngram-simple-size-m 24
+  --spec-draft-n-max 24`). Off by default because it changes a few words now and then (most on
+  the CPU devices, see "Accuracy" above) and the default should be the model's own output; on
+  for someone who dictates long texts on a GPU and wants them about twice as fast. Same pinned
+  build, no new download. Telemetry records the setting per session (`s1_fast_drafting`).
 - **Wire *ahead* after the incremental STT wiring lands**, on the STT worker's output: each
   segment's text goes to `Ahead::push`, a returned piece is polished right away on a polish
   worker (one thread, in order, same `polish_or_raw` and guard per piece), and at release
@@ -984,9 +1027,13 @@ target/release/agt-bench live --device coreml --precision fp32 --max-secs 10 eva
 
 # Polish speed: transcripts first (DirectML), one per line for the plain runs
 target/release/agt-bench live --device directml --idle-ms 0 --texts long.tsv --segments segs.tsv eval-data/long/clips
-cut -f4 long.tsv > long.txt
-target/release/agt-bench polish --runs 1 --pause-ms 3000 long.txt          # what AGT ships
-target/release/agt-bench polish --segments --pause-ms 3000 --refs eval-data/long/clips segs.tsv
+cut -f3,4 long.tsv > long.txt                                               # name<TAB>text
+target/release/agt-bench polish --runs 1 --pause-ms 3000 --fast-drafting off long.txt   # latency
+target/release/agt-bench polish --runs 1 --pause-ms 3000 --fast-drafting on long.txt
+# accuracy (CPU device: add --s1-device cpu --timeout-ms 120000)
+target/release/agt-bench polish --runs 1 --fast-drafting off --refs eval-data/long/clips --save off.tsv long.txt
+target/release/agt-bench polish --runs 1 --fast-drafting on --refs eval-data/long/clips --save on.tsv --compare off.tsv long.txt
+target/release/agt-bench polish --segments --pause-ms 3000 --fast-drafting on --refs eval-data/long/clips segs.tsv
 # llama-server flags (the managed server's files are in AGT's models folder, s1-mini/ and agt-llama-server/b11669/)
 python3 scripts/polish_sweep.py --exe <llama-server> --model <s1-mini-q4_k_m.gguf> --texts long.txt \
   --warm warm.txt --pause-ms 3000 --label base --args "--n-gpu-layers all"

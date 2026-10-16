@@ -146,6 +146,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut all = Vec::new();
     // The first run's pasted text per line.
     let mut firsts = Vec::with_capacity(lines.len());
+    // Why first runs were pasted raw (timeouts, guard), if any were.
+    let mut fallbacks: Vec<String> = Vec::new();
     for line in &lines {
         let mut times = Vec::with_capacity(runs);
         let mut results = Vec::with_capacity(runs);
@@ -169,6 +171,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         );
         println!("  in:  {line}");
         firsts.push(results[0].0.clone());
+        if let agt_polish::Outcome::Fallback(why) = &results[0].1 {
+            fallbacks.push(why.clone());
+        }
         // Distinct results only (a model at temperature 0 usually repeats itself).
         results.dedup();
         for (out, outcome) in &results {
@@ -185,6 +190,14 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             pct(0.5),
             pct(0.9),
             all[all.len() - 1]
+        );
+    }
+    if !fallbacks.is_empty() {
+        println!(
+            "pasted raw: {} of {} ({})",
+            fallbacks.len(),
+            lines.len(),
+            fallbacks.join("; ")
         );
     }
     accuracy(
