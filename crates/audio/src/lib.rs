@@ -17,7 +17,8 @@
 //! empty or not connected. The stream is rebuilt automatically if it fails (device
 //! unplugged) or, when on the default device, if the default changed since it was built; on
 //! the fallback, each recording checks whether the chosen device is back (an enumeration, a
-//! few ms) and switches to it.
+//! few ms) and switches to it. A chosen device that is connected but fails to open also
+//! falls back, until it has been unplugged and reconnected.
 
 pub mod resample;
 pub mod wav;
@@ -88,6 +89,8 @@ pub struct Recorder {
     device: String,
     /// The chosen device's absence was logged (once, not on every recording).
     missing_logged: bool,
+    /// The chosen device failed to open; it's retried once it was unplugged and is back.
+    chosen_broken: bool,
     live: Option<Live>,
     capture: Arc<Mutex<Capture>>,
     failed: Arc<AtomicBool>,
@@ -102,6 +105,7 @@ impl Recorder {
             keep_open,
             device,
             missing_logged: false,
+            chosen_broken: false,
             live: None,
             capture: Arc::new(Mutex::new(Capture {
                 recording: false,
@@ -129,20 +133,53 @@ impl Recorder {
     pub fn prepare(&mut self) -> Result<(), Error> {
         let healthy = self.live.is_some() && !self.failed.load(Ordering::Relaxed);
         // The chosen device, running: nothing to check (no enumeration on every key press).
-        if healthy && self.live.as_ref().is_some_and(|l| l.chosen) {
+        // Except a paused stream on Windows: cpal reports a removed device only once the
+        // stream plays, so the press would record nothing; it's looked up (~3 ms, like the
+        // default device's check).
+        let unplug_reported = self.keep_open || !cfg!(windows);
+        if unplug_reported && healthy && self.live.as_ref().is_some_and(|l| l.chosen) {
             return Ok(());
         }
         let host = cpal::default_host();
         let (device, chosen) = self.pick_device(&host)?;
         let device_id = device.id().ok().map(|id| id.to_string());
-        if healthy && self.live.as_ref().is_some_and(|l| l.device_id == device_id) {
+        if healthy
+            && let Some(live) = &mut self.live
+            && live.device_id == device_id
+        {
+            live.chosen = chosen;
             return Ok(());
         }
         self.live = None; // drops (closes) any previous stream first
+        match self.open(&device, device_id, chosen) {
+            Err(e) if chosen => {
+                // Connected but unusable (held exclusively, broken driver): the default until
+                // the chosen device is unplugged and back, rather than failing every press.
+                tracing::warn!(
+                    "cannot open microphone \"{}\": {e}; using the default input device",
+                    self.device
+                );
+                self.chosen_broken = true;
+                let device = host
+                    .default_input_device()
+                    .ok_or("no microphone (default input device) found")?;
+                let device_id = device.id().ok().map(|id| id.to_string());
+                self.open(&device, device_id, false)
+            }
+            r => r,
+        }
+    }
 
+    /// Builds (and in keep-open mode starts) the stream on `device`.
+    fn open(
+        &mut self,
+        device: &cpal::Device,
+        device_id: Option<String>,
+        chosen: bool,
+    ) -> Result<(), Error> {
         let t = Instant::now();
         let config = device.default_input_config()?;
-        let name = device_name(&device).unwrap_or_else(|| "?".into());
+        let name = device_name(device).unwrap_or_else(|| "?".into());
         let stream_config = config.config();
         {
             let mut c = self.capture.lock().unwrap();
@@ -151,10 +188,10 @@ impl Recorder {
         }
         self.failed.store(false, Ordering::Relaxed);
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => self.build::<f32>(&device, &stream_config),
-            cpal::SampleFormat::I16 => self.build::<i16>(&device, &stream_config),
-            cpal::SampleFormat::I32 => self.build::<i32>(&device, &stream_config),
-            cpal::SampleFormat::U16 => self.build::<u16>(&device, &stream_config),
+            cpal::SampleFormat::F32 => self.build::<f32>(device, &stream_config),
+            cpal::SampleFormat::I16 => self.build::<i16>(device, &stream_config),
+            cpal::SampleFormat::I32 => self.build::<i32>(device, &stream_config),
+            cpal::SampleFormat::U16 => self.build::<u16>(device, &stream_config),
             other => return Err(format!("unsupported microphone sample format {other}").into()),
         }?;
         if self.keep_open {
@@ -177,18 +214,23 @@ impl Recorder {
     }
 
     /// The chosen device if it's connected (`true`), else the default input device.
+    /// (If it failed to open, the default until it has been seen missing.)
     fn pick_device(&mut self, host: &cpal::Host) -> Result<(cpal::Device, bool), Error> {
         if !self.device.is_empty() {
             match host.input_devices() {
                 Ok(mut all) => {
-                    if let Some(d) = all.find(|d| device_name(d).as_deref() == Some(&self.device)) {
-                        self.missing_logged = false;
-                        return Ok((d, true));
+                    match all.find(|d| device_name(d).as_deref() == Some(&self.device)) {
+                        Some(d) if !self.chosen_broken => {
+                            self.missing_logged = false;
+                            return Ok((d, true));
+                        }
+                        Some(_) => {}
+                        None => self.chosen_broken = false,
                     }
                 }
                 Err(e) => tracing::warn!("cannot list microphones: {e}"),
             }
-            if !self.missing_logged {
+            if !self.missing_logged && !self.chosen_broken {
                 tracing::warn!(
                     "microphone \"{}\" not found; using the default input device",
                     self.device

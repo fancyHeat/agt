@@ -579,6 +579,10 @@ fn microphone_choices(current: &str, names: Vec<String>) -> Vec<Choice> {
         let checked = n == current;
         Choice::set(path, n.clone(), n.into(), checked)
     }));
+    for c in &mut choices {
+        // Device names are free text; a lone `&` would be taken as a menu mnemonic.
+        c.label = c.label.replace('&', "&&");
+    }
     choices
 }
 
