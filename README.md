@@ -51,6 +51,9 @@ Good to know:
   this off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
   in `config.toml`).
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
+- macOS: if focus clearly wasn't in a text box when the text was pasted (you'd clicked a web
+  page, a link or the desktop), the text is still pasted, and a note where the bar was says so,
+  with a **Copy** button that puts the text on your clipboard. It needs the overlay on.
 
 ## macOS
 

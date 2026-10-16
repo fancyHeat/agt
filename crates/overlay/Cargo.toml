@@ -23,6 +23,7 @@ objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "std",
+    "CGColor",
     "CGColorSpace",
     "CGDataProvider",
     "CGImage",
@@ -36,11 +37,19 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
+    "NSAppearance",
+    "NSButton",
+    "NSButtonCell",
+    "NSCell",
     "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
     "NSGraphics",
     "NSPanel",
     "NSResponder",
     "NSScreen",
+    "NSTextField",
     "NSView",
     "NSWindow",
 ] }

@@ -202,6 +202,13 @@ pub fn foreground_window() -> Option<usize> {
     (!hwnd.is_null()).then_some(hwnd as usize)
 }
 
+/// Not checked on Windows yet (that takes UI Automation): always "can't tell".
+pub fn focus_takes_text() -> Option<bool> {
+    None
+}
+
+pub fn prepare_focus_check() {}
+
 pub fn key_down(key: Key) -> Option<bool> {
     // A swallowed key never updates the system's key state.
     (!key.swallowed()).then(|| vk_down(key.code))
