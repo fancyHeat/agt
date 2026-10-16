@@ -93,11 +93,10 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
         ),
     )?;
 
-    b.check(
+    b.choice(
         menu,
-        "Keep microphone open",
-        &["audio", "keep_mic_open"],
-        |c| c.audio.keep_mic_open,
+        "Microphone",
+        microphone_choices(&c.audio.device, agt_audio::input_device_names()),
     )?;
 
     // Speech-to-text.
@@ -558,6 +557,35 @@ fn hotkey_choices(current: &str) -> Vec<Choice> {
     choices
 }
 
+/// The system default, the connected input devices, and the file's device if it isn't
+/// connected (still checked: AGT goes back to it when it is).
+fn microphone_choices(current: &str, names: Vec<String>) -> Vec<Choice> {
+    let path = &["audio", "device"];
+    let mut choices = vec![Choice::set(
+        path,
+        "System default".into(),
+        "".into(),
+        current.is_empty(),
+    )];
+    if !current.is_empty() && !names.iter().any(|n| n == current) {
+        choices.push(Choice::set(
+            path,
+            format!("{current} (not connected)"),
+            current.into(),
+            true,
+        ));
+    }
+    choices.extend(names.into_iter().map(|n| {
+        let checked = n == current;
+        Choice::set(path, n.clone(), n.into(), checked)
+    }));
+    for c in &mut choices {
+        // Device names are free text; a lone `&` would be taken as a menu mnemonic.
+        c.label = c.label.replace('&', "&&");
+    }
+    choices
+}
+
 fn engine_label(e: Engine) -> &'static str {
     match e {
         Engine::Parakeet => "Parakeet",
@@ -674,6 +702,10 @@ mod tests {
             &[0, 500],
             ms,
         ));
+        all.extend(microphone_choices(
+            "",
+            vec![r#"Mic "A" \ (USB)"#.into(), "Headset".into()],
+        ));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
@@ -683,6 +715,19 @@ mod tests {
         assert_eq!(keys.iter().filter(|c| c.checked).count(), 1);
         let keys = hotkey_choices("F13+F14+X");
         assert!(keys.last().unwrap().checked && keys.last().unwrap().changes.is_empty());
+        // The default mic is checked by default; a chosen mic that's unplugged stays listed.
+        let mics = microphone_choices("", vec!["Headset".into()]);
+        assert!(mics[0].checked && mics.iter().filter(|c| c.checked).count() == 1);
+        let mics = microphone_choices("Gone", vec!["Headset".into()]);
+        let labels: Vec<_> = mics.iter().map(|c| (c.label.as_str(), c.checked)).collect();
+        assert_eq!(
+            labels,
+            [
+                ("System default", false),
+                ("Gone (not connected)", true),
+                ("Headset", false)
+            ]
+        );
         // A non-preset number is listed, in order, and checked.
         let n = numbers(&["x"], 7, &[0, 500], ms);
         let labels: Vec<_> = n.iter().map(|c| (c.label.as_str(), c.checked)).collect();
