@@ -214,6 +214,34 @@ fn version_2_database_gains_the_duck_columns() {
 }
 
 #[test]
+fn version_4_database_gains_the_fast_drafting_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..4] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    conn.execute(
+        "INSERT INTO app_sessions (started_at, app_version, os, arch) VALUES (1, 'old', 'x', 'y')",
+        [],
+    )
+    .unwrap();
+    migrate(&mut conn).unwrap();
+    let s = SessionStart {
+        s1_fast_drafting: Some(true),
+        ..Default::default()
+    };
+    insert_session(&conn, &s, 2).unwrap();
+    let rows: Vec<Option<bool>> = conn
+        .prepare("SELECT s1_fast_drafting FROM app_sessions ORDER BY started_at")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [None, Some(true)]);
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);

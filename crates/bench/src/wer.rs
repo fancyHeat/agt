@@ -34,6 +34,91 @@ pub fn word_errors(reference: &str, hypothesis: &str) -> (usize, usize) {
     (prev[h.len()], r.len())
 }
 
+/// Word errors by kind, after normalizing both sides like [`word_errors`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Errors {
+    pub sub: usize,
+    pub del: usize,
+    pub ins: usize,
+    /// Reference words.
+    pub words: usize,
+}
+
+impl Errors {
+    pub fn of(reference: &str, hypothesis: &str) -> Self {
+        let (r, h) = (normalize(reference), normalize(hypothesis));
+        let mut e = Errors {
+            words: r.len(),
+            ..Self::default()
+        };
+        for op in edit_script(&r, &h) {
+            match op {
+                Edit::Same(..) => {}
+                Edit::Sub(..) => e.sub += 1,
+                Edit::Del(_) => e.del += 1,
+                Edit::Ins(_) => e.ins += 1,
+            }
+        }
+        e
+    }
+
+    pub fn total(&self) -> usize {
+        self.sub + self.del + self.ins
+    }
+
+    pub fn add(&mut self, o: Errors) {
+        (self.sub, self.del, self.ins) = (self.sub + o.sub, self.del + o.del, self.ins + o.ins);
+        self.words += o.words;
+    }
+}
+
+/// One step of turning `a` into `b`: indices into `a` and/or `b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    Same(usize, usize),
+    Sub(usize, usize),
+    Del(usize),
+    Ins(usize),
+}
+
+/// A minimal (Levenshtein) edit script from `a` to `b`, in order.
+pub fn edit_script<T: PartialEq>(a: &[T], b: &[T]) -> Vec<Edit> {
+    let (n, m) = (a.len(), b.len());
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            d[i][j] = (d[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]))
+                .min(d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1);
+        }
+    }
+    let (mut i, mut j, mut ops) = (n, m, Vec::new());
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && d[i][j] == d[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]) {
+            (i, j) = (i - 1, j - 1);
+            ops.push(if a[i] == b[j] {
+                Edit::Same(i, j)
+            } else {
+                Edit::Sub(i, j)
+            });
+        } else if i > 0 && d[i][j] == d[i - 1][j] + 1 {
+            i -= 1;
+            ops.push(Edit::Del(i));
+        } else {
+            j -= 1;
+            ops.push(Edit::Ins(j));
+        }
+    }
+    ops.reverse();
+    ops
+}
+
 pub fn normalize(s: &str) -> Vec<String> {
     let s = s
         .to_lowercase()
@@ -226,6 +311,21 @@ mod tests {
         assert_eq!(word_errors("a b c", ""), (3, 3));
         assert_eq!(word_errors("Don't stop", "don't stop"), (0, 2));
         assert_eq!(word_errors("double check", "double-check"), (0, 2));
+    }
+
+    #[test]
+    fn errors_by_kind() {
+        let kinds = |r, h| {
+            let e = Errors::of(r, h);
+            (e.sub, e.del, e.ins, e.words)
+        };
+        assert_eq!(kinds("the cat sat", "The bat sat down."), (1, 0, 1, 3));
+        assert_eq!(kinds("we went home today", "We went today."), (0, 1, 0, 4));
+        assert_eq!(kinds("a b", "a b"), (0, 0, 0, 2));
+        assert_eq!(
+            edit_script(&["a", "b"], &["a", "c", "b"]),
+            [Edit::Same(0, 0), Edit::Ins(1), Edit::Same(1, 2)]
+        );
     }
 
     #[test]

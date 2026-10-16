@@ -209,6 +209,7 @@ pub struct SessionStart {
     pub s1_structure: Option<String>,
     pub s1_context: Option<String>,
     pub s1_device: Option<String>,
+    pub s1_fast_drafting: Option<bool>,
     /// `audio.device`: the chosen microphone's name, "" = the system default.
     pub audio_device: String,
     /// `None` with the overlay off.

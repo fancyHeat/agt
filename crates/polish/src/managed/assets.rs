@@ -38,7 +38,10 @@ use std::{
 pub const MODEL_DIR: &str = "s1-mini";
 /// Subfolder of the models dir holding the llama.cpp builds AGT installed.
 pub const LLAMA_DIR: &str = "agt-llama-server";
-/// The pinned llama.cpp release.
+/// The pinned llama.cpp release. When bumping it, check every flag in
+/// `LlamaLauncher::args` (process.rs) against the new `llama-server --help`: options get
+/// renamed (the `--spec-*` ones were recently), and an unknown flag makes the server exit
+/// at start, i.e. no polish at all.
 pub const LLAMA_BUILD: &str = "b11669";
 
 /// S1-mini Q4_K_M, the build its published accuracy was measured on. Revision `v1` of

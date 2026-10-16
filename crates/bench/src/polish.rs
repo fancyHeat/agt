@@ -10,29 +10,55 @@
 //!   --styling <s>        s1-mini: casual | semi-casual | semi-formal | formal
 //!   --context <c>        s1-mini: general | email
 //!   --s1-device <d>      s1-mini: auto | cpu
+//!   --fast-drafting <b>  s1-mini: on | off (polish.s1-mini.fast_drafting)
 //!   --models-dir <dir>   s1-mini: where it's downloaded (default: AGT's models folder)
 //!   --server-log <file>  s1-mini: llama-server's output (default: in the temp folder)
 //!   --timeout-ms <n>     override polish.timeout_ms
 //!   --runs <n>           polish each line n times (default 3); latency = median
 //!   --hold <secs>        keep running (and the s1-mini server up) this long afterwards
 //!   --pause-ms <n>       wait this long before each line (e.g. to let the server go idle)
+//!   --segments           the file is `agt-bench live --segments` output: compare polishing
+//!                        each dictation whole with polishing its segments one by one
+//!   --refs <dir>         `<name>.txt` references there: WER of raw and polished text, with
+//!                        substitutions, deletions and insertions apart
+//!   --save <file>        write each line's polished text (first run) as `name<TAB>text`
+//!   --compare <file>     compare with a run saved by --save: outputs that differ, the WER
+//!                        between the two, and every differing passage
 //! ```
 //!
 //! Always polishes (`polish.enabled` is ignored) and warms up first; for s1-mini the warmup
 //! includes the download and server start. Output per line: median latency, the guard
 //! outcome (polished / skipped / raw: reason) and the text that would be pasted. Lines
-//! starting with `#` are comments.
+//! starting with `#` are comments; a line `name<TAB>text` names its transcript (for --refs,
+//! --save and --compare; otherwise it's `line <n>`).
+//!
+//! **Segments** (`--segments`): the pipeline could polish each finished segment of a long
+//! dictation in the background while the user is still talking, leaving only the tail for
+//! release. For each dictation this polishes the whole text (today), each segment on its own,
+//! and the pieces of `agt_polish::ahead`, then reports release latency (whole vs what is left
+//! at release), how far the joined output is from the whole-text output (word edits, case and
+//! punctuation count), the WER of raw, whole and joined against the reference, and the text
+//! around every piece boundary where a sentence break differs.
+//!
+//! Release latency here is the best case: every background piece is done (and the GPU idle)
+//! before release. In the app the last background piece may still be running at release,
+//! and STT may share the GPU, so release can also wait for that piece.
 
-use agt_core::{Config, config::PolishConfig, paths};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use agt_core::{Config, config::PolishConfig, paths, polish::Polisher};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
-const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--fast-drafting on|off] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] [--refs dir] [--save f] [--compare f] [--segments] <transcripts.txt>";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut cfg = PolishConfig::default();
     let mut models_dir = paths::models_dir();
     let mut server_log = std::env::temp_dir().join("agt-bench-llama-server.log");
     let (mut runs, mut hold, mut pause, mut file) = (3usize, 0u64, 0u64, None);
+    let (mut segments, mut refs, mut save, mut compare) = (false, None, None, None);
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
@@ -56,6 +82,17 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
             "--hold" => hold = val()?.parse().map_err(|_| "bad --hold")?,
             "--pause-ms" => pause = val()?.parse().map_err(|_| "bad --pause-ms")?,
+            "--fast-drafting" => {
+                cfg.s1_mini.fast_drafting = match val()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--fast-drafting: on or off".into()),
+                }
+            }
+            "--segments" => segments = true,
+            "--refs" => refs = Some(PathBuf::from(val()?)),
+            "--save" => save = Some(PathBuf::from(val()?)),
+            "--compare" => compare = Some(PathBuf::from(val()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -66,11 +103,22 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     }
     let file = file.ok_or(USAGE)?;
     let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
-    let lines: Vec<String> = text
+    // `name<TAB>text` or just the text (named by its number).
+    let named: Vec<(String, String)> = text
         .lines()
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .enumerate()
+        .map(|(i, l)| {
+            let (name, t) = l.split_once('\t').unwrap_or(("", l));
+            let name = if name.is_empty() {
+                format!("line {}", i + 1)
+            } else {
+                name.to_owned()
+            };
+            (name, t.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
         .collect();
+    let lines: Vec<String> = named.iter().map(|(_, t)| t.clone()).collect();
 
     let t0 = Instant::now();
     let env = agt_polish::Env {
@@ -90,9 +138,16 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         Ok(()) => println!("warmup: {:.0} ms", ms(t)),
         Err(e) => println!("warmup failed ({:.0} ms): {e}", ms(t)),
     }
+    if segments {
+        return by_segment(polisher.as_ref(), &cfg, &text, refs.as_deref(), pause);
+    }
 
     // Latency of every request that was actually sent (skipped lines excluded).
     let mut all = Vec::new();
+    // The first run's pasted text per line.
+    let mut firsts = Vec::with_capacity(lines.len());
+    // Why first runs were pasted raw (timeouts, guard), if any were.
+    let mut fallbacks: Vec<String> = Vec::new();
     for line in &lines {
         let mut times = Vec::with_capacity(runs);
         let mut results = Vec::with_capacity(runs);
@@ -115,6 +170,10 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             line.split_whitespace().count()
         );
         println!("  in:  {line}");
+        firsts.push(results[0].0.clone());
+        if let agt_polish::Outcome::Fallback(why) = &results[0].1 {
+            fallbacks.push(why.clone());
+        }
         // Distinct results only (a model at temperature 0 usually repeats itself).
         results.dedup();
         for (out, outcome) in &results {
@@ -133,6 +192,21 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             all[all.len() - 1]
         );
     }
+    if !fallbacks.is_empty() {
+        println!(
+            "pasted raw: {} of {} ({})",
+            fallbacks.len(),
+            lines.len(),
+            fallbacks.join("; ")
+        );
+    }
+    accuracy(
+        &named,
+        &firsts,
+        refs.as_deref(),
+        save.as_deref(),
+        compare.as_deref(),
+    )?;
     if hold > 0 {
         eprintln!("holding for {hold} s");
         std::thread::sleep(std::time::Duration::from_secs(hold));
@@ -142,4 +216,392 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
+}
+
+/// `--refs`, `--save`, `--compare` for plain runs: WER of the raw and polished text against
+/// `<refs>/<name>.txt` with deletions and insertions apart, the outputs saved as
+/// `name<TAB>text`, and the difference from a saved run (WER with the saved output as the
+/// reference, and every differing passage).
+fn accuracy(
+    named: &[(String, String)],
+    outs: &[String],
+    refs: Option<&Path>,
+    save: Option<&Path>,
+    compare: Option<&Path>,
+) -> Result<(), String> {
+    use crate::wer::{Edit, Errors, edit_script};
+    let fmt = |e: &Errors| {
+        format!(
+            "WER {:.2}% (sub {}, del {}, ins {}; {} words)",
+            crate::pct(e.total(), e.words),
+            e.sub,
+            e.del,
+            e.ins,
+            e.words
+        )
+    };
+    if let Some(dir) = refs {
+        let (mut raw, mut polished) = (Errors::default(), Errors::default());
+        for ((name, text), out) in named.iter().zip(outs) {
+            let Ok(r) = std::fs::read_to_string(dir.join(format!("{name}.txt"))) else {
+                continue;
+            };
+            raw.add(Errors::of(&r, text));
+            polished.add(Errors::of(&r, out));
+        }
+        println!("vs reference: raw {}", fmt(&raw));
+        println!("vs reference: polished {}", fmt(&polished));
+    }
+    if let Some(path) = save {
+        let body: String = named
+            .iter()
+            .zip(outs)
+            .map(|((name, _), out)| format!("{name}\t{}\n", out.replace(['\t', '\n'], " ")))
+            .collect();
+        std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    if let Some(path) = compare {
+        let saved =
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let saved: std::collections::HashMap<&str, &str> =
+            saved.lines().filter_map(|l| l.split_once('\t')).collect();
+        let (mut diff, mut changed, mut n) = (Errors::default(), 0, 0);
+        println!();
+        for ((name, _), out) in named.iter().zip(outs) {
+            let Some(&before) = saved.get(name.as_str()) else {
+                continue;
+            };
+            n += 1;
+            diff.add(Errors::of(before, out));
+            if before == out.replace(['\t', '\n'], " ") {
+                continue;
+            }
+            changed += 1;
+            // Differing passages, case and punctuation included, with some context.
+            let (a, b): (Vec<&str>, Vec<&str>) = (
+                before.split_whitespace().collect(),
+                out.split_whitespace().collect(),
+            );
+            // Runs of edits: (words of `a` before the run, removed, added).
+            let mut runs: Vec<(usize, Vec<&str>, Vec<&str>)> = Vec::new();
+            let (mut used, mut open) = (0, false);
+            for op in edit_script(&a, &b) {
+                if !open && !matches!(op, Edit::Same(..)) {
+                    runs.push((used, Vec::new(), Vec::new()));
+                }
+                open = !matches!(op, Edit::Same(..));
+                let run = runs.last_mut();
+                match (op, run) {
+                    (Edit::Same(..), _) => used += 1,
+                    (Edit::Sub(i, j), Some(r)) => (r.1.push(a[i]), r.2.push(b[j]), used += 1).2,
+                    (Edit::Del(i), Some(r)) => (r.1.push(a[i]), used += 1).1,
+                    (Edit::Ins(j), Some(r)) => r.2.push(b[j]),
+                    _ => {}
+                }
+            }
+            for (at, from, to) in runs {
+                let ctx = a[at.saturating_sub(5)..at].join(" ");
+                println!(
+                    "  [{name}] ...{ctx} {{{}}} -> {{{}}}",
+                    from.join(" "),
+                    to.join(" ")
+                );
+            }
+        }
+        println!(
+            "vs {}: {changed} of {n} outputs differ; WER between them {}",
+            path.display(),
+            fmt(&diff)
+        );
+    }
+    Ok(())
+}
+
+/// `--segments`: whole-text polish vs polishing ahead of release (see the module docs).
+fn by_segment(
+    polisher: &dyn Polisher,
+    cfg: &PolishConfig,
+    text: &str,
+    refs: Option<&Path>,
+    pause: u64,
+) -> Result<(), String> {
+    let polish = |s: &str| {
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+        let t = Instant::now();
+        let (out, outcome) = agt_polish::polish_or_raw(polisher, s, cfg);
+        (out, outcome == agt_polish::Outcome::Polished, ms(t))
+    };
+    let mut whole_ms = Vec::new();
+    let mut ways = [Way::new("each segment"), Way::new("ahead")];
+    // Reference words, and word errors of raw and whole.
+    let (mut ref_words, mut raw_errors, mut whole_errors) = (0, 0, 0);
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut cols = line.split('\t');
+        let name = cols.next().unwrap_or_default();
+        let segs: Vec<&str> = cols.map(str::trim).filter(|s| !s.is_empty()).collect();
+        let Some((&tail, before)) = segs.split_last() else {
+            continue;
+        };
+        let raw = segs.join(" ");
+        let (whole, ok, took) = polish(&raw);
+        whole_ms.push(took);
+        println!();
+        println!(
+            "[{name}] {} segments, {} words, tail {} words | whole: {took:.0} ms{}",
+            segs.len(),
+            raw.split_whitespace().count(),
+            tail.split_whitespace().count(),
+            if ok { "" } else { " (not polished)" }
+        );
+        let reference =
+            refs.and_then(|d| std::fs::read_to_string(d.join(format!("{name}.txt"))).ok());
+        if let Some(r) = &reference {
+            let (e, n) = crate::wer::word_errors(r, &raw);
+            (raw_errors, ref_words) = (raw_errors + e, ref_words + n);
+            whole_errors += crate::wer::word_errors(r, &whole).0;
+        }
+        let w: Vec<String> = whole.split_whitespace().map(str::to_owned).collect();
+        // Each segment on its own; the tail at release.
+        let pieces: Vec<String> = before.iter().map(|s| s.to_string()).collect();
+        ways[0].run(
+            &polish,
+            &pieces,
+            &[tail.to_owned()],
+            &w,
+            reference.as_deref(),
+        );
+        // `agt_polish::ahead`.
+        let mut ahead = agt_polish::ahead::Ahead::new(cfg)
+            .ok_or("--segments: these polish settings need the whole text")?;
+        let pieces: Vec<String> = before.iter().filter_map(|s| ahead.push(s)).collect();
+        let last = ahead.finish(tail);
+        ways[1].run(&polish, &pieces, &last, &w, reference.as_deref());
+    }
+    whole_ms.sort_by(f64::total_cmp);
+    println!();
+    println!("{}", stats("whole text (today)", &whole_ms));
+    for way in &mut ways {
+        way.report(ref_words);
+    }
+    if ref_words > 0 {
+        println!(
+            "WER vs reference ({ref_words} words): raw {:.2}%, whole {:.2}%",
+            crate::pct(raw_errors, ref_words),
+            crate::pct(whole_errors, ref_words)
+        );
+    }
+    Ok(())
+}
+
+/// `n requests | p50 | p90 | max` of sorted latencies.
+fn stats(label: &str, v: &[f64]) -> String {
+    match v.last() {
+        None => format!("{label}: none"),
+        Some(max) => format!(
+            "{label}: {} requests | p50 {:.0} ms | p90 {:.0} ms | max {max:.0} ms",
+            v.len(),
+            crate::percentile(v, 0.5),
+            crate::percentile(v, 0.9),
+        ),
+    }
+}
+
+/// One way of polishing a dictation in pieces: some in the background, the rest at release.
+struct Way {
+    label: &'static str,
+    release_ms: Vec<f64>,
+    background_ms: Vec<f64>,
+    release_words: Vec<f64>,
+    /// Word edits vs the whole-text output, its words.
+    edits: usize,
+    words: usize,
+    /// Piece boundaries, and those where only this way / only the whole text ends a sentence.
+    boundaries: usize,
+    extra_breaks: usize,
+    lost_breaks: usize,
+    not_polished: usize,
+    errors: usize,
+}
+
+impl Way {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            release_ms: Vec::new(),
+            background_ms: Vec::new(),
+            release_words: Vec::new(),
+            edits: 0,
+            words: 0,
+            boundaries: 0,
+            extra_breaks: 0,
+            lost_breaks: 0,
+            not_polished: 0,
+            errors: 0,
+        }
+    }
+
+    fn run(
+        &mut self,
+        polish: &dyn Fn(&str) -> (String, bool, f64),
+        background: &[String],
+        at_release: &[String],
+        whole: &[String],
+        reference: Option<&str>,
+    ) {
+        let mut joined: Vec<String> = Vec::new();
+        let mut starts = Vec::new();
+        let (mut release_ms, mut release_words) = (0.0, 0);
+        for (k, piece) in background.iter().chain(at_release).enumerate() {
+            let (out, ok, took) = polish(piece);
+            self.not_polished += usize::from(!ok);
+            if k < background.len() {
+                self.background_ms.push(took);
+            } else {
+                // One server slot: the pieces left at release go one after the other.
+                release_ms += took;
+                release_words += piece.split_whitespace().count();
+            }
+            starts.push(joined.len());
+            joined.extend(out.split_whitespace().map(str::to_owned));
+        }
+        self.release_ms.push(release_ms);
+        self.release_words.push(release_words as f64);
+        let pieces = background.len() + at_release.len();
+        let map = align(&joined, whole);
+        self.edits += map.edits;
+        self.words += whole.len();
+        if let Some(r) = reference {
+            self.errors += crate::wer::word_errors(r, &joined.join(" ")).0;
+        }
+        println!(
+            "  {}: {} pieces, release {:.0} ms ({} words), {} word edits vs whole",
+            self.label, pieces, release_ms, release_words, map.edits
+        );
+        for &b in starts.iter().skip(1) {
+            self.boundaries += 1;
+            let at = map.to_b[b];
+            let ends = |t: &[String], i: usize| i > 0 && ends_sentence(&t[i - 1]);
+            let mark = match (ends(&joined, b), ends(whole, at)) {
+                (true, false) => {
+                    self.extra_breaks += 1;
+                    "extra sentence break"
+                }
+                (false, true) => {
+                    self.lost_breaks += 1;
+                    "lost sentence break"
+                }
+                _ => continue,
+            };
+            let around = |t: &[String], i: usize| {
+                let (lo, hi) = (i.saturating_sub(6), (i + 6).min(t.len()));
+                format!("{} | {}", t[lo..i].join(" "), t[i..hi].join(" "))
+            };
+            println!("    {mark}: ...{}...", around(&joined, b));
+            println!("      whole text: ...{}...", around(whole, at));
+        }
+    }
+
+    fn report(&mut self, ref_words: usize) {
+        self.release_ms.sort_by(f64::total_cmp);
+        self.background_ms.sort_by(f64::total_cmp);
+        self.release_words.sort_by(f64::total_cmp);
+        println!("{}:", self.label);
+        println!("  {}", stats("at release", &self.release_ms));
+        println!("  {}", stats("in the background", &self.background_ms));
+        if !self.release_words.is_empty() {
+            println!(
+                "  words left at release: p50 {:.0}, p90 {:.0}",
+                crate::percentile(&self.release_words, 0.5),
+                crate::percentile(&self.release_words, 0.9)
+            );
+        }
+        println!(
+            "  vs whole text: {} word edits in {} words ({:.2}%); {} boundaries: {} extra sentence breaks, {} lost; {} requests not polished (guard){}",
+            self.edits,
+            self.words,
+            crate::pct(self.edits, self.words),
+            self.boundaries,
+            self.extra_breaks,
+            self.lost_breaks,
+            self.not_polished,
+            if ref_words > 0 {
+                format!("; WER {:.2}%", crate::pct(self.errors, ref_words))
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
+/// A word that ends a sentence (`end.`, `why?"`, `no!)`).
+fn ends_sentence(word: &str) -> bool {
+    word.trim_end_matches(['"', '\'', ')', '\u{201d}', '\u{2019}'])
+        .ends_with(['.', '?', '!'])
+}
+
+struct Alignment {
+    /// Word edits (substitutions, insertions, deletions; exact match, so case and
+    /// punctuation count).
+    edits: usize,
+    /// For each position in `a` (and one past its end): the matching position in `b`.
+    to_b: Vec<usize>,
+}
+
+/// Word-level Levenshtein alignment of `a` onto `b`.
+fn align(a: &[String], b: &[String]) -> Alignment {
+    let (n, m) = (a.len(), b.len());
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            d[i][j] = (d[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]))
+                .min(d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1);
+        }
+    }
+    let mut to_b = vec![0; n + 1];
+    to_b[n] = m;
+    let (mut i, mut j) = (n, m);
+    while i > 0 {
+        if j > 0 && d[i][j] == d[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]) {
+            (i, j) = (i - 1, j - 1);
+        } else if j > 0 && d[i][j] == d[i][j - 1] + 1 {
+            j -= 1;
+            continue;
+        } else {
+            i -= 1;
+        }
+        to_b[i] = j;
+    }
+    Alignment {
+        edits: d[n][m],
+        to_b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn alignment_maps_positions_and_counts_edits() {
+        let a = words("We met. Then we left early.");
+        let b = words("We met, then we left.");
+        let m = align(&a, &b);
+        // met./met,  Then/then  left/left.  early. deleted
+        assert_eq!(m.edits, 4);
+        assert_eq!(m.to_b[2], 2); // "Then" <-> "then"
+        assert_eq!(m.to_b[a.len()], b.len());
+        assert_eq!(align(&a, &a).edits, 0);
+        assert!(ends_sentence("left.\"") && ends_sentence("why?") && !ends_sentence("met,"));
+    }
 }

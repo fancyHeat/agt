@@ -83,7 +83,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// for this platform.
 pub(crate) fn start(cfg: &PolishConfig, env: &Env) -> std::result::Result<Managed, String> {
     let assets = assets::Assets::for_this_platform(&env.models_dir)?;
-    let launcher = process::LlamaLauncher::new(assets, cfg.s1_mini.device, env.log_file.clone());
+    let launcher = process::LlamaLauncher::new(assets, &cfg.s1_mini, env.log_file.clone());
     let shared = Arc::new(Shared::default());
     let (s, report) = (shared.clone(), env.on_status.clone());
     std::thread::Builder::new()

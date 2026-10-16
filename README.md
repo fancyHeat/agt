@@ -39,7 +39,9 @@ Good to know:
 - Long dictations are fine (up to 30 minutes): AGT transcribes what you said before each pause
   while you keep talking, so when you let go only the last few seconds are left to transcribe.
   With S1-mini polish, a dictation of more than about 1,400 words (some 10 minutes) is pasted
-  unpolished: it doesn't fit the model's context.
+  unpolished: it doesn't fit the model's context. Settings → Polish → **Fast drafting**
+  (`fast_drafting` under `[polish.s1-mini]`) polishes long text about twice as fast on a GPU,
+  at the cost of an occasional different word or comma; it's off by default.
 - While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
   and comes back when you let go. Settings → **Lower other audio while dictating** turns this
   off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`

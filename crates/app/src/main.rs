@@ -249,6 +249,7 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         s1_structure: s1.then(|| lower(&polish.s1_mini.structure)),
         s1_context: s1.then(|| lower(&polish.s1_mini.context)),
         s1_device: s1.then(|| lower(&polish.s1_mini.device)),
+        s1_fast_drafting: s1.then_some(polish.s1_mini.fast_drafting),
         restore_clipboard_ms: config.paste.restore_clipboard_ms as i64,
         trailing_space: config.paste.trailing_space,
         overlay_enabled: config.overlay.enabled,
