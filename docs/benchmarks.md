@@ -337,12 +337,12 @@ otherwise:
   Its back-to-back advantage (what Phase 4's `say` clips and the start-up probe measured)
   disappears after ~1 s of GPU idle.
 - Accuracy: CPU int8 has the best real-speech WER (4.20% vs 5.93% for Core ML's 10 s window).
-- Cost: 0.65 GB download and ~1 s load, vs 2.5 GB + 2.4 GB of compiled cache, a 20-40 s first
+- Cost: 0.65 GB download and ~1 s load, vs 2.5 GB + 2.4 GB of compiled cache, a ~45 s first
   compile and 4-9 s loads.
 - The probe itself was a liability: it measures the GPU warm and back to back (Core ML's best
   case), costs ~6 s and a temporary 2.4 GB fp32 CPU session at every launch, left the first
-  Core ML dictation at 0.7-1.4 s, and flips to the CPU (fp32) when another app is busy on the
-  GPU. Windows keeps its DirectML probe for now; whether a discrete GPU loses as much after
+  Core ML dictation at 0.7-1.4 s, and flipped to the CPU (fp32) while this benchmark was using
+  the GPU (app log: "Core ML 149 ms, CPU 105 ms for 3 s of audio; using the CPU"). Windows keeps its DirectML probe for now; whether a discrete GPU loses as much after
   a pause hasn't been measured (`--gap-ms` makes that a one-line run).
 - **8 GB Macs**: the same default. CPU int8 needs ~1.4 GB; don't switch to Core ML or fp32
   there (Core ML's working set is ~2.9 GB including the mapped compiled model, and it degrades

@@ -47,22 +47,43 @@ enum UpdateEvent {
     Settled(u64),
 }
 
+/// How long exiting waits for the telemetry writer to commit the last records.
+const TELEMETRY_FLUSH: Duration = Duration::from_secs(2);
+
 fn main() {
+    // `agt stats`: a report from the telemetry database; doesn't start the app.
+    if std::env::args().nth(1).as_deref() == Some("stats") {
+        return print_stats();
+    }
+
     let config_path = paths::config_file();
     let config = Config::load_or_create(&config_path);
     let log_level = config.as_ref().map_or("info", |c| &c.log_level).to_owned();
-    // Logging is set up before Velopack so its install/update hooks are logged too.
-    logging::init(&paths::log_dir(), &log_level);
+    // Events are queued from here on, and written once the database is opened below.
+    logging::init(&log_level);
 
     // One instance only (Phase 1 adds global hotkeys; two instances would both paste).
     // Held for the life of the process; the OS releases it on exit.
     let Some(_instance_lock) = acquire_instance_lock() else {
-        tracing::info!("AGT is already running; exiting");
+        eprintln!("agt: AGT is already running; exiting");
         return;
     };
 
     // Handles Velopack install/update hooks (may exit) and applies downloaded updates.
-    VelopackApp::build().run();
+    #[allow(unused_mut)]
+    let mut velopack = VelopackApp::build();
+    // The usage history lives outside the install folder so reinstalls keep it (see
+    // `paths`); uninstalling still removes it. Models are left, as before.
+    #[cfg(windows)]
+    {
+        velopack = velopack.on_before_uninstall_fast_callback(|_| {
+            let history = paths::history_dir();
+            if history != paths::data_dir() {
+                let _ = std::fs::remove_dir_all(history);
+            }
+        });
+    }
+    velopack.run();
 
     tracing::info!(
         "AGT {VERSION} starting; config at {}",
@@ -76,6 +97,9 @@ fn main() {
             (Config::fallback(), true)
         }
     };
+    // After the lock and Velopack's hooks, so neither a second instance nor a hook run
+    // counts as a session.
+    agt_telemetry::global().start(paths::db_file(), session_start(&config, config_error));
 
     let updater = update::start(&config.update);
 
@@ -129,6 +153,7 @@ fn main() {
         pipeline: pipeline.ok(),
         overlay: None,
         failures_at_start: 0,
+        exit_reason: agt_telemetry::ExitReason::Quit,
         overlay_position: config
             .overlay
             .enabled
@@ -139,8 +164,66 @@ fn main() {
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop error: {e}");
+        app.exit_reason = agt_telemetry::ExitReason::Error;
     }
     tracing::info!("AGT exiting");
+    agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
+}
+
+/// The session's non-secret settings. Polish: provider, model, style and S1-mini's options
+/// only (never the API key, its variable, the URL, which may carry credentials, or a custom
+/// prompt).
+fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionStart {
+    let lower = |v: &dyn std::fmt::Debug| format!("{v:?}").to_lowercase();
+    let polish = &config.polish;
+    let on = polish.enabled;
+    let s1 = on && polish.provider == agt_core::config::PolishProvider::S1Mini;
+    agt_telemetry::SessionStart {
+        app_version: VERSION.into(),
+        hotkey: config.hotkey.key.clone(),
+        min_hold_ms: config.hotkey.min_hold_ms as i64,
+        keep_mic_open: config.audio.keep_mic_open,
+        stt_engine: lower(&config.stt.engine),
+        stt_model: config.stt.model.clone(),
+        stt_precision: lower(&config.stt.precision),
+        stt_device: lower(&config.stt.device),
+        stt_threads: config.stt.threads as i64,
+        polish_enabled: on,
+        polish_provider: on.then(|| lower(&polish.provider)),
+        polish_model: on.then(|| polish.model().to_owned()),
+        polish_style: on.then(|| lower(&polish.style)),
+        s1_styling: s1.then(|| lower(&polish.s1_mini.styling)),
+        s1_structure: s1.then(|| lower(&polish.s1_mini.structure)),
+        s1_context: s1.then(|| lower(&polish.s1_mini.context)),
+        s1_device: s1.then(|| lower(&polish.s1_mini.device)),
+        restore_clipboard_ms: config.paste.restore_clipboard_ms as i64,
+        trailing_space: config.paste.trailing_space,
+        overlay_enabled: config.overlay.enabled,
+        updates_enabled: config.update.enabled,
+        log_level: config.log_level.clone(),
+        config_error,
+    }
+}
+
+/// `agt stats`. Release builds on Windows are GUI-subsystem programs with no console, so
+/// attach to the one we were started from (output then interleaves with the shell's prompt,
+/// which doesn't wait for GUI programs; `agt stats | more` or `> file` avoids that).
+fn print_stats() {
+    // Only without a stdout already (redirected to a file or pipe, or a debug build).
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+        };
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+    let path = paths::db_file();
+    match agt_telemetry::stats::report(&path) {
+        Ok(report) => println!("AGT stats ({})\n{report}", path.display()),
+        Err(e) => eprintln!("agt stats: {e}"),
+    }
 }
 
 /// `None` if another instance holds the lock. `Some(None)` if locking failed for another
@@ -188,6 +271,8 @@ struct App {
     /// The pipeline's failure count when the current dictation started (see
     /// [`pipeline::Event::Status`]).
     failures_at_start: u64,
+    /// Recorded in the session when the event loop returns.
+    exit_reason: agt_telemetry::ExitReason,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -195,7 +280,16 @@ impl ApplicationHandler<AppEvent> for App {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
             let installed = self.updater.is_some();
-            match tray::Tray::new(VERSION, self.config_error, &self.polish_info, installed) {
+            // On macOS (and with AGT_HOME) the history is in the config folder: one item will do.
+            let data_folder = paths::history_dir() != paths::config_dir();
+            let tray = tray::Tray::new(
+                VERSION,
+                self.config_error,
+                &self.polish_info,
+                installed,
+                data_folder,
+            );
+            match tray {
                 Ok(t) => {
                     if let Some(s) = &self.status {
                         t.set_status(&s.to_string());
@@ -204,6 +298,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 Err(e) => {
                     tracing::error!("failed to create tray icon: {e}");
+                    self.exit_reason = agt_telemetry::ExitReason::Error;
                     event_loop.exit();
                 }
             }
@@ -271,6 +366,9 @@ impl ApplicationHandler<AppEvent> for App {
                         .copied()
                         .unwrap_or(agt_platform::Permission::Accessibility),
                 );
+            }
+            AppEvent::Menu(e) if Some(&e.id) == tray.open_data.as_ref() => {
+                open_folder(&paths::history_dir())
             }
             AppEvent::Menu(e) if e.id == tray.quit => {
                 if let Some(u) = &self.updater {
@@ -396,7 +494,10 @@ impl App {
         };
         tray.set_update(&format!("Restarting into {}...", asset.Version), false);
         match update::apply_and_restart(&updater.um, asset) {
-            Ok(()) => event_loop.exit(),
+            Ok(()) => {
+                self.exit_reason = agt_telemetry::ExitReason::UpdateRestart;
+                event_loop.exit();
+            }
             Err(e) => {
                 tracing::error!("failed to start updater: {e}");
                 tray.set_update("Update failed - see log", true);

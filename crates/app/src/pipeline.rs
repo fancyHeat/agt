@@ -10,9 +10,9 @@
 //!   and are pasted in order (nothing is dropped). Long recordings are chunked by `agt-stt`.
 //!   With `polish.enabled`, each transcript is then cleaned up by an LLM (`agt-polish`),
 //!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted.
-//! - `permissions` (macOS, only while something is missing): asks for the Microphone, Input
-//!   Monitoring and Accessibility permissions at start-up, then re-checks every
-//!   [`PERMISSION_POLL`] until all are granted, so no restart is needed.
+//! - `permissions` (macOS, only while something is missing): asks for the Microphone and
+//!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
+//!   both are granted, so no restart is needed.
 //! - `paste`: saves the clipboard when a recording starts (on a helper thread, with a
 //!   deadline, so a hung clipboard owner can't block pasting), pastes, and restores the
 //!   clipboard `paste.restore_clipboard_ms` later. If that save is what keeps the clipboard
@@ -22,6 +22,10 @@
 //!
 //! Status changes are reported through a callback (the app forwards them to the tray and the
 //! overlay).
+//!
+//! Each dictation's measurements travel with it as an [`agt_telemetry::Dictation`] and are
+//! recorded (a channel send, never a disk write) wherever it ends: after the paste, or at the
+//! stage that dropped it. Only counts and timings: never the audio or the text.
 
 use agt_audio::{Level, Recorder};
 use agt_core::{
@@ -36,6 +40,7 @@ use agt_platform::{
     Permission,
 };
 use agt_polish::Outcome;
+use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
     fmt,
     sync::{
@@ -164,7 +169,7 @@ impl Hub {
             Status::Recording
         } else if s.pending > 0 {
             Status::Transcribing
-        } else if !s.missing.is_empty() {
+        } else if !s.missing.is_empty() && !matches!(s.engine, Engine::Failed(_)) {
             Status::NeedsPermission(s.missing.clone())
         } else {
             match (&s.engine, &s.error) {
@@ -232,6 +237,7 @@ struct Job {
     released: Instant,
     /// The foreground window at release ([`agt_platform::foreground_window`]).
     target: Option<usize>,
+    dictation: Box<Dictation>,
 }
 
 enum ToStt {
@@ -245,13 +251,9 @@ enum ToPaste {
     Snapshot,
     Paste {
         text: String,
-        audio_secs: f64,
         released: Instant,
-        stt_start: Instant,
-        stt_end: Instant,
-        /// For the timings log line, e.g. "polish 120 ms (polished)"; `None` when off.
-        polish: Option<String>,
         target: Option<usize>,
+        dictation: Box<Dictation>,
     },
     /// The user asked for the last transcript on the clipboard (tray menu).
     CopyLast,
@@ -337,7 +339,8 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
     let notify = hub.notify.clone();
     let env = agt_polish::Env {
         models_dir: config.stt.models_path(),
-        log_file: Some(paths::log_dir().join("llama-server.log")),
+        // Start-up output only (see agt-polish), next to agt.db ("Open data folder").
+        log_file: Some(paths::history_dir().join("llama-server.log")),
         on_status: Arc::new(move |s: &agt_polish::Status| {
             tracing::info!("polish: {s}");
             notify(Event::PolishInfo(s.to_string()));
@@ -350,12 +353,19 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
             let warm = p.clone();
             spawn("polish-warmup", move || {
                 let t = Instant::now();
-                match warm.warmup() {
-                    Ok(()) => tracing::info!("polish warmed up ({:.0} ms)", ms(t.elapsed())),
+                let result = warm.warmup();
+                let took = ms(t.elapsed());
+                match &result {
+                    Ok(()) => tracing::info!("polish warmed up ({took:.0} ms)"),
                     Err(e) => tracing::warn!(
                         "polish warmup failed ({e}); dictations are pasted unpolished until the server responds"
                     ),
                 }
+                telemetry::global().session(telemetry::SessionUpdate {
+                    polish_warmup_ms: Some(took),
+                    polish_warmup_ok: Some(result.is_ok()),
+                    ..Default::default()
+                });
             });
             // The managed S1-mini reports its own state (PolishInfo) as it downloads/starts.
             let info = match config.polish.provider {
@@ -502,13 +512,15 @@ impl AudioThread {
         } else if let Err(e) = recorder.prepare() {
             tracing::warn!("microphone not available yet: {e}");
         }
-        let mut down_at: Option<Instant> = None;
+        // The hold in progress: when the key went down, and its measurements so far.
+        let mut holding: Option<(Instant, Box<Dictation>)> = None;
         let mut watch = ReleaseWatch::new(&self.key, 0);
 
         loop {
-            let ev = if down_at.is_some() {
+            // `missed`: a release synthesized after the hook missed the real one.
+            let (ev, missed) = if holding.is_some() {
                 match events.recv_timeout(RELEASE_POLL) {
-                    Ok(ev) => ev,
+                    Ok(ev) => (ev, false),
                     Err(RecvTimeoutError::Timeout) => match self.missed_release(&events, &watch) {
                         Some(ev) => ev,
                         None => continue,
@@ -517,36 +529,43 @@ impl AudioThread {
                 }
             } else {
                 match events.recv() {
-                    Ok(ev) => ev,
+                    Ok(ev) => (ev, false),
                     Err(_) => return,
                 }
             };
             match ev {
                 HotkeyEvent::Down(t) => {
                     *self.key_down.lock().unwrap() = Some(t);
-                    if down_at.take().is_some() {
+                    if let Some((down, mut d)) = holding.take() {
                         // The previous hold's release was never seen (and the poll couldn't
                         // tell, e.g. a swallowed F13-F24 key). Its audio may span minutes of
                         // unrelated speech: discard it rather than paste it.
                         recorder.stop();
                         tracing::warn!("previous hold was never released; discarded it");
                         self.hub.update(|s| s.recording = false);
+                        d.hold_ms = Some(ms(t.saturating_duration_since(down)));
+                        telemetry::global().dictation(d, Ended::StaleDiscarded);
                     }
                     // Before starting: any paste from here on counts as "during this recording".
                     watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
-                    down_at = self.start_recording(&mut recorder, t);
+                    holding = self.start_recording(&mut recorder, t).map(|d| (t, d));
                 }
                 HotkeyEvent::Up(released) => {
-                    let Some(down) = down_at.take() else { continue };
-                    self.finish_recording(&mut recorder, down, released);
+                    let Some((down, mut d)) = holding.take() else {
+                        continue;
+                    };
+                    d.missed_release = missed;
+                    self.finish_recording(&mut recorder, down, released, d);
                 }
                 HotkeyEvent::Cancel => {
-                    if down_at.take().is_some() {
+                    if let Some((down, mut d)) = holding.take() {
                         recorder.stop();
                         tracing::info!(
                             "dictation cancelled (another key was pressed, or the hold was stale)"
                         );
                         self.hub.update(|s| s.recording = false);
+                        d.hold_ms = Some(ms(down.elapsed()));
+                        telemetry::global().dictation(d, Ended::Cancelled);
                     }
                 }
             }
@@ -554,12 +573,12 @@ impl AudioThread {
     }
 
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
-    /// release if the key turns out not to be down any more.
+    /// release (with `true`) if the key turns out not to be down any more.
     fn missed_release(
         &self,
         events: &Receiver<HotkeyEvent>,
         watch: &ReleaseWatch,
-    ) -> Option<HotkeyEvent> {
+    ) -> Option<(HotkeyEvent, bool)> {
         let keys = self.key.keys();
         let mut keys_down = [None; MAX_CHORD];
         for (down, &k) in keys_down.iter_mut().zip(keys) {
@@ -571,23 +590,29 @@ impl AudioThread {
         // The hook runs before the key state updates, so a real release would normally be
         // queued already; give a racing one a moment to arrive.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
-            return Some(ev);
+            return Some((ev, false));
         }
         tracing::warn!(
             "{} is no longer down but no release was seen; finishing the dictation and re-installing the keyboard hook",
             self.key
         );
         self.reset.reset();
-        Some(HotkeyEvent::Up(Instant::now()))
+        Some((HotkeyEvent::Up(Instant::now()), true))
     }
 
-    fn start_recording(&self, recorder: &mut Recorder, t: Instant) -> Option<Instant> {
+    /// Returns the new dictation's record if recording started.
+    fn start_recording(&self, recorder: &mut Recorder, t: Instant) -> Option<Box<Dictation>> {
+        let mut d = Box::new(Dictation {
+            started_at: wall_clock(t),
+            ..Default::default()
+        });
         if !self.hub.engine_ready() {
             if self.hub.engine_failed() {
                 let _ = self.to_stt.send(ToStt::RetryLoad);
             }
             tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
             self.hub.reject();
+            telemetry::global().dictation(d, Ended::NotReady);
             return None;
         }
         if self.hub.missing(Permission::Microphone) {
@@ -601,47 +626,60 @@ impl AudioThread {
         }
         match recorder.start() {
             Ok(()) => {
+                let mic = ms(Instant::now() - t);
                 let _ = self.to_paste.send(ToPaste::Snapshot);
                 self.hub.update(|s| s.recording = true);
-                tracing::debug!(
-                    "recording (key down → mic started {:.1} ms)",
-                    ms(Instant::now() - t)
-                );
-                Some(t)
+                tracing::debug!("recording (key down → mic started {mic:.1} ms)");
+                d.key_down_to_mic_ms = Some(mic);
+                Some(d)
             }
             Err(e) => {
                 tracing::error!("cannot start microphone: {e}");
                 self.hub
                     .update(|s| s.fail("microphone unavailable (see log)"));
                 self.hub.reject();
+                telemetry::global().dictation(d, Ended::MicFailed);
                 None
             }
         }
     }
 
-    fn finish_recording(&self, recorder: &mut Recorder, down: Instant, released: Instant) {
+    fn finish_recording(
+        &self,
+        recorder: &mut Recorder,
+        down: Instant,
+        released: Instant,
+        mut d: Box<Dictation>,
+    ) {
         // Where the text should go: pasting is skipped if focus has moved by then.
         let target = agt_platform::foreground_window();
         let rec = recorder.stop();
         let held = released.saturating_duration_since(down);
+        // A few µs per second of audio.
+        let rms = (rec.samples.iter().map(|x| x * x).sum::<f32>()
+            / rec.samples.len().max(1) as f32)
+            .sqrt();
         tracing::debug!(
-            "recorded {:.2} s from the microphone (rms {:.4})",
+            "recorded {:.2} s from the microphone (rms {rms:.4})",
             rec.samples.len() as f64 / SAMPLE_RATE as f64,
-            (rec.samples.iter().map(|x| x * x).sum::<f32>() / rec.samples.len().max(1) as f32)
-                .sqrt()
         );
-        if let Some(d) = rec.first_audio {
-            tracing::debug!("first audio {:.1} ms after recording started", ms(d));
+        if let Some(first) = rec.first_audio {
+            tracing::debug!("first audio {:.1} ms after recording started", ms(first));
         }
+        d.hold_ms = Some(ms(held));
+        d.rms = Some(rms.into());
+        d.first_audio_ms = rec.first_audio.map(ms);
         if held < Duration::from_millis(self.config.hotkey.min_hold_ms) {
             tracing::info!(
                 "hold of {} ms is shorter than min_hold_ms; ignored",
                 held.as_millis()
             );
             self.hub.update(|s| s.recording = false);
+            telemetry::global().dictation(d, Ended::TooShort);
             return;
         }
         let audio = self.test_wav.clone().unwrap_or(rec.samples);
+        d.audio_secs = Some(audio.len() as f64 / SAMPLE_RATE as f64);
         self.hub.update(|s| {
             s.recording = false;
             s.pending += 1;
@@ -650,6 +688,7 @@ impl AudioThread {
             audio,
             released,
             target,
+            dictation: d,
         }));
     }
 }
@@ -657,7 +696,12 @@ impl AudioThread {
 fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
     let t = Instant::now();
     let mut last_pct = u64::MAX;
+    // When the download finished, and its size (the model files are fetched first).
+    let mut downloaded: Option<(Instant, u64)> = None;
     let loaded = agt_stt::load(&config.stt, &mut |p| {
+        if p.done >= p.total {
+            downloaded = Some((Instant::now(), p.total));
+        }
         let pct = p.done * 100 / p.total.max(1);
         if pct != last_pct {
             last_pct = pct;
@@ -672,15 +716,26 @@ fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
         }
     })
     .and_then(|mut engine| {
+        let loaded = Instant::now();
         hub.update(|s| s.engine = Engine::Loading("Loading model...".into()));
         engine.warmup()?;
-        Ok(engine)
+        Ok((engine, loaded))
     });
     match loaded {
-        Ok(engine) => {
+        Ok((engine, loaded)) => {
             let name = engine.name();
             tracing::info!("{name} ready ({:.1} s)", t.elapsed().as_secs_f64());
             let note = engine.notice();
+            let load_start = downloaded.map_or(t, |(at, _)| at);
+            telemetry::global().session(telemetry::SessionUpdate {
+                stt_backend: Some(name),
+                stt_notice: note.clone(),
+                model_download_ms: downloaded.map(|(at, _)| ms(at - t)),
+                model_download_bytes: downloaded.map(|(_, bytes)| bytes as i64),
+                model_load_ms: Some(ms(loaded.saturating_duration_since(load_start))),
+                warmup_ms: Some(ms(loaded.elapsed())),
+                ..Default::default()
+            });
             hub.update(|s| s.engine = Engine::Ready(note));
             Some(engine)
         }
@@ -715,8 +770,10 @@ fn stt_thread(
             }
             ToStt::Transcribe(job) => job,
         };
+        let mut d = job.dictation;
         let Some(engine) = engine.as_mut() else {
             hub.update(|s| s.pending -= 1);
+            telemetry::global().dictation(d, Ended::NotReady);
             continue;
         };
         let stt_start = Instant::now();
@@ -726,13 +783,19 @@ fn stt_thread(
         if engine.notice() != notice {
             // E.g. the GPU failed and the engine switched to the CPU.
             let note = engine.notice();
+            telemetry::global().session(telemetry::SessionUpdate {
+                stt_backend: Some(engine.name()),
+                stt_notice: note.clone(),
+                ..Default::default()
+            });
             hub.update(|s| s.engine = Engine::Ready(note));
         }
-        let audio_secs = job.audio.len() as f64 / SAMPLE_RATE as f64;
+        d.queue_wait_ms = Some(ms(stt_start.saturating_duration_since(job.released)));
+        d.stt_ms = Some(ms(stt_end - stt_start));
+        d.stt_backend = Some(engine.name());
         match result {
             Ok(t) => {
                 let mut text = finish_text(&t.text, false);
-                let mut polish = None;
                 if let Some(p) = polisher.as_deref().filter(|_| !text.is_empty()) {
                     let t = Instant::now();
                     let (polished, outcome) = agt_polish::polish_or_raw(p, &text, &config.polish);
@@ -740,26 +803,30 @@ fn stt_thread(
                         tracing::warn!("polish failed, pasting the raw transcript: {why}");
                     }
                     text = polished;
-                    polish = Some(format!("polish {:.0} ms ({outcome})", ms(t.elapsed())));
+                    d.polish_ms = Some(ms(t.elapsed()));
+                    d.polish_outcome = Some(match outcome {
+                        Outcome::Polished => "polished",
+                        Outcome::Skipped(_) => "skipped",
+                        Outcome::Fallback(_) => "fallback",
+                    });
                 }
                 if config.paste.trailing_space && !text.is_empty() {
                     text.push(' ');
                 }
                 if text.is_empty() {
                     tracing::info!(
-                        "no speech recognized in {audio_secs:.1} s of audio (stt {:.0} ms)",
+                        "no speech recognized in {:.1} s of audio (stt {:.0} ms)",
+                        job.audio.len() as f64 / SAMPLE_RATE as f64,
                         ms(stt_end - stt_start)
                     );
                     hub.update(|s| s.pending -= 1);
+                    telemetry::global().dictation(d, Ended::NoSpeech);
                 } else {
                     let _ = to_paste.send(ToPaste::Paste {
                         text,
-                        audio_secs,
                         released: job.released,
                         target: job.target,
-                        stt_start,
-                        stt_end,
-                        polish,
+                        dictation: d,
                     });
                 }
             }
@@ -769,6 +836,7 @@ fn stt_thread(
                     s.pending -= 1;
                     s.fail("transcription failed (see log)");
                 });
+                telemetry::global().dictation(d, Ended::TranscribeFailed);
             }
         }
     }
@@ -788,28 +856,37 @@ fn finish_text(raw: &str, trailing_space: bool) -> String {
 #[derive(Default)]
 struct Saver {
     saved: Option<ClipboardSnapshot>,
-    in_flight: Option<Receiver<Option<ClipboardSnapshot>>>,
+    /// Which save finished last (see [`Saver::start`]) and how long it took (ms), for
+    /// telemetry.
+    save_ms: Option<(u64, f64)>,
+    /// How many saves were started; the running one is number `starts`.
+    starts: u64,
+    in_flight: Option<Receiver<(Option<ClipboardSnapshot>, f64)>>,
 }
 
 impl Saver {
-    /// Starts saving the clipboard unless a save is already running.
-    fn start(&mut self) {
+    /// Starts saving the clipboard unless a save is already running. Returns the new save's
+    /// number, if it started one.
+    fn start(&mut self) -> Option<u64> {
         if self.in_flight.is_some() {
-            return;
+            return None;
         }
         let (tx, rx) = mpsc::channel();
         spawn("clipboard-save", move || {
             let _ = tx.send(snapshot());
         });
         self.in_flight = Some(rx);
+        self.starts += 1;
+        Some(self.starts)
     }
 
     /// Picks up a finished save, waiting at most `wait`.
     fn collect(&mut self, wait: Duration) {
         if let Some(rx) = &self.in_flight {
             match rx.recv_timeout(wait) {
-                Ok(s) => {
+                Ok((s, took)) => {
                     self.saved = s;
+                    self.save_ms = Some((self.starts, took));
                     self.in_flight = None;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -961,6 +1038,8 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
     let mut last = LastTranscript::default();
     let sensitive = paste_sensitive_keys(&hotkey);
+    // The clipboard save started for the next paste (its time is credited to that one).
+    let mut save_for_paste: Option<u64> = None;
 
     loop {
         let deadline = [pending_restore.as_ref().map(|(_, at)| *at), last.deadline()]
@@ -977,17 +1056,14 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                 // holds the user's data; saving now would save our own text instead.
                 if restore && pending_restore.is_none() {
                     saver.saved = None;
-                    saver.start();
+                    save_for_paste = saver.start();
                 }
             }
             Ok(ToPaste::Paste {
                 text,
-                audio_secs,
                 released,
-                stt_start,
-                stt_end,
-                polish,
                 target,
+                dictation: mut d,
             }) => {
                 // Later messages (the next dictation's paste included) queue up behind this
                 // wait, so pastes stay in order.
@@ -999,6 +1075,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                 if !sensitive.is_empty() && held() {
                     let (waited, released) =
                         wait_for_hotkey_release(held, HOTKEY_RELEASE_POLL, HOTKEY_RELEASE_MAX);
+                    d.hotkey_wait_ms = Some(ms(waited));
                     if released {
                         tracing::debug!(
                             "paste waited {:.0} ms for {hotkey} to be released",
@@ -1023,7 +1100,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                         .is_some_and(ClipboardSnapshot::is_stale);
                     if stale || (saver.saved.is_none() && saver.in_flight.is_none()) {
                         saver.saved = None;
-                        saver.start();
+                        save_for_paste = saver.start().or(save_for_paste);
                         saver.collect(SNAPSHOT_WAIT);
                     }
                     if saver.saved.is_none() && saver.in_flight.is_none() {
@@ -1073,29 +1150,30 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                         Err(e) => s.fail(&e.tray_text()),
                     }
                 });
+                // Everything below is bookkeeping after the paste: off the latency path.
+                let chars = text.chars().count();
+                d.chars_out = Some(chars as i64);
+                d.words_out = Some(text.split_whitespace().count() as i64);
+                // Only the save made for this paste, and only if it finished by now.
+                let ours = save_for_paste.take();
+                d.clipboard_save_ms = saver
+                    .save_ms
+                    .filter(|&(n, _)| Some(n) == ours)
+                    .map(|(_, took)| took);
+                d.paste_ms = Some(ms(pasted - paste_start));
                 match result {
                     Ok(token) => {
-                        tracing::info!(
-                            "dictation: audio {audio_secs:.2} s | release→stt {:.0} ms | stt {:.0} ms | {}paste {:.0} ms | release→paste {:.0} ms | {} chars",
-                            ms(stt_start - released),
-                            ms(stt_end - stt_start),
-                            polish.map(|p| p + " | ").unwrap_or_default(),
-                            ms(pasted - paste_start),
-                            ms(pasted - released),
-                            text.chars().count()
-                        );
-                        tracing::debug!("pasted {text:?}");
+                        d.release_to_paste_ms = Some(ms(pasted - released));
+                        // At debug: the same numbers are in the `dictations` table.
+                        tracing::debug!("dictation: {}", timings(&d));
                         if restore {
                             pending_restore = Some((token, pasted + restore_after));
                         }
+                        telemetry::global().dictation(d, Ended::Pasted);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "paste failed ({} chars not pasted): {e}",
-                            text.chars().count()
-                        );
-                        // Dictated text stays out of the log unless debug logging is on.
-                        tracing::debug!("unpasted transcript: {text:?}");
+                        tracing::error!("paste failed ({chars} chars not pasted): {e}");
+                        telemetry::global().dictation(d, e.outcome());
                     }
                 }
             }
@@ -1166,14 +1244,23 @@ enum PasteError {
 }
 
 impl PasteError {
+    fn outcome(&self) -> Ended {
+        match self {
+            PasteError::ClipboardBusy(_) => Ended::ClipboardBusy,
+            PasteError::Blocked(_) => Ended::PasteBlocked,
+            PasteError::WindowChanged => Ended::FocusChanged,
+        }
+    }
+
     fn tray_text(&self) -> String {
         let what = match self {
             PasteError::ClipboardBusy(_) => {
                 "clipboard busy (another app is holding it); not pasted"
             }
-            PasteError::Blocked(_) if cfg!(target_os = "macos") => {
-                "paste blocked (Accessibility permission?); clipboard restored"
-            }
+            PasteError::Blocked(_) if cfg!(target_os = "macos") => &format!(
+                "paste blocked ({} permission?); clipboard restored",
+                Permission::Accessibility
+            ),
             PasteError::Blocked(_) => "paste blocked (admin window?); clipboard restored",
             PasteError::WindowChanged => "not pasted: focus moved to another window",
         };
@@ -1194,9 +1281,10 @@ impl fmt::Display for PasteError {
     }
 }
 
-fn snapshot() -> Option<ClipboardSnapshot> {
+/// Saves the clipboard; returns the snapshot and how long it took (ms).
+fn snapshot() -> (Option<ClipboardSnapshot>, f64) {
     let t = Instant::now();
-    match agt_platform::snapshot_clipboard() {
+    let snap = match agt_platform::snapshot_clipboard() {
         Ok(s) => {
             tracing::debug!("clipboard saved in {:.1} ms", ms(t.elapsed()));
             Some(s)
@@ -1205,11 +1293,36 @@ fn snapshot() -> Option<ClipboardSnapshot> {
             tracing::warn!("cannot save clipboard (it won't be restored): {e}");
             None
         }
-    }
+    };
+    (snap, ms(t.elapsed()))
 }
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
+}
+
+/// One line of a pasted dictation's timings, e.g. `audio 2.97 s | release→stt 0 ms |
+/// stt 157 ms | paste 4 ms | release→paste 161 ms | 42 chars`.
+fn timings(d: &Dictation) -> String {
+    let v = |x: Option<f64>| x.unwrap_or(0.0);
+    let polish = match (d.polish_ms, d.polish_outcome) {
+        (Some(t), Some(outcome)) => format!("polish {t:.0} ms ({outcome}) | "),
+        _ => String::new(),
+    };
+    format!(
+        "audio {:.2} s | release→stt {:.0} ms | stt {:.0} ms | {polish}paste {:.0} ms | release→paste {:.0} ms | {} chars",
+        v(d.audio_secs),
+        v(d.queue_wait_ms),
+        v(d.stt_ms),
+        v(d.paste_ms),
+        v(d.release_to_paste_ms),
+        d.chars_out.unwrap_or(0)
+    )
+}
+
+/// The wall-clock time (unix ms) of an `Instant` in the recent past.
+fn wall_clock(t: Instant) -> i64 {
+    telemetry::now_ms() - ms(t.elapsed()) as i64
 }
 
 #[cfg(test)]
@@ -1331,15 +1444,15 @@ mod tests {
         if let Some(d) = delay {
             thread::spawn(move || {
                 thread::sleep(d);
-                let _ = tx.send(None); // the save finished (its result doesn't matter here)
+                let _ = tx.send((None, 0.0)); // the save finished (its result doesn't matter here)
             });
         } else {
             // Hung save: keep the sender alive, never send.
             std::mem::forget(tx);
         }
         Saver {
-            saved: None,
             in_flight: Some(rx),
+            ..Default::default()
         }
     }
 
@@ -1471,7 +1584,10 @@ mod tests {
         assert_eq!(
             Status::NeedsPermission(vec![Permission::Microphone, Permission::Accessibility])
                 .to_string(),
-            "Needs permission: Microphone, Accessibility (System Settings > Privacy & Security)"
+            format!(
+                "Needs permission: Microphone, {} (System Settings > Privacy & Security)",
+                Permission::Accessibility
+            )
         );
     }
 }

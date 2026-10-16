@@ -1,0 +1,439 @@
+use super::*;
+use crate::{Sink, Update, open_read_only};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+fn memory() -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    conn
+}
+
+/// A fresh directory under the system temp dir (removed by the caller when done).
+fn temp_dir() -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "agt-telemetry-test-{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn count(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+fn dictation(conn: &Connection, at: i64, release_to_paste: f64, outcome: Outcome) {
+    let d = Dictation {
+        started_at: at,
+        release_to_paste_ms: Some(release_to_paste),
+        stt_ms: Some(release_to_paste / 2.0),
+        audio_secs: Some(2.0),
+        ..Default::default()
+    };
+    insert_dictation(conn, 1, &d, outcome).unwrap();
+}
+
+#[test]
+fn migrates_an_empty_database_once() {
+    let mut conn = memory();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version as usize, MIGRATIONS.len());
+    for table in [
+        "app_sessions",
+        "dictations",
+        "events",
+        "updates",
+        "metric_rollups",
+    ] {
+        assert_eq!(count(&conn, &format!("SELECT count(*) FROM {table}")), 0);
+    }
+    migrate(&mut conn).unwrap(); // already current: no-op, no "table exists" error
+}
+
+#[test]
+fn rtf_is_derived() {
+    let conn = memory();
+    dictation(&conn, now_ms(), 200.0, Outcome::Pasted);
+    let rtf: f64 = conn
+        .query_row("SELECT rtf FROM dictations", [], |r| r.get(0))
+        .unwrap();
+    assert!((rtf - 0.05).abs() < 1e-9, "100 ms for 2 s of audio");
+}
+
+#[test]
+fn rollups_cover_completed_days_once() {
+    let mut conn = memory();
+    let now = now_ms();
+    // Same timestamp per day, so rows can't straddle a local midnight.
+    for v in [100.0, 200.0, 300.0] {
+        dictation(&conn, now - 3 * DAY_MS, v, Outcome::Pasted);
+    }
+    dictation(&conn, now - 3 * DAY_MS, 0.0, Outcome::NoSpeech);
+    dictation(&conn, now - 2 * DAY_MS, 50.0, Outcome::Pasted);
+    dictation(&conn, now, 999.0, Outcome::Pasted); // today: not complete yet
+
+    assert_eq!(rollup(&mut conn).unwrap(), 2);
+    let (n, p50, max): (i64, f64, f64) = conn
+        .query_row(
+            "SELECT count, p50, max FROM metric_rollups WHERE metric = 'release_to_paste_ms'
+            ORDER BY day LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((n, p50, max), (3, 200.0, 300.0), "pasted dictations only");
+    let no_speech: i64 = conn
+        .query_row(
+            "SELECT count FROM metric_rollups WHERE metric = 'outcome.no_speech'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(no_speech, 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM metric_rollups WHERE p50 = 999.0 OR max = 999.0"
+        ),
+        0,
+        "today isn't rolled up"
+    );
+
+    let rows = count(&conn, "SELECT count(*) FROM metric_rollups");
+    assert_eq!(rollup(&mut conn).unwrap(), 1, "only the last day is redone");
+    assert_eq!(count(&conn, "SELECT count(*) FROM metric_rollups"), rows);
+
+    // Recorded late (it ended after midnight, or the database was locked): the last
+    // rolled-up day picks it up; days before it are final.
+    dictation(&conn, now - 2 * DAY_MS, 70.0, Outcome::Pasted);
+    dictation(&conn, now - 3 * DAY_MS, 70.0, Outcome::Pasted);
+    assert_eq!(rollup(&mut conn).unwrap(), 1);
+    let counts: Vec<i64> = conn
+        .prepare(
+            "SELECT count FROM metric_rollups WHERE metric = 'release_to_paste_ms' ORDER BY day",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(counts, [3, 2]);
+    assert_eq!(count(&conn, "SELECT count(*) FROM metric_rollups"), rows);
+}
+
+#[test]
+fn old_rollups_are_final() {
+    let mut conn = memory();
+    let now = now_ms();
+    for v in [100.0, 200.0] {
+        dictation(&conn, now - 5 * DAY_MS, v, Outcome::Pasted);
+    }
+    assert_eq!(rollup(&mut conn).unwrap(), 1);
+    // Retention pruned part of that day (or it's simply old): its rollup isn't redone.
+    conn.execute(
+        "DELETE FROM dictations WHERE release_to_paste_ms = 100.0",
+        [],
+    )
+    .unwrap();
+    assert_eq!(rollup(&mut conn).unwrap(), 0);
+    let n: i64 = conn
+        .query_row(
+            "SELECT count FROM metric_rollups WHERE metric = 'release_to_paste_ms'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "the complete rollup is kept");
+}
+
+#[test]
+fn latency_excludes_the_hotkey_wait() {
+    let conn = memory();
+    let d = Dictation {
+        started_at: now_ms(),
+        release_to_paste_ms: Some(900.0),
+        hotkey_wait_ms: Some(700.0),
+        ..Default::default()
+    };
+    insert_dictation(&conn, 1, &d, Outcome::Pasted).unwrap();
+    let latency: f64 = conn
+        .query_row("SELECT latency_ms FROM dictations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(latency, 200.0);
+}
+
+#[test]
+fn home_directory_is_redacted() {
+    let home = Home::new(Some(r"C:\Users\Jane Doe"));
+    assert_eq!(
+        home.redact(r"config at C:\Users\Jane Doe\AppData\Roaming\AGT\config.toml"),
+        r"config at ~\AppData\Roaming\AGT\config.toml"
+    );
+    assert_eq!(
+        home.redact("models in C:/Users/Jane Doe/AGT"),
+        "models in ~/AGT"
+    );
+    assert_eq!(home.redact("no path"), "no path");
+    let root = Home::new(Some("/"));
+    assert_eq!(
+        root.redact("/usr/lib"),
+        "/usr/lib",
+        "too short to be a home"
+    );
+}
+
+#[test]
+fn prune_keeps_each_table_for_its_retention() {
+    let conn = memory();
+    let now = now_ms();
+    let ago = |days: i64| now - days * DAY_MS - 1000;
+    for days in [0, RETENTION_DAYS_RAW] {
+        dictation(&conn, ago(days), 1.0, Outcome::Pasted);
+        conn.execute(
+            "INSERT INTO updates (ts, kind, result) VALUES (?1, 'check', 'none')",
+            [ago(days)],
+        )
+        .unwrap();
+    }
+    for (days, level) in [
+        (0, "DEBUG"),
+        (RETENTION_DAYS_DEBUG_EVENTS, "DEBUG"),
+        (RETENTION_DAYS_DEBUG_EVENTS, "TRACE"),
+        (RETENTION_DAYS_DEBUG_EVENTS, "INFO"),
+        (RETENTION_DAYS_EVENTS, "WARN"),
+    ] {
+        conn.execute(
+            "INSERT INTO events (ts, level, target, message) VALUES (?1, ?2, 't', 'm')",
+            params![ago(days), level],
+        )
+        .unwrap();
+    }
+    for days in [0, RETENTION_DAYS_SESSIONS] {
+        let id = insert_session(&conn, &SessionStart::default(), ago(days)).unwrap();
+        assert!(id > 0);
+    }
+
+    assert_eq!(prune(&conn, now).unwrap(), 1 + 1 + 3 + 1);
+    assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 1);
+    assert_eq!(count(&conn, "SELECT count(*) FROM updates"), 1);
+    let levels: String = conn
+        .query_row(
+            "SELECT group_concat(level, ',') FROM (SELECT level FROM events ORDER BY ts DESC)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        levels, "DEBUG,INFO",
+        "recent debug kept, a week-old one dropped"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM app_sessions"), 1);
+    assert_eq!(prune(&conn, now).unwrap(), 0);
+}
+
+#[test]
+fn stale_sessions_are_closed_as_crash_or_unknown() {
+    let conn = memory();
+    let crashed = insert_session(&conn, &SessionStart::default(), 1000).unwrap();
+    let killed = insert_session(&conn, &SessionStart::default(), 2000).unwrap();
+    // A worker thread panicked, the app kept running, then was killed.
+    let survived = insert_session(&conn, &SessionStart::default(), 3000).unwrap();
+    let not_a_panic = insert_session(&conn, &SessionStart::default(), 4000).unwrap();
+    let event = |ts: i64, session: i64, level: &str, message: &str| {
+        conn.execute(
+            "INSERT INTO events (ts, session_id, level, target, message)
+            VALUES (?1, ?2, ?3, 'agt', ?4)",
+            params![ts, session, level, message],
+        )
+        .unwrap();
+    };
+    event(4000, crashed, "INFO", "ready");
+    event(
+        5000,
+        crashed,
+        "ERROR",
+        "panic at src/main.rs:1:1 on thread main: x",
+    );
+    event(
+        5000,
+        survived,
+        "ERROR",
+        "panic at src/pipeline.rs:1:1 on thread stt: x",
+    );
+    event(6000, survived, "INFO", "status: Ready");
+    event(7000, not_a_panic, "ERROR", "Panic at the disco");
+    assert_eq!(close_stale_sessions(&conn).unwrap(), 4);
+    let get = |id: i64| -> (String, i64) {
+        conn.query_row(
+            "SELECT exit_reason, ended_at FROM app_sessions WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        get(crashed),
+        ("crash".into(), 5000),
+        "ended at its last event"
+    );
+    assert_eq!(get(killed), ("unknown".into(), 2000));
+    assert_eq!(get(survived), ("unknown".into(), 6000));
+    assert_eq!(get(not_a_panic), ("unknown".into(), 7000));
+}
+
+#[test]
+fn queue_is_capped_while_the_writer_is_stalled() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    let sink = Sink::default();
+    // Not started yet: nothing is drained, like a database locked for a long time.
+    for _ in 0..crate::QUEUE_SOFT_CAP + 500 {
+        sink.event("DEBUG", "t", "verbose".into());
+    }
+    sink.event("WARN", "t", "important".into());
+    sink.dictation(Dictation::default(), Outcome::Pasted);
+    assert!(sink.start(path.clone(), SessionStart::default()));
+    assert!(sink.flush(Duration::from_secs(10)));
+    let conn = open_read_only(&path).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'verbose'"
+        ) as usize,
+        crate::QUEUE_SOFT_CAP
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'important'"
+        ),
+        1,
+        "warnings get more room than debug events"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = '500 events were dropped while the database was unavailable'"
+        ),
+        1
+    );
+    drop(conn);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn corrupt_file_is_moved_aside() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    std::fs::write(
+        &path,
+        b"this is not a database, just some bytes long enough..........",
+    )
+    .unwrap();
+    let conn = open(&path).expect("a fresh database");
+    drop(conn);
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("agt.db.corrupt-")),
+        "{names:?}"
+    );
+    let conn = open_read_only(&path).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 0);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unusable_database_turns_telemetry_off() {
+    let dir = temp_dir();
+    // A directory where the file should be: can't be opened, isn't "corrupt".
+    let path = dir.join("agt.db");
+    std::fs::create_dir_all(&path).unwrap();
+    let sink = Sink::default();
+    assert!(sink.start(path.clone(), SessionStart::default()));
+    sink.event("INFO", "t", "m".into()); // must not panic or block
+    assert!(!sink.flush(Duration::from_secs(5)), "writer gave up");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn senders_never_wait_for_the_disk() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    let sink = Sink::default();
+    // Sent before the writer runs: kept and written once it does.
+    sink.event("INFO", "t", "early".into());
+    assert!(sink.start(path.clone(), SessionStart::default()));
+    assert!(sink.flush(Duration::from_secs(10)));
+
+    // Another connection holds the write lock: the writer is stuck in its busy wait.
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let t = Instant::now();
+    for i in 0..10_000 {
+        sink.dictation(
+            Dictation {
+                started_at: now_ms() - i,
+                ..Default::default()
+            },
+            Outcome::Pasted,
+        );
+    }
+    let sending = t.elapsed();
+    assert!(
+        sending < Duration::from_millis(500),
+        "10k sends took {sending:?} while the database was locked"
+    );
+    sink.event("DEBUG", "t", "during the lock".into());
+    // Longer than the connection's busy timeout (2 s): the batch is kept and retried, and
+    // a flush only succeeds once it's really committed.
+    assert!(
+        !sink.flush(Duration::from_secs(3)),
+        "nothing can be committed while the lock is held"
+    );
+    blocker.execute_batch("COMMIT").unwrap();
+
+    sink.update(Update {
+        kind: "check",
+        from_version: "0.0.1".into(),
+        to_version: None,
+        result: "none",
+        error: None,
+        duration_ms: 1.0,
+    });
+    assert!(sink.end_session(crate::ExitReason::Quit, Duration::from_secs(10)));
+    let conn = open_read_only(&path).unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 10_000);
+    assert_eq!(count(&conn, "SELECT count(*) FROM updates"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'during the lock'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM events WHERE message = 'early' AND session_id = 1"
+        ),
+        1
+    );
+    let reason: String = conn
+        .query_row("SELECT exit_reason FROM app_sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reason, "quit");
+    let report = crate::stats::report(&path).unwrap();
+    assert!(report.contains("10000 dictations"), "{report}");
+    drop(conn);
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -545,6 +545,10 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Re
 // ---------------------------------------------------------------------------------------
 // Permissions: Windows has no per-app prompts for any of this.
 
+pub fn accessibility_name() -> &'static str {
+    "Accessibility"
+}
+
 pub fn missing_permissions() -> Vec<Permission> {
     Vec::new()
 }

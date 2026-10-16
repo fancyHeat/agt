@@ -11,6 +11,8 @@ agt-core.workspace = true
 agt-fetch.workspace = true
 tracing.workspace = true
 serde_json = "1"
+# Base URLs are parsed to show only their host (never credentials).
+url = "2"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 sha2 = "0.11"
 

@@ -2,8 +2,8 @@
 //! permissions they need.
 //!
 //! - Windows: low-level keyboard hook, Win32 clipboard, `SendInput`.
-//! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone, Input Monitoring and
-//!   Accessibility permissions (see [`missing_permissions`]).
+//! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone and Accessibility
+//!   permissions (see [`missing_permissions`]).
 //! - Anything else returns [`Error`]s saying it's unsupported.
 
 use std::{
@@ -279,9 +279,9 @@ impl std::fmt::Display for Hotkey {
 pub enum Permission {
     /// Recording (without it, macOS delivers silence).
     Microphone,
-    /// Seeing the hotkey (the keyboard event tap).
-    InputMonitoring,
-    /// Sending Cmd+V (and swallowing F13-F20).
+    /// Seeing the hotkey (the keyboard event tap), sending Cmd+V and swallowing F13-F20. (With
+    /// it, Input Monitoring isn't needed.) Listed as "Device Control" in System Settings from
+    /// macOS 27 on.
     Accessibility,
 }
 
@@ -289,8 +289,7 @@ impl fmt::Display for Permission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Permission::Microphone => "Microphone",
-            Permission::InputMonitoring => "Input Monitoring",
-            Permission::Accessibility => "Accessibility",
+            Permission::Accessibility => imp::accessibility_name(),
         })
     }
 }
@@ -336,8 +335,8 @@ impl HotkeyReset {
 /// thread and must return quickly (e.g. just send on a channel): a slow handler delays every
 /// keystroke on the system. Modifier keys are passed through; F13-F24 are swallowed.
 ///
-/// macOS: if Input Monitoring isn't granted yet, this still succeeds; the thread waits for
-/// the permission and starts watching as soon as it's granted (no restart needed).
+/// macOS: if Accessibility isn't granted yet, this still succeeds; the thread waits for the
+/// permission and starts watching as soon as it's granted (no restart needed).
 pub fn start_hotkey(
     hotkey: &Hotkey,
     on_event: impl Fn(HotkeyEvent) + Send + 'static,
@@ -407,8 +406,8 @@ pub fn paste_count() -> u64 {
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
 /// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
-/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, the poll reads the
-/// hardware state, which our injected events don't change).
+/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, Cmd+V only posts Left
+/// Command and V).
 pub fn paste_may_release(key: Key) -> bool {
     imp::paste_may_release(key)
 }

@@ -1,5 +1,6 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, "Copy last
-//! transcript", "Update now", (macOS) "Privacy & Security settings", "Open config folder" and
+//! transcript", "Update now", (macOS) "Privacy & Security settings", "Open config folder",
+//! "Open data folder" (where it differs) and
 //! "Quit".
 
 use tray_icon::{
@@ -22,6 +23,8 @@ pub struct Tray {
     /// macOS only: opens the System Settings page of the first missing permission.
     pub privacy: Option<MenuId>,
     pub open_config: MenuId,
+    /// "Open data folder" (the usage history, agt.db), when it differs from the config folder.
+    pub open_data: Option<MenuId>,
     pub quit: MenuId,
 }
 
@@ -29,11 +32,13 @@ impl Tray {
     /// `config_error`: shown as a disabled menu line so a broken config is noticeable.
     /// `polish`: a disabled info line, e.g. "Polish: off".
     /// `installed`: whether this is a Velopack install (else "Update now" is disabled).
+    /// `data_folder`: whether to offer "Open data folder".
     pub fn new(
         version: &str,
         config_error: bool,
         polish: &str,
         installed: bool,
+        data_folder: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let title = format!("AGT {version}");
         let title_item = MenuItem::new(&title, false, None);
@@ -50,6 +55,7 @@ impl Tray {
         let privacy = cfg!(target_os = "macos")
             .then(|| MenuItem::new("Privacy & Security settings...", true, None));
         let open_config = MenuItem::new("Open config folder", true, None);
+        let open_data = data_folder.then(|| MenuItem::new("Open data folder", true, None));
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::with_items(&[
             &title_item,
@@ -64,7 +70,11 @@ impl Tray {
         if let Some(p) = &privacy {
             menu.append(p)?;
         }
-        menu.append_items(&[&open_config, &quit])?;
+        menu.append(&open_config)?;
+        if let Some(item) = &open_data {
+            menu.append(item)?;
+        }
+        menu.append(&quit)?;
 
         let builder = TrayIconBuilder::new()
             .with_tooltip(&title)
@@ -86,6 +96,7 @@ impl Tray {
             update_item: update,
             privacy: privacy.map(|p| p.id().clone()),
             open_config: open_config.id().clone(),
+            open_data: open_data.map(|i| i.id().clone()),
             quit: quit.id().clone(),
         })
     }

@@ -182,10 +182,10 @@ impl Encoder {
     }
 }
 
-/// What `stt.device = "auto"` tries first, kept only if it isn't slower than the CPU (see
-/// [`Parakeet::load`]). Windows: DirectML. macOS: the CPU (int8). Core ML is only used when
-/// asked for: on an M4 with real speech and a few seconds between dictations, the CPU's int8
-/// encoder was ~2x faster for short clips (113 vs 215 ms p50) and as fast for 6-20 s ones,
+/// What `stt.device = "auto"` uses. Windows: DirectML, kept only if it isn't slower than the
+/// CPU (see [`Parakeet::load`]). macOS: the CPU (int8). Core ML is only used when asked for: on
+/// an M4 with real speech and a few seconds between dictations, the CPU's int8 encoder was ~2x
+/// faster for short clips (113 vs 215 ms p50) and faster for 6-20 s ones (239 vs 290 ms),
 /// more accurate (the 10 s window splits longer dictations), needs a quarter of the download
 /// and no ~20 s compile. A warm, back-to-back GPU (what a start-up probe measures) hides the
 /// ~90 ms Core ML pays after the GPU idles for a second or more. See docs/benchmarks.md.
@@ -208,7 +208,7 @@ fn wanted_device(cfg: &SttConfig) -> Device {
 /// The encoder precision actually used: Core ML always runs the fp32 encoder.
 fn precision(cfg: &SttConfig) -> Precision {
     match wanted_device(cfg) {
-        Device::CoreMl => Precision::Fp32,
+        Device::CoreMl if cfg!(target_os = "macos") => Precision::Fp32,
         _ => cfg.precision,
     }
 }
