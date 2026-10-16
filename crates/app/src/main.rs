@@ -575,25 +575,28 @@ impl App {
         self.start_restart_timer();
     }
 
-    /// If a restart is waiting and dictation is idle, posts [`UpdateEvent::Settled`] once it
-    /// has been idle for [`RESTART_SETTLE`]; any status change in between makes it stale.
-    fn start_restart_timer(&self) {
+    /// Whether dictation is idle enough for the pending restart: ready, errored or waiting for
+    /// permissions, or unavailable altogether. For an update, not on an error while a
+    /// transcript can still be copied: it may be a failed paste's, and a restart would lose it
+    /// (for settings the user just changed, on an error anyway: a bad setting may be the
+    /// error). Never while loading: a restart would start a model download over. Clicking
+    /// "Install update X now" / "Restart now to apply" restarts regardless.
+    fn idle(&self) -> bool {
         use pipeline::Status;
-        // Idle: ready, errored or waiting for permissions, or dictation unavailable altogether.
-        // Not on an error while a transcript can still be copied: it may be a failed paste's,
-        // and a restart would lose it (for settings the user just changed, on Error anyway: a
-        // bad setting may be the error). Never while loading: a restart would start a model
-        // download over. Clicking "Install update X now" / "Restart now to apply" restarts
-        // regardless.
-        let idle = self.pipeline.is_none()
+        self.pipeline.is_none()
             || match &self.status {
-                Some(Status::Ready(_) | Status::NeedsPermission(_)) => true,
-                Some(Status::Error(_)) => {
+                Some(Status::Ready(_)) => true,
+                Some(Status::Error(_) | Status::NeedsPermission(_)) => {
                     !self.copy_available || matches!(self.restart_with, Some(Restart::Settings))
                 }
                 _ => false,
-            };
-        if self.restart_with.is_none() || !idle {
+            }
+    }
+
+    /// If a restart is waiting and dictation is idle, posts [`UpdateEvent::Settled`] once it
+    /// has been idle for [`RESTART_SETTLE`]; any status change in between makes it stale.
+    fn start_restart_timer(&self) {
+        if self.restart_with.is_none() || !self.idle() {
             return;
         }
         let (proxy, n) = (self.proxy.clone(), self.changes);
@@ -665,6 +668,12 @@ impl App {
                 Ok(c) => {
                     self.file = Ok(c);
                     self.settings_changed();
+                    // A click is an explicit request: apply it now, without the settle wait
+                    // (that's for edits to the file, which may come in a few saves).
+                    if matches!(self.restart_with, Some(Restart::Settings)) && self.idle() {
+                        let restart = self.restart_with.take().unwrap();
+                        self.restart_now(restart, event_loop);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("cannot change config.toml: {e}");
