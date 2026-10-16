@@ -26,6 +26,10 @@ tray-icon = "0.26"
 velopack = "1.2"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
+# Whether the app bundle is writable (see `update::silent`).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # `agt stats` attaches to the console it was started from (release builds have none).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -20,6 +20,7 @@ dependencies = [
  "agt-polish",
  "agt-stt",
  "agt-telemetry",
+ "libc",
  "tracing",
  "tracing-log",
  "tracing-subscriber",

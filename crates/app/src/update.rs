@@ -178,31 +178,74 @@ fn check_and_download(
 
 /// Hands `asset` to the Velopack updater, which applies it once this process exits and then
 /// starts the new version. Call right before exiting.
-///
-/// Not silent on macOS: the .pkg installer leaves the bundle owned by root, and a silent
-/// updater can't ask for an admin password to replace it, so it gave up and relaunched the old
-/// version (offering the same update again). This runs on a click, so a prompt is expected; the
-/// new bundle Velopack moves in is the user's, so later updates don't need one.
 pub fn apply_and_restart(um: &UpdateManager, asset: &VelopackAsset) -> Result<(), velopack::Error> {
     tracing::info!("applying update {} and restarting", asset.Version);
     let t = Instant::now();
-    let silent = !cfg!(target_os = "macos");
-    let result = um.wait_exit_then_apply_updates(asset, silent, true, Vec::<String>::new());
+    let result = um.wait_exit_then_apply_updates(asset, silent(), true, Vec::<String>::new());
     record("apply", Some(&asset.Version), t, &result, "ok");
     result
 }
 
 /// If an update has been downloaded, hand it to the Velopack updater, which applies it
-/// silently once this process exits. Call right before exiting.
+/// (silently, see [`silent`]) once this process exits. Call right before exiting.
 pub fn apply_pending_on_exit(um: &UpdateManager) {
     let Some(asset) = um.get_update_pending_restart() else {
         return;
     };
     tracing::info!("applying update {} on exit", asset.Version);
     let t = Instant::now();
-    let result = um.wait_exit_then_apply_updates(&asset, true, false, Vec::<String>::new());
+    let result = um.wait_exit_then_apply_updates(&asset, silent(), false, Vec::<String>::new());
     record("apply", Some(&asset.Version), t, &result, "ok");
     if let Err(e) = result {
         tracing::error!("failed to start updater: {e}");
+    }
+}
+
+/// Whether the updater can apply without asking anything: everywhere but a macOS bundle this
+/// user can't write. The .pkg installer leaves `/Applications/AGT.app` owned by root, and a
+/// silent updater can't ask for an admin password to replace it, so it gave up and relaunched
+/// the old version (offering the same update again). Not silent, Velopack asks once; the
+/// bundle it moves in was extracted by this user, so later updates are silent again.
+fn silent() -> bool {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = bundle_path()
+        && !writable(&bundle)
+    {
+        tracing::info!(
+            "{} is not writable: the updater will ask for an admin password",
+            bundle.display()
+        );
+        return false;
+    }
+    true
+}
+
+/// The `.app` this runs from (`AGT.app/Contents/MacOS/agt`).
+#[cfg(target_os = "macos")]
+fn bundle_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bundle = exe.parent()?.parent()?.parent()?;
+    (bundle.extension()? == "app").then(|| bundle.to_path_buf())
+}
+
+/// Whether this user may write `dir` (moving a directory to another parent rewrites its `..`).
+#[cfg(target_os = "macos")]
+fn writable(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::writable;
+
+    #[test]
+    fn writable_tells_own_dirs_from_root_owned_ones() {
+        assert!(writable(&std::env::temp_dir()));
+        assert!(!writable(std::path::Path::new("/System")));
     }
 }
