@@ -67,9 +67,10 @@ Until everything is granted, the menu-bar item says which permission is missing,
 "Privacy & Security settings..." item opens the right page.
 
 The default hotkey is **Fn** (the 🌐 Globe key). With Accessibility granted, AGT keeps Fn's
-own presses from apps, so tapping it doesn't also open the emoji picker or start Apple's
-dictation (System Settings > Keyboard > "Press 🌐 key to"), and Fn+key shortcuts still work.
-While AGT runs, tapping 🌐 alone does nothing else; to use it again, pick another hotkey.
+own presses from apps, so tapping it (a hands-free double tap is two taps) doesn't also do
+what System Settings > Keyboard > "Press 🌐 key to" says, such as opening the emoji picker.
+Fn+key shortcuts still work, but while AGT runs, tapping 🌐 alone does nothing else. If the
+picker still opens, set "Press 🌐 key to" to **Do Nothing**.
 Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
 `"Fn+RightOption"`.
 
