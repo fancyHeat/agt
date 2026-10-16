@@ -83,15 +83,19 @@ impl LlamaLauncher {
             "--slots",
             // Never download anything (the model is a local file).
             "--offline",
-            // No copies of past prompts' KV cache in RAM (default: up to 8 GB). Every
-            // dictation is a new prompt and only the fixed prefix could be reused, which the
-            // slot's own cache already does; with it the server grew by ~25 MB per request.
+            // No cache of past prompts' KV state in RAM (default: up to 8 GiB). Every
+            // dictation is a new prompt and only the fixed ~50-token prefix could be reused,
+            // which the slot's own cache already does, so AGT never hits it; it only grew the
+            // server by ~25 MB per request.
             "--cache-ram",
             "0",
             // The answer is mostly the transcript again, so draft from the prompt: find the
             // last 3 tokens earlier in the context and propose the (up to) 24 that followed
             // them; one batched pass checks them all and keeps what the model would have
-            // written anyway. 2-2.5x faster (docs/benchmarks.md, "Polish speed").
+            // written anyway. Up to ~3x faster when the model mostly keeps the (punctuated)
+            // transcript, no faster when it rewrites a lot (unpunctuated input). Batched
+            // checking can flip near-tie choices, so a few outputs differ by a word or a
+            // few (docs/benchmarks.md, "Polish speed").
             "--spec-type",
             "ngram-simple",
             "--spec-ngram-simple-size-n",

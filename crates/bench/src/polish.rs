@@ -28,10 +28,15 @@
 //!
 //! **Segments** (`--segments`): the pipeline could polish each finished segment of a long
 //! dictation in the background while the user is still talking, leaving only the tail for
-//! release. For each dictation this polishes the whole text (today) and each segment on its
-//! own, then reports release latency (whole vs tail), how far the joined segment output is
-//! from the whole-text output (word edits, case and punctuation count), the WER of raw,
-//! whole and joined against the reference, and the text around every segment boundary.
+//! release. For each dictation this polishes the whole text (today), each segment on its own,
+//! and the pieces of `agt_polish::ahead`, then reports release latency (whole vs what is left
+//! at release), how far the joined output is from the whole-text output (word edits, case and
+//! punctuation count), the WER of raw, whole and joined against the reference, and the text
+//! around every piece boundary where a sentence break differs.
+//!
+//! Release latency here is the best case: every background piece is done (and the GPU idle)
+//! before release. In the app the last background piece may still be running at release,
+//! and STT may share the GPU, so release can also wait for that piece.
 
 use agt_core::{Config, config::PolishConfig, paths, polish::Polisher};
 use std::{
@@ -209,14 +214,20 @@ fn by_segment(
         }
         let w: Vec<String> = whole.split_whitespace().map(str::to_owned).collect();
         // Each segment on its own; the tail at release.
-        let mut pieces: Vec<String> = before.iter().map(|s| s.to_string()).collect();
-        pieces.push(tail.to_owned());
-        ways[0].run(&polish, &pieces, &w, reference.as_deref());
+        let pieces: Vec<String> = before.iter().map(|s| s.to_string()).collect();
+        ways[0].run(
+            &polish,
+            &pieces,
+            &[tail.to_owned()],
+            &w,
+            reference.as_deref(),
+        );
         // `agt_polish::ahead`.
-        let mut ahead = agt_polish::ahead::Ahead::new();
-        let mut pieces: Vec<String> = before.iter().filter_map(|s| ahead.push(s)).collect();
-        pieces.push(ahead.finish(tail));
-        ways[1].run(&polish, &pieces, &w, reference.as_deref());
+        let mut ahead = agt_polish::ahead::Ahead::new(cfg)
+            .ok_or("--segments: these polish settings need the whole text")?;
+        let pieces: Vec<String> = before.iter().filter_map(|s| ahead.push(s)).collect();
+        let last = ahead.finish(tail);
+        ways[1].run(&polish, &pieces, &last, &w, reference.as_deref());
     }
     whole_ms.sort_by(f64::total_cmp);
     println!();
@@ -247,8 +258,7 @@ fn stats(label: &str, v: &[f64]) -> String {
     }
 }
 
-/// One way of polishing a dictation in pieces: all but the last piece in the background,
-/// the last at release.
+/// One way of polishing a dictation in pieces: some in the background, the rest at release.
 struct Way {
     label: &'static str,
     release_ms: Vec<f64>,
@@ -285,25 +295,30 @@ impl Way {
     fn run(
         &mut self,
         polish: &dyn Fn(&str) -> (String, bool, f64),
-        pieces: &[String],
+        background: &[String],
+        at_release: &[String],
         whole: &[String],
         reference: Option<&str>,
     ) {
         let mut joined: Vec<String> = Vec::new();
         let mut starts = Vec::new();
-        for (k, piece) in pieces.iter().enumerate() {
+        let (mut release_ms, mut release_words) = (0.0, 0);
+        for (k, piece) in background.iter().chain(at_release).enumerate() {
             let (out, ok, took) = polish(piece);
             self.not_polished += usize::from(!ok);
-            if k + 1 == pieces.len() {
-                self.release_ms.push(took);
-                self.release_words
-                    .push(piece.split_whitespace().count() as f64);
-            } else {
+            if k < background.len() {
                 self.background_ms.push(took);
+            } else {
+                // One server slot: the pieces left at release go one after the other.
+                release_ms += took;
+                release_words += piece.split_whitespace().count();
             }
             starts.push(joined.len());
             joined.extend(out.split_whitespace().map(str::to_owned));
         }
+        self.release_ms.push(release_ms);
+        self.release_words.push(release_words as f64);
+        let pieces = background.len() + at_release.len();
         let map = align(&joined, whole);
         self.edits += map.edits;
         self.words += whole.len();
@@ -312,11 +327,7 @@ impl Way {
         }
         println!(
             "  {}: {} pieces, release {:.0} ms ({} words), {} word edits vs whole",
-            self.label,
-            pieces.len(),
-            self.release_ms.last().unwrap_or(&0.0),
-            self.release_words.last().unwrap_or(&0.0),
-            map.edits
+            self.label, pieces, release_ms, release_words, map.edits
         );
         for &b in starts.iter().skip(1) {
             self.boundaries += 1;

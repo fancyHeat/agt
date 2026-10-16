@@ -781,16 +781,38 @@ idle varies with what else the desktop is doing (see "Idle and suspension" below
 was measured back to back, so compare within a row pair, not across.
 
 **Output identity.** Greedy decoding with drafts is meant to give the same text, but checking
-24 drafted tokens in one batch runs different GPU kernels than one token at a time, and where
-two tokens are nearly tied the rounding difference picks the other one. That happened on one
-long transcript on both machines (a garbled passage with quotes: `...opposition to the
-project. The EU is a 50-year-old attempted answer...` vs `...opposition to the EU as a
-50-year-old attempt...`; on the Mac today's output was the second one already) and on one
-punctuation mark per platform in the clips; some lines also flip between runs of the same
-server. It's the same kind and size of difference as changing backends: the CUDA build's
-output, without drafts, differs from Vulkan's on 5 of 12 long transcripts (28 words). On the
-CPU, 7 of 12 long outputs differ, by 7 words in all (`doll,`/`doll`, `Tonight`/`To night`,
-`nine`/`9`, a repeated `Smallpox.` dropped) plus whitespace.
+24 drafted tokens in one batch runs different kernels than one token at a time, and where
+two tokens are nearly tied the rounding difference can pick the other one. The output is
+deterministic per setup (the same on every server start for a new text; only a repeat of the
+same text on a running server, which hits the prompt cache, sometimes differs), so every
+difference below comes from drafting:
+
+- Parakeet's punctuated transcripts: Windows 1 of 12 long outputs differ (9 words: a garbled
+  passage with quotes, `...opposition to the project. The EU is a 50-year-old attempted
+  answer...` vs `...opposition to the EU as a 50-year-old attempt...`), the Mac 2 of 12 (the
+  same passage plus a comma, 10 words; there today's output already had the `EU as` wording
+  and drafting picked the other one); clips 1 of 78 on each (a comma; a comma vs a period).
+- The CPU device: 7 of 12 long outputs differ, by 7 words in all (`doll,`/`doll`,
+  `Tonight`/`To night`, `nine`/`9`, a repeated `Smallpox.` dropped) plus whitespace.
+- Heavy rewrites (the review of this change, Windows, the references as input: lowercase,
+  no punctuation): 2-4 of 12 long outputs differ (9-12 words), on the CPU 4 of 5. Most are
+  near-tie wording and punctuation (`a infrared`/`an infrared`, the case of `Securities and
+  Exchange Commission`), but some are a few words: `would like to remind, allow me to remind
+  you` became `would like to remind you`, `find out what features a user` became `find out
+  what are the features which a user`.
+
+That is the same kind of difference as changing backends: the CUDA build's output, without
+drafts, differs from Vulkan's on 5 of 12 long transcripts (28 words). Polish output isn't
+ground truth, and both versions read as plausible clean-ups, but drafting can change a few
+words, not only punctuation.
+
+**Speed depends on how much the model copies.** Drafts are accepted only where the output
+repeats the input. On Parakeet's punctuated transcripts 50-80% are accepted (above); on the
+review's runs with already-polished text as input 86% (1116/2308 -> 330/556 ms, 3.4x), with
+lowercase unpunctuated input only 13-22%: 1081/2048 -> 1053/1772 ms and 1118/2228 ->
+1235-1674/1824-1977 ms on Windows (no faster, sometimes slower), no faster on the CPU
+(4320 -> 4333 ms p50). Parakeet and Whisper both punctuate, so AGT's input is near the good
+end, but the speed-up is "up to", not a constant.
 
 **Other flags** (Windows, long, 3 s idle, with the drafting above; 516/903/1183 ms without
 them): flash attention off 581/1028/1765, forced on 689/1095/1384; q8_0 KV cache 823/1500/3175
@@ -802,10 +824,13 @@ its runtime) decodes no faster than Vulkan (298 vs 315 tokens/s in the server, 3
 `llama-bench tg128`): at 0.6B the step is launch- and sync-bound, not bandwidth-bound. Vulkan
 stays.
 
-**Memory.** llama-server's `--cache-ram` (default 8192 MiB) keeps the KV cache of earlier
-prompts in RAM to reuse them; every dictation is a new prompt, so it only grows: after ~45 long requests the server's working set was 1,569 MB vs 346 MB with
-`--cache-ram 0` (private bytes 2,856 vs 1,629 MB); on the Mac the physical footprint was 1,818
-vs 579 MB. No latency difference (1218 vs 1215 ms p50). VRAM is the same with and without
+**Memory.** llama-server's `--cache-ram` (default 8192 MiB) keeps the KV state of earlier
+prompts in RAM, least recently used dropped first, to reuse a prompt's prefix later. With one
+slot and a new transcript every time, the only reusable prefix is S1-mini's ~50-token system
+prompt, which the slot keeps anyway (`cache_n` ~69 on the next request with `--cache-ram 0`),
+so AGT never hits this cache; it just fills up towards its 8 GiB cap: after ~45 long requests
+the server's working set was 1,569 MB vs 346 MB with `--cache-ram 0` (private bytes 2,856 vs
+1,629 MB); on the Mac the physical footprint was 1,818 vs 579 MB. No latency difference (1218 vs 1215 ms p50). VRAM is the same with and without
 drafts (Windows 860 MB after short requests, ~1,260 MB once long ones ran); working set after
 the runs ~250-310 MB, Mac footprint ~596 MB.
 
@@ -827,7 +852,19 @@ segments, 92 segment boundaries):
   tail.
 - *ahead* (`agt_polish::ahead`): cut pieces only at a sentence end *inside* a segment, never at
   a segment boundary; what follows the last such sentence end waits for the next segment; at
-  release, polish what's left plus the tail.
+  release, polish what's left plus the tail. When in doubt it doesn't cut: words with a period
+  inside (`U.S.`, `a.m.`, `e.g.`, `Ph.D.`), abbreviations (`Mr.`, `approx.`, `Fig.`, `Inc.`)
+  and initials never end a sentence, and the next word must start with a capital letter (not
+  a digit). Held text over 800 words (a run-on without a usable sentence end) is cut at its
+  last segment boundary, and the release text is split into pieces of at most 1,000 words, so
+  no piece reaches S1-mini's 1,400-word limit. `Ahead::new` refuses S1-mini's email context
+  and list structure, which need the whole text.
+
+Release latency for both is the best case: the bench polishes every background piece, then
+idles 3 s, so at release nothing else is running. In the app the last background piece may
+still be in flight at release (it starts when its segment's STT is done) and STT shares the
+GPU, so release can also wait for up to one background request (p90 ~0.2 s Windows, ~0.3 s
+Mac, below).
 
 | | Windows release p50/p90/max ms | Mac release p50/p90/max ms | background requests p50/p90 ms (Win, Mac) | words at release p50/p90 | words differing from whole (Win, Mac) | sentence breaks at piece joins (extra/lost vs whole) | WER (Win, Mac) |
 |---|---|---|---|---|---|---|---|
@@ -854,20 +891,25 @@ same.
 
 ### What the numbers say (polish speed)
 
-- **Prompt-lookup drafting halves polish time on every platform, for free.** n-gram drafting
-  from the transcript accepts 50-80% of what it proposes because the answer is mostly a copy:
-  long dictations go from 1.2-1.3 s to 0.5-0.7 s p50 and 2.2-2.3 s to 0.9-1.1 s p90 on Windows,
-  2.5 s to 1.0 s p50 and 4.8 s to 1.7 s p90 on the Mac; 2-60 s clips 40% faster; the Windows
-  CPU fallback 1.8x. No model, download, VRAM or RAM is added. Short lookups (n = 3) recover
-  fastest after an edit; 24-token drafts were best on both machines (m = 16 is as good on
-  Windows, 35% slower on the Mac; 32-48 waste more work on rejected drafts).
-- **The output is the same text, give or take near-ties.** Byte-identical on 88 of 90
-  transcripts on Windows (87 on the Mac); the rest are single-token near-ties that already
-  differ between backends (CUDA vs Vulkan: 5 of 12) and Macs vs PCs. No dropped or invented
-  content attributable to drafting was seen.
-- **`--cache-ram` was a leak in practice.** With b11669's default the server's memory grows
-  with every dictation (+1.2 GB after ~45 long ones, up to 8 GB), for a cache AGT can't use.
-  Off, with no latency cost.
+- **Prompt-lookup drafting makes polish up to ~3x faster when the model mostly keeps the
+  transcript, which is the normal case with a punctuating recognizer.** On Parakeet's
+  transcripts n-gram drafting accepts 50-80% of what it proposes: long dictations go from
+  1.2-1.3 s to 0.5-0.7 s p50 and 2.2-2.3 s to 0.9-1.1 s p90 on Windows, 2.5 s to 1.0 s p50
+  and 4.8 s to 1.7 s p90 on the Mac; 2-60 s clips ~40% faster; the Windows CPU fallback 1.8x.
+  Where the model rewrites a lot (lowercase unpunctuated input) only 13-22% is accepted and
+  it is no faster (1.0-1.15x, sometimes slower). No model, download, VRAM or RAM is added.
+  Short lookups (n = 3) recover fastest after an edit; 24-token drafts were best on both
+  machines (m = 16 is as good on Windows, 35% slower on the Mac; 32-48 waste more work on
+  rejected drafts).
+- **The output is deterministic and mostly the same text, but not always.** With Parakeet's
+  transcripts 88 of 90 outputs are byte-identical to today's on Windows and 87 of 90 on the
+  Mac; the CPU device changes 7 of 12 long ones (7 words), and heavy rewrites change 2-4 of
+  12 (sometimes a few words, e.g. a repeated `allow me to remind` dropped). The changes are
+  near-tie choices of the kind a backend change already makes (CUDA vs Vulkan: 5 of 12), on
+  a step whose output is not ground truth: acceptable, but not "identical".
+- **`--cache-ram` holds memory AGT never uses.** With b11669's default the server keeps
+  earlier prompts' KV state in RAM up to 8 GiB (+1.2 GB after ~45 long dictations), and with
+  one slot and a new transcript each time AGT never hits it. Off, with no latency cost.
 - **Nothing else in the server pays.** Flash attention, KV cache type, threads, batch sizes
   and CUDA are all within noise or worse; prefill is ~3% of a request and the fixed prompt is
   already cached. Decoding 0.6B parameters is launch-bound on both GPUs (~3 and ~6.5 ms a
@@ -899,16 +941,17 @@ same.
 - **Wire *ahead* after the incremental STT wiring lands**, on the STT worker's output: each
   segment's text goes to `Ahead::push`, a returned piece is polished right away on a polish
   worker (one thread, in order, same `polish_or_raw` and guard per piece), and at release
-  `Ahead::finish(tail)` is polished and the pieces are joined with spaces. Short dictations
-  need no special case: a single segment never yields a piece before `finish`, so they take
-  exactly today's path. Only when `[Context: general]` (S1-mini's email context writes a
-  greeting and sign-off around the whole text) and only for the managed or a local server (a
-  cloud provider would bill a request per piece). Cancel drops the queue like STT's does. Worth
-  it mostly on the Mac (p90 1.7 -> 0.44 s) and for multi-minute dictations; on Windows it saves
-  ~0.35 s p50 / 0.6 s p90 for 1-6 minute ones. It would also lift the 1,400-word cap on
-  polishing (`polish_outcome = too_long`): every piece is small, however long the dictation
-  (a piece only grows while no segment has a sentence end inside it; a safety cut at ~1,000
-  words would bound that).
+  the pieces of `Ahead::finish(tail)` are polished and all pieces are joined with spaces.
+  Short dictations need no special case: a single segment never yields a piece before
+  `finish`, so they take exactly today's path. `Ahead::new(&cfg)` returns `None` for S1-mini's
+  email context and list structure (whole text only); the caller decides about providers (only
+  the managed or a local server: a cloud provider would bill a request per piece). Cancel drops
+  the queue like STT's does. Count guard fallbacks per piece in telemetry (a dictation can
+  then be part raw, part polished), and check on real dictations whether self-corrections that
+  span a cut ("Tuesday. No, actually Wednesday.") suffer. Worth it mostly on the Mac and for
+  multi-minute dictations; on Windows it saves ~0.3 s p50 / ~0.6 s p90 for 1-6 minute ones in
+  the best case (see the caveat above). It would also lift the 1,400-word cap on polishing
+  (`polish_outcome = too_long`): no piece is over 1,000 words, however long the dictation.
 - **Telemetry** (metrics only): polish time at release, the release piece's word count, pieces
   polished ahead and their total time, guard fallbacks per piece, and draft acceptance
   (llama-server's `timings.draft_n` / `draft_n_accepted`) to see whether 24-token drafts suit

@@ -99,6 +99,8 @@ def main():
 
     port = free_port()
     cmd = [a.exe, "-m", a.model, "--port", str(port)] + FIXED + shlex.split(a.args)
+    if os.name == "nt" and "--device none" not in a.args:
+        cmd += ["--load-mode", "none"]  # as AGT runs it on Windows (weights read, not mapped)
     log = open(os.path.join(a.out, a.label + ".log"), "w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=os.path.dirname(a.exe) or None)
     root = f"http://127.0.0.1:{port}"
@@ -171,9 +173,10 @@ def main():
         edits = sum(word_edits(base[r["line"]], r["out"]) for r in first)
         words = sum(len(base[r["line"]].split()) for r in first)
         print(f"vs {a.compare}: {same}/{len(first)} outputs identical, {edits} word edits in {words} words")
+    # A repeat of the same line reuses the cached prompt, which can change a near-tie.
     flaky = sum(len({r["out"] for r in rows if r["line"] == i}) > 1 for i in range(len(texts)))
     if flaky:
-        print(f"{flaky} lines gave different outputs on different runs")
+        print(f"{flaky} lines gave a different output when repeated (prompt cache hit)")
 
 
 if __name__ == "__main__":
