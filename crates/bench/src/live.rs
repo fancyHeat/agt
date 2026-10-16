@@ -46,7 +46,7 @@ use std::{
     path::PathBuf,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -94,8 +94,9 @@ struct Clip {
     pauses: Vec<(f64, f64)>,
 }
 
+/// In samples, computed like `CutConfig::live` and `Chunked` do (f32), so the limits agree.
 fn secs(s: f64) -> usize {
-    (s * SAMPLE_RATE as f64) as usize
+    (s as f32 * SAMPLE_RATE as f32) as usize
 }
 
 fn list(a: &str, v: String) -> Result<Vec<f64>, String> {
@@ -364,6 +365,8 @@ fn simulate(
 fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], cut: &CutConfig) -> Result<Run, String> {
     let busy = AtomicBool::new(false);
     let done_at = Mutex::new(None::<Instant>);
+    // Segments sent to the worker and not done yet (`busy` is only the one being transcribed).
+    let queued = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel::<Segment>();
     let mut r = Run::default();
@@ -375,6 +378,7 @@ fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], cut: &CutConfig) -> Re
                 let (t, cpu) = (Instant::now(), mem::cpu_time());
                 let piece = transcribe(engine, &seg.audio);
                 *done_at.lock().unwrap() = Some(Instant::now());
+                queued.fetch_sub(1, Ordering::SeqCst);
                 busy.store(false, Ordering::SeqCst);
                 compute += crate::ms(t);
                 cpu_ms += (mem::cpu_time() - cpu).as_secs_f64() * 1e3;
@@ -412,16 +416,20 @@ fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], cut: &CutConfig) -> Re
             for seg in cutter.push(piece) {
                 count(&mut r, &seg);
                 kept += seg.audio.len();
+                queued.fetch_add(1, Ordering::SeqCst);
                 let _ = tx.send(seg);
             }
         }
         let release = Instant::now();
-        r.busy_at_release = busy.load(Ordering::SeqCst);
-        r.idle_at_release_ms = done_at.lock().unwrap().map_or(crate::ms(t0), crate::ms);
+        r.busy_at_release = queued.load(Ordering::SeqCst) > 0;
+        if !r.busy_at_release {
+            r.idle_at_release_ms = done_at.lock().unwrap().map_or(crate::ms(t0), crate::ms);
+        }
         for seg in cutter.finish() {
             count(&mut r, &seg);
             kept += seg.audio.len();
             r.tail_secs += seg.audio.len() as f64 / SAMPLE_RATE as f64;
+            queued.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(seg);
         }
         drop(tx);
@@ -554,7 +562,11 @@ fn report(
         });
         let tails = sorted(&|r| r.tail_secs);
         let busy = runs.iter().filter(|r| r.busy_at_release).count();
-        let idle = sorted(&|r| r.idle_at_release_ms);
+        let idle = sorted_all(
+            runs.iter()
+                .filter(|r| !r.busy_at_release)
+                .map(|r| r.idle_at_release_ms),
+        );
         println!(
             "segments: {} at pauses, {} at the limit, {} tails; tail p50 {:.1} s, p90 {:.1} s; worker busy at release {busy} of {}, else idle p50 {:.1} s",
             cuts[0],
@@ -652,16 +664,18 @@ fn cut_report(label: &str, cut: &CutConfig, clips: &[Clip], quiet: bool) {
             seg_lens.push(s.audio.len() as f64 / 16_000.0);
         }
         if !quiet {
+            let pauses = match cut.pause {
+                Some(_) => format!(
+                    "; inserted pauses >= {:.1} s cut: {f}/{}; pause cuts elsewhere: {}",
+                    len + 0.1,
+                    big.len(),
+                    at.len() - ins
+                ),
+                None => String::new(),
+            };
             println!(
-                "{:<18} {:>6.1} s: {} pause / {} limit / {} end cuts; inserted pauses >= {:.1} s cut: {f}/{}; pause cuts elsewhere: {}",
-                c.name,
-                c.secs,
-                n[0],
-                n[1],
-                n[2],
-                len + 0.1,
-                big.len(),
-                at.len() - ins
+                "{:<18} {:>6.1} s: {} pause / {} limit / {} end cuts{pauses}",
+                c.name, c.secs, n[0], n[1], n[2],
             );
         }
         (found, long, inside) = (found + f, long + big.len(), inside + at.len() - ins);

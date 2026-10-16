@@ -118,7 +118,8 @@ pub struct PauseCut {
     /// pause). At most `len`.
     pub pad: usize,
     /// Drop each pause's silence beyond `pad` on either side instead of transcribing it;
-    /// segments without any speech (a silent tail) are dropped too.
+    /// a tail without any speech is dropped too. Only once speech has been heard: before
+    /// that, everything is kept.
     pub trim: bool,
 }
 
@@ -150,7 +151,10 @@ pub struct Segment {
 /// Every segment fits in `max_len`. With [`PauseCut`], a silence of `len` ends the segment as
 /// soon as it is seen (cut `pad` after the last speech), so on release only the audio since
 /// the last pause is left to transcribe. Silence is measured against a running noise floor
-/// (the quietest moment of the last 20 s), so it works at any mic gain or noise level.
+/// (the quietest moment of the last 20 s), so it doesn't depend on the mic gain; speech has
+/// to stand out from the noise (tested down to ~25 dB). Nothing is trimmed until speech has
+/// been heard: a recording that starts mid-word at a low level could otherwise teach the floor
+/// the speech's own level and lose it as "silence"; the worst case is now transcribing noise.
 ///
 /// No threads, no I/O; memory is the audio not handed out yet (at most `max_len` plus a
 /// block). Cancelling is dropping it.
@@ -166,6 +170,9 @@ pub struct Cutter {
     silence: Option<Silence>,
     /// `buf[..speech_end]` contains speech; 0 if `buf` has none.
     speech_end: usize,
+    /// Speech has been heard at all. Until then the floor may be the speech itself (the user
+    /// was already talking, quietly, when recording started), so nothing is trimmed.
+    heard: bool,
     /// Samples pushed so far.
     received: usize,
 }
@@ -199,6 +206,7 @@ impl Cutter {
             levels: VecDeque::with_capacity(FLOOR_BLOCKS),
             silence: None,
             speech_end: 0,
+            heard: false,
             received: 0,
         }
     }
@@ -219,7 +227,8 @@ impl Cutter {
     }
 
     /// The hotkey was released: the rest of the audio, as one segment (or more if it is over
-    /// `max_len`). None if there is nothing left, or (trimming) nothing but silence.
+    /// `max_len`). None if there is nothing left, or (trimming) nothing but silence since
+    /// the last segment.
     pub fn finish(mut self) -> Vec<Segment> {
         self.scanned = self.buf.len();
         let mut out = Vec::new();
@@ -227,12 +236,14 @@ impl Cutter {
             out.push(self.cut_at_limit());
         }
         let trim = self.cfg.pause.as_ref().filter(|p| p.trim);
-        if let (Some(p), Some(s)) = (trim, &self.silence) {
+        if let (Some(p), Some(s), true) = (trim, &self.silence, self.heard) {
             // Trailing silence: keep `pad` of it.
             let end = (s.start + p.pad).min(self.buf.len());
             self.buf.truncate(end);
+            self.scanned = end;
         }
-        if !self.buf.is_empty() && (trim.is_none() || self.speech_end > 0) {
+        // Nothing heard: hand it all out rather than risk dropping quiet speech.
+        if !self.buf.is_empty() && (trim.is_none() || self.speech_end > 0 || !self.heard) {
             let len = self.buf.len();
             out.push(self.take(len, Cut::End));
         }
@@ -291,6 +302,7 @@ impl Cutter {
         let s = match (&mut self.silence, quiet) {
             (None, false) => {
                 self.speech_end = self.scanned;
+                self.heard = true;
                 return;
             }
             (None, true) => self.silence.insert(Silence {
@@ -309,6 +321,7 @@ impl Cutter {
             if s.loud >= ONSET {
                 self.silence = None;
                 self.speech_end = self.scanned;
+                self.heard = true;
                 return;
             }
         }
@@ -321,7 +334,7 @@ impl Cutter {
                 if p.trim {
                     self.silence.as_mut().unwrap().trim_from = Some(0);
                 }
-            } else if p.trim {
+            } else if p.trim && self.heard {
                 let keep = if self.speech_end > 0 {
                     start + p.pad
                 } else {
@@ -635,18 +648,17 @@ mod tests {
     }
 
     #[test]
-    fn silence_alone_is_not_transcribed_when_trimming() {
+    fn nothing_is_trimmed_before_speech_is_heard() {
+        // No speech at all: handed out whole (it might be speech too quiet to tell apart).
         let audio = talk(30.0, &[]);
-        assert!(cut_all(pauses(1000, 0, true), &audio).is_empty());
-        // Leading and trailing silence is trimmed to the padding.
+        let segs = cut_all(pauses(1000, 0, true), &audio);
+        assert_eq!(segs.iter().map(|s| s.audio.len()).sum::<usize>(), 30 * S);
+        // Leading silence is kept; trailing silence is trimmed to the padding.
         let audio = talk(12.0, &[(5.0, 7.0)]);
         let segs = cut_all(pauses(1000, 0, true), &audio);
         let lens: Vec<usize> = segs.iter().map(|s| s.audio.len()).collect();
         assert_eq!(lens.len(), 1);
-        assert!(
-            (2 * S + S / 2 - S / 50..=2 * S + S / 2).contains(&lens[0]),
-            "{lens:?}"
-        );
+        assert!(near(lens[0], 7.25), "{lens:?}");
         // Without trimming nothing is lost.
         let segs = cut_all(pauses(1000, 0, false), &audio);
         assert_eq!(segs.iter().map(|s| s.audio.len()).sum::<usize>(), 12 * S);
@@ -661,6 +673,34 @@ mod tests {
         assert_eq!(cuts, [Cut::Pause, Cut::End]);
         // 0.5 + 5 + 0.25 + (trimmed) 0.25 + 5 + 0.25
         assert!(near(segs[0].audio.len(), 11.25), "{}", segs[0].audio.len());
+    }
+
+    #[test]
+    fn released_after_trailing_silence() {
+        // Speech, then 0.5 s (not yet a pause) or 3 s (a pause, trimmed) of room noise.
+        for secs in [7.0, 9.5] {
+            let audio = talk(secs, &[(0.5, 6.5)]);
+            let segs = cut_all(CutConfig::live(25.0), &audio);
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0].cut, Cut::End);
+            assert_eq!(segs[0].at, audio.len());
+            assert!(near(segs[0].audio.len(), 6.75), "{}", segs[0].audio.len());
+        }
+    }
+
+    #[test]
+    fn quiet_speech_from_the_first_sample_is_kept() {
+        // Already talking when recording starts, peaks ~24 dB over the room noise: the floor
+        // first learned is the speech's own; none of it may be dropped as silence. (At this
+        // level the end of the last syllable, ~0.1 s, may be taken for the start of the pause.)
+        let audio: Vec<f32> = talk(6.5, &[(0.0, 6.0)]).iter().map(|x| x * 0.03).collect();
+        let segs = cut_all(CutConfig::live(25.0), &audio);
+        let kept: usize = segs.iter().map(|s| s.audio.len()).sum();
+        assert!(
+            kept >= 5 * S + 3 * S / 4,
+            "{} s kept",
+            kept as f32 / S as f32
+        );
     }
 
     #[test]
