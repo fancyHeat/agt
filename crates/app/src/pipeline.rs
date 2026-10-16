@@ -97,10 +97,6 @@ const BUSY_SAVE_WAIT: Duration = Duration::from_secs(2);
 const HOTKEY_RELEASE_POLL: Duration = Duration::from_millis(15);
 const HOTKEY_RELEASE_MAX: Duration = Duration::from_secs(10);
 
-/// `agt_polish`'s reason for not polishing a transcript longer than S1-mini's context holds
-/// (recorded as the polish outcome `too_long`).
-const TOO_LONG_TO_POLISH: &str = "too long";
-
 /// On exit, how long to wait for a ducked volume to be put back.
 const DUCK_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
@@ -1136,7 +1132,7 @@ fn stt_thread(
                         Outcome::Fallback(why) => {
                             tracing::warn!("polish failed, pasting the raw transcript: {why}")
                         }
-                        Outcome::Skipped(TOO_LONG_TO_POLISH) => tracing::info!(
+                        Outcome::Skipped(agt_polish::guard::TOO_LONG) => tracing::info!(
                             "transcript too long to polish ({} words); pasting it raw",
                             d.words_raw.unwrap_or_default()
                         ),
@@ -1146,7 +1142,7 @@ fn stt_thread(
                     d.polish_ms = Some(ms(t.elapsed()));
                     d.polish_outcome = Some(match outcome {
                         Outcome::Polished => "polished",
-                        Outcome::Skipped(TOO_LONG_TO_POLISH) => "too_long",
+                        Outcome::Skipped(agt_polish::guard::TOO_LONG) => "too_long",
                         Outcome::Skipped(_) => "skipped",
                         Outcome::Fallback(_) => "fallback",
                     });
