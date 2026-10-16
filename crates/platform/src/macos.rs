@@ -3,7 +3,7 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkey (event tap), swallowing F13-F20, sending Cmd+V | Accessibility |
+//! | Seeing the hotkey (event tap), swallowing F13-F20 and Fn, sending Cmd+V | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
 //!
 //! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
@@ -53,6 +53,7 @@ const TAP_RETRY: Duration = Duration::from_secs(1);
 // Virtual key codes (Carbon `kVK_*`).
 const KVK_COMMAND: u16 = 0x37;
 const KVK_ESCAPE: u16 = 0x35;
+const KVK_FUNCTION: u16 = 0x3F;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
@@ -85,6 +86,16 @@ fn down_flag(code: u16) -> CGEventFlags {
     }
 }
 
+/// Whether apps never see the hotkey's key `i`: F13-F20, and Fn when it's the whole hotkey.
+/// Tapped alone, Fn makes apps do what "Press 🌐 key to" says (the emoji picker, by default),
+/// which a double tap always is and which then takes the paste. Fn+key still works: the flag
+/// on other keys comes from the HID state. In a chord, the other key already keeps Fn from
+/// counting as tapped alone.
+fn swallowed(hotkey: &Hotkey, i: usize) -> bool {
+    let keys = hotkey.keys();
+    keys[i].swallowed() || (keys.len() == 1 && keys[i].code == KVK_FUNCTION)
+}
+
 /// CoreFoundation objects owned by the hotkey thread but poked from others: enabling a tap
 /// and stopping a run loop are thread-safe.
 struct Cf<T>(T);
@@ -99,7 +110,7 @@ struct TapState {
 
 struct Shared {
     hotkey: Hotkey,
-    /// Whether any chord key is swallowed (F13-F20), which takes an active tap.
+    /// Whether any chord key is [`swallowed`], which takes an active tap.
     swallow: bool,
     stop: AtomicBool,
     state: Mutex<TapState>,
@@ -151,7 +162,7 @@ pub fn start_hotkey(
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
     let shared = Arc::new(Shared {
-        swallow: hotkey.keys().iter().any(Key::swallowed),
+        swallow: (0..hotkey.keys().len()).any(|i| swallowed(&hotkey, i)),
         stop: AtomicBool::new(false),
         state: Mutex::new(TapState {
             detector: HoldDetector::new(hotkey.keys().len()),
@@ -224,7 +235,7 @@ fn create_tap(shared: &Arc<Shared>) -> Option<CFRetained<CFMachPort>> {
     let mask = (1u64 << CGEventType::KeyDown.0)
         | (1u64 << CGEventType::KeyUp.0)
         | (1u64 << CGEventType::FlagsChanged.0);
-    // Active whenever Accessibility allows it: the hotkey may have to be swallowed (F13-F20),
+    // Active whenever Accessibility allows it: the hotkey may have to be swallowed,
     // and so may Esc while it ends a hands-free recording ([`crate::arm_escape`]).
     let options = if post_access() {
         CGEventTapOptions::Default
@@ -305,8 +316,8 @@ unsafe extern "C-unwind" fn tap_callback(
     if let Some(e) = e {
         (st.on_event)(e);
     }
-    if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
-        // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
+    if swallow_esc || chord_key.is_some_and(|i| swallowed(&shared.hotkey, i)) {
+        // F13-F20, Fn alone, and the Esc that ends a hands-free recording: apps never see them.
         return null_mut();
     }
     pass

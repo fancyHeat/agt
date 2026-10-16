@@ -42,8 +42,8 @@ log_level = "info"
 # Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (the default on
 # Windows); LeftWin/RightWin only work in a chord with Ctrl or Shift. A chord starts once
 # all its keys are down and ends when any of them is released.
-# macOS keys: Fn (the Globe key, the default; set System Settings > Keyboard > "Press 🌐 key
-# to" to "Do Nothing"), RightOption, RightCommand, or F13-F20.
+# macOS keys: Fn (the Globe key, the default; on its own, AGT keeps it from apps so tapping
+# it doesn't also open the emoji picker), RightOption, RightCommand, or F13-F20.
 # With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
 # keys are up: if you already hold the hotkey for the next dictation, the previous text
 # lands when you release it (after 10 s it's pasted anyway).
