@@ -2,8 +2,9 @@
 //!
 //! With `update.enabled`, checks on startup and every `update.check_interval_minutes`, downloads
 //! in the background, and applies the update when the user quits (or on the next launch, via
-//! `VelopackApp`). The tray's "Update now" ([`check_now`]) works even with updates disabled: a
-//! click is an explicit request.
+//! `VelopackApp`). The tray's "Update now" ([`check_now`]) also installs the update and restarts
+//! as soon as dictation is idle, and works even with updates disabled: a click is an explicit
+//! request.
 //!
 //! The feed is read from `releases/latest/download/` (plain HTTPS, no GitHub API, so no token
 //! and no API rate limit). That release's feed lists its full package plus the delta from the
@@ -171,7 +172,7 @@ fn check_and_download(
     let downloaded = um.download_updates(&info, None);
     record("download", Some(target), t, &downloaded, "ok");
     downloaded?;
-    tracing::info!("update {target} downloaded; it will be applied on quit or next launch");
+    tracing::info!("update {target} downloaded");
     Ok(())
 }
 

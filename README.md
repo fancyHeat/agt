@@ -66,7 +66,8 @@ or Colemak layout (other than "Dvorak - QWERTY ⌘") the paste may not work.
 ## Updates
 
 AGT updates itself from this page's releases in the background; the new version is used the
-next time it starts. Tray menu → **Update now** checks right away.
+next time it starts. Tray menu → **Update now** checks right away and, if there is an update,
+downloads and installs it and restarts AGT (as soon as dictation is idle) — no further clicks.
 
 ## Settings
 
