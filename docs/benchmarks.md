@@ -152,15 +152,16 @@ using ~30% of the GPU, DirectML was 187 back to back and 260-298 ms at 2-5 s.
 
 - DirectML pays **55-80 ms after 2 s or more of idle** and nothing up to 1.5 s (the 1.5 s p90
   already shows it); 3, 10 and 30 s cost the same. The same shape as Core ML (+90 ms from 3 s
-  on), so most likely the GPU clocking down too. The CPU stays flat within noise.
+  on), so most likely the GPU clocking down too. The CPU stays flat within noise on short and
+  medium clips; its long ones are 17% slower after a pause (1718 vs 1472 ms).
 - On short dictations after a pause the CPU wins (171 vs 210 ms, 3.4 s avg); DirectML wins
   medium ones by ~200 ms and long ones by more than a second. Break-even is around 4-5 s.
   Unlike the Mac, where the CPU int8 encoder is fast enough for medium dictations too, the
   i9's cost grows steeply with length, so DirectML stays the default.
 - The old start-up probe compared 3 s back to back (DirectML's best case, ~1.0x the CPU);
   after a pause the short-clip ratio here is 1.23 (full eval) to 1.5 (sweep), at or past its
-  1.25 limit, for a GPU that is far ahead on everything longer. The probe now measures both
-  lengths after a pause (see the Decision).
+  1.25 limit, for a GPU that is far ahead on everything longer. The probe now times DirectML
+  after a pause and weighs a medium clip too (see the Decision).
 
 ### DirectML: why fixed-length padding gave wrong transcripts
 
@@ -344,21 +345,23 @@ static-shape encoder, falling back to the CPU when there is no usable DirectX 12
 - Guards, since `auto` is now what every new Windows install runs:
   - DirectML asks for the **high-performance adapter** (the discrete GPU on a hybrid laptop;
     the default preference usually gets the integrated one).
-  - At start-up, `auto` times 3 s and 10 s of audio on DirectML and on the CPU as a dictation
-    sees them: each DirectML run after 3 s of GPU idle (one run per length, after one untimed
-    run that compiles it; the CPU's session and runs count toward the first pause), the CPU
-    best of two back to back (it doesn't slow after a pause). DirectML is kept if its total
-    is at most the CPU's. Logged; here: `stt.device "auto": DirectML 242 + 241 ms (each after
-    3 s idle), CPU 162 + 420 ms, for 3 + 10 s of audio; using DirectML` (483 vs 582 ms in
-    total). The sum weighs one short and one medium dictation: the CPU wins the short one
-    after a pause, the padded DirectML encoder (same cost for any length up to 25 s) wins the
-    medium one by more; a GPU that pays several times the CPU's time for a 25 s window (an
-    integrated GPU, a software adapter) loses both. 3 s, not 2: this GPU's penalty starts
-    between 1.5 and 2 s, Core ML's was partial at 1 s (2 s untested). Not measured on an
-    integrated GPU (this machine's is disabled), which is why it's a check in the code rather
-    than a docs caveat. Cost: loading takes 10.6-13.6 s instead of ~2.7 s without a probe
-    (6.8-8.0 s with the old back-to-back one): a second encoder session, one 3 s pause and eight probe
-    runs, in the background at start-up, before the tray says "Ready".
+  - At start-up, `auto` compares DirectML and the CPU as a dictation sees them. The CPU
+    transcribes 3 s and 10 s of audio, best of two back to back (short and medium clips
+    barely slow after a pause). DirectML, after one untimed run that compiles it, runs the
+    10 s probe once after 3 s of GPU idle; its padded window costs about the same for any
+    length up to 25 s (242 vs 241 ms for 3 and 10 s), so that one run counts for both
+    lengths. DirectML is kept if twice its time is at most the CPU's total. Logged; here:
+    `stt.device "auto": DirectML 226 ms per call after 3 s idle (fixed window), CPU 168 +
+    399 ms, for 3 + 10 s of audio; using DirectML` (452 vs 567 ms; 0.64-0.87 over 11
+    loads). The sum weighs one short and one medium dictation: the CPU wins the short one
+    after a pause, DirectML the medium one by more; a GPU that pays several times the CPU's
+    time for a 25 s window (an integrated GPU, a software adapter) loses both. 3 s, not 2:
+    this GPU's penalty starts between 1.5 and 2 s and 3 s is the measured plateau. Not
+    measured on an integrated GPU (this machine's is disabled), which is why it's a check in
+    the code rather than a docs caveat. Cost: the CPU's session and five runs (~3-4 s here)
+    fill most or all of the pause, so loading takes 7.1-9.6 s vs 6.4-8.1 s with the old
+    back-to-back probe and ~2.7 s without one (same session; three outliers at 11-22 s with
+    the desktop busy), in the background at start-up, before the tray says "Ready".
   - A GPU that fails to run (not only to load: driver reset, device removed, out of VRAM),
     at start-up or on any later dictation, is replaced by the CPU once and for good; logged,
     and noted in the tray only if `device` named the GPU explicitly.

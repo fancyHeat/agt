@@ -225,21 +225,21 @@ fn precision(cfg: &SttConfig) -> Precision {
 /// (docs/benchmarks.md, window sweep).
 pub const COREML_WINDOW_SECS: f32 = 10.0;
 
-/// Under `auto`, the GPU is kept if its total for the [`PROBE_SECS`] clips, each run after
-/// [`PROBE_PAUSE`] of GPU idle, is at most this many times the CPU's (best of two, back to
-/// back; the CPU barely slows after a pause). Both sides are what a dictation sees, so no
-/// slack: a fixed-window GPU encoder costs about the same for 3 and 10 s, the CPU's cost
-/// grows with the length, and the sum weighs one short and one medium dictation. On an RTX
-/// 2080 Ti and an i9-9900K, after a 3 s pause: 3.4 s 210 vs 171 ms, 10.7 s 230 vs 436 ms
-/// (the CPU wins short dictations, DirectML the rest by far); an integrated GPU that pays a
-/// 25 s window for every dictation loses. See docs/benchmarks.md.
+/// Under `auto`, the GPU is kept if its time for one run after [`PROBE_PAUSE`] of GPU idle,
+/// counted once per [`PROBE_SECS`] clip (its fixed window costs about the same for any
+/// length: 242 vs 241 ms for 3 and 10 s), is at most this many times the CPU's total for the
+/// clips (best of two each, back to back; the CPU barely slows after a pause for short and
+/// medium clips). Both sides are what a dictation sees, so no slack: the sum weighs one
+/// short and one medium dictation. On an RTX 2080 Ti and an i9-9900K, after a 3 s pause:
+/// 3.4 s 210 vs 171 ms, 10.7 s 230 vs 436 ms (the CPU wins short dictations, DirectML the
+/// rest by far); an integrated GPU that pays a 25 s window for every dictation loses. See
+/// docs/benchmarks.md.
 const AUTO_GPU_TOLERANCE: f64 = 1.0;
 /// Probe lengths: a short dictation (also the warmup) and a medium one.
 const PROBE_SECS: [f32; 2] = [3.0, 10.0];
-/// GPU idle before each timed GPU probe run. DirectML on the RTX 2080 Ti is as fast as back
-/// to back after 1.5 s of idle and 55-80 ms slower from 2 s on (3, 10, 30 s: the same); Core
-/// ML on an M4 is +30 ms after 1 s and +90 ms from 3 s on. The CPU's session and probe runs
-/// count toward the first pause, so the probe costs ~4 s more than a back-to-back one.
+/// GPU idle before the timed GPU probe run. DirectML on the RTX 2080 Ti is as fast as back
+/// to back after 1.5 s of idle and 55-80 ms slower from 2 s on (3, 10, 30 s: the same). The
+/// CPU's session and probe runs count toward it, so it mostly overlaps work already done.
 const PROBE_PAUSE: Duration = Duration::from_secs(3);
 
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
@@ -346,7 +346,7 @@ impl Parakeet {
     /// here (which also compiles it), so a GPU that can create a session but not run it
     /// (driver bug, device removed, out of VRAM) falls back to the CPU instead of failing.
     /// Under `stt.device = "auto"` the GPU is only kept if it isn't slower than the CPU on
-    /// a short and a medium clip, each after a pause (see [`AUTO_GPU_TOLERANCE`]).
+    /// a short and a medium clip after a pause (see [`AUTO_GPU_TOLERANCE`]).
     pub fn load(cfg: &SttConfig, progress: &mut dyn FnMut(Progress)) -> Result<Self> {
         let files = files(cfg)?;
         let dir = cfg.models_path().join(&cfg.model);
@@ -479,7 +479,7 @@ impl Parakeet {
             }
             Ok(None) => {}
         }
-        // The GPU idles from here; the CPU's session and runs count toward its first pause.
+        // The GPU idles from here; the CPU's session and runs count toward the pause.
         let idle = Instant::now();
         let cpu = match Encoder::new(&self.env, &self.encoder_path, Device::Cpu, self.threads) {
             Ok(c) => c,
@@ -489,29 +489,41 @@ impl Parakeet {
             }
         };
         let gpu_encoder = std::mem::replace(&mut self.encoder, cpu);
-        let cpu_ms = self.time(&probes)?;
-        let cpu_encoder = std::mem::replace(&mut self.encoder, gpu_encoder);
-        let gpu_ms = match self.time_paused(&probes, idle) {
+        let cpu_ms = match self.time(&probes) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(
-                    "stt.device \"auto\": the encoder failed on {}: {e}; using the CPU",
-                    device_title(gpu)
-                );
-                self.encoder = cpu_encoder; // frees the VRAM
-                self.update_name();
+                tracing::warn!("stt.device \"auto\": can't compare with the CPU ({e})");
+                self.encoder = gpu_encoder; // drops the CPU session
                 return Ok(());
             }
         };
-        let sum = |t: &[f64]| t.iter().sum::<f64>();
-        let keep_gpu = sum(&gpu_ms) <= sum(&cpu_ms) * AUTO_GPU_TOLERANCE;
-        let list = |t: &[f64]| t.iter().map(|t| format!("{t:.0}")).collect::<Vec<_>>();
+        let cpu_encoder = std::mem::replace(&mut self.encoder, gpu_encoder);
+        // One GPU run after the pause, on the longest probe. Its fixed window makes the time
+        // about the same for every length, so it stands for each probe.
+        std::thread::sleep(PROBE_PAUSE.saturating_sub(idle.elapsed()));
+        let t = Instant::now();
+        if let Err(e) = self.run(&probes[probes.len() - 1]) {
+            tracing::warn!(
+                "the encoder failed on {}: {e}; running the encoder on the CPU from now on",
+                device_title(gpu)
+            );
+            self.encoder = cpu_encoder; // frees the VRAM
+            self.fell_back_from = Some(gpu);
+            self.update_name();
+            return Ok(());
+        }
+        let gpu_ms = ms(t.elapsed());
+        let keep_gpu =
+            gpu_ms * probes.len() as f64 <= cpu_ms.iter().sum::<f64>() * AUTO_GPU_TOLERANCE;
         tracing::info!(
-            "stt.device \"auto\": {} {} ms (each after {} s idle), CPU {} ms, for {} s of audio; using {}",
+            "stt.device \"auto\": {} {gpu_ms:.0} ms per call after {} s idle (fixed window), CPU {} ms, for {} s of audio; using {}",
             device_title(gpu),
-            list(&gpu_ms).join(" + "),
             PROBE_PAUSE.as_secs_f32(),
-            list(&cpu_ms).join(" + "),
+            cpu_ms
+                .iter()
+                .map(|t| format!("{t:.0}"))
+                .collect::<Vec<_>>()
+                .join(" + "),
             PROBE_SECS.map(|s| s.to_string()).join(" + "),
             if keep_gpu {
                 device_title(gpu)
@@ -540,22 +552,6 @@ impl Parakeet {
                     best = best.min(ms(t.elapsed()));
                 }
                 Ok(best)
-            })
-            .collect()
-    }
-
-    /// One run per probe, in ms, each started [`PROBE_PAUSE`] after the encoder last ran
-    /// (`since` for the first): what a dictation after a pause sees. One run, not best of
-    /// two: every run would need its own pause.
-    fn time_paused(&mut self, probes: &[Vec<f32>], mut since: Instant) -> Result<Vec<f64>> {
-        probes
-            .iter()
-            .map(|audio| {
-                std::thread::sleep(PROBE_PAUSE.saturating_sub(since.elapsed()));
-                let t = Instant::now();
-                self.run(audio)?;
-                since = Instant::now();
-                Ok(ms(since - t))
             })
             .collect()
     }
