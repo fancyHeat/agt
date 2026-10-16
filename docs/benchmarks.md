@@ -284,7 +284,7 @@ window); back to back, ms p50/p90:
   has, the CPU int8 encoder is **~2x faster for short clips** (113 vs 215 ms p50), faster for
   medium ones too (239 vs 290) and only slower for > 20 s (668 vs 506). Most dictations are short.
 - **CPU int8 is also the most accurate** on real speech here (4.20%, Core ML 5.93%), loads in
-  1 s instead of 4-9 s (plus 20-40 s once to compile), and downloads 0.65 GB instead of 2.5 GB
+  1 s instead of 4-9 s (plus ~45 s once to compile), and downloads 0.65 GB instead of 2.5 GB
   plus 2.4 GB of compiled cache.
 - **Whisper on Metal is out**: large-v3-turbo needs 1.25 s for a 3 s clip on the M4's GPU (it
   always encodes a 30 s window; the RTX 2080 Ti did it in 126 ms), small.en 250 ms with worse

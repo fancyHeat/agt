@@ -24,7 +24,7 @@
 //! the time axis fixed to [`COREML_WINDOW_SECS`] the whole graph compiles to one ML Program on
 //! the GPU. Core ML needs the fp32 encoder (the int8 one uses ops it doesn't support). The
 //! compiled model is cached next to the model (`coreml-<frames>/`), so only the first load pays
-//! the ~20 s compile.
+//! the ~45 s compile.
 
 use crate::{
     models::{self, ModelFile, Progress},
@@ -187,7 +187,7 @@ impl Encoder {
 /// an M4 with real speech and a few seconds between dictations, the CPU's int8 encoder was ~2x
 /// faster for short clips (113 vs 215 ms p50) and faster for 6-20 s ones (239 vs 290 ms),
 /// more accurate (the 10 s window splits longer dictations), needs a quarter of the download
-/// and no ~20 s compile. A warm, back-to-back GPU (what a start-up probe measures) hides the
+/// and no ~45 s compile. A warm, back-to-back GPU (what a start-up probe measures) hides the
 /// ~90 ms Core ML pays after the GPU idles for a second or more. See docs/benchmarks.md.
 fn auto_device() -> Device {
     if cfg!(windows) {
