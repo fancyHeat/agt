@@ -18,6 +18,7 @@ dependencies = [
  "agt-overlay",
  "agt-platform",
  "agt-polish",
+ "agt-settings-ui",
  "agt-stt",
  "agt-telemetry",
  "libc",
@@ -131,6 +132,16 @@ dependencies = [
  "tracing",
  "ureq",
  "url",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agt-settings-ui"
+version = "0.0.13"
+dependencies = [
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "windows-sys 0.61.2",
 ]
 

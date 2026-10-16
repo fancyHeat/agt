@@ -1,7 +1,7 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, a config
-//! error line (while there is one), "Copy last transcript", "Update now", "Settings" (see
-//! [`crate::settings`]), (macOS) "Privacy & Security settings", "Open config folder", "Open
-//! data folder" (where it differs) and "Quit".
+//! error line (while there is one), "Copy last transcript", "Update now", "Settings..." (the
+//! settings window) and "Quick settings" (see [`crate::settings`]), (macOS) "Privacy &
+//! Security settings", "Open config folder", "Open data folder" (where it differs) and "Quit".
 
 use crate::settings::Settings;
 use tray_icon::{
@@ -28,6 +28,8 @@ pub struct Tray {
     update_item: MenuItem,
     pub copy_last: MenuId,
     pub update: MenuId,
+    /// "Settings...": opens the settings window.
+    pub open_settings: MenuId,
     /// macOS only: opens the System Settings page of the first missing permission.
     pub privacy: Option<MenuId>,
     pub open_config: MenuId,
@@ -59,6 +61,7 @@ impl Tray {
         } else {
             MenuItem::new("Update now (not installed)", false, None)
         };
+        let open_settings = MenuItem::new("Settings...", true, None);
         let settings = Settings::new();
         let privacy = cfg!(target_os = "macos")
             .then(|| MenuItem::new("Privacy & Security settings...", true, None));
@@ -71,7 +74,7 @@ impl Tray {
             &polish,
             &PredefinedMenuItem::separator(),
         ])?;
-        menu.append_items(&[&copy_last, &update, &settings.menu])?;
+        menu.append_items(&[&copy_last, &update, &open_settings, &settings.menu])?;
         if let Some(p) = &privacy {
             menu.append(p)?;
         }
@@ -103,6 +106,7 @@ impl Tray {
             copy_last_item: copy_last,
             update: update.id().clone(),
             update_item: update,
+            open_settings: open_settings.id().clone(),
             privacy: privacy.map(|p| p.id().clone()),
             open_config: open_config.id().clone(),
             open_data: open_data.map(|i| i.id().clone()),

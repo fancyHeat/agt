@@ -82,6 +82,10 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("stats") {
         return print_stats();
     }
+    // `agt settings`: the settings window (see `settings::window`); doesn't start the app.
+    if std::env::args().nth(1).as_deref() == Some("settings") {
+        return settings::window::run();
+    }
 
     let config_path = paths::config_file();
     let config = Config::load_or_create(&config_path);
@@ -492,6 +496,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
+            AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
                 // The page for the first missing permission (or Accessibility, to review).
@@ -742,13 +747,7 @@ impl App {
                 }
             }
             Action::EditFile => open_in_editor(&self.config_path),
-            Action::OpenHistory => {
-                let dir = paths::dictations_dir();
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    tracing::error!("cannot create {}: {e}", dir.display());
-                }
-                open_folder(&dir);
-            }
+            Action::OpenHistory => open_history(),
             Action::ApplyNow => {
                 let restart = self.restart_with.take().unwrap_or(Restart::Settings);
                 self.restart_now(restart, event_loop);
@@ -827,7 +826,7 @@ impl App {
 
 /// Opens `file` in a text editor: the default one on macOS, Notepad on Windows (`.toml`
 /// usually has no app associated there).
-fn open_in_editor(file: &std::path::Path) {
+pub(crate) fn open_in_editor(file: &std::path::Path) {
     let mut command = if cfg!(windows) {
         std::process::Command::new("notepad")
     } else if cfg!(target_os = "macos") {
@@ -840,6 +839,15 @@ fn open_in_editor(file: &std::path::Path) {
     if let Err(e) = command.arg(file).spawn() {
         tracing::error!("failed to open {}: {e}", file.display());
     }
+}
+
+/// Opens the saved dictations' folder (created if needed).
+pub(crate) fn open_history() {
+    let dir = paths::dictations_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("cannot create {}: {e}", dir.display());
+    }
+    open_folder(&dir);
 }
 
 fn open_folder(dir: &std::path::Path) {

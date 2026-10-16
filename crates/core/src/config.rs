@@ -1,8 +1,8 @@
 //! `config.toml`. Every field has a default, so a partial or empty file is valid.
 //! Unknown keys are rejected so typos surface instead of being silently ignored.
 //!
-//! The file is the only place settings live: the tray's Settings menu edits it through
-//! [`set`], which keeps the user's comments and layout.
+//! The file is the only place settings live: the tray's menu and the settings window edit
+//! it through [`set`], which keeps the user's comments and layout.
 
 use serde::Deserialize;
 use std::{fs, io, path::Path, path::PathBuf};
@@ -26,8 +26,8 @@ pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
-    r#"# AGT configuration. The tray menu's Settings change this file too. AGT applies a saved
-# change by restarting itself once you're not dictating.
+    r#"# AGT configuration. The tray menu's Settings window changes this file too. AGT applies a
+# saved change by restarting itself once you're not dictating.
 # If this file has an error, a running AGT keeps its settings until it's fixed; starting with
 # an error, AGT uses defaults (updates off). Either way it records the error.
 
@@ -176,7 +176,7 @@ position = "bottom"
 [history]
 # Keep a copy of each dictation, e.g. to look back at what you said or to build a custom
 # dictionary. Stored only on this machine, as plain files in the "dictations" folder next to
-# agt.db (tray: Settings > History > Open history folder); never uploaded. Turning saving off
+# agt.db (tray: Settings... > History > Open history folder); never uploaded. Turning saving off
 # keeps what's already there (it's still deleted after keep_days).
 # Save the transcript (before polish), the polished text and the pasted text (dictations.jsonl).
 save_text = false

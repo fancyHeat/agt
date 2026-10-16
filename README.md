@@ -39,7 +39,7 @@ Good to know:
 - Long dictations are fine (up to 30 minutes): AGT transcribes what you said before each pause
   while you keep talking, so when you let go only the last few seconds are left to transcribe.
   With S1-mini polish, a dictation of more than about 1,400 words (some 10 minutes) is pasted
-  unpolished: it doesn't fit the model's context. Settings → Polish → **Fast drafting**
+  unpolished: it doesn't fit the model's context. Settings... → Polish → **Fast drafting**
   (`fast_drafting` under `[polish.s1-mini]`) polishes long text about twice as fast on a GPU,
   at the cost of an occasional different word or comma; it's off by default.
 - **Hands-free:** tap the hotkey twice quickly and AGT keeps recording after you let go; press
@@ -47,8 +47,8 @@ Good to know:
   discarded. `double_tap_ms` under `[hotkey]` in `config.toml` sets how quick (0 turns it
   off).
 - While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
-  and comes back when you let go. Settings → **Lower other audio while dictating** turns this
-  off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
+  and comes back when you let go. Settings... → **Lower other audio while dictating** turns
+  this off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
   in `config.toml`).
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
 
@@ -86,20 +86,24 @@ downloads and installs it and restarts AGT (as soon as dictation is idle) — no
 
 ## Settings
 
-Settings live in a plain text file, `config.toml`, with a comment on every option:
+Tray menu → **Settings...** opens the settings window: every option, in pages (General,
+Speech, Polish, History, Advanced). The tray's **Quick settings** submenu has the same
+choices without opening a window.
+
+Either way, settings live in a plain text file, `config.toml`, with a comment on every option:
 
 - Windows: `%APPDATA%\AGT\config.toml`
 - macOS: `~/Library/Application Support/AGT/config.toml`
 
 Tray menu → **Open config folder** takes you there. AGT restarts on its own to apply a change
-(once dictation is idle): right away for one made in the tray's **Settings** menu, a few
-seconds after the last save for an edit to the file. You can change the hotkey, turn the
+(once dictation is idle): right away for one made in **Quick settings**, a few seconds after
+the last change for one made in the settings window or the file. You can change the hotkey, turn the
 overlay off, or enable optional AI clean-up of your text (removes "um"s, fixes punctuation;
 off by default, and it runs locally unless you point it at a cloud service).
 
 ## Dictation history
 
-Off by default. Tray menu → **Settings → History** lets AGT keep a copy of each dictation:
+Off by default. **Settings... → History** lets AGT keep a copy of each dictation:
 
 - **Save transcripts**: the transcript as recognized, the cleaned-up text (if AI clean-up is
   on) and the text that was pasted.
