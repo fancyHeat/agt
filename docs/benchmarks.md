@@ -124,6 +124,45 @@ WER per source (%; ~250-360 words each, so ±1 point is noise):
 - Per-dictation time outside the encoder (CPU log-mel features + greedy TDT decoding) is
   10-40 ms for 3-11 s of audio; it's most of what remains on CUDA.
 
+### With pauses between dictations (Windows)
+
+The table above is back to back. As on the Mac (see below), a GPU that idles between
+dictations is slower on the next one. Parakeet v2 int8, full eval set, one run per clip with
+a 3 s pause before each (`--gap-ms 3000 --runs 1`) vs back to back (`--runs 3`), same session:
+
+| Engine | short | medium | long | WER all |
+|---|---|---|---|---|
+| DirectML, back to back | 142/150 | 162/173 | 361/586 | 3.99 |
+| DirectML, 3 s pauses | 210/227 | **230/252** | **444/622** | 3.99 |
+| CPU, back to back | 169/229 | 429/558 | 1472/2182 | 4.09 |
+| CPU, 3 s pauses | **171/216** | 436/559 | 1718/2072 | 4.09 |
+
+8 short clips (2.2-3.1 s; LibriSpeech, TED, VoxPopuli, Earnings-22, AMI, as in the Mac
+sweep), 3 runs each, per-call p50 in ms, `AGT_LOG=debug` for the encoder:
+
+| Pause before each call | 0 (back to back) | 1 s | 1.5 s | 2 s | 2.5 s | 3 s | 10 s | 30 s¹ |
+|---|---|---|---|---|---|---|---|---|
+| DirectML: whole call | 148 | 151 | 150 | 214 | 230 | 219 | 202 | 211 |
+| DirectML: encoder only | 138 | 141 | 141 | 204 | 219 | 208 | 199 | 203 |
+| CPU int8: whole call¹ | 129 | 135 | 139 | - | - | 146 | 128 | 144 |
+| CPU int8: encoder only¹ | 130 | 125 | 137 | - | - | 135 | 126 | 137 |
+
+¹ From an earlier session (DirectML there: 141 back to back, 209 at 3 s). With a browser
+using ~30% of the GPU, DirectML was 187 back to back and 260-298 ms at 2-5 s.
+
+- DirectML pays **55-80 ms after 2 s or more of idle** and nothing up to 1.5 s (the 1.5 s p90
+  already shows it); 3, 10 and 30 s cost the same. The same shape as Core ML (+90 ms from 3 s
+  on), so most likely the GPU clocking down too. The CPU stays flat within noise on short and
+  medium clips; its long ones are 17% slower after a pause (1718 vs 1472 ms).
+- On short dictations after a pause the CPU wins (171 vs 210 ms, 3.4 s avg); DirectML wins
+  medium ones by ~200 ms and long ones by more than a second. Break-even is around 4-5 s.
+  Unlike the Mac, where the CPU int8 encoder is fast enough for medium dictations too, the
+  i9's cost grows steeply with length, so DirectML stays the default.
+- The old start-up probe compared 3 s back to back (DirectML's best case, ~1.0x the CPU);
+  after a pause the short-clip ratio here is 1.23 (full eval) to 1.5 (sweep), at or past its
+  1.25 limit, for a GPU that is far ahead on everything longer. The probe now times DirectML
+  after a pause and weighs a medium clip too (see the Decision).
+
 ### DirectML: why fixed-length padding gave wrong transcripts
 
 Phase 1 found that padding the features to a fixed length made DirectML fast but returned
@@ -297,7 +336,8 @@ window); back to back, ms p50/p90:
 static-shape encoder, falling back to the CPU when there is no usable DirectX 12 GPU).
 
 - Latency: 142 ms / 162 ms / 362 ms p50 for 3 / 11 / 36 s, vs 152 / 407 / 1335 ms on the CPU;
-  p90 is tighter too (147 vs 206 ms short). Only CUDA is faster.
+  p90 is tighter too (147 vs 206 ms short). Only CUDA is faster. With 3 s pauses between
+  dictations: 210 / 230 / 444 vs 171 / 436 / 1718 ms (the CPU wins below ~4-5 s).
 - Accuracy: same model and WER as the Phase 1 default (best on real speech of everything tried).
 - Size: nothing new to ship (DirectML is already in the release), same 650 MB model.
 - Cost: 1.1 GB of VRAM while AGT runs (and ~1 GB RAM, as on the CPU). Existing configs keep
@@ -305,16 +345,23 @@ static-shape encoder, falling back to the CPU when there is no usable DirectX 12
 - Guards, since `auto` is now what every new Windows install runs:
   - DirectML asks for the **high-performance adapter** (the discrete GPU on a hybrid laptop;
     the default preference usually gets the integrated one).
-  - At start-up, `auto` transcribes 3 s of audio on DirectML and on the CPU (best of two,
-    after one untimed run) and keeps DirectML only if it takes at most 1.25x the CPU's time.
-    Logged; here: `stt.device "auto": DirectML 142 ms, CPU 150 ms for 3 s of audio; using
-    DirectML`. 3 s is the CPU's best case: the padded DirectML encoder costs the same for
-    any length up to 25 s, the CPU's grows with the length, so a GPU that is roughly even at
-    3 s is far ahead at 10 s (row 6 vs row 1), and one that pays several times the CPU's time
-    for a 25 s window (an integrated GPU, a software adapter) loses. Not measured on an
-    integrated GPU (this machine's is disabled), which is why it's a check in the code rather
-    than a docs caveat. Cost: loading takes ~6 s instead of ~2.7 s (a second encoder session
-    and six probe runs; in the background at start-up, before the tray says "Ready").
+  - At start-up, `auto` compares DirectML and the CPU as a dictation sees them. The CPU
+    transcribes 3 s and 10 s of audio, best of two back to back (short and medium clips
+    barely slow after a pause). DirectML, after one untimed run that compiles it, runs the
+    10 s probe once after 3 s of GPU idle; its padded window costs about the same for any
+    length up to 25 s (242 vs 241 ms for 3 and 10 s), so that one run counts for both
+    lengths. DirectML is kept if twice its time is at most the CPU's total. Logged; here:
+    `stt.device "auto": DirectML 226 ms per call after 3 s idle (fixed window), CPU 168 +
+    399 ms, for 3 + 10 s of audio; using DirectML` (452 vs 567 ms; 0.64-0.87 over 11
+    loads). The sum weighs one short and one medium dictation: the CPU wins the short one
+    after a pause, DirectML the medium one by more; a GPU that pays several times the CPU's
+    time for a 25 s window (an integrated GPU, a software adapter) loses both. 3 s, not 2:
+    this GPU's penalty starts between 1.5 and 2 s and 3 s is the measured plateau. Not
+    measured on an integrated GPU (this machine's is disabled), which is why it's a check in
+    the code rather than a docs caveat. Cost: the CPU's session and five runs (~3-4 s here)
+    fill most or all of the pause, so loading takes 7.1-9.6 s vs 6.4-8.1 s with the old
+    back-to-back probe and ~2.7 s without one (same session; three outliers at 11-22 s with
+    the desktop busy), in the background at start-up, before the tray says "Ready".
   - A GPU that fails to run (not only to load: driver reset, device removed, out of VRAM),
     at start-up or on any later dictation, is replaced by the CPU once and for good; logged,
     and noted in the tray only if `device` named the GPU explicitly.
@@ -342,8 +389,10 @@ otherwise:
 - The probe itself was a liability: it measures the GPU warm and back to back (Core ML's best
   case), costs ~6 s and a temporary 2.4 GB fp32 CPU session at every launch, left the first
   Core ML dictation at 0.7-1.4 s, and flipped to the CPU (fp32) while this benchmark was using
-  the GPU (app log: "Core ML 149 ms, CPU 105 ms for 3 s of audio; using the CPU"). Windows keeps its DirectML probe for now; whether a discrete GPU loses as much after
-  a pause hasn't been measured (`--gap-ms` makes that a one-line run).
+  the GPU (app log: "Core ML 149 ms, CPU 105 ms for 3 s of audio; using the CPU"). Windows
+  keeps DirectML and a probe: the RTX 2080 Ti pays a similar 55-80 ms after a pause, but the
+  i9's CPU is so much slower on longer dictations that DirectML still wins there (Windows
+  pause section), and the probe now measures after a pause.
 - **8 GB Macs**: the same default. CPU int8 needs ~1.4 GB; don't switch to Core ML or fp32
   there (Core ML's working set is ~2.9 GB including the mapped compiled model, and it degrades
   by paging rather than failing).
@@ -366,6 +415,8 @@ by the section above and not used for decisions.
 uv run scripts/prepare_eval.py                      # eval-data/clips, ~5 min
 cargo build --release -p agt-bench                  # Parakeet: auto, cpu, directml (Windows)
 target/release/agt-bench --device directml eval-data/clips
+target/release/agt-bench --device directml --gap-ms 3000 --runs 1 eval-data/clips   # pauses between calls
+AGT_LOG=info target/release/agt-bench --device auto eval-data/clips   # logs the start-up probe
 cargo build --release -p agt-bench --features cuda  # + CUDA 13 / cuDNN 9 DLLs on PATH
 cargo build --release -p agt-bench --features whisper-vulkan   # needs CMake, libclang, Vulkan headers (see below)
 target/release/agt-bench --engine whisper --model whisper-large-v3-turbo-q5_0 --device vulkan eval-data/clips

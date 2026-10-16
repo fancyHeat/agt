@@ -20,6 +20,8 @@ pub enum Action {
     Toggle(SettingPath, fn(&Config) -> bool),
     /// Open `config.toml` in a text editor.
     EditFile,
+    /// Open the saved dictations' folder (created if needed).
+    OpenHistory,
     /// Restart now instead of waiting for dictation to be idle.
     ApplyNow,
 }
@@ -93,11 +95,10 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
         ),
     )?;
 
-    b.check(
+    b.choice(
         menu,
-        "Keep microphone open",
-        &["audio", "keep_mic_open"],
-        |c| c.audio.keep_mic_open,
+        "Microphone",
+        microphone_choices(&c.audio.device, agt_audio::input_device_names()),
     )?;
     b.check(
         menu,
@@ -234,6 +235,24 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
             },
         ),
     )?;
+
+    // History.
+    let history = b.submenu(menu, "History")?;
+    b.check(
+        &history,
+        "Save transcripts",
+        &["history", "save_text"],
+        |c| c.history.save_text,
+    )?;
+    b.check(&history, "Save audio", &["history", "save_audio"], |c| {
+        c.history.save_audio
+    })?;
+    b.choice(&history, "Keep for", keep_days(c.history.keep_days))?;
+    history.append(&PredefinedMenuItem::separator())?;
+    // Not a setting: works while the file has an error too.
+    let editable = std::mem::replace(&mut b.editable, true);
+    b.item(&history, "Open history folder", Action::OpenHistory)?;
+    b.editable = editable;
 
     // Updates.
     let update = b.submenu(menu, "Updates")?;
@@ -567,6 +586,19 @@ fn ms(n: u64) -> String {
     format!("{n} ms")
 }
 
+fn keep_days(current: u64) -> Vec<Choice> {
+    numbers(
+        &["history", "keep_days"],
+        current,
+        &[0, 7, 30, 90],
+        |n| match n {
+            0 => "Forever".into(),
+            1 => "1 day".into(),
+            n => format!("{n} days"),
+        },
+    )
+}
+
 /// The keys `agt-platform` accepts on their own, the default chord, and the file's value
 /// if it's another one (a chord the user wrote).
 fn hotkey_choices(current: &str) -> Vec<Choice> {
@@ -592,6 +624,35 @@ fn hotkey_choices(current: &str) -> Vec<Choice> {
         .collect();
     if !names.iter().any(|n| is_current(n)) {
         choices.push(Choice::current(current));
+    }
+    choices
+}
+
+/// The system default, the connected input devices, and the file's device if it isn't
+/// connected (still checked: AGT goes back to it when it is).
+fn microphone_choices(current: &str, names: Vec<String>) -> Vec<Choice> {
+    let path = &["audio", "device"];
+    let mut choices = vec![Choice::set(
+        path,
+        "System default".into(),
+        "".into(),
+        current.is_empty(),
+    )];
+    if !current.is_empty() && !names.iter().any(|n| n == current) {
+        choices.push(Choice::set(
+            path,
+            format!("{current} (not connected)"),
+            current.into(),
+            true,
+        ));
+    }
+    choices.extend(names.into_iter().map(|n| {
+        let checked = n == current;
+        Choice::set(path, n.clone(), n.into(), checked)
+    }));
+    for c in &mut choices {
+        // Device names are free text; a lone `&` would be taken as a menu mnemonic.
+        c.label = c.label.replace('&', "&&");
     }
     choices
 }
@@ -712,6 +773,11 @@ mod tests {
             &[0, 500],
             ms,
         ));
+        all.extend(microphone_choices(
+            "",
+            vec![r#"Mic "A" \ (USB)"#.into(), "Headset".into()],
+        ));
+        all.extend(keep_days(c.history.keep_days));
         all.extend(duck_levels(c.audio.duck_level()));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
@@ -722,10 +788,26 @@ mod tests {
         assert_eq!(keys.iter().filter(|c| c.checked).count(), 1);
         let keys = hotkey_choices("F13+F14+X");
         assert!(keys.last().unwrap().checked && keys.last().unwrap().changes.is_empty());
+        // The default mic is checked by default; a chosen mic that's unplugged stays listed.
+        let mics = microphone_choices("", vec!["Headset".into()]);
+        assert!(mics[0].checked && mics.iter().filter(|c| c.checked).count() == 1);
+        let mics = microphone_choices("Gone", vec!["Headset".into()]);
+        let labels: Vec<_> = mics.iter().map(|c| (c.label.as_str(), c.checked)).collect();
+        assert_eq!(
+            labels,
+            [
+                ("System default", false),
+                ("Gone (not connected)", true),
+                ("Headset", false)
+            ]
+        );
         // A non-preset number is listed, in order, and checked.
         let n = numbers(&["x"], 7, &[0, 500], ms);
         let labels: Vec<_> = n.iter().map(|c| (c.label.as_str(), c.checked)).collect();
         assert_eq!(labels, [("0 ms", false), ("7 ms", true), ("500 ms", false)]);
+        // A custom history retention is kept; "Forever" is 0.
+        let days: Vec<_> = keep_days(14).into_iter().map(|c| c.label).collect();
+        assert_eq!(days, ["Forever", "7 days", "14 days", "30 days", "90 days"]);
         // The default duck level is a preset; another one is shown as is.
         let levels = duck_levels(c.audio.duck_level());
         assert_eq!(levels.iter().filter(|c| c.checked).count(), 1);

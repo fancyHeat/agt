@@ -1,0 +1,21 @@
+[package]
+name = "agt-history"
+description = "AGT dictation history: optional local copies of each dictation's text and audio."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agt-core.workspace = true
+agt-audio.workspace = true
+serde.workspace = true
+serde_json = "1"
+tracing.workspace = true
+
+# The local time zone's offset, for the day folders and file names.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

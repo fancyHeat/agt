@@ -3,7 +3,9 @@
 //!
 //! **Privacy:** only counts, durations, enums, versions and non-secret settings are stored.
 //! Never audio, transcripts, polished text, clipboard contents, window titles or API keys;
-//! nothing in this crate takes text from a dictation.
+//! nothing in this crate takes text from a dictation. The user can opt in to keeping a
+//! dictation's audio and text: that's the dictation history (`agt-history`), separate files,
+//! joined to the `dictations` table on `started_at`.
 //!
 //! **Never blocks the caller.** Every record is a small struct sent over an `mpsc` channel
 //! to one `telemetry` writer thread, which drains whatever is queued and commits it in one
@@ -26,8 +28,8 @@
 //!
 //! | Table | One row per | Kept |
 //! |---|---|---|
-//! | `app_sessions` | AGT run: version, OS, non-secret settings (polish: provider, model, style, S1-mini options; never its key or URL), the engine and device that actually ran (`stt_backend`, `stt_notice` on a GPU → CPU fallback), model download / load / warmup times, `exit_reason`: `quit`, `update_restart`, `settings_restart`, `error`, `crash` (its last event was a panic) or `unknown` (killed, logoff, power loss) | 365 days |
-//! | `dictations` | hotkey press: `outcome` (see [`Outcome`]), `latency_ms` (release → paste, minus `hotkey_wait_ms`: the headline), `release_to_paste_ms` (wall time), `hold_ms`, `audio_secs`, `rms`, `key_down_to_mic_ms`, `first_audio_ms`, `queue_wait_ms`, `stt_ms`, `rtf`, `polish_ms` + `polish_outcome`, `hotkey_wait_ms`, `clipboard_save_ms`, `paste_ms`, `chars_out`, `words_out`, `missed_release`, `stt_backend` | 180 days |
+//! | `app_sessions` | AGT run: version, OS, non-secret settings (the chosen microphone, `audio_device`; polish: provider, model, style, S1-mini options, timeouts, `min_words`, whether a custom prompt is set; never its key, URL or prompt text; `[history]`: `history_save_text`, `history_save_audio`, `history_keep_days`), the engine and device that actually ran (`stt_backend`, `stt_notice` on a GPU → CPU fallback), model download / load / warmup times, `exit_reason`: `quit`, `update_restart`, `settings_restart`, `error`, `crash` (its last event was a panic) or `unknown` (killed, logoff, power loss) | 365 days |
+//! | `dictations` | hotkey press: `outcome` (see [`Outcome`]), `latency_ms` (release → paste, minus `hotkey_wait_ms`: the headline), `release_to_paste_ms` (wall time), `hold_ms`, `audio_secs`, `rms`, `key_down_to_mic_ms`, `first_audio_ms`, `queue_wait_ms`, `stt_ms`, `rtf`, `polish_ms` + `polish_outcome`, `hotkey_wait_ms`, `clipboard_save_ms`, `paste_ms`, `chars_out`, `words_out`, `words_raw` (before polish), `missed_release`, `stt_backend`, `history_saved` (handed to the dictation history; a disk error there is only logged) | 180 days |
 //! | `events` | event (what the log file had): `level`, `target`, `message`; the app's `log_level` sets which are recorded; the home directory is replaced by `~` | 30 days (DEBUG/TRACE 7) |
 //! | `updates` | update check, download or apply: versions, `result`, `error`, `duration_ms` | 180 days |
 //! | `metric_rollups` | local day and metric: `count`, `min`, `p50`, `p90`, `p99`, `max`, `mean` of each duration over that day's `pasted` dictations, plus `outcome.<x>` and `polish_outcome.<x>` counts | forever |
@@ -145,6 +147,10 @@ pub struct Dictation {
     pub words_out: Option<i64>,
     /// The engine as it ran, e.g. "parakeet-tdt-0.6b-v2 int8 (directml)".
     pub stt_backend: Option<String>,
+    /// Words in the transcript before polish (`words_out` is after).
+    pub words_raw: Option<i64>,
+    /// Handed to the dictation history (`agt-history`) to be saved.
+    pub history_saved: bool,
 }
 
 /// What is known about this run at start-up. Only non-secret settings: no API key, no URL.
@@ -176,6 +182,21 @@ pub struct SessionStart {
     pub s1_structure: Option<String>,
     pub s1_context: Option<String>,
     pub s1_device: Option<String>,
+    /// `audio.device`: the chosen microphone's name, "" = the system default.
+    pub audio_device: String,
+    /// `None` with the overlay off.
+    pub overlay_position: Option<String>,
+    /// `[polish]` limits, when polish is on.
+    pub polish_timeout_ms: Option<i64>,
+    pub polish_timeout_per_word_ms: Option<i64>,
+    pub polish_min_words: Option<i64>,
+    /// Whether a custom prompt / user message is set (never the text itself).
+    pub polish_custom_prompt: Option<bool>,
+    pub polish_custom_user_message: Option<bool>,
+    /// `[history]`: what is saved (the files themselves never go into the database).
+    pub history_save_text: bool,
+    pub history_save_audio: bool,
+    pub history_keep_days: i64,
 }
 
 /// Facts learned later in a session; `None` fields leave the stored value as it is.

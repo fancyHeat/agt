@@ -1,6 +1,6 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: instance lock, ducked-volume marker (`data_dir`) | usage history: `agt.db`, `llama-server.log` (`history_dir`) | models (`models_dir`) |
+//! | | config (`config_dir`) | data: instance lock, ducked-volume marker (`data_dir`) | usage history: `agt.db`, `llama-server.log`, saved dictations in `dictations/` (`history_dir`) | models (`models_dir`) |
 //! |---|---|---|---|---|
 //! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-data` | `%LOCALAPPDATA%\AGT-models` |
 //! | macOS | `~/Library/Application Support/AGT` | same | same | `<data>/models` |
@@ -44,6 +44,11 @@ pub fn config_file() -> PathBuf {
 /// The telemetry database (sessions, dictation metrics, events; see `agt-telemetry`).
 pub fn db_file() -> PathBuf {
     history_dir().join("agt.db")
+}
+
+/// Saved dictations, when `[history]` is on (see `agt-history`): one folder per local day.
+pub fn dictations_dir() -> PathBuf {
+    history_dir().join("dictations")
 }
 
 /// While other audio is ducked, the volume to restore if AGT dies before it does.

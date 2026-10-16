@@ -56,10 +56,102 @@ fn migrates_an_empty_database_once() {
 }
 
 #[test]
-fn a_version_1_database_gains_the_duck_columns() {
+fn version_1_database_gets_the_new_columns() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(MIGRATIONS[0]).unwrap();
     conn.pragma_update(None, "user_version", 1).unwrap();
+    conn.execute(
+        "INSERT INTO dictations (started_at, outcome) VALUES (1000, 'pasted')",
+        [],
+    )
+    .unwrap();
+    migrate(&mut conn).unwrap();
+    let s = SessionStart {
+        polish_min_words: Some(4),
+        polish_custom_prompt: Some(false),
+        overlay_position: Some("bottom".into()),
+        audio_device: "Headset".into(),
+        history_save_audio: true,
+        history_keep_days: 30,
+        ..Default::default()
+    };
+    let id = insert_session(&conn, &s, 2000).unwrap();
+    let row: (i64, bool, bool, i64, String, String) = conn
+        .query_row(
+            "SELECT polish_min_words, polish_custom_prompt, history_save_audio,
+                history_keep_days, overlay_position, audio_device FROM app_sessions WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, (4, false, true, 30, "bottom".into(), "Headset".into()));
+    let d = Dictation {
+        started_at: 3000,
+        words_raw: Some(7),
+        history_saved: true,
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let row: (i64, bool) = conn
+        .query_row(
+            "SELECT words_raw, history_saved FROM dictations WHERE started_at = 3000",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (7, true));
+    // Rows from before the migration read as "not saved".
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM dictations WHERE history_saved = 0"
+        ),
+        1
+    );
+}
+
+/// `agt stats` opens read-only and can't migrate: a newer `agt stats` must still read a
+/// database an older running AGT created (it only queries version-1 columns).
+#[test]
+fn stats_read_a_never_migrated_v1_database() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO dictations (started_at, outcome, stt_ms, audio_secs, release_to_paste_ms,
+                chars_out, words_out) VALUES (?1, 'pasted', 100, 2, 150, 10, 2)",
+            [now_ms()],
+        )
+        .unwrap();
+    }
+    let report = crate::stats::report(&path).unwrap_or_else(|e| panic!("{e}"));
+    assert!(report.contains("1 dictation"), "{report}");
+    let version: i64 = open_read_only(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1, "read-only: not migrated");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn version_2_database_gains_the_duck_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.execute_batch(MIGRATIONS[1]).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
     conn.execute(
         "INSERT INTO app_sessions (started_at, app_version, os, arch) VALUES (1, 'old', 'x', 'y')",
         [],

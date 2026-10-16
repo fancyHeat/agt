@@ -41,7 +41,7 @@ use ort::{
 };
 use std::{
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 macro_rules! hf {
@@ -186,12 +186,13 @@ impl Encoder {
 }
 
 /// What `stt.device = "auto"` uses. Windows: DirectML, kept only if it isn't slower than the
-/// CPU (see [`Parakeet::load`]). macOS: the CPU (int8). Core ML is only used when asked for: on
-/// an M4 with real speech and a few seconds between dictations, the CPU's int8 encoder was ~2x
-/// faster for short clips (113 vs 215 ms p50) and faster for 6-20 s ones (239 vs 290 ms),
-/// more accurate (the 10 s window splits longer dictations), needs a quarter of the download
-/// and no ~45 s compile. A warm, back-to-back GPU (what a start-up probe measures) hides the
-/// ~90 ms Core ML pays after the GPU idles for a second or more. See docs/benchmarks.md.
+/// CPU for a short and a medium dictation after a pause (see [`AUTO_GPU_TOLERANCE`]). macOS:
+/// the CPU (int8). Core ML is only used when asked for: on an M4 with real speech and a few
+/// seconds between dictations, the CPU's int8 encoder was ~2x faster for short clips (113 vs
+/// 215 ms p50) and faster for 6-20 s ones (239 vs 290 ms), more accurate (the 10 s window
+/// splits longer dictations), needs a quarter of the download and no ~45 s compile. A warm,
+/// back-to-back GPU hides the ~90 ms Core ML pays after the GPU idles for a second or more.
+/// See docs/benchmarks.md.
 fn auto_device() -> Device {
     if cfg!(windows) {
         Device::DirectMl
@@ -224,15 +225,22 @@ fn precision(cfg: &SttConfig) -> Precision {
 /// (docs/benchmarks.md, window sweep).
 pub const COREML_WINDOW_SECS: f32 = 10.0;
 
-/// Under `auto`, the GPU is kept if its time for [`PROBE_SECS`] of audio is at most this
-/// many times the CPU's. A short clip is the CPU's best case: a fixed-window GPU encoder costs
-/// the same for any length up to its window, the CPU's cost grows with the length (3.4 s:
-/// 142 vs 152 ms; 10.7 s: 162 vs 407 ms on an RTX 2080 Ti and an i9-9900K). So near-parity
-/// on 3 s still means the GPU wins for everything longer; an integrated GPU that pays a 25 s
-/// window for every dictation shows up as several times slower and loses.
-const AUTO_GPU_TOLERANCE: f64 = 1.25;
-/// Length of the warmup/probe audio (the typical short dictation).
-const PROBE_SECS: f32 = 3.0;
+/// Under `auto`, the GPU is kept if its time for one run after [`PROBE_PAUSE`] of GPU idle,
+/// counted once per [`PROBE_SECS`] clip (its fixed window costs about the same for any
+/// length: 242 vs 241 ms for 3 and 10 s), is at most this many times the CPU's total for the
+/// clips (best of two each, back to back; the CPU barely slows after a pause for short and
+/// medium clips). Both sides are what a dictation sees, so no slack: the sum weighs one
+/// short and one medium dictation. On an RTX 2080 Ti and an i9-9900K, after a 3 s pause:
+/// 3.4 s 210 vs 171 ms, 10.7 s 230 vs 436 ms (the CPU wins short dictations, DirectML the
+/// rest by far); an integrated GPU that pays a 25 s window for every dictation loses. See
+/// docs/benchmarks.md.
+const AUTO_GPU_TOLERANCE: f64 = 1.0;
+/// Probe lengths: a short dictation (also the warmup) and a medium one.
+const PROBE_SECS: [f32; 2] = [3.0, 10.0];
+/// GPU idle before the timed GPU probe run. DirectML on the RTX 2080 Ti is as fast as back
+/// to back after 1.5 s of idle and 55-80 ms slower from 2 s on (3, 10, 30 s: the same). The
+/// CPU's session and probe runs count toward it, so it mostly overlaps work already done.
+const PROBE_PAUSE: Duration = Duration::from_secs(3);
 
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
 const ENCODER_FP32: &str = "encoder-model.onnx";
@@ -338,7 +346,7 @@ impl Parakeet {
     /// here (which also compiles it), so a GPU that can create a session but not run it
     /// (driver bug, device removed, out of VRAM) falls back to the CPU instead of failing.
     /// Under `stt.device = "auto"` the GPU is only kept if it isn't slower than the CPU on
-    /// a short clip (see [`AUTO_GPU_TOLERANCE`]).
+    /// a short and a medium clip after a pause (see [`AUTO_GPU_TOLERANCE`]).
     pub fn load(cfg: &SttConfig, progress: &mut dyn FnMut(Progress)) -> Result<Self> {
         let files = files(cfg)?;
         let dir = cfg.models_path().join(&cfg.model);
@@ -444,26 +452,35 @@ impl Parakeet {
     }
 
     /// Runs the GPU encoder once (falling back to the CPU if that fails) and, if `auto`,
-    /// keeps it only if it is not slower than the CPU.
+    /// keeps it only if it is not slower than the CPU on the probes (see
+    /// [`AUTO_GPU_TOLERANCE`]).
     fn check_gpu(&mut self, auto: bool) -> Result<()> {
-        let probe = probe_audio(PROBE_SECS);
+        let probes = PROBE_SECS.map(probe_audio);
         let gpu = self.encoder.device;
-        let gpu_ms = match self.time(&probe) {
-            Ok(t) => t,
+        let first = if auto {
+            self.run(&probes[0]).map(|_| None) // compiles the kernels
+        } else {
+            self.time(&probes[..1]).map(|t| Some(t[0]))
+        };
+        match first {
             Err(e) => {
                 return self.fall_back(&format!(
                     "the encoder failed its first run on {}: {e}",
                     device_title(gpu)
                 ));
             }
-        };
-        if !auto {
-            tracing::info!(
-                "{}: {gpu_ms:.0} ms for {PROBE_SECS} s of audio",
-                device_title(gpu)
-            );
-            return Ok(());
+            Ok(Some(t)) => {
+                tracing::info!(
+                    "{}: {t:.0} ms for {} s of audio",
+                    device_title(gpu),
+                    PROBE_SECS[0]
+                );
+                return Ok(());
+            }
+            Ok(None) => {}
         }
+        // The GPU idles from here; the CPU's session and runs count toward the pause.
+        let idle = Instant::now();
         let cpu = match Encoder::new(&self.env, &self.encoder_path, Device::Cpu, self.threads) {
             Ok(c) => c,
             Err(e) => {
@@ -472,37 +489,71 @@ impl Parakeet {
             }
         };
         let gpu_encoder = std::mem::replace(&mut self.encoder, cpu);
-        let cpu_ms = self.time(&probe)?;
-        let keep_gpu = gpu_ms <= cpu_ms * AUTO_GPU_TOLERANCE;
+        let cpu_ms = match self.time(&probes) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("stt.device \"auto\": can't compare with the CPU ({e})");
+                self.encoder = gpu_encoder; // drops the CPU session
+                return Ok(());
+            }
+        };
+        let cpu_encoder = std::mem::replace(&mut self.encoder, gpu_encoder);
+        // One GPU run after the pause, on the longest probe. Its fixed window makes the time
+        // about the same for every length, so it stands for each probe.
+        std::thread::sleep(PROBE_PAUSE.saturating_sub(idle.elapsed()));
+        let t = Instant::now();
+        if let Err(e) = self.run(&probes[probes.len() - 1]) {
+            tracing::warn!(
+                "the encoder failed on {}: {e}; running the encoder on the CPU from now on",
+                device_title(gpu)
+            );
+            self.encoder = cpu_encoder; // frees the VRAM
+            self.fell_back_from = Some(gpu);
+            self.update_name();
+            return Ok(());
+        }
+        let gpu_ms = ms(t.elapsed());
+        let keep_gpu =
+            gpu_ms * probes.len() as f64 <= cpu_ms.iter().sum::<f64>() * AUTO_GPU_TOLERANCE;
         tracing::info!(
-            "stt.device \"auto\": {} {gpu_ms:.0} ms, CPU {cpu_ms:.0} ms for {PROBE_SECS} s of audio; using {}",
+            "stt.device \"auto\": {} {gpu_ms:.0} ms per call after {} s idle (fixed window), CPU {} ms, for {} s of audio; using {}",
             device_title(gpu),
+            PROBE_PAUSE.as_secs_f32(),
+            cpu_ms
+                .iter()
+                .map(|t| format!("{t:.0}"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+            PROBE_SECS.map(|s| s.to_string()).join(" + "),
             if keep_gpu {
                 device_title(gpu)
             } else {
                 "the CPU"
             }
         );
-        if keep_gpu {
-            self.encoder = gpu_encoder; // drops the CPU session
-        } else {
-            drop(gpu_encoder); // frees the VRAM
+        if !keep_gpu {
+            self.encoder = cpu_encoder; // frees the VRAM
             self.update_name();
         }
         Ok(())
     }
 
-    /// Best of two runs on `audio`, in ms, after one untimed run (which compiles a GPU
+    /// Best of two runs per probe, in ms, after one untimed run (which compiles a GPU
     /// encoder's kernels).
-    fn time(&mut self, audio: &[f32]) -> Result<f64> {
-        self.run(audio)?;
-        let mut best = f64::MAX;
-        for _ in 0..2 {
-            let t = Instant::now();
-            self.run(audio)?;
-            best = best.min(ms(t.elapsed()));
-        }
-        Ok(best)
+    fn time(&mut self, probes: &[Vec<f32>]) -> Result<Vec<f64>> {
+        self.run(&probes[0])?;
+        probes
+            .iter()
+            .map(|audio| {
+                let mut best = f64::MAX;
+                for _ in 0..2 {
+                    let t = Instant::now();
+                    self.run(audio)?;
+                    best = best.min(ms(t.elapsed()));
+                }
+                Ok(best)
+            })
+            .collect()
     }
 
     /// Rebuilds the encoder on the CPU after the GPU one failed.
@@ -657,7 +708,7 @@ impl SttEngine for Parakeet {
     }
 
     fn warmup(&mut self) -> Result<()> {
-        self.transcribe(&probe_audio(PROBE_SECS), &TranscribeOpts::default())?;
+        self.transcribe(&probe_audio(PROBE_SECS[0]), &TranscribeOpts::default())?;
         Ok(())
     }
 

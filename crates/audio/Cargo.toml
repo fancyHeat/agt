@@ -1,6 +1,6 @@
 [package]
 name = "agt-audio"
-description = "AGT audio: microphone capture to 16 kHz mono f32, resampling, WAV reading."
+description = "AGT audio: microphone capture to 16 kHz mono f32, resampling, WAV reading and writing."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

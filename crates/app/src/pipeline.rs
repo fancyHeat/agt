@@ -28,6 +28,10 @@
 //! Each dictation's measurements travel with it as an [`agt_telemetry::Dictation`] and are
 //! recorded (a channel send, never a disk write) wherever it ends: after the paste, or at the
 //! stage that dropped it. Only counts and timings: never the audio or the text.
+//!
+//! With `[history]` on, a transcribed dictation's text and/or audio also travel with it, as an
+//! [`agt_history::Entry`], and are handed to the history writer (again a channel send) after
+//! the paste. With it off, no entry is built.
 
 use agt_audio::{Level, Recorder};
 use agt_core::{
@@ -37,6 +41,7 @@ use agt_core::{
     polish::Polisher,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
+use agt_history::{self as history, History};
 use agt_platform::{
     ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key,
     MAX_CHORD, PasteToken, Permission,
@@ -265,6 +270,8 @@ enum ToPaste {
         released: Instant,
         target: Option<usize>,
         dictation: Box<Dictation>,
+        /// Only with `[history]` on.
+        saved: Option<Box<history::Entry>>,
     },
     /// The user asked for the last transcript on the clipboard (tray menu).
     CopyLast,
@@ -321,11 +328,12 @@ pub fn start(
     spawn("audio", move || audio.run(audio_rx, lvl));
 
     let (polisher, polish_info) = load_polisher(config, &hub);
-    let (h, cfg, tp) = (hub.clone(), config.clone(), to_paste.clone());
-    spawn("stt", move || stt_thread(cfg, h, stt_rx, tp, polisher));
+    let saver = history::start(&config.history, paths::dictations_dir());
+    let (h, cfg, tp, hs) = (hub.clone(), config.clone(), to_paste.clone(), saver.clone());
+    spawn("stt", move || stt_thread(cfg, h, stt_rx, tp, polisher, hs));
 
     let (h, cfg) = (hub.clone(), config.clone());
-    spawn("paste", move || paste_thread(cfg, h, paste_rx, key));
+    spawn("paste", move || paste_thread(cfg, h, paste_rx, key, saver));
 
     hub.update(|_| {});
     Ok(Pipeline {
@@ -521,7 +529,11 @@ struct AudioThread {
 
 impl AudioThread {
     fn run(self, events: Receiver<HotkeyEvent>, level: Level) {
-        let mut recorder = Recorder::new(self.config.audio.keep_mic_open, level);
+        let mut recorder = Recorder::new(
+            self.config.audio.keep_mic_open,
+            self.config.audio.device.clone(),
+            level,
+        );
         // Without the Microphone permission (macOS) the stream would be built on a device
         // that delivers silence; it's built on the first recording after the grant instead.
         if self.hub.missing(Permission::Microphone) {
@@ -782,11 +794,12 @@ fn stt_thread(
     jobs: Receiver<ToStt>,
     to_paste: Sender<ToPaste>,
     polisher: Option<Arc<dyn Polisher>>,
+    history: Option<History>,
 ) {
     let mut engine = load_engine(&config, &hub);
     let opts = TranscribeOpts::default();
     for msg in jobs {
-        let job = match msg {
+        let mut job = match msg {
             ToStt::RetryLoad => {
                 if engine.is_none() {
                     hub.update(|s| s.engine = Engine::Loading("Loading model...".into()));
@@ -822,6 +835,24 @@ fn stt_thread(
         match result {
             Ok(t) => {
                 let mut text = finish_text(&t.text, false);
+                d.words_raw = Some(text.split_whitespace().count() as i64);
+                // The audio is moved, not copied: transcription is done with it. The raw
+                // text's copy is a few hundred bytes: nanoseconds before the paste.
+                let mut saved = history.as_ref().map(|h| {
+                    Box::new(history::Entry {
+                        started_at: d.started_at,
+                        audio: if h.save_audio {
+                            std::mem::take(&mut job.audio)
+                        } else {
+                            Vec::new()
+                        },
+                        audio_secs: d.audio_secs.unwrap_or_default(),
+                        text: h.save_text.then(|| history::Text {
+                            raw: text.clone(),
+                            ..Default::default()
+                        }),
+                    })
+                });
                 if let Some(p) = polisher.as_deref().filter(|_| !text.is_empty()) {
                     let t = Instant::now();
                     let (polished, outcome) = agt_polish::polish_or_raw(p, &text, &config.polish);
@@ -836,16 +867,25 @@ fn stt_thread(
                         Outcome::Fallback(_) => "fallback",
                     });
                 }
+                if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
+                    t.polish_outcome = d.polish_outcome;
+                    t.polished = (d.polish_outcome == Some("polished")).then(|| text.clone());
+                }
                 if config.paste.trailing_space && !text.is_empty() {
                     text.push(' ');
                 }
                 if text.is_empty() {
                     tracing::info!(
                         "no speech recognized in {:.1} s of audio (stt {:.0} ms)",
-                        job.audio.len() as f64 / SAMPLE_RATE as f64,
+                        d.audio_secs.unwrap_or_default(),
                         ms(stt_end - stt_start)
                     );
                     hub.update(|s| s.pending -= 1);
+                    // No speech is kept too: what the model missed is worth having.
+                    if let (Some(h), Some(e)) = (&history, saved) {
+                        h.save(e);
+                        d.history_saved = true;
+                    }
                     telemetry::global().dictation(d, Ended::NoSpeech);
                 } else {
                     let _ = to_paste.send(ToPaste::Paste {
@@ -853,6 +893,7 @@ fn stt_thread(
                         released: job.released,
                         target: job.target,
                         dictation: d,
+                        saved,
                     });
                 }
             }
@@ -1056,7 +1097,13 @@ fn undo_clipboard(
     }
 }
 
-fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey) {
+fn paste_thread(
+    config: Config,
+    hub: Hub,
+    rx: Receiver<ToPaste>,
+    hotkey: Hotkey,
+    history: Option<History>,
+) {
     let restore_after = Duration::from_millis(config.paste.restore_clipboard_ms);
     let restore = !restore_after.is_zero();
     let mut saver = Saver::default();
@@ -1090,6 +1137,7 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                 released,
                 target,
                 dictation: mut d,
+                saved,
             }) => {
                 // Later messages (the next dictation's paste included) queue up behind this
                 // wait, so pastes stay in order.
@@ -1187,6 +1235,13 @@ fn paste_thread(config: Config, hub: Hub, rx: Receiver<ToPaste>, hotkey: Hotkey)
                     .filter(|&(n, _)| Some(n) == ours)
                     .map(|(_, took)| took);
                 d.paste_ms = Some(ms(pasted - paste_start));
+                if let (Some(h), Some(mut e)) = (&history, saved) {
+                    if let Some(t) = e.text.as_mut() {
+                        t.pasted = result.is_ok().then_some(text);
+                    }
+                    h.save(e);
+                    d.history_saved = true;
+                }
                 match result {
                     Ok(token) => {
                         d.release_to_paste_ms = Some(ms(pasted - released));

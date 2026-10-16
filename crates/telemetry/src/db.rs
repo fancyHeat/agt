@@ -160,7 +160,24 @@ CREATE TABLE metric_rollups (
     PRIMARY KEY (day, metric)
 ) WITHOUT ROWID;
 "#,
-    // 2: audio.duck and audio.duck_level.
+    // 2: the remaining non-secret settings (microphone, [history], polish limits, custom
+    // prompts: whether, never what), the raw transcript's word count, and whether a history
+    // record was saved.
+    r#"
+ALTER TABLE app_sessions ADD COLUMN audio_device TEXT;
+ALTER TABLE app_sessions ADD COLUMN overlay_position TEXT;
+ALTER TABLE app_sessions ADD COLUMN polish_timeout_ms INTEGER;
+ALTER TABLE app_sessions ADD COLUMN polish_timeout_per_word_ms INTEGER;
+ALTER TABLE app_sessions ADD COLUMN polish_min_words INTEGER;
+ALTER TABLE app_sessions ADD COLUMN polish_custom_prompt INTEGER;
+ALTER TABLE app_sessions ADD COLUMN polish_custom_user_message INTEGER;
+ALTER TABLE app_sessions ADD COLUMN history_save_text INTEGER;
+ALTER TABLE app_sessions ADD COLUMN history_save_audio INTEGER;
+ALTER TABLE app_sessions ADD COLUMN history_keep_days INTEGER;
+ALTER TABLE dictations ADD COLUMN words_raw INTEGER;
+ALTER TABLE dictations ADD COLUMN history_saved INTEGER NOT NULL DEFAULT 0;
+"#,
+    // 3: audio.duck and audio.duck_level.
     r#"
 ALTER TABLE app_sessions ADD COLUMN duck INTEGER;
 ALTER TABLE app_sessions ADD COLUMN duck_level REAL;
@@ -263,9 +280,14 @@ pub(crate) fn insert_session(
             keep_mic_open, stt_engine, stt_model, stt_precision, stt_device, stt_threads,
             polish_enabled, polish_provider, polish_model, polish_style, restore_clipboard_ms,
             trailing_space, overlay_enabled, updates_enabled, log_level, config_error,
-            s1_styling, s1_structure, s1_context, s1_device, duck, duck_level)
+            s1_styling, s1_structure, s1_context, s1_device, audio_device, overlay_position,
+            polish_timeout_ms,
+            polish_timeout_per_word_ms, polish_min_words, polish_custom_prompt,
+            polish_custom_user_message, history_save_text, history_save_audio, history_keep_days,
+            duck, duck_level)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
+            ?37, ?38)",
         params![
             at,
             s.app_version,
@@ -293,6 +315,16 @@ pub(crate) fn insert_session(
             s.s1_structure,
             s.s1_context,
             s.s1_device,
+            s.audio_device,
+            s.overlay_position,
+            s.polish_timeout_ms,
+            s.polish_timeout_per_word_ms,
+            s.polish_min_words,
+            s.polish_custom_prompt,
+            s.polish_custom_user_message,
+            s.history_save_text,
+            s.history_save_audio,
+            s.history_keep_days,
             s.duck,
             s.duck_level,
         ],
@@ -345,9 +377,10 @@ pub(crate) fn insert_dictation(
         "INSERT INTO dictations (session_id, started_at, outcome, hold_ms, audio_secs, rms,
             key_down_to_mic_ms, first_audio_ms, missed_release, queue_wait_ms, stt_ms, rtf,
             polish_ms, polish_outcome, hotkey_wait_ms, clipboard_save_ms, paste_ms,
-            release_to_paste_ms, chars_out, words_out, stt_backend, latency_ms)
+            release_to_paste_ms, chars_out, words_out, stt_backend, latency_ms, words_raw,
+            history_saved)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22)",
+            ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             session,
             d.started_at,
@@ -371,6 +404,8 @@ pub(crate) fn insert_dictation(
             d.words_out,
             d.stt_backend,
             latency,
+            d.words_raw,
+            d.history_saved,
         ],
     )?;
     Ok(())

@@ -54,6 +54,10 @@ key = ""#,
 min_hold_ms = 150
 
 [audio]
+# Microphone to record from, by name as the Settings menu lists it. "": the system's default
+# input device (and whichever device that later becomes). A named microphone that isn't
+# connected falls back to the default.
+device = ""
 # Keep the microphone stream running all the time. Off: the stream is only started while the
 # hotkey is held, so the OS "microphone in use" indicator is off when you're not dictating
 # (start-up takes a few milliseconds, measured on the first dictation and logged).
@@ -160,6 +164,20 @@ enabled = true
 # "bottom" or "top" of the screen with the focused window (horizontally centered).
 position = "bottom"
 
+[history]
+# Keep a copy of each dictation, e.g. to look back at what you said or to build a custom
+# dictionary. Stored only on this machine, as plain files in the "dictations" folder next to
+# agt.db (tray: Settings > History > Open history folder); never uploaded. Turning saving off
+# keeps what's already there (it's still deleted after keep_days).
+# Save the transcript (before polish), the polished text and the pasted text (dictations.jsonl).
+save_text = false
+# Save the recording as a WAV file (16 kHz mono; about 1.9 MB per minute of speech).
+save_audio = false
+# Delete saved dictations after this many days; 0 = keep them forever. Whole days are
+# deleted, so up to one day more may be kept. Each record joins its timings and settings in
+# agt.db, which keeps those 180 days: older records no longer find theirs.
+keep_days = 30
+
 [update]
 # Check GitHub Releases for updates on startup and periodically (tray "Update now" works
 # either way).
@@ -222,6 +240,7 @@ pub struct Config {
     pub paste: PasteConfig,
     pub polish: PolishConfig,
     pub overlay: OverlayConfig,
+    pub history: HistoryConfig,
     pub update: UpdateConfig,
     /// Why `[polish]` couldn't be used (see [`Config::parse`]); polish is then off.
     #[serde(skip)]
@@ -242,6 +261,8 @@ pub struct HotkeyConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
+    /// Input device name; "" = the system default.
+    pub device: String,
     pub keep_mic_open: bool,
     pub duck: bool,
     /// As written; the method clamps it.
@@ -254,6 +275,7 @@ pub const DEFAULT_DUCK_LEVEL: f32 = 0.1;
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
+            device: String::new(),
             keep_mic_open: false,
             duck: true,
             duck_level: DEFAULT_DUCK_LEVEL,
@@ -557,6 +579,33 @@ impl Default for OverlayConfig {
     }
 }
 
+/// `[history]`: optional copies of dictations on this machine (see `agt-history`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    pub save_text: bool,
+    pub save_audio: bool,
+    /// 0 = forever.
+    pub keep_days: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            save_text: false,
+            save_audio: false,
+            keep_days: 30,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// Whether dictations are saved at all.
+    pub fn enabled(&self) -> bool {
+        self.save_text || self.save_audio
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -575,6 +624,7 @@ impl Default for Config {
             paste: PasteConfig::default(),
             polish: PolishConfig::default(),
             overlay: OverlayConfig::default(),
+            history: HistoryConfig::default(),
             update: UpdateConfig::default(),
             polish_error: None,
             polish_notice: None,
@@ -1076,6 +1126,23 @@ mod tests {
         assert!(!c.overlay.enabled);
         assert_eq!(c.overlay.position, OverlayPosition::Top);
         assert!(Config::parse("[overlay]\nposition = \"left\"").is_err());
+    }
+
+    #[test]
+    fn history_settings() {
+        let c = Config::default().history;
+        assert!(!c.save_text && !c.save_audio && !c.enabled());
+        assert_eq!(c.keep_days, 30);
+        let c = Config::parse("[history]\nsave_audio = true\nkeep_days = 0\n")
+            .unwrap()
+            .history;
+        assert!(c.enabled() && !c.save_text);
+        assert_eq!(c.keep_days, 0);
+        assert!(Config::parse("[history]\ntypo = 1").is_err());
+        assert!(Config::parse("[history]\nkeep_days = -1").is_err());
+        let out =
+            with_settings(DEFAULT_CONFIG, &[(&["history", "keep_days"], 7i64.into())]).unwrap();
+        assert_eq!(Config::parse(&out).unwrap().history.keep_days, 7);
     }
 
     #[test]
