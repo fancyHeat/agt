@@ -610,7 +610,8 @@ default device, the 12 transcripts of 95-570 words): p50 1168 ms, p90 2145 ms, m
 - **Polish is now the long pole** for long dictations: 1.2 s p50, 2.1 s p90 for a few hundred
   words, 5-10x the STT tail. It still needs the whole text (sentence boundaries and style
   depend on context), so it stays a single call at release; polishing finished segments in the
-  background is the next lever if long dictations feel slow, but it was not tried here.
+  background is the next lever if long dictations feel slow, but it was not tried here (it is
+  in "Polish speed" below).
 
 ### Recommendation for the app wiring phase
 
@@ -705,6 +706,212 @@ monologue with no 1 s pause in 25 s), which today's post-release chunking makes 
 at its own 25 s cuts. Not fixed: lowercasing after a join would break the real sentence
 starts, which are far more common; polish sees the whole text and can repair it.
 
+## Polish speed
+
+With long dictations transcribed while recording, release -> text is 0.2-0.4 s and the
+optional S1-mini polish (1.2 s p50, 2.1 s p90, 4.5 s max above) is the long pole. S1-mini is
+Qwen3-0.6B (Q4_K_M, 485 MB) run by AGT's own `llama-server` (llama.cpp b11669); its output is
+the transcript again with small edits, so a request is almost all decoding: 100-680 prompt
+tokens are read in 20-50 ms, then it writes about as many tokens one by one (~3.2 ms each on
+the RTX 2080 Ti, ~6.5 ms on the M4).
+
+**Inputs.** The 12 long dictations above as Parakeet (DirectML) transcribed them while
+recording (83-569 words, 3,807 polished words; `agt-bench live --texts --segments`), and the
+78 clips of the regular set (2-60 s, 1,883 words). Latency is the first request for each
+transcript (the same text again hits llama-server's caches), 3 s idle before each, after a
+warm-up pass over 30 other clips; p50/p90/max over transcripts. Windows: the i9-9900K + RTX
+2080 Ti above, Vulkan (what AGT ships). Mac: the M4 mini, Metal. Flags were tried with
+`scripts/polish_sweep.py` (llama-server with AGT's fixed flags plus the ones under test, S1-mini's
+prompt and AGT's request); what ships was then measured with `agt-bench polish`.
+
+### Results
+
+**Speculative decoding from the prompt** (`--spec-type ngram-simple`, in b11669): find the
+last *n* generated tokens earlier in the context (here: in the transcript) and propose the *m*
+that followed them; one batched forward pass checks all of them and keeps the ones the model
+would have chosen anyway. No draft model, no extra memory. Long transcripts, Windows (warm-up
+pass, back to back):
+
+| Drafting | p50/p90/max ms | tokens/s | drafts accepted |
+|---|---|---|---|
+| none (today) | 1244/2283/2330 | 315 | - |
+| `ngram-simple` defaults (n 12, m 48) | 674/1214/1824 | 528 | 48% |
+| n 2, m 16 | 633/947/1187 | 680 | 50% |
+| n 3, m 8 | 743/1117/1318 | 618 | 77% |
+| n 3, m 16 | 608/874/1179 | 725 | 62% |
+| n 4, m 8 | 704/1105/1323 | 619 | 81% |
+| n 4, m 16 | 628/1065/1517 | 623 | 67% |
+| n 4, m 32 | 568/1033/1422 | 675 | 51% |
+| n 6, m 16 | 585/1045/1312 | 659 | 72% |
+| n 8, m 16 | 671/1179/1517 | 575 | 76% |
+| `ngram-mod` defaults | 772/1595/2014 | 434 | 43% |
+| `ngram-map-k` defaults (no warm-up pass) | 1058/2059/2085 | 341 | 47% |
+
+With 3 s idle before each request, which separates the close ones (two runs each where shown):
+
+| Drafting | Windows p50/p90/max ms | Mac p50/p90/max ms |
+|---|---|---|
+| none (today) | 1200/2235/2371 | 2459/4753/4787 (154 tokens/s) |
+| n 3, m 8 | - | 1227/1922/2242 |
+| n 3, m 16 | 623/1045/1209, 593/919/1206 | 1323/2088/2623, 1316/2059/2648 |
+| n 4, m 16 | 622/995/1245 | 1257/2146/2568 |
+| **n 3, m 24** | **520/937/1151, 516/903/1183** | **978/1688/2198, 954/1672/2141** (432-438 tokens/s) |
+| n 4, m 24 | - | 927/1781/2197 |
+| n 3, m 32 | - | 1221/2061/2720 |
+| n 3, m 48 | - | 1153/2062/2574 |
+| n 3, m 16 + `ngram-mod` | 1005/2413/2943 | - |
+
+**What ships** (this change: `--spec-type ngram-simple --spec-ngram-simple-size-n 3
+--spec-ngram-simple-size-m 24 --spec-draft-n-max 24 --cache-ram 0`), 3 s idle before each:
+
+| | Windows (Vulkan) | Mac (Metal) |
+|---|---|---|
+| long, today | 1342/2318/2380 ms, 308 tokens/s | 2459/4753/4787 ms, 154 tokens/s |
+| long, this change (sweep script) | 720/1089/1343 ms, 601 tokens/s | 954/1672/2141 ms, 438 tokens/s |
+| long, this change (`agt-bench polish`, AGT's client and guard) | 519/900/1178 ms | 975/1676/2127 ms |
+| long, outputs identical to today | 11 of 12 (9 words differ in 3,807) | 10 of 12 (10 words) |
+| clips 2-60 s, today | 116/203/614 ms | 192/333/1181 ms |
+| clips 2-60 s, this change | 71/130/338 ms | 108/183/525 ms |
+| clips, outputs identical to today | 77 of 78 (one comma) | 77 of 78 (comma vs period) |
+| Windows CPU (`s1_mini.device = "cpu"`), long, back to back | 10075/20448/22268 -> 5556/9330/12098 ms (37 -> 84 tokens/s) | - |
+
+The two Windows "today" rows (1200 vs 1342 ms p50) and the two "this change" rows (720 vs
+519 ms) are the same setup on different runs: how fast the RTX 2080 Ti clocks back up after 3 s
+idle varies with what else the desktop is doing (see "Idle and suspension" below). Each pair
+was measured back to back, so compare within a row pair, not across.
+
+**Output identity.** Greedy decoding with drafts is meant to give the same text, but checking
+24 drafted tokens in one batch runs different GPU kernels than one token at a time, and where
+two tokens are nearly tied the rounding difference picks the other one. That happened on one
+long transcript on both machines (a garbled passage with quotes: `...opposition to the
+project. The EU is a 50-year-old attempted answer...` vs `...opposition to the EU as a
+50-year-old attempt...`; on the Mac today's output was the second one already) and on one
+punctuation mark per platform in the clips; some lines also flip between runs of the same
+server. It's the same kind and size of difference as changing backends: the CUDA build's
+output, without drafts, differs from Vulkan's on 5 of 12 long transcripts (28 words). On the
+CPU, 7 of 12 long outputs differ, by 7 words in all (`doll,`/`doll`, `Tonight`/`To night`,
+`nine`/`9`, a repeated `Smallpox.` dropped) plus whitespace.
+
+**Other flags** (Windows, long, 3 s idle, with the drafting above; 516/903/1183 ms without
+them): flash attention off 581/1028/1765, forced on 689/1095/1384; q8_0 KV cache 823/1500/3175
+(and 7 of 12 outputs changed); `-t 8` 718/1094/1347. None helps: at a 4096 context the
+attention and KV cache are a small part of a 0.6B model's step, and prefill is already ~3% of a
+request. Batch and ubatch only affect prefill. The system prompt is already reused from the
+slot's cache (`cache_n`); it's ~50 tokens anyway. The CUDA 12.4 build (b11669, +650 MB with
+its runtime) decodes no faster than Vulkan (298 vs 315 tokens/s in the server, 370 in
+`llama-bench tg128`): at 0.6B the step is launch- and sync-bound, not bandwidth-bound. Vulkan
+stays.
+
+**Memory.** llama-server's `--cache-ram` (default 8192 MiB) keeps the KV cache of earlier
+prompts in RAM to reuse them; every dictation is a new prompt, so it only grows: after ~45 long requests the server's working set was 1,569 MB vs 346 MB with
+`--cache-ram 0` (private bytes 2,856 vs 1,629 MB); on the Mac the physical footprint was 1,818
+vs 579 MB. No latency difference (1218 vs 1215 ms p50). VRAM is the same with and without
+drafts (Windows 860 MB after short requests, ~1,260 MB once long ones ran); working set after
+the runs ~250-310 MB, Mac footprint ~596 MB.
+
+**Idle and suspension** (Windows, 12 clips of 17-85 words, drafting on): back to back 67 ms p50;
+after 2 s idle 211 ms, after 2 s suspended 216 ms, after 10 s suspended 261 ms (today's flags:
+437 ms). Half an hour later the same 10 s suspended run gave 89 ms (and 87-89 ms with a
+1-token request 2, 5 or 10 s before, as a key-down "wake-up" would send). Suspension itself
+costs nothing measurable: what varies is the GPU's clocks after idle (P8 at 300 MHz), which
+depends on what else the desktop is doing. Mac: back to back 100 ms, 10 s idle 129 ms, 10 s
+suspended 139 ms. Resuming the server at key-down would save microseconds; a wake-up request at
+key-down didn't help in the state measured, and can't keep the GPU up through a long dictation.
+
+**Polishing ahead of release** (`agt-bench polish --segments --pause-ms 3000`, drafting on):
+the pipeline could polish while the user is still talking, leaving only the end for release.
+Two ways, both against polishing the whole text at release (the 12 long dictations, 104 STT
+segments, 92 segment boundaries):
+
+- *each segment*: polish every STT segment on its own as it's transcribed; at release, the
+  tail.
+- *ahead* (`agt_polish::ahead`): cut pieces only at a sentence end *inside* a segment, never at
+  a segment boundary; what follows the last such sentence end waits for the next segment; at
+  release, polish what's left plus the tail.
+
+| | Windows release p50/p90/max ms | Mac release p50/p90/max ms | background requests p50/p90 ms (Win, Mac) | words at release p50/p90 | words differing from whole (Win, Mac) | sentence breaks at piece joins (extra/lost vs whole) | WER (Win, Mac) |
+|---|---|---|---|---|---|---|---|
+| whole text (today's path, drafting on) | 509/885/1152 | 870/1682/2173 | - | 278/566 | - | - | 8.04%, 7.91% |
+| each segment | 70/116/185 | 123/191/253 | 95/149, 154/234 (92) | 27/51 | 3.08%, 2.86% | 10/2 of 92 | 8.07%, 8.04% |
+| **ahead** | **172/284/289** | **281/438/446** | 106/191, 161/297 (62) | 62/108 | 2.05%, 1.86% | **0/0 of 62** | **7.99%, 7.99%** |
+
+WER is against the eval set's references with the normalizer above, which ignores case and
+punctuation; the raw STT text scores 7.19%, so polish's rewrites cost 0.7-0.9 points under this
+normalizer however it is split. "Words differing" counts exact word edits (case and
+punctuation included) between the joined pieces and the whole-text output.
+
+The speech recognizer ends every segment with a period, also when the pause was
+mid-sentence; polishing the whole text repairs those joins, polishing a segment alone can't:
+*each segment* left 10 of 92 joins broken (`My great-grandparents. | Died all of them...`,
+`The face of someone. | Who, against all odds...`, `...the TV. | And as this is...`). *Ahead*
+never cuts there, so every segment join is polished with both sides and the piece joins are
+real sentence ends (0 of 62 differ from the whole text). Its other differences are the
+near-tie choices described above, spread through the text (`Mrs.`/`Miss Farinder`, `the
+project. The EU is`/`the EU as`, `5`/`five`), not concentrated at the joins, and WER is the
+same.
+
+### What the numbers say (polish speed)
+
+- **Prompt-lookup drafting halves polish time on every platform, for free.** n-gram drafting
+  from the transcript accepts 50-80% of what it proposes because the answer is mostly a copy:
+  long dictations go from 1.2-1.3 s to 0.5-0.7 s p50 and 2.2-2.3 s to 0.9-1.1 s p90 on Windows,
+  2.5 s to 1.0 s p50 and 4.8 s to 1.7 s p90 on the Mac; 2-60 s clips 40% faster; the Windows
+  CPU fallback 1.8x. No model, download, VRAM or RAM is added. Short lookups (n = 3) recover
+  fastest after an edit; 24-token drafts were best on both machines (m = 16 is as good on
+  Windows, 35% slower on the Mac; 32-48 waste more work on rejected drafts).
+- **The output is the same text, give or take near-ties.** Byte-identical on 88 of 90
+  transcripts on Windows (87 on the Mac); the rest are single-token near-ties that already
+  differ between backends (CUDA vs Vulkan: 5 of 12) and Macs vs PCs. No dropped or invented
+  content attributable to drafting was seen.
+- **`--cache-ram` was a leak in practice.** With b11669's default the server's memory grows
+  with every dictation (+1.2 GB after ~45 long ones, up to 8 GB), for a cache AGT can't use.
+  Off, with no latency cost.
+- **Nothing else in the server pays.** Flash attention, KV cache type, threads, batch sizes
+  and CUDA are all within noise or worse; prefill is ~3% of a request and the fixed prompt is
+  already cached. Decoding 0.6B parameters is launch-bound on both GPUs (~3 and ~6.5 ms a
+  token), so fewer forward passes (drafting) is the lever, not faster ones.
+- **Suspension is free; GPU clocks are not.** Resuming the suspended server costs nothing
+  measurable, so resuming it at key-down buys nothing. After idle the RTX 2080 Ti sometimes
+  needs ~150 ms more for a short request (P8 -> P0), sometimes ~20 ms, depending on the desktop;
+  a key-down wake-up request didn't change it when measured, and couldn't survive a long
+  dictation anyway. Not worth wiring.
+- **max_tokens** (bytes / 2 + 64, ~2x the expected output) only stops a runaway answer;
+  generation ends at the end-of-text token long before it, so tightening it changes no latency.
+  **Skipping polish** when it can't change anything isn't possible to know in advance: STT
+  output with correct punctuation still gets numbers, repeats and false starts rewritten.
+- **Polishing ahead turns release -> polished text into a tail-sized request.** With drafting,
+  *ahead* takes long dictations from 0.5/0.9 s to 0.17/0.28 s (p50/p90) on Windows and from
+  0.9/1.7 s to 0.28/0.44 s on the Mac, with the same WER and no broken joins; the release piece
+  is the last sentence of the previous segment plus the tail (62 words p50). Polishing each
+  segment on its own is faster still (0.07/0.12 s) but leaves ~1 in 9 segment joins as a
+  sentence break mid-sentence, which is exactly the boundary artifact whole-text polish was
+  repairing. The cost is background work: about one 0.1-0.2 s request per segment that has a
+  sentence end (62 requests in 35 min of dictation, ~6.5 s of GPU time on Windows), each with
+  a GPU wake-up.
+
+### Recommendation (polish speed)
+
+- **Ship now** (this change): `--spec-type ngram-simple --spec-ngram-simple-size-n 3
+  --spec-ngram-simple-size-m 24 --spec-draft-n-max 24` and `--cache-ram 0` in the managed
+  server's arguments. Same pinned build, no new download.
+- **Wire *ahead* after the incremental STT wiring lands**, on the STT worker's output: each
+  segment's text goes to `Ahead::push`, a returned piece is polished right away on a polish
+  worker (one thread, in order, same `polish_or_raw` and guard per piece), and at release
+  `Ahead::finish(tail)` is polished and the pieces are joined with spaces. Short dictations
+  need no special case: a single segment never yields a piece before `finish`, so they take
+  exactly today's path. Only when `[Context: general]` (S1-mini's email context writes a
+  greeting and sign-off around the whole text) and only for the managed or a local server (a
+  cloud provider would bill a request per piece). Cancel drops the queue like STT's does. Worth
+  it mostly on the Mac (p90 1.7 -> 0.44 s) and for multi-minute dictations; on Windows it saves
+  ~0.35 s p50 / 0.6 s p90 for 1-6 minute ones.
+- **Telemetry** (metrics only): polish time at release, the release piece's word count, pieces
+  polished ahead and their total time, guard fallbacks per piece, and draft acceptance
+  (llama-server's `timings.draft_n` / `draft_n_accepted`) to see whether 24-token drafts suit
+  real dictation as well as this set.
+- **Not worth doing**: resuming at key-down or a wake-up request, the CUDA build, flash
+  attention / KV cache / thread / batch settings, `ngram-mod` (it learns across requests, so it
+  is fast on a repeated text and slower on a new one: 336 vs 772 ms), smaller `max_tokens`.
+
 ## Reproducing
 
 ```sh
@@ -726,6 +933,17 @@ target/release/agt-bench live --device cpu --realtime --only ted-dict-01 eval-da
 target/release/agt-bench live --device cpu --idle-ms 0 --joins eval-data/long/clips   # the app's path, joins
 target/release/agt-bench live --device cpu --idle-ms 0 --no-guards eval-data/long/clips   # bare cutter
 target/release/agt-bench live --device coreml --precision fp32 --max-secs 10 eval-data/long/clips   # macOS
+
+# Polish speed: transcripts first (DirectML), one per line for the plain runs
+target/release/agt-bench live --device directml --idle-ms 0 --texts long.tsv --segments segs.tsv eval-data/long/clips
+cut -f4 long.tsv > long.txt
+target/release/agt-bench polish --runs 1 --pause-ms 3000 long.txt          # what AGT ships
+target/release/agt-bench polish --segments --pause-ms 3000 --refs eval-data/long/clips segs.tsv
+# llama-server flags (the managed server's files are in AGT's models folder, s1-mini/ and agt-llama-server/b11669/)
+python3 scripts/polish_sweep.py --exe <llama-server> --model <s1-mini-q4_k_m.gguf> --texts long.txt \
+  --warm warm.txt --pause-ms 3000 --label base --args "--n-gpu-layers all"
+python3 scripts/polish_sweep.py ... --label spec --compare base \
+  --args "--n-gpu-layers all --cache-ram 0 --spec-type ngram-simple --spec-ngram-simple-size-n 3 --spec-ngram-simple-size-m 24 --spec-draft-n-max 24"
 
 # macOS (Apple Silicon): `brew install cmake` for whisper-metal
 cargo build --release --locked -p agt-bench
