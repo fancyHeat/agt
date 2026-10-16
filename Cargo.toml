@@ -18,6 +18,7 @@ agt-polish = { path = "crates/polish" }
 agt-fetch = { path = "crates/fetch" }
 agt-overlay = { path = "crates/overlay" }
 agt-telemetry = { path = "crates/telemetry" }
+agt-history = { path = "crates/history" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 tracing = "0.1"

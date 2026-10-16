@@ -74,6 +74,8 @@ enum UpdateEvent {
 
 /// How long exiting waits for the telemetry writer to commit the last records.
 const TELEMETRY_FLUSH: Duration = Duration::from_secs(2);
+/// The same for the dictation history writer.
+const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
 fn main() {
     // `agt stats`: a report from the telemetry database; doesn't start the app.
@@ -212,11 +214,13 @@ fn main() {
     }
     tracing::info!("AGT exiting");
     agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
+    // The last dictation's history record (and WAV) may still be being written.
+    agt_history::flush(HISTORY_FLUSH);
 }
 
-/// The session's non-secret settings. Polish: provider, model, style and S1-mini's options
-/// only (never the API key, its variable, the URL, which may carry credentials, or a custom
-/// prompt).
+/// The session's non-secret settings. Polish: provider, model, style, S1-mini's options and
+/// limits only (never the API key, its variable, the URL, which may carry credentials, or a
+/// custom prompt: only whether there is one).
 fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionStart {
     let lower = |v: &dyn std::fmt::Debug| format!("{v:?}").to_lowercase();
     let polish = &config.polish;
@@ -246,6 +250,19 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         updates_enabled: config.update.enabled,
         log_level: config.log_level.clone(),
         config_error,
+        audio_device: config.audio.device.clone(),
+        overlay_position: config
+            .overlay
+            .enabled
+            .then(|| config.overlay.position.as_str().into()),
+        polish_timeout_ms: on.then_some(polish.timeout_ms as i64),
+        polish_timeout_per_word_ms: on.then_some(polish.timeout_per_word_ms as i64),
+        polish_min_words: on.then_some(polish.min_words as i64),
+        polish_custom_prompt: on.then_some(!polish.prompt.is_empty()),
+        polish_custom_user_message: on.then_some(!polish.user_message.is_empty()),
+        history_save_text: config.history.save_text,
+        history_save_audio: config.history.save_audio,
+        history_keep_days: config.history.keep_days as i64,
     }
 }
 
@@ -719,6 +736,13 @@ impl App {
                 }
             }
             Action::EditFile => open_in_editor(&self.config_path),
+            Action::OpenHistory => {
+                let dir = paths::dictations_dir();
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::error!("cannot create {}: {e}", dir.display());
+                }
+                open_folder(&dir);
+            }
             Action::ApplyNow => {
                 let restart = self.restart_with.take().unwrap_or(Restart::Settings);
                 self.restart_now(restart, event_loop);

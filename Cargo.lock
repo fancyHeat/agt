@@ -14,6 +14,7 @@ version = "0.0.11"
 dependencies = [
  "agt-audio",
  "agt-core",
+ "agt-history",
  "agt-overlay",
  "agt-platform",
  "agt-polish",
@@ -71,6 +72,19 @@ dependencies = [
  "sha2",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "agt-history"
+version = "0.0.11"
+dependencies = [
+ "agt-audio",
+ "agt-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
