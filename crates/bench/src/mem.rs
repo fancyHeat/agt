@@ -1,4 +1,5 @@
-//! Process memory for the report: peak resident set and (Windows) GPU dedicated memory.
+//! Process resources for the report: peak resident set, (Windows) GPU dedicated memory and
+//! CPU time.
 
 /// Peak working set (Windows) / max RSS (macOS, Linux) of this process so far, in bytes.
 #[cfg(windows)]
@@ -55,4 +56,33 @@ pub fn gpu_dedicated_bytes() -> Option<u64> {
 #[cfg(not(windows))]
 pub fn gpu_dedicated_bytes() -> Option<u64> {
     None
+}
+
+/// CPU time (user + kernel) this process has used so far, all threads.
+#[cfg(windows)]
+pub fn cpu_time() -> std::time::Duration {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
+    let mut t: [FILETIME; 4] = unsafe { std::mem::zeroed() };
+    let [c, e, k, u] = &mut t;
+    // SAFETY: valid pseudo-handle and four writable FILETIMEs.
+    unsafe { GetProcessTimes(GetCurrentProcess(), c, e, k, u) };
+    let ticks = |f: &FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    std::time::Duration::from_nanos((ticks(&t[2]) + ticks(&t[3])) * 100)
+}
+
+#[cfg(unix)]
+pub fn cpu_time() -> std::time::Duration {
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage writes into the provided struct.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let tv = |t: libc::timeval| std::time::Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    tv(u.ru_utime) + tv(u.ru_stime)
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn cpu_time() -> std::time::Duration {
+    std::time::Duration::ZERO
 }

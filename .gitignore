@@ -10,3 +10,4 @@
 *.pfx
 *.pem
 .env
+__pycache__/

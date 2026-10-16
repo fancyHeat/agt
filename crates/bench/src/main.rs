@@ -24,10 +24,14 @@
 //!
 //! Engine-agnostic: it only uses `agt_stt::load` and the `SttEngine` trait.
 //!
+//! `agt-bench live [options] <dir>` simulates recording long dictations and transcribing them
+//! while they are being recorded (see [`live`]).
+//!
 //! `agt-bench polish [options] <transcripts.txt>` instead runs the LLM clean-up (`[polish]`)
 //! over each non-empty line of a text file and prints latency, the guard outcome and the
 //! result (see [`polish`]).
 
+mod live;
 mod polish;
 
 mod mem;
@@ -79,27 +83,21 @@ fn run() -> Result<(), String> {
         .with_max_level(level.unwrap_or(tracing::Level::WARN))
         .with_writer(std::io::stderr)
         .init();
-    if std::env::args().nth(1).as_deref() == Some("polish") {
-        return polish::run(std::env::args().skip(2));
+    match std::env::args().nth(1).as_deref() {
+        Some("polish") => return polish::run(std::env::args().skip(2)),
+        Some("live") => return live::run(std::env::args().skip(2)),
+        _ => {}
     }
     let mut cfg = SttConfig::default();
     let (mut runs, mut warmup, mut quiet, mut dir) = (3usize, true, false, None);
     let mut gap = std::time::Duration::ZERO;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
+        if stt_flag(&mut cfg, &a, &mut args)? {
+            continue;
+        }
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
-            "--config" => {
-                let p = val()?;
-                let text = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
-                cfg = Config::parse(&text).map_err(|e| e.to_string())?.stt;
-            }
-            "--engine" => cfg.engine = enum_value(&a, val()?)?,
-            "--model" => cfg.model = val()?,
-            "--precision" => cfg.precision = enum_value(&a, val()?)?,
-            "--device" => cfg.device = enum_value(&a, val()?)?,
-            "--threads" => cfg.threads = val()?.parse().map_err(|_| "bad --threads")?,
-            "--models-dir" => cfg.models_dir = val()?,
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
             "--gap-ms" => {
                 gap = std::time::Duration::from_millis(val()?.parse().map_err(|_| "bad --gap-ms")?)
@@ -297,6 +295,31 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Applies one of the `[stt]` flags (`--config`, `--engine`, `--model`, `--precision`,
+/// `--device`, `--threads`, `--models-dir`); false if `a` isn't one.
+fn stt_flag(
+    cfg: &mut SttConfig,
+    a: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<bool, String> {
+    let mut val = || args.next().ok_or(format!("{a} needs a value"));
+    match a {
+        "--config" => {
+            let p = val()?;
+            let text = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
+            *cfg = Config::parse(&text).map_err(|e| e.to_string())?.stt;
+        }
+        "--engine" => cfg.engine = enum_value(a, val()?)?,
+        "--model" => cfg.model = val()?,
+        "--precision" => cfg.precision = enum_value(a, val()?)?,
+        "--device" => cfg.device = enum_value(a, val()?)?,
+        "--threads" => cfg.threads = val()?.parse().map_err(|_| "bad --threads")?,
+        "--models-dir" => cfg.models_dir = val()?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
@@ -321,9 +344,9 @@ fn name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// `ted-medium-03` -> `ted`; names without a bucket marker are their own set.
+/// `ted-medium-03` (or `ted-dict-01`) -> `ted`; names without a bucket marker are their own set.
 fn set_of(name: &str) -> String {
-    ["-short-", "-medium-", "-long-"]
+    ["-short-", "-medium-", "-long-", "-dict-"]
         .iter()
         .find_map(|m| name.find(m).map(|i| name[..i].to_owned()))
         .unwrap_or_else(|| "other".into())
