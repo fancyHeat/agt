@@ -661,7 +661,11 @@ the cutter; segments still queued are skipped and the text of one being transcri
 discarded (a flag per recording), while an earlier dictation still queued pastes in order.
 The recording cap went from 5 to 30 minutes (115 MB of samples at most; the recorder's
 callback buffer is emptied every 250 ms so a long recording is never reallocated inside the
-audio callback). Telemetry: `release_to_text_ms` and the `live_*` columns of `dictations`.
+audio callback). Telemetry: `release_to_text_ms` and the `live_*` columns of `dictations` (for a cancelled one too, as
+far as it got). Polish is skipped (`polish_outcome = too_long`) for a transcript over 1,400
+words with S1-mini: its 4096-token context holds about that much plus the answer, and a
+longer one would only fail after generating until the timeout (25-70 s for 10-30 minutes,
+blocking the next dictation).
 `agt-bench live` runs the same `Live` (`--no-guards` for the bare cutter, `--joins` for the
 check below).
 

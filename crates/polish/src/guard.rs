@@ -1,7 +1,8 @@
 //! Guards around a polisher: it may only make dictation better, never worse or stuck.
 //!
 //! [`polish_or_raw`] returns the raw transcript when:
-//! - it has fewer than `polish.min_words` words (not worth the latency);
+//! - it has fewer than `polish.min_words` words (not worth the latency), or (S1-mini) more
+//!   than its context holds ([`S1_MINI_MAX_WORDS`]);
 //! - the request fails or exceeds its deadline;
 //! - the output fails [`check`]: after stripping wrappers the model may add (code fences,
 //!   surrounding quotes, `<transcript>` tags, a `<think>` block), it is empty; has fewer than
@@ -46,12 +47,25 @@ impl fmt::Display for Outcome {
     }
 }
 
+/// S1-mini's longest transcript, in words. Its llama-server context (`CTX` in
+/// `managed/process.rs`, 4096 tokens) holds the prompt plus the transcript plus the answer
+/// (about as long), at ~1.4 tokens per word: 4096 / 2 / 1.4 ≈ 1,460. Longer ones would only
+/// fail after generating until the context or the timeout runs out (25-70 s for a 10-30
+/// minute dictation), so they aren't sent.
+pub const S1_MINI_MAX_WORDS: usize = 1400;
+
+/// The [`Outcome::Skipped`] reason for a transcript over [`S1_MINI_MAX_WORDS`].
+pub const TOO_LONG: &str = "too long";
+
 /// Polishes `raw` (whitespace-normalized transcript) or returns it unchanged. Never fails;
 /// takes at most about [`PolishConfig::timeout`].
 pub fn polish_or_raw(p: &dyn Polisher, raw: &str, cfg: &PolishConfig) -> (String, Outcome) {
     let words = raw.split_whitespace().count();
     if words < cfg.min_words.max(1) {
         return (raw.to_owned(), Outcome::Skipped("too short"));
+    }
+    if cfg.provider == PolishProvider::S1Mini && words > S1_MINI_MAX_WORDS {
+        return (raw.to_owned(), Outcome::Skipped(TOO_LONG));
     }
     let out = match p.polish(raw, &PolishCtx::default()) {
         Ok(out) => out,
@@ -318,6 +332,24 @@ mod tests {
             polish_or_raw(&ok, "um hi", &cfg),
             ("um hi".into(), Outcome::Skipped("too short"))
         );
+        // Over S1-mini's context: not even sent (cloud providers have room).
+        let long = "word ".repeat(S1_MINI_MAX_WORDS + 1);
+        let s1 = PolishConfig {
+            provider: PolishProvider::S1Mini,
+            ..PolishConfig::default()
+        };
+        assert_eq!(
+            polish_or_raw(&Fixed(Err("not sent")), &long, &s1),
+            (long.clone(), Outcome::Skipped(TOO_LONG))
+        );
+        let cloud = PolishConfig {
+            provider: PolishProvider::OpenAi,
+            ..PolishConfig::default()
+        };
+        assert!(matches!(
+            polish_or_raw(&Fixed(Err("sent")), &long, &cloud).1,
+            Outcome::Fallback(_)
+        ));
         let (text, outcome) = polish_or_raw(&Fixed(Err("timeout")), raw, &cfg);
         assert_eq!(
             (text.as_str(), outcome),

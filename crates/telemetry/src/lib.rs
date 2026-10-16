@@ -119,7 +119,8 @@ pub struct Dictation {
     /// Wall clock at key down (unix ms).
     pub started_at: i64,
     pub hold_ms: Option<f64>,
-    /// Length of the audio that was transcribed.
+    /// Length of the audio that was transcribed (for one dropped after segments of it were,
+    /// how much had been recorded).
     pub audio_secs: Option<f64>,
     /// Loudness of the recording (RMS, 0..1): tells silence/mic problems from STT problems.
     pub rms: Option<f64>,
@@ -132,7 +133,8 @@ pub struct Dictation {
     pub queue_wait_ms: Option<f64>,
     pub stt_ms: Option<f64>,
     pub polish_ms: Option<f64>,
-    /// "polished", "skipped" or "fallback" (the reason is only in the events).
+    /// "polished", "skipped", "too_long" (over S1-mini's context, not sent) or "fallback"
+    /// (the reason is only in the events).
     pub polish_outcome: Option<&'static str>,
     /// Paste waited for paste-sensitive hotkey keys to be released.
     pub hotkey_wait_ms: Option<f64>,

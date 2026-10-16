@@ -457,6 +457,11 @@ impl Live {
         self.stats.cuts.iter().any(|&n| n > 0)
     }
 
+    /// What it did so far.
+    pub fn stats(&self) -> &LiveStats {
+        &self.stats
+    }
+
     /// Adds recorded audio; returns the pieces to transcribe now (usually none).
     pub fn push(&mut self, samples: &[f32]) -> Vec<Piece> {
         self.stats.received += samples.len();

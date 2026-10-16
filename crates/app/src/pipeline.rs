@@ -52,7 +52,7 @@ use agt_platform::{
     MAX_CHORD, PasteToken, Permission,
 };
 use agt_polish::Outcome;
-use agt_stt::chunk::{Cut, CutConfig, Live, Piece, Texts};
+use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
     fmt,
@@ -96,6 +96,10 @@ const BUSY_SAVE_WAIT: Duration = Duration::from_secs(2);
 /// After [`HOTKEY_RELEASE_MAX`] it pastes anyway (releasing them, as before).
 const HOTKEY_RELEASE_POLL: Duration = Duration::from_millis(15);
 const HOTKEY_RELEASE_MAX: Duration = Duration::from_secs(10);
+
+/// `agt_polish`'s reason for not polishing a transcript longer than S1-mini's context holds
+/// (recorded as the polish outcome `too_long`).
+const TOO_LONG_TO_POLISH: &str = "too long";
 
 /// On exit, how long to wait for a ducked volume to be put back.
 const DUCK_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
@@ -585,7 +589,8 @@ impl Feed {
         Self {
             live: Live::new(CutConfig::live(chunk_secs)),
             audio: Vec::new(),
-            buf: Vec::new(),
+            // Swapped into the callback: room for 250 ms polls, so it never allocates there.
+            buf: Vec::with_capacity(SAMPLE_RATE as usize / 2),
             fed: 0,
             shared: Arc::default(),
             sent: false,
@@ -621,6 +626,17 @@ impl Feed {
             let _ = to_stt.send(ToStt::Segment(piece, self.shared.clone()));
         }
     }
+}
+
+/// A recording's cuts so far into its telemetry (released or dropped).
+fn live_stats(d: &mut Dictation, stats: &LiveStats, max_queue: usize) {
+    let n = |cut: Cut| Some(stats.cuts[cut as usize] as i64);
+    d.live_pause_cuts = n(Cut::Pause);
+    d.live_limit_cuts = n(Cut::Limit);
+    d.live_end_cuts = n(Cut::End);
+    d.live_skipped = Some(stats.skipped as i64);
+    d.live_trimmed_secs = Some((stats.received - stats.kept) as f64 / SAMPLE_RATE as f64);
+    d.live_max_queue = Some(max_queue as i64);
 }
 
 impl AudioThread {
@@ -784,9 +800,13 @@ impl AudioThread {
 
     /// A recording ends without being transcribed: recorded as `outcome`. If segments of it
     /// went to `stt`, by `stt` once it has skipped them (or discarded the one in flight).
-    fn drop_dictation(&self, feed: Feed, d: Box<Dictation>, outcome: Ended) {
+    fn drop_dictation(&self, feed: Feed, mut d: Box<Dictation>, outcome: Ended) {
         if feed.sent {
             feed.shared.dropped.store(true, Relaxed);
+            // As far as it got (up to the last poll).
+            d.audio_secs = Some(secs(&feed.audio));
+            let queued = feed.shared.queued.load(Relaxed);
+            live_stats(&mut d, feed.live.stats(), feed.max_queue.max(queued));
             let _ = self.to_stt.send(ToStt::Dropped(d, outcome));
         } else {
             telemetry::global().dictation(d, outcome);
@@ -833,15 +853,9 @@ impl AudioThread {
         let live = feed.live.cut().then(|| {
             let (tail, stats) = feed.live.finish();
             let queued = feed.shared.queued.load(Relaxed) + tail.len();
-            let n = |cut: Cut| Some(stats.cuts[cut as usize] as i64);
-            d.live_pause_cuts = n(Cut::Pause);
-            d.live_limit_cuts = n(Cut::Limit);
-            d.live_end_cuts = n(Cut::End);
-            d.live_skipped = Some(stats.skipped as i64);
+            live_stats(&mut d, &stats, feed.max_queue.max(queued));
             d.live_tail_joined = Some(stats.tail_joined);
-            d.live_trimmed_secs = Some((stats.received - stats.kept) as f64 / SAMPLE_RATE as f64);
             d.live_tail_secs = Some(stats.tail as f64 / SAMPLE_RATE as f64);
-            d.live_max_queue = Some(feed.max_queue.max(queued) as i64);
             (tail, feed.shared)
         });
         let audio = self.test_wav.clone().unwrap_or(feed.audio);
@@ -1028,7 +1042,14 @@ fn stt_thread(
                 p.stt_ms += took;
                 match result {
                     Ok(text) => p.texts.add(text, piece.redo),
-                    Err(e) => p.error = Some(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            "segment {} ({:.1} s) failed to transcribe; the dictation will fail: {e}",
+                            p.texts.0.len() + 1,
+                            secs(&piece.audio)
+                        );
+                        p.error = Some(e);
+                    }
                 }
                 continue;
             }
@@ -1111,13 +1132,21 @@ fn stt_thread(
                 if let Some(p) = polisher.as_deref().filter(|_| !text.is_empty()) {
                     let t = Instant::now();
                     let (polished, outcome) = agt_polish::polish_or_raw(p, &text, &config.polish);
-                    if let Outcome::Fallback(why) = &outcome {
-                        tracing::warn!("polish failed, pasting the raw transcript: {why}");
+                    match &outcome {
+                        Outcome::Fallback(why) => {
+                            tracing::warn!("polish failed, pasting the raw transcript: {why}")
+                        }
+                        Outcome::Skipped(TOO_LONG_TO_POLISH) => tracing::info!(
+                            "transcript too long to polish ({} words); pasting it raw",
+                            d.words_raw.unwrap_or_default()
+                        ),
+                        _ => {}
                     }
                     text = polished;
                     d.polish_ms = Some(ms(t.elapsed()));
                     d.polish_outcome = Some(match outcome {
                         Outcome::Polished => "polished",
+                        Outcome::Skipped(TOO_LONG_TO_POLISH) => "too_long",
                         Outcome::Skipped(_) => "skipped",
                         Outcome::Fallback(_) => "fallback",
                     });
