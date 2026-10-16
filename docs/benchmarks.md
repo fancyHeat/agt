@@ -438,13 +438,19 @@ holds only the audio not handed out yet, and cancelling is dropping it. It cuts:
   400 ms of the last 5 s. Without pause cuts it makes exactly `split`'s cuts (tested), so the
   post-release path (`Chunked`) is unchanged;
 - with **trimming**, each pause's silence beyond `pad` either side is dropped instead of
-  transcribed, and a tail that is only silence is not transcribed at all.
+  transcribed, and a tail that is only silence is not transcribed at all. Only once speech has
+  been heard: until then nothing is dropped (see below).
 
 Silence is a 10 ms level (median of the last 9 blocks, so clicks and 10-20 dB noise flutter
 don't count) less than 15 dB above the noise floor (the lowest level of the last 20 s, kept
-within -70..-40 dBFS). On this set it finds all 78 inserted pauses over 1.1 s and 33 natural
-1 s pauses inside the utterances (`agt-bench live --cuts-only`). `CutConfig::live` is the
-setting recommended below.
+within -70..-40 dBFS). That makes it independent of the mic gain but not of the SNR: speech
+has to stand out from the noise (tested down to ~25 dB peak to noise), and at low levels the
+-70 dB clamp can take the end of the last syllable (~0.1 s) for the start of a pause. The floor
+is learned from whatever comes first, so a recording that starts mid-sentence at a low level
+can learn the speech itself as the floor; that's why nothing is trimmed before speech has been
+heard (the worst case is transcribing some noise, never dropping speech; unit-tested). On this
+set it finds all 78 inserted pauses over 1.1 s and 33 natural 1 s pauses inside the
+utterances (`agt-bench live --cuts-only`). `CutConfig::live` is the setting recommended below.
 
 **Bench** (`agt-bench live`): replays each dictation as if recorded. Audio goes into the
 cutter in 20 ms pieces; one worker transcribes the segments in order, each when it is ready
@@ -461,24 +467,32 @@ session was also using now and then.
 
 ### Results
 
-Release -> text in ms, p50/p90/max over the 12 dictations; WER in %; compute is the total time
-spent in `transcribe`. "Cut at pauses" is `CutConfig::live`: 1 s pause, 8 s minimum segment,
-250 ms padding, trimmed.
+Release -> text in ms, p50/p90/max over the 12 dictations; WER in %, without AMI first (the
+number to read; see above); compute is the total time spent in `transcribe`. "Cut at pauses"
+is `CutConfig::live`: 1 s pause, 8 s minimum segment, 250 ms padding, trimmed. (Its WER is
+from a re-run after a review fix to the cutter, which only changes how leading silence is
+handled: one AMI word up or down, nothing outside AMI; the timings are from before it.)
 
-| Platform, engine | Path | release -> text | WER all | WER w/o AMI | compute | segments (pause/limit/tail) | tail p50/p90 |
+| Platform, engine | Path | release -> text | WER w/o AMI | WER all | compute | segments (pause/limit/tail) | tail p50/p90 |
 |---|---|---|---|---|---|---|---|
-| Windows, CPU int8 | today, after release | 5710/11722/13732 | 8.17 | 7.33 | 86.2 s | - | - |
-| | while recording, limit cuts only | 586/974/991 | 8.17 | 7.33 | 83.4 s | 0/86/12 | 13.8/24.7 s |
-| | **while recording, cut at pauses** | **378/747/900** | **7.19** | **7.04** | 61.7 s | 80/12/12 | 9.5/15.4 s |
-| Windows, DirectML int8 | today, after release | 1371/2729/3330 | 10.71 | 10.31 | 20.3 s | - | - |
-| | while recording, limit cuts only | 239/262/267 | 10.71 | 10.31 | 25.9 s | 0/86/12 | 13.8/24.7 s |
-| | **while recording, cut at pauses** | **228/268/271** | **7.16** | **7.01** | 26.3 s | 80/12/12 | 9.5/15.4 s |
-| macOS, CPU int8 | today, after release | 2512/5441/6400 | 9.60 | - | 39.8 s | - | - |
-| | while recording, limit cuts only | 295/528/531 | 9.60 | - | 44.4 s | 0/86/12 | 13.8/24.7 s |
-| | **while recording, cut at pauses** | **229/360/456** | **7.26** | **7.10** | 32.8 s | 80/12/12 | 9.5/15.4 s |
-| macOS, Core ML fp32 (10 s window) | today, after release | 1432/3188/4023 | 9.70 | - | 24.0 s | - | - |
-| | while recording, limit cuts only | 125/144/148 | 9.70 | - | 39.4 s | 0/277/12 | 5.6/8.3 s |
-| | while recording, cut at pauses | 124/143/145 | 7.52 | 7.16 | 26.0 s | 23/155/12 | 5.7/9.3 s |
+| Windows, CPU int8 | today, after release | 5710/11722/13732 | 7.33 | 8.17 | 86.2 s | - | - |
+| | while recording, limit cuts only | 586/974/991 | 7.33 | 8.17 | 83.4 s | 0/86/12 | 13.8/24.7 s |
+| | **while recording, cut at pauses** | **378/747/900** | **7.04** | 7.21 | 61.7 s | 80/12/12 | 9.5/15.4 s |
+| Windows, DirectML int8 | today, after release | 1371/2729/3330 | 10.31 | 10.71 | 20.3 s | - | - |
+| | while recording, limit cuts only | 239/262/267 | 10.31 | 10.71 | 25.9 s | 0/86/12 | 13.8/24.7 s |
+| | **while recording, cut at pauses** | **228/268/271** | **7.01** | 7.19 | 26.3 s | 80/12/12 | 9.5/15.4 s |
+| macOS, CPU int8 | today, after release | 2512/5441/6400 | - | 9.60 | 39.8 s | - | - |
+| | while recording, limit cuts only | 295/528/531 | - | 9.60 | 44.4 s | 0/86/12 | 13.8/24.7 s |
+| | **while recording, cut at pauses** | **229/360/456** | **7.10** | 7.29 | 32.8 s | 80/12/12 | 9.5/15.4 s |
+| macOS, Core ML fp32 (10 s window) | today, after release | 1432/3188/4023 | - | 9.70 | 24.0 s | - | - |
+| | while recording, limit cuts only | 125/144/148 | - | 9.70 | 39.4 s | 0/277/12 | 5.6/8.3 s |
+| | while recording, cut at pauses | 124/143/145 | 7.16 | 7.55 | 26.0 s | 23/155/12 | 5.7/9.3 s |
+
+On the Windows CPU the WER difference (7.33 -> 7.04% without AMI, ~9 words of ~3,100 in 12
+synthetic dictations) is noise: read it as "no regression". The real accuracy change is on
+DirectML and the Mac CPU, where today's path drops whole sentences next to long silence and
+trimming fixes it (10.31 -> 7.01% on DirectML; the Mac's 9.60% "all" is the same effect, see
+below).
 
 Memory: Windows CPU peak RSS 1.37 GB for the whole run (0.9 GB in the real-time runs, which
 only transcribe while recording); DirectML 1.16 GB + 1.1 GB VRAM; Mac CPU 1.33 GB footprint;
@@ -486,28 +500,33 @@ Core ML 4.4 GB RSS (the memory-mapped compiled model), 2.8 GB footprint. The cut
 holds at most 25 s of audio (1.6 MB); all segments are at most 25 s, so nothing grows with the
 length of the dictation except the text.
 
-**Where to cut** (Windows CPU int8, back to back, so only WER and cut counts mean anything;
-deterministic, re-runs give the same numbers):
+**Where to cut** (Windows CPU int8, back to back, so only WER, cut counts and relative compute
+mean anything; after the review fix):
 
-| Pause cut | min segment | trim | segments (pause/limit/tail) | tail p50/p90 | trimmed | compute | WER all | w/o AMI | vox |
+| Pause cut | min segment | trim | segments (pause/limit/tail) | tail p50/p90 | trimmed | compute | WER w/o AMI | all | vox |
 |---|---|---|---|---|---|---|---|---|---|
-| none (limit cuts only) | - | - | 0/86/12 | 13.8/24.7 s | 0% | 82.7 s | 8.17 | 7.33 | 5.26 |
-| 0.5 s | 0 | yes | 285/1/11 | 3.5/13.3 s | 33% | 61.9 s | 9.39 | 9.11 | 14.04 |
-| 0.7 s | 0 | yes | 231/1/11 | 8.8/14.3 s | 32% | 59.3 s | 8.87 | 8.53 | 13.60 |
-| 1 s | 0 | yes | 159/7/12 | 9.5/14.5 s | 31% | 57.5 s | 7.89 | 7.39 | 7.02 |
-| 1.5 s | 0 | yes | 107/15/12 | 8.3/14.5 s | 30% | 59.0 s | 8.02 | 7.30 | 4.82 |
-| 2 s | 0 | yes | 70/29/12 | 9.5/18.6 s | 28% | 60.1 s | 7.73 | 7.25 | 4.39 |
-| 0.5 s | 8 s | yes | 109/1/12 | 8.8/13.3 s | 33% | 56.2 s | 7.29 | 7.13 | 3.51 |
-| 0.7 s | 8 s | yes | 99/3/12 | 9.5/14.5 s | 32% | 54.4 s | 7.16 | 7.07 | 4.39 |
-| 1 s | 3 s | yes | 127/7/12 | 9.5/14.5 s | 31% | 58.9 s | 7.47 | 7.27 | 6.58 |
-| 1 s | 5 s | yes | 111/7/12 | 9.5/14.5 s | 31% | 57.6 s | 7.39 | 7.07 | 3.07 |
-| **1 s** | **8 s** | **yes** | 80/12/12 | 9.5/15.4 s | 31% | 55.2 s | **7.19** | **7.04** | 3.07 |
-| 1 s | 12 s | yes | 57/15/12 | 13.3/18.2 s | 31% | 60.9 s | 7.34 | 6.98 | 3.95 |
-| 1 s | 16 s | yes | 40/22/12 | 14.3/18.2 s | 31% | 60.6 s | 7.52 | 7.04 | 3.07 |
-| 1.5 s | 8 s | yes | 64/18/12 | 10.5/17.1 s | 30% | 58.0 s | 7.65 | 7.16 | 3.07 |
-| 2 s | 8 s | yes | 51/29/12 | 10.1/19.9 s | 28% | 59.4 s | 7.68 | 7.04 | 3.07 |
-| 1 s | 0 | no | 159/20/12 | 13.2/18.0 s | 0% | 88.3 s | 8.12 | 7.39 | 7.46 |
-| 1 s | 8 s | no | 99/27/12 | 13.2/21.7 s | 0% | 81.0 s | 7.89 | 7.01 | 3.07 |
+| none (limit cuts only) | - | - | 0/86/12 | 13.8/24.7 s | 0% | 96.7 s | 7.33 | 8.17 | 5.26 |
+| 0.5 s | 0 | yes | 285/1/11 | 3.5/13.3 s | 33% | 72.5 s | 9.06 | 9.36 | 14.04 |
+| 0.7 s | 0 | yes | 231/1/11 | 8.8/14.3 s | 32% | 69.3 s | 8.53 | 8.90 | 13.60 |
+| 1 s | 0 | yes | 159/7/12 | 9.5/14.5 s | 31% | 70.3 s | 7.39 | 7.91 | 7.02 |
+| 1.5 s | 0 | yes | 107/15/12 | 8.3/14.5 s | 30% | 67.3 s | 7.30 | 8.02 | 4.82 |
+| 2 s | 0 | yes | 70/29/12 | 9.5/18.6 s | 28% | 69.2 s | 7.25 | 7.73 | 4.39 |
+| 0.5 s | 8 s | yes | 110/1/12 | 8.8/13.3 s | 33% | 64.7 s | 7.07 | 7.34 | 3.51 |
+| 0.7 s | 8 s | yes | 99/3/12 | 9.5/14.5 s | 32% | 65.0 s | 7.07 | 7.19 | 4.39 |
+| 1 s | 3 s | yes | 128/7/12 | 9.5/14.5 s | 31% | 67.9 s | 7.27 | 7.55 | 6.58 |
+| 1 s | 5 s | yes | 111/7/12 | 9.5/14.5 s | 31% | 66.0 s | 7.07 | 7.42 | 3.07 |
+| **1 s** | **8 s** | **yes** | 80/12/12 | 9.5/15.4 s | 31% | 66.1 s | **7.04** | 7.21 | 3.07 |
+| 1 s | 12 s | yes | 57/15/12 | 13.3/18.2 s | 31% | 64.5 s | 6.98 | 7.37 | 3.95 |
+| 1 s | 16 s | yes | 39/23/12 | 14.3/18.2 s | 31% | 65.4 s | 7.04 | 7.44 | 3.07 |
+| 1.5 s | 8 s | yes | 64/18/12 | 10.5/17.1 s | 30% | 66.5 s | 7.16 | 7.65 | 3.07 |
+| 2 s | 8 s | yes | 51/29/12 | 10.1/19.9 s | 28% | 67.7 s | 7.04 | 7.68 | 3.07 |
+| 1 s | 0 | no | 159/20/12 | 13.2/18.0 s | 0% | 100.9 s | 7.39 | 8.12 | 7.46 |
+| 1 s | 8 s | no | 99/27/12 | 13.2/21.7 s | 0% | 94.4 s | 7.01 | 7.89 | 3.07 |
+
+The untrimmed rows also transcribe pure-noise segments: after a pause cut the rest of a long
+pause stays in the buffer and becomes `Limit` segments of room noise (e.g. 10 s of speech,
+45 s of silence, 5 s of speech gives a 20.5 s segment of only noise). That is the setting with
+the most hallucination risk; it exists to measure trimming, not to ship.
 
 **Running alongside the user** (`--realtime`, cut at pauses; `ted-dict-01`, 141 s, and
 `earn-dict-01`, 112 s): "cores" is process CPU time over wall time while a segment is
@@ -537,21 +556,33 @@ default device, the 12 transcripts of 95-570 words): p50 1168 ms, p90 2145 ms, m
   left at release is the audio since the last pause cut, 9.5 s p50 and 15 s p90 here (the last
   burst of speech before release). The worker was never busy at release; it had been idle
   ~12 s (p50), so a GPU pays its idle penalty on the tail, and that is included above.
-- **Cuts at real pauses don't hurt; short segments do.** With an 8 s minimum segment every
-  pause length from 0.5 to 2 s is as accurate as today's path or better (7.0-7.2% without AMI vs
-  7.3%). Without a minimum, 0.5-0.7 s cuts are worse (8.5-9.1%), almost all of it VoxPopuli: a
-  2-3 s segment of background murmur on its own comes back as "Okay. Yeah. So okay." while the
-  same murmur next to real speech is ignored. That's Phase 1's boundary hallucination; the
-  minimum segment is what fixes it, not a longer pause. 1 s with 8 s is the pick: the most
-  accurate overall, few calls (80 pause cuts in 35 min), and a 1 s silence is a deliberate stop
-  (most within-thought pauses here are shorter). Longer minimums only make the tail longer.
-- **Trimming pauses saves a third of the compute and removes a failure mode.** Untrimmed, on
-  the CPU the WER is about the same (7.01 vs 7.04% without AMI), but long silence inside a
-  chunk makes the model drop whole sentences on DirectML and the Mac CPU: `ls-clean-dict-02`
+- **Cuts at pauses between utterances don't hurt; short segments do.** With an 8 s minimum
+  segment every pause length from 0.5 to 2 s is within noise of today's path (7.0-7.2% without
+  AMI vs 7.3%). Without a minimum, 0.5-0.7 s cuts are worse (8.5-9.1%), almost all of it
+  VoxPopuli: a 2-3 s segment of background murmur on its own comes back as "Okay. Yeah. So
+  okay." while the same murmur next to real speech is ignored. That's Phase 1's boundary
+  hallucination; the minimum segment is what fixes it, not a longer pause. With 8 s, 0.5-2 s
+  all score within ~0.15 points, so the pause length is chosen on other grounds: 1 s makes
+  fewer calls than 0.5-0.7 s (80 vs 99-110 pause cuts in 35 min) and is less likely to fire on
+  a hesitation inside a sentence, while 1.5-2 s make the tail longer (p90 17-20 s vs 15 s).
+- **What this doesn't show.** Every inserted pause sits between two of the corpus's
+  utterances, usually at a sentence end; real thinking pauses often come mid-sentence ("I think
+  we should ... move it to Friday"). The only mid-utterance cuts measured are the 13 "pause
+  cuts elsewhere" of the recommended setting. And the WER normalizer drops case and
+  punctuation, so the typical boundary artifact, the model closing the clause and capitalizing
+  the next segment ("we should. Move it"), is invisible here. The wiring phase should look at
+  the joined cased text of real long dictations (and whether polish repairs such joins).
+- **Trimming pauses removes a failure mode, and on the CPU a third of the compute.**
+  Untrimmed, on the CPU the WER is about the same (7.01 vs 7.04% without AMI), but long silence
+  inside a chunk makes the model drop whole sentences on DirectML and the Mac CPU: `ls-clean-dict-02`
   (4 min, 3 pauses of 3-25 s) is 19.8% (DirectML) and 14.5% (Mac CPU) today and with limit cuts,
   1.4% and 2.0% trimmed ("The late astounding events, however, had rendered Procope manifestly
   uneasy..." is missing entirely from the untrimmed transcript). That is today's post-release
-  path too: trimming would help it regardless of incremental transcription.
+  path too: trimming would help it regardless of incremental transcription. The compute saving
+  is CPU-only: on DirectML (20.3 -> 26.3 s) and Core ML (24.0 -> 26.0 s; 39.4 s with limit cuts
+  only) the total goes *up* compared with one pass after release, because more, smaller calls
+  each pay the GPU's idle wake-up. Fine for latency, but it is background GPU work (and
+  battery) that grows with the number of segments.
 - **The device question doesn't flip on Windows.** The tail is a medium-length clip (p50 9.5
   s), and after a pause DirectML wins medium clips (Windows pause section). While recording,
   DirectML is 228/268 ms vs the CPU's 378/747 ms; the CPU default would cost ~150 ms at p50 and
@@ -562,7 +593,12 @@ default device, the 12 transcripts of 95-570 words): p50 1168 ms, p90 2145 ms, m
   tail. Their tradeoff is the existing one: on Windows DirectML 230 vs CPU 436 ms after a pause
   (CPU wins only below ~4-5 s); on the Mac the CPU wins (239 vs 290 ms) and the Core ML window
   (10 s) caps every tail at 10 s, which is why Core ML's long-dictation tails are short (124 vs
-  229 ms) - at more WER (7.52 vs 7.26%), 2.8 GB of footprint and slow loads.
+  229 ms) - at more WER (7.55 vs 7.29%), 2.8 GB of footprint and slow loads.
+- **A short tail after a pause cut is transcribed on its own.** The 8 s minimum guards the
+  segments cut at pauses, not the tail: 10 s of speech, a pause cut, then a cough or "um" just
+  before release gives a ~1 s `End` segment, the kind of short segment that hallucinates. Not
+  measured (every tail here is a whole utterance); the proposed tail-length telemetry will show
+  how often tails are that short.
 - **No contention worth worrying about.** On the i9 the CPU worker uses 4-6 of 16 hardware
   threads while transcribing a segment, and neither the 20 ms feeds (p99 0.6 ms late) nor a
   foreground thread slowed measurably; `threads = 4` only made the tail 30-60 ms slower. On the
@@ -583,9 +619,14 @@ default device, the 12 transcripts of 95-570 words): p50 1168 ms, p90 2145 ms, m
 - **Transcribe** each segment on the existing STT worker as soon as the cutter hands it out (a
   channel; the engine stays single-threaded), in order; on release push the `finish()` tail,
   wait for the queue to drain and join the texts with spaces, then polish and paste as today.
-  Short dictations take the same path: a 3 s recording is one `End` segment with its leading
-  and trailing silence trimmed. On the regular eval set (78 clips of 2-60 s) that gives the
-  same WER as today without AMI (3.16%; 4.19 vs 4.09% with it, two AMI words).
+  Short dictations take the same path: a 3 s recording is one `End` segment, its trailing
+  silence trimmed to 250 ms and its leading silence kept (nothing is trimmed before speech is
+  heard). On the regular eval set (78 clips of 2-60 s) that gives the same WER as today without
+  AMI (3.16%; 4.19 vs 4.09% with it, two AMI words; measured before the review fix, which only
+  keeps more leading silence).
+- **Before shipping**, check the joined text for boundary artifacts on real dictations with
+  mid-sentence pauses (see above), and consider a guard for short tails (e.g. if the tail is
+  under ~2 s and the previous segment is still queued, transcribe them together).
 - **Cancel / Esc / short tap / focus change**: drop the cutter and the queued segments and bump
   a generation number that the worker checks before it delivers or starts anything; the call
   already running is not interrupted (at most ~1 s on the i9 CPU for a 25 s segment, ~0.3 s
