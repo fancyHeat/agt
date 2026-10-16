@@ -30,7 +30,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// restore after a paste and back-to-back dictations. A settings click in the tray only waits
 /// for the clipboard restore.
 const RESTART_SETTLE: Duration = Duration::from_secs(5);
-/// Allowance for the paste between a dictation's Ready status and the clipboard restore timer.
+/// Allowance on top of `restore_clipboard_ms`: for the paste thread to wake and the restore to run.
 const RESTORE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Set for the instance a settings restart starts, so it waits for this one to exit and
@@ -636,7 +636,7 @@ impl App {
                     }
                     Err(e) => {
                         tracing::error!("cannot restart to apply settings: {e}");
-                        // Retried once dictation is idle again (or on "Restart now to apply").
+                        // Retried after the next settle (or on "Restart now to apply").
                         self.restart_with = Some(Restart::Settings);
                     }
                 }
