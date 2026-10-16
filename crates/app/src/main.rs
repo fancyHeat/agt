@@ -192,6 +192,7 @@ fn main() {
         pipeline: pipeline.ok(),
         overlay: None,
         failures_at_start: 0,
+        copy_available: false,
         exit_reason: agt_telemetry::ExitReason::Quit,
         overlay_position: config
             .overlay
@@ -336,8 +337,8 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     /// `None` if this isn't a Velopack install.
     updater: Option<update::Updater>,
-    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (or, for settings,
-    /// for the user to click "Restart now to apply").
+    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (or for the user to
+    /// click "Install update X now" / "Restart now to apply").
     restart_with: Option<Restart>,
     /// Counts pipeline status changes and settings changes: a restart timer is stale if this
     /// moved on.
@@ -363,6 +364,8 @@ struct App {
     /// The pipeline's failure count when the current dictation started (see
     /// [`pipeline::Event::Status`]).
     failures_at_start: u64,
+    /// "Copy last transcript" has something to copy (a failed paste's text lives only here).
+    copy_available: bool,
     /// Recorded in the session when the event loop returns.
     exit_reason: agt_telemetry::ExitReason,
 }
@@ -426,6 +429,12 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(tray) = &self.tray {
                         tray.set_copy_enabled(*available);
                     }
+                    if self.copy_available != *available {
+                        self.copy_available = *available;
+                        self.changes += 1;
+                        self.changed_at = Instant::now();
+                        self.start_restart_timer();
+                    }
                 }
                 pipeline::Event::PolishInfo(info) => {
                     if let Some(tray) = &self.tray {
@@ -451,7 +460,7 @@ impl ApplicationHandler<AppEvent> for App {
                     p.copy_last_transcript();
                 }
             }
-            AppEvent::Menu(e) if e.id == tray.update => self.update_now(),
+            AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
                 // The page for the first missing permission (or Accessibility, to review).
@@ -524,8 +533,13 @@ impl ApplicationHandler<AppEvent> for App {
 impl App {
     /// "Update now": with an update already downloaded, installs it once idle; else checks
     /// and downloads on a worker thread, which reports back as [`AppEvent::Update`] (an
-    /// update it downloads is installed the same way, with no further click).
-    fn update_now(&mut self) {
+    /// update it downloads is installed the same way, with no further click). Clicked while
+    /// an install waits for idle, installs right away (the way out if dictation is stuck).
+    fn update_now(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(Restart::Update(_)) = self.restart_with {
+            let restart = self.restart_with.take().unwrap();
+            return self.restart_now(restart, event_loop);
+        }
         let (Some(updater), Some(tray)) = (&self.updater, &self.tray) else {
             return;
         };
@@ -551,10 +565,11 @@ impl App {
     }
 
     /// Installs `asset` and restarts into it once dictation has been idle for
-    /// [`RESTART_SETTLE`] (right away if it already has been).
+    /// [`RESTART_SETTLE`] (right away if it already has been). Until then the item offers
+    /// to install right away.
     fn restart_when_idle(&mut self, asset: VelopackAsset) {
         if let Some(tray) = &self.tray {
-            tray.set_update(&format!("Installing update {}...", asset.Version), false);
+            tray.set_update(&format!("Install update {} now", asset.Version), true);
         }
         self.restart_with = Some(Restart::Update(asset));
         self.start_restart_timer();
@@ -565,19 +580,25 @@ impl App {
     fn start_restart_timer(&self) {
         use pipeline::Status;
         // Idle: ready, errored or waiting for permissions, or dictation unavailable altogether.
-        // Never while loading: a restart would start a model download over (it waits until
-        // the model is ready; "Restart now to apply" still restarts right away).
+        // Not on an error while a transcript can still be copied: it may be a failed paste's,
+        // and a restart would lose it (for settings the user just changed, on Error anyway: a
+        // bad setting may be the error). Never while loading: a restart would start a model
+        // download over. Clicking "Install update X now" / "Restart now to apply" restarts
+        // regardless.
         let idle = self.pipeline.is_none()
-            || matches!(
-                self.status,
-                Some(Status::Ready(_) | Status::Error(_) | Status::NeedsPermission(_))
-            );
+            || match &self.status {
+                Some(Status::Ready(_) | Status::NeedsPermission(_)) => true,
+                Some(Status::Error(_)) => {
+                    !self.copy_available || matches!(self.restart_with, Some(Restart::Settings))
+                }
+                _ => false,
+            };
         if self.restart_with.is_none() || !idle {
             return;
         }
         let (proxy, n) = (self.proxy.clone(), self.changes);
         let wait = RESTART_SETTLE.saturating_sub(self.changed_at.elapsed());
-        // If this fails, a downloaded update is still applied on quit.
+        // If this fails, the item still restarts on click.
         let _ = thread::Builder::new()
             .name("restart-timer".into())
             .spawn(move || {
@@ -603,12 +624,13 @@ impl App {
                 return;
             }
         };
-        let asset = &asset;
         let (Some(updater), Some(tray)) = (&self.updater, &self.tray) else {
             return;
         };
+        // The background updater may have downloaded a newer one while this waited.
+        let asset = updater.um.get_update_pending_restart().unwrap_or(asset);
         tray.set_update(&format!("Restarting into {}...", asset.Version), false);
-        match update::apply_and_restart(&updater.um, asset) {
+        match update::apply_and_restart(&updater.um, &asset) {
             Ok(()) => {
                 self.exit_reason = agt_telemetry::ExitReason::UpdateRestart;
                 event_loop.exit();
@@ -616,6 +638,10 @@ impl App {
             Err(e) => {
                 tracing::error!("failed to start updater: {e}");
                 tray.set_update("Update failed - see log", true);
+                // Changed settings still restart once idle.
+                let differs = self.file.as_ref().is_ok_and(|c| *c != self.running);
+                self.restart_with = differs.then_some(Restart::Settings);
+                self.start_restart_timer();
             }
         }
     }
