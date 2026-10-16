@@ -141,7 +141,7 @@ fn main() {
         builder.with_activation_policy(ActivationPolicy::Accessory);
         // winit activates the app on launch by default, which makes it frontmost: with no
         // window to type into, every keystroke goes nowhere until the user clicks elsewhere
-        // (seen after each settings restart and at login).
+        // (e.g. after every settings restart).
         builder.with_activate_ignoring_other_apps(false);
     }
     let event_loop = builder.build().expect("create event loop");
