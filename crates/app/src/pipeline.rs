@@ -9,7 +9,8 @@
 //!   (`agt_stt::chunk::Live`, cheap), and each finished one goes to `stt` right away, so at
 //!   release only the last few seconds are left to transcribe (see [`Feed`]). A double tap
 //!   (`hotkey.double_tap_ms`) records hands-free instead: the release doesn't end that
-//!   recording, the next press and release does (Esc cancels it, [`HANDS_FREE_MAX`] ends it).
+//!   recording, the next press and release does (Esc cancels it, and so does
+//!   [`HANDS_FREE_MAX`]).
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
 //!   system output volume down until the recording ends, however it ends.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
@@ -79,8 +80,10 @@ pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 /// It's also how often the new audio is taken and cut ([`Feed`]).
 const RELEASE_POLL: Duration = Duration::from_millis(250);
 
-/// A hands-free recording (double tap) that nobody ends is finished (and pasted) after this.
-const HANDS_FREE_MAX: Duration = Duration::from_secs(30 * 60);
+/// A hands-free recording (double tap) that nobody ends is discarded after this, the longest
+/// recording: it was most likely forgotten, and pasting it would put whatever was said since
+/// into whatever window has focus by then.
+const HANDS_FREE_MAX: Duration = Duration::from_secs(agt_audio::MAX_SECONDS as u64);
 
 /// A press shorter than this (or than `min_hold_ms`, if that's longer) is a tap: a double tap
 /// is two of them. Not tied to `min_hold_ms` alone, which may be 0.
@@ -688,49 +691,46 @@ impl AudioThread {
         let tap = Duration::from_millis(self.config.hotkey.min_hold_ms).max(TAP);
 
         loop {
-            let hands_free_until = match (&holding, latch) {
-                (Some((down, ..)), Latch::On) => Some(*down + HANDS_FREE_MAX),
-                _ => None,
-            };
+            let hands_free = latch == Latch::On && holding.is_some();
             // Esc is ours only while it can end something.
-            agt_platform::arm_escape(hands_free_until.is_some());
+            agt_platform::arm_escape(hands_free);
             // `missed`: a release synthesized after the hook missed the real one.
-            let (ev, missed) = if let Some(until) = hands_free_until {
-                // The hotkey is up: no release to watch for, but a press the hook missed.
-                // The new audio is still taken every poll, until the time limit.
-                let wait = until
-                    .saturating_duration_since(Instant::now())
-                    .min(RELEASE_POLL);
-                match events.recv_timeout(wait) {
+            let (ev, missed) = if let Some((down, .., feed)) = &mut holding {
+                // Hands-free, the hotkey is up: no release to watch for, but a press the hook
+                // missed, and the time limit.
+                let until = *down + HANDS_FREE_MAX;
+                let wait = match hands_free {
+                    true => until.saturating_duration_since(Instant::now()),
+                    false => RELEASE_POLL,
+                };
+                match events.recv_timeout(wait.min(RELEASE_POLL)) {
                     Ok(ev) => (ev, false),
-                    Err(RecvTimeoutError::Timeout) if Instant::now() < until => {
-                        if let Some((.., feed)) = &mut holding {
-                            feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
-                        }
-                        match self.missed_press(&events) {
-                            Some(ev) => (ev, false),
-                            None => continue,
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
+                    Err(RecvTimeoutError::Timeout) if hands_free && Instant::now() >= until => {
                         tracing::warn!(
-                            "hands-free recording reached {} minutes; finishing it",
+                            "hands-free recording reached {} minutes; discarded it",
                             HANDS_FREE_MAX.as_secs() / 60
                         );
                         latch = Latch::Off;
                         if let Some((down, d, _ducked, feed)) = holding.take() {
-                            self.finish_recording(&mut recorder, down, Instant::now(), d, feed);
+                            let now = Instant::now();
+                            self.abort_recording(
+                                &mut recorder,
+                                down,
+                                now,
+                                d,
+                                feed,
+                                Ended::TimedOut,
+                            );
                         }
                         continue;
                     }
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            } else if let Some((.., feed)) = &mut holding {
-                match events.recv_timeout(RELEASE_POLL) {
-                    Ok(ev) => (ev, false),
                     Err(RecvTimeoutError::Timeout) => {
                         feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
-                        match self.missed_release(&events, &watch) {
+                        let missed = match hands_free {
+                            true => self.missed_press(&events).map(|ev| (ev, false)),
+                            false => self.missed_release(&events, &watch),
+                        };
+                        match missed {
                             Some(ev) => ev,
                             None => continue,
                         }
@@ -819,7 +819,8 @@ impl AudioThread {
                     if let Some((down, d, _ducked, feed)) = holding.take() {
                         tracing::info!("hands-free dictation cancelled (Esc)");
                         let now = Instant::now();
-                        self.abort_recording(&mut recorder, down, now, d, feed, Ended::Cancelled);
+                        let outcome = Ended::EscCancelled;
+                        self.abort_recording(&mut recorder, down, now, d, feed, outcome);
                     }
                 }
             }

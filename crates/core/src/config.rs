@@ -54,7 +54,7 @@ key = ""#,
 min_hold_ms = 150
 # Hands-free: tap the hotkey twice (the second press within this many milliseconds of letting
 # go of the first) and AGT keeps recording after you let go, until you press the hotkey
-# again; that press pastes. Esc cancels. Stops on its own after 30 minutes. 0: off.
+# again; that press pastes. Esc cancels, and so does running for 30 minutes. 0: off.
 double_tap_ms = 400
 
 [audio]
