@@ -15,7 +15,7 @@ use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
 use block2::RcBlock;
 use objc2::{
     msg_send,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyClass, AnyObject, Bool, ProtocolObject},
 };
 use objc2_app_kit::{
@@ -393,6 +393,8 @@ unsafe extern "C" {
 
 /// `kAXErrorNoValue`: the attribute is supported but empty (e.g. nothing has focus).
 const AX_NO_VALUE: i32 = -25212;
+/// `kAXErrorAttributeUnsupported`: the element (or app) doesn't have the attribute.
+const AX_UNSUPPORTED: i32 = -25205;
 /// `kAXErrorIllegalArgument`: what we report when an app hands back something that isn't an
 /// accessibility element.
 const AX_ILLEGAL_ARGUMENT: i32 = -25201;
@@ -423,6 +425,8 @@ const NOT_TEXT_ROLES: &[&str] = &[
     "AXList",
     "AXOutline",
     "AXTable",
+    "AXRow",
+    "AXCell",
     "AXBrowser",
     "AXImage",
     "AXMenu",
@@ -487,11 +491,8 @@ pub fn prepare_focus_check() {
     let Some((app, Some(pid))) = focused_app() else {
         return;
     };
-    if !PREPARED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(pid)
-    {
+    let prepared = || PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+    if prepared().contains(&pid) {
         return;
     }
     // Electron's switch for building its accessibility tree (Chromium does it only for
@@ -505,6 +506,10 @@ pub fn prepare_focus_check() {
             )
         };
         tracing::debug!("focus: pid {pid} AXManualAccessibility → {rc}");
+        // Asked again next time if it didn't get the message (busy, just launched).
+        if rc == 0 || rc == AX_UNSUPPORTED {
+            prepared().insert(pid);
+        }
     }
 }
 
@@ -512,9 +517,11 @@ pub fn focus_takes_text() -> Option<bool> {
     let (app, pid) = focused_app()?;
     let pid = pid.unwrap_or(0);
     let is_finder = || {
-        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-            .and_then(|a| a.bundleIdentifier())
-            .is_some_and(|b| b.to_string() == FINDER)
+        autoreleasepool(|_| {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                .and_then(|a| a.bundleIdentifier())
+                .is_some_and(|b| b.to_string() == FINDER)
+        })
     };
     let focused = match ax_element_attribute(&app, "AXFocusedUIElement") {
         Ok(f) => f,
@@ -539,8 +546,19 @@ pub fn focus_takes_text() -> Option<bool> {
     // In an editable region of a web page (Chromium and WebKit): a rich text editor, say.
     // Not "has a text selection": Chromium gives every element of a page one, links too.
     // Only asked when the role doesn't already answer it: it's another round trip to the app.
-    let editable = !TEXT_ROLES.contains(&role.as_str())
-        && ax_attribute(&focused, "AXEditableAncestor").is_ok();
+    let editable = if TEXT_ROLES.contains(&role.as_str()) {
+        false
+    } else {
+        match ax_attribute(&focused, "AXEditableAncestor") {
+            Ok(_) => true,
+            Err(AX_NO_VALUE | AX_UNSUPPORTED) => false,
+            // Didn't answer in time, say: a link in an editor would look like a plain link.
+            Err(e) => {
+                tracing::debug!("focus: pid {pid}: {role}, can't tell (accessibility error {e})");
+                return None;
+            }
+        }
+    };
     let finder = !editable && matches!(role.as_str(), "AXGroup" | "AXScrollArea") && is_finder();
     let takes = takes_text(Some(&role), editable, finder);
     tracing::debug!("focus: pid {pid}: {role} (editable {editable}) → takes text: {takes:?}");
