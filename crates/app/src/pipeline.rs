@@ -567,6 +567,10 @@ enum Latch {
     Pressed,
     /// Recording with the hotkey up: the next press's release ends it.
     On,
+    /// That press is down: its release ends it. Another press meanwhile (an auto-repeat after
+    /// a missed press re-installed the hook) changes nothing; another key (a shortcut with the
+    /// hotkey, or Esc) goes back to `On`.
+    Ending,
 }
 
 /// Whether a press at `now` may be the second tap of a double tap: a tap (see [`TAP`]) was
@@ -746,11 +750,13 @@ impl AudioThread {
             match ev {
                 HotkeyEvent::Down(t) => {
                     *self.key_down.lock().unwrap() = Some(t);
-                    if latch == Latch::On && holding.is_some() {
+                    if matches!(latch, Latch::On | Latch::Ending) && holding.is_some() {
                         // Ends the hands-free recording on its release, like a hold: every
                         // paste comes after the hotkey is let go.
-                        latch = Latch::Off;
-                        tracing::debug!("hands-free recording ending: {} pressed", self.key);
+                        if latch == Latch::On {
+                            tracing::debug!("hands-free recording ending: {} pressed", self.key);
+                        }
+                        latch = Latch::Ending;
                         continue;
                     }
                     latch = Latch::Off;
@@ -800,6 +806,11 @@ impl AudioThread {
                     }
                     d.missed_release = missed;
                     self.finish_recording(&mut recorder, down, released, d, feed);
+                }
+                HotkeyEvent::Cancel if latch == Latch::Ending && holding.is_some() => {
+                    // A shortcut with the hotkey while hands-free: not the end of it.
+                    tracing::debug!("{} was part of a shortcut; still hands-free", self.key);
+                    latch = Latch::On;
                 }
                 HotkeyEvent::Cancel => {
                     latch = Latch::Off;

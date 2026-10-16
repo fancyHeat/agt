@@ -589,7 +589,7 @@ impl HoldDetector {
     /// Esc; `armed`: [`arm_escape`] is on and no modifier is held. An armed Esc press with no
     /// chord key down is [`HotkeyEvent::Escape`] (with the hotkey held, Esc is a `Cancel`).
     /// Also returns whether to keep the key from the focused app: an Esc reported as `Escape`,
-    /// and its release.
+    /// its auto-repeat and its release.
     pub(crate) fn on_hook_key(
         &mut self,
         chord_key: Option<usize>,
@@ -605,6 +605,9 @@ impl HoldDetector {
         }
         if !down {
             return (ev, std::mem::take(&mut self.escape_down));
+        }
+        if self.escape_down {
+            return (ev, true); // its auto-repeat
         }
         if ev.is_none() && armed && self.state == Hold::Idle && self.down == 0 {
             self.escape_down = true;
@@ -750,11 +753,12 @@ mod tests {
         assert_eq!(esc(&mut d, false, true, 0), (None, false));
         assert_eq!(esc(&mut d, false, false, 5), (None, false));
         // Armed with the hotkey up: ends a hands-free recording, and the app sees neither the
-        // press nor its release (even if disarmed in between).
+        // press, its auto-repeat nor its release (even if disarmed in between).
         assert_eq!(
             esc(&mut d, true, true, 10),
             (Some(HotkeyEvent::Escape), true)
         );
+        assert_eq!(esc(&mut d, false, true, 12), (None, true));
         assert_eq!(esc(&mut d, false, false, 15), (None, true));
         // Esc while the hotkey is held is the hold's cancel, not an Escape too.
         assert_eq!(d.on_key(HOT, true, 20, t), Some(HotkeyEvent::Down(t)));
