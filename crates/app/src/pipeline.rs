@@ -153,6 +153,11 @@ pub enum Event {
     Rejected,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
     CopyAvailable(bool),
+    /// A dictation was pasted, but keyboard focus wasn't in anything that takes text (macOS):
+    /// offer to copy it.
+    NotInTextBox,
+    /// The last transcript was put on the clipboard (see [`Pipeline::copy_last_transcript`]).
+    Copied,
     /// New tray line about LLM polish (the managed S1-mini downloading, starting, failed).
     PolishInfo(String),
 }
@@ -222,6 +227,14 @@ impl Hub {
 
     fn copy_available(&self, available: bool) {
         (self.notify)(Event::CopyAvailable(available));
+    }
+
+    fn not_in_text_box(&self) {
+        (self.notify)(Event::NotInTextBox);
+    }
+
+    fn copied(&self) {
+        (self.notify)(Event::Copied);
     }
 
     fn engine_ready(&self) -> bool {
@@ -1562,6 +1575,8 @@ fn paste_thread(
         };
         match msg {
             Ok(ToPaste::Snapshot) => {
+                // Here, not on the audio thread: it asks the frontmost app, which may be slow.
+                agt_platform::prepare_focus_check();
                 // While our transcript is still on the clipboard, the saved snapshot already
                 // holds the user's data; saving now would save our own text instead.
                 if restore && pending_restore.is_none() {
@@ -1661,6 +1676,12 @@ fn paste_thread(
                         Err(e) => s.fail(&e.tray_text()),
                     }
                 });
+                // Pasted anyway (the check can be wrong, and an app may take a paste outside
+                // a text field, like a design canvas), so this only offers a way out.
+                if result.is_ok() && agt_platform::focus_takes_text() == Some(false) {
+                    tracing::info!("pasted, but focus isn't in a text box; offering Copy");
+                    hub.not_in_text_box();
+                }
                 // Everything below is bookkeeping after the paste: off the latency path.
                 let chars = text.chars().count();
                 d.chars_out = Some(chars as i64);
@@ -1713,6 +1734,7 @@ fn paste_thread(
                                 s.error = None;
                             }
                         });
+                        hub.copied();
                         tracing::info!(
                             "last transcript ({} chars) copied to the clipboard",
                             text.chars().count()

@@ -51,6 +51,8 @@ enum AppEvent {
     Update(UpdateEvent),
     /// `config.toml` was modified (or appeared, or went away).
     ConfigFile,
+    /// The Copy button on the "not in a text box" notice was clicked.
+    NoticeCopy,
 }
 
 /// Why AGT is waiting to restart.
@@ -428,7 +430,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
             // Created hidden now, so showing it on key down is a single present.
             if let (Some(position), Some(_)) = (self.overlay_position, &self.pipeline) {
-                match agt_overlay::Overlay::new(position) {
+                let proxy = self.proxy.clone();
+                let on_copy = move || {
+                    let _ = proxy.send_event(AppEvent::NoticeCopy);
+                };
+                match agt_overlay::Overlay::new(position, on_copy) {
                     Ok(o) => self.overlay = Some(o),
                     Err(e) => tracing::warn!("no overlay: {e}"),
                 }
@@ -458,6 +464,19 @@ impl ApplicationHandler<AppEvent> for App {
                 pipeline::Event::Rejected => {
                     if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
                         o.flash_error(p.level.get(), Instant::now());
+                    }
+                }
+                pipeline::Event::NotInTextBox => {
+                    if let Some(o) = &mut self.overlay {
+                        o.show_notice(Instant::now());
+                    }
+                    // Not idle while it's up: a restart would take the Copy button away.
+                    self.changes += 1;
+                    self.changed_at = Instant::now();
+                }
+                pipeline::Event::Copied => {
+                    if let Some(o) = &mut self.overlay {
+                        o.notice_copied(Instant::now());
                     }
                 }
                 pipeline::Event::CopyAvailable(available) => {
@@ -490,6 +509,11 @@ impl ApplicationHandler<AppEvent> for App {
         }
         let Some(tray) = &self.tray else { return };
         match event {
+            AppEvent::NoticeCopy => {
+                if let Some(p) = &self.pipeline {
+                    p.copy_last_transcript();
+                }
+            }
             AppEvent::Menu(e) if e.id == tray.copy_last => {
                 if let Some(p) = &self.pipeline {
                     p.copy_last_transcript();
@@ -549,6 +573,7 @@ impl ApplicationHandler<AppEvent> for App {
         let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) else {
             return;
         };
+        let notice = overlay.notice_visible();
         if overlay
             .next_frame()
             .is_some_and(|due| Instant::now() >= due)
@@ -559,6 +584,11 @@ impl ApplicationHandler<AppEvent> for App {
             Some(due) => ControlFlow::WaitUntil(due),
             None => ControlFlow::Wait,
         });
+        if notice && !overlay.notice_visible() {
+            // Idle again (see `idle`).
+            self.changed_at = Instant::now();
+            self.start_restart_timer();
+        }
     }
 
     fn resumed(&mut self, _: &ActiveEventLoop) {}
@@ -619,6 +649,9 @@ impl App {
     /// "Install update X now" / "Restart now to apply" restarts regardless.
     fn idle(&self) -> bool {
         use pipeline::Status;
+        if self.overlay.as_ref().is_some_and(|o| o.notice_visible()) {
+            return false;
+        }
         self.pipeline.is_none()
             || match &self.status {
                 Some(Status::Ready(_)) => true,

@@ -20,9 +20,9 @@ const BAR_MIN: f32 = 3.0;
 const BAR_MAX: f32 = 22.0;
 const BAR_STEP: Duration = Duration::from_millis(42);
 
-const BG: Rgba = Rgba(0.07, 0.07, 0.09, 0.84);
+pub(crate) const BG: Rgba = Rgba(0.07, 0.07, 0.09, 0.84);
 const BG_ERROR: Rgba = Rgba(0.50, 0.08, 0.08, 0.90);
-const BORDER: Rgba = Rgba(1.0, 1.0, 1.0, 0.14);
+pub(crate) const BORDER: Rgba = Rgba(1.0, 1.0, 1.0, 0.14);
 const BAR: Rgba = Rgba(1.0, 1.0, 1.0, 0.95);
 const DOT: Rgba = Rgba(1.0, 0.27, 0.27, 1.0);
 

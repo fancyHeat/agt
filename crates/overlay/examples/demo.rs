@@ -3,6 +3,7 @@
 //! ```sh
 //! cargo run --release -p agt-overlay --example demo -- --png <dir>   # render each state to PNGs (off-screen)
 //! cargo run --release -p agt-overlay --example demo -- --show        # show it on screen for ~4 s and measure
+//! cargo run --release -p agt-overlay --example demo -- --notice      # the "not in a text box" notice; click Copy
 //! ```
 //!
 //! `--show` drives the overlay from a winit event loop the way the app does (status events
@@ -12,7 +13,7 @@
 //! changed. It never takes focus or sends input.
 
 use agt_overlay::{
-    FRAME, Mode, Overlay, Position,
+    FRAME, Mode, NOTICE_FOR, Overlay, Position,
     canvas::Canvas,
     scene::{self, BARS, Scene},
 };
@@ -24,7 +25,7 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::WindowId,
 };
 
@@ -33,7 +34,8 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--png") if args.len() == 2 => write_pngs(Path::new(&args[1])),
         Some("--show") => show(args.get(1).map(Into::into)),
-        _ => eprintln!("usage: demo --png <dir> | --show"),
+        Some("--notice") => notice(),
+        _ => eprintln!("usage: demo --png <dir> | --show | --notice"),
     }
 }
 
@@ -83,6 +85,8 @@ fn write_pngs(dir: &Path) {
 /// Events from the "pipeline" thread, timestamped when sent.
 enum Ev {
     Mode(Mode, Instant),
+    /// The notice's Copy button was clicked.
+    Copy,
     Done,
 }
 
@@ -102,6 +106,8 @@ struct Demo {
     foreground: usize,
     /// Where to save a screen capture of the pill (taken just before it switches to transcribing).
     capture: Option<PathBuf>,
+    /// `--notice`: show the notice at start; its Copy button posts [`Ev::Copy`] here.
+    notice: Option<EventLoopProxy<Ev>>,
 }
 
 impl Demo {
@@ -133,7 +139,17 @@ impl Demo {
 impl ApplicationHandler<Ev> for Demo {
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
         if cause == StartCause::Init {
-            self.overlay = Some(Overlay::new(Position::Bottom).expect("create overlay"));
+            let proxy = self.notice.clone();
+            let on_copy = move || {
+                if let Some(p) = &proxy {
+                    let _ = p.send_event(Ev::Copy);
+                }
+            };
+            let mut overlay = Overlay::new(Position::Bottom, on_copy).expect("create overlay");
+            if self.notice.is_some() {
+                overlay.show_notice(Instant::now());
+            }
+            self.overlay = Some(overlay);
             self.foreground = foreground().0;
             self.end_phase("start");
         }
@@ -178,6 +194,12 @@ impl ApplicationHandler<Ev> for Demo {
                 );
                 if mode != Mode::Hidden {
                     self.phase.frames += 1;
+                }
+            }
+            Ev::Copy => {
+                println!("Copy clicked; foreground window {}", foreground().0);
+                if let Some(o) = self.overlay.as_mut() {
+                    o.notice_copied(Instant::now());
                 }
             }
             Ev::Done => {
@@ -233,6 +255,30 @@ fn show(capture: Option<PathBuf>) {
         phase: Phase::default(),
         foreground: 0,
         capture,
+        notice: None,
+    };
+    event_loop.run_app(&mut demo).expect("run");
+}
+
+/// Shows the "not in a text box" notice until it hides itself, printing Copy clicks.
+fn notice() {
+    let event_loop = EventLoop::<Ev>::with_user_event()
+        .build()
+        .expect("event loop");
+    let proxy = event_loop.create_proxy();
+    let done = proxy.clone();
+    thread::spawn(move || {
+        thread::sleep(NOTICE_FOR + Duration::from_secs(1));
+        let _ = done.send_event(Ev::Done);
+    });
+    println!("frontmost app (pid) at start: {}", foreground().0);
+    let mut demo = Demo {
+        overlay: None,
+        t0: Instant::now(),
+        phase: Phase::default(),
+        foreground: 0,
+        capture: None,
+        notice: Some(proxy),
     };
     event_loop.run_app(&mut demo).expect("run");
 }

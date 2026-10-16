@@ -20,7 +20,8 @@ use objc2::{
 };
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSWorkspace};
 use objc2_core_foundation::{
-    CFMachPort, CFRetained, CFRunLoop, CFString, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    CFMachPort, CFRetained, CFRunLoop, CFString, CFType, kCFBooleanTrue, kCFRunLoopCommonModes,
+    kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
@@ -368,6 +369,119 @@ fn front_window_of(pid: i32) -> Option<i64> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------------------
+// Focus
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXUIElementCreateSystemWide() -> Option<NonNull<CFType>>;
+    fn AXUIElementCopyAttributeValue(
+        element: &CFType,
+        attribute: &CFString,
+        value: *mut *mut CFType,
+    ) -> i32;
+    fn AXUIElementSetAttributeValue(element: &CFType, attribute: &CFString, value: &CFType) -> i32;
+    fn AXUIElementSetMessagingTimeout(element: &CFType, seconds: f32) -> i32;
+    fn AXUIElementGetPid(element: &CFType, pid: *mut i32) -> i32;
+}
+
+/// `kAXErrorNoValue`: the attribute is supported but empty (e.g. nothing has focus).
+const AX_NO_VALUE: i32 = -25212;
+
+/// How long one accessibility request may take before giving up (the default is 6 s, and a
+/// busy app answers late or not at all).
+const AX_TIMEOUT: f32 = 0.25;
+
+/// Focused-element roles that take typed text. Secure (password) fields are `AXTextField`s.
+const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"];
+
+fn ax_element(raw: Option<NonNull<CFType>>) -> Option<CFRetained<CFType>> {
+    // SAFETY: `AXUIElementCreate*` return a +1 reference.
+    raw.map(|p| unsafe { CFRetained::from_raw(p) })
+}
+
+fn ax_attribute(element: &CFType, name: &'static str) -> Result<CFRetained<CFType>, i32> {
+    let mut value = null_mut();
+    let rc = unsafe {
+        AXUIElementCopyAttributeValue(element, &CFString::from_static_str(name), &mut value)
+    };
+    match NonNull::new(value) {
+        // SAFETY: a `Copy` function: the value is +1.
+        Some(v) if rc == 0 => Ok(unsafe { CFRetained::from_raw(v) }),
+        _ if rc == 0 => Err(AX_NO_VALUE),
+        _ => Err(rc),
+    }
+}
+
+/// The accessibility element of the app with the keyboard focus, and its pid; requests to it
+/// (and everything else) are bounded by [`AX_TIMEOUT`]. Asked of the accessibility API, not
+/// `NSWorkspace`, whose frontmost app only follows along on a thread running the main run loop.
+fn focused_app() -> Option<(CFRetained<CFType>, i32)> {
+    if !unsafe { AXIsProcessTrusted() } {
+        return None;
+    }
+    let all = ax_element(unsafe { AXUIElementCreateSystemWide() })?;
+    // On the system-wide element it is the default for every element.
+    unsafe { AXUIElementSetMessagingTimeout(&all, AX_TIMEOUT) };
+    let app = ax_attribute(&all, "AXFocusedApplication").ok()?;
+    let mut pid = 0;
+    unsafe { AXUIElementGetPid(&app, &mut pid) };
+    Some((app, pid))
+}
+
+pub fn prepare_focus_check() {
+    let Some((app, pid)) = focused_app() else {
+        return;
+    };
+    // Electron's switch for building its accessibility tree (Chromium does it only for
+    // assistive apps, which it can't detect on macOS). Other apps answer "unsupported".
+    if let Some(yes) = unsafe { kCFBooleanTrue } {
+        let rc = unsafe {
+            AXUIElementSetAttributeValue(
+                &app,
+                &CFString::from_static_str("AXManualAccessibility"),
+                yes,
+            )
+        };
+        tracing::debug!("focus: pid {pid} AXManualAccessibility → {rc}");
+    }
+}
+
+pub fn focus_takes_text() -> Option<bool> {
+    let (app, pid) = focused_app()?;
+    let focused = match ax_attribute(&app, "AXFocusedUIElement") {
+        Ok(f) => f,
+        // The app has nothing focused (no window, or a window with no focusable control).
+        Err(AX_NO_VALUE) => {
+            tracing::debug!("focus: pid {pid}: nothing focused");
+            return Some(false);
+        }
+        Err(e) => {
+            tracing::debug!("focus: pid {pid}: can't tell (accessibility error {e})");
+            return None;
+        }
+    };
+    let role = ax_attribute(&focused, "AXRole")
+        .ok()
+        .and_then(|r| r.downcast_ref::<CFString>().map(ToString::to_string));
+    let Some(role) = role else {
+        tracing::debug!("focus: pid {pid}: can't tell (no role)");
+        return None;
+    };
+    // In an editable region of a web page (Chromium and WebKit): a rich text editor, say.
+    // Not "has a text selection": Chromium gives every element of a page one, links too.
+    let editable = ax_attribute(&focused, "AXEditableAncestor").is_ok();
+    let takes = takes_text(&role, editable);
+    tracing::debug!("focus: pid {pid}: {role} (editable {editable}) → takes text: {takes}");
+    Some(takes)
+}
+
+/// Whether a focused element with `role` takes typed text. `editable`: it is in an editable
+/// region of a web page.
+fn takes_text(role: &str, editable: bool) -> bool {
+    TEXT_ROLES.contains(&role) || editable
 }
 
 // ---------------------------------------------------------------------------------------
@@ -876,5 +990,31 @@ impl OutputVolume {
             return Ok(false);
         }
         Ok(get_property(self.device, &address, 0u32)? != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_roles_and_editable_regions_take_text() {
+        for role in ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"] {
+            assert!(takes_text(role, false), "{role}");
+        }
+        // A paragraph of a contenteditable editor (Notion, Google Docs, Slack's message box).
+        assert!(takes_text("AXStaticText", true));
+        assert!(takes_text("AXGroup", true));
+        // A link or a page with no field focused, the Finder desktop, a list, a button.
+        for role in [
+            "AXLink",
+            "AXWebArea",
+            "AXScrollArea",
+            "AXList",
+            "AXButton",
+            "AXWindow",
+        ] {
+            assert!(!takes_text(role, false), "{role}");
+        }
     }
 }

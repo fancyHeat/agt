@@ -8,7 +8,7 @@
 //! The window is owned by the thread that creates it (the UI thread), whose message loop
 //! (winit's) dispatches its few messages to `DefWindowProcW`.
 
-use crate::{Error, Surface, canvas::Canvas};
+use crate::{Error, NoticeSurface, Surface, canvas::Canvas};
 use std::{mem::zeroed, ptr::null_mut};
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, POINT, RECT, SIZE},
@@ -258,4 +258,20 @@ impl Drop for Window {
             DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// The "not in a text box" notice isn't built on Windows yet (nothing asks for it: the focus
+/// check there always answers "can't tell").
+pub struct Notice;
+
+impl Notice {
+    pub fn new(_on_copy: Box<dyn Fn()>) -> Result<Self, Error> {
+        Err("not on Windows yet".into())
+    }
+}
+
+impl NoticeSurface for Notice {
+    fn show(&mut self, _: f32, _: bool) {}
+    fn copied(&mut self) {}
+    fn hide(&mut self) {}
 }

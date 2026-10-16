@@ -10,6 +10,10 @@
 //! - It costs nothing while hidden: [`Overlay::next_frame`] is `None`, so the caller's event
 //!   loop has no timer to wake for. While visible it asks for ~60 frames per second.
 //!
+//! - After a paste that had no text field to land in, a notice takes the pill's place: "You
+//!   weren't in a text box", with a Copy button (macOS; the only window here that takes a
+//!   click, and it still never activates AGT or moves keyboard focus).
+//!
 //! All methods must be called on the UI (main) thread.
 
 pub mod canvas;
@@ -51,6 +55,10 @@ pub enum Position {
 pub const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// How long the error flash stays up.
 pub const ERROR_FOR: Duration = Duration::from_millis(900);
+/// How long the "not in a text box" notice stays up if its button isn't clicked.
+pub const NOTICE_FOR: Duration = Duration::from_secs(12);
+/// How long it says "Copied" after the click.
+pub const COPIED_FOR: Duration = Duration::from_millis(1200);
 
 /// The OS window the pill is shown in.
 trait Surface {
@@ -62,8 +70,22 @@ trait Surface {
     fn hide(&mut self);
 }
 
+/// The OS window the "not in a text box" notice is shown in.
+trait NoticeSurface {
+    /// Shows the message and the Copy button, centered where the pill goes (`margin` from the
+    /// bottom or top edge of the screen with the keyboard focus).
+    fn show(&mut self, margin: f32, top: bool);
+    /// Swaps the message and button for "Copied", in place.
+    fn copied(&mut self);
+    fn hide(&mut self);
+}
+
 pub struct Overlay {
     window: Box<dyn Surface>,
+    /// `None` where there is no notice (Windows for now).
+    notice: Option<Box<dyn NoticeSurface>>,
+    /// While the notice is up: when it hides.
+    notice_until: Option<Instant>,
     position: Position,
     mode: Mode,
     since: Instant,
@@ -77,15 +99,30 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    /// Creates the (hidden) window.
-    pub fn new(position: Position) -> Result<Self, Error> {
-        Ok(Self::with_surface(Box::new(sys::Window::new()?), position))
+    /// Creates the (hidden) windows. `on_copy` is called (on the UI thread) when the notice's
+    /// Copy button is clicked.
+    pub fn new(position: Position, on_copy: impl Fn() + 'static) -> Result<Self, Error> {
+        let window = Box::new(sys::Window::new()?);
+        let notice = match sys::Notice::new(Box::new(on_copy)) {
+            Ok(n) => Some(Box::new(n) as Box<dyn NoticeSurface>),
+            Err(e) => {
+                tracing::info!("no \"not in a text box\" notice: {e}");
+                None
+            }
+        };
+        Ok(Self::with_surfaces(window, notice, position))
     }
 
-    fn with_surface(window: Box<dyn Surface>, position: Position) -> Self {
+    fn with_surfaces(
+        window: Box<dyn Surface>,
+        notice: Option<Box<dyn NoticeSurface>>,
+        position: Position,
+    ) -> Self {
         let now = Instant::now();
         Self {
             window,
+            notice,
+            notice_until: None,
             position,
             mode: Mode::Hidden,
             since: now,
@@ -129,7 +166,44 @@ impl Overlay {
         }
     }
 
+    /// Shows "You weren't in a text box" with a Copy button where the pill was: for a
+    /// dictation pasted where nothing takes text. Only while the pill is hidden (a new
+    /// recording has moved on); it hides after [`NOTICE_FOR`] or when the pill comes back.
+    pub fn show_notice(&mut self, now: Instant) {
+        if self.mode != Mode::Hidden {
+            return;
+        }
+        let Some(notice) = &mut self.notice else {
+            return;
+        };
+        notice.show(scene::MARGIN, self.position == Position::Top);
+        self.notice_until = Some(now + NOTICE_FOR);
+    }
+
+    /// The notice's text was copied: it says so, then hides after [`COPIED_FOR`].
+    pub fn notice_copied(&mut self, now: Instant) {
+        if let (Some(notice), Some(_)) = (&mut self.notice, self.notice_until) {
+            notice.copied();
+            self.notice_until = Some(now + COPIED_FOR);
+        }
+    }
+
+    /// Whether the notice is up.
+    pub fn notice_visible(&self) -> bool {
+        self.notice_until.is_some()
+    }
+
+    fn hide_notice(&mut self) {
+        if self.notice_until.take().is_some()
+            && let Some(notice) = &mut self.notice
+        {
+            notice.hide();
+        }
+    }
+
     fn enter(&mut self, mode: Mode, level: f32, now: Instant) {
+        // The pill takes its place back.
+        self.hide_notice();
         let showing = self.mode == Mode::Hidden;
         if showing {
             // Pick the screen (and so the scale) each time it appears.
@@ -168,11 +242,14 @@ impl Overlay {
 
     /// When [`Overlay::tick`] should next be called; `None` while hidden (no timer needed).
     pub fn next_frame(&self) -> Option<Instant> {
-        self.next
+        [self.next, self.notice_until].into_iter().flatten().min()
     }
 
-    /// Draws the next frame if it's due (and hides after an error flash).
+    /// Draws the next frame if it's due (and hides after an error flash or the notice's time).
     pub fn tick(&mut self, level: f32, now: Instant) {
+        if self.notice_until.is_some_and(|until| now >= until) {
+            self.hide_notice();
+        }
         let Some(due) = self.next else { return };
         if now < due {
             return;
@@ -223,6 +300,7 @@ mod tests {
         places: usize,
         presents: usize,
         visible: bool,
+        notice: Option<&'static str>,
     }
 
     struct Fake(Rc<RefCell<Log>>);
@@ -243,10 +321,26 @@ mod tests {
         }
     }
 
+    impl NoticeSurface for Fake {
+        fn show(&mut self, _: f32, _: bool) {
+            self.0.borrow_mut().notice = Some("not in a text box");
+        }
+        fn copied(&mut self) {
+            self.0.borrow_mut().notice = Some("copied");
+        }
+        fn hide(&mut self) {
+            self.0.borrow_mut().notice = None;
+        }
+    }
+
     fn overlay() -> (Overlay, Rc<RefCell<Log>>) {
         let log = Rc::new(RefCell::new(Log::default()));
         (
-            Overlay::with_surface(Box::new(Fake(log.clone())), Position::Bottom),
+            Overlay::with_surfaces(
+                Box::new(Fake(log.clone())),
+                Some(Box::new(Fake(log.clone()))),
+                Position::Bottom,
+            ),
             log,
         )
     }
@@ -316,5 +410,53 @@ mod tests {
         o.tick(0.0, t + ERROR_FOR);
         assert_eq!(o.mode(), Mode::Hidden);
         assert!(!log.borrow().visible);
+    }
+
+    #[test]
+    fn notice_shows_while_hidden_then_times_out() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.show_notice(t);
+        assert_eq!(log.borrow().notice, Some("not in a text box"));
+        assert_eq!(
+            o.next_frame(),
+            Some(t + NOTICE_FOR),
+            "one wakeup, to hide it"
+        );
+        o.tick(0.0, t + NOTICE_FOR / 2);
+        assert!(o.notice_visible());
+        o.tick(0.0, t + NOTICE_FOR);
+        assert_eq!(log.borrow().notice, None);
+        assert_eq!(o.next_frame(), None);
+    }
+
+    #[test]
+    fn notice_says_copied_then_hides_soon() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.notice_copied(t);
+        assert_eq!(log.borrow().notice, None, "nothing to confirm while hidden");
+        o.show_notice(t);
+        o.notice_copied(t + Duration::from_secs(2));
+        assert_eq!(log.borrow().notice, Some("copied"));
+        let until = t + Duration::from_secs(2) + COPIED_FOR;
+        assert_eq!(o.next_frame(), Some(until));
+        o.tick(0.0, until);
+        assert!(!o.notice_visible());
+    }
+
+    #[test]
+    fn notice_gives_way_to_the_pill() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.set_mode(Mode::Recording, 0.1, t);
+        o.show_notice(t);
+        assert_eq!(log.borrow().notice, None, "not over a recording");
+        o.set_mode(Mode::Hidden, 0.0, t);
+        o.show_notice(t);
+        o.set_mode(Mode::Recording, 0.1, t + FRAME);
+        assert_eq!(log.borrow().notice, None, "the next recording hides it");
+        assert!(!o.notice_visible());
+        assert_eq!(o.next_frame(), Some(t + FRAME * 2));
     }
 }
