@@ -21,6 +21,9 @@
 //!                       eval set inserted (`<name>.pauses`); no engine
 //!   --only <text>       only files whose name contains this
 //!   --texts <file>      append every transcript to this file (tab-separated)
+//!   --segments <file>   append each dictation's transcribed pieces to this file, one line per
+//!                       dictation and setup: the name, then every piece's text, tab-separated
+//!                       (input for `agt-bench polish --segments`)
 //!   --joins             print the text on either side of every join between segments, and
 //!                       count the sentence breaks there (period + capital)
 //!   --quiet             no per-file lines
@@ -58,7 +61,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage: agt-bench live [stt flags] [--pause-ms list] [--min-secs list] [--pad-ms n] [--no-trim] [--no-guards] [--max-secs s] [--idle-ms n] [--baseline] [--realtime] [--cuts-only] [--only text] [--texts file] [--joins] [--quiet] <dir>";
+const USAGE: &str = "usage: agt-bench live [stt flags] [--pause-ms list] [--min-secs list] [--pad-ms n] [--no-trim] [--no-guards] [--max-secs s] [--idle-ms n] [--baseline] [--realtime] [--cuts-only] [--only text] [--texts file] [--segments file] [--joins] [--quiet] <dir>";
 
 /// Audio callback size.
 const PIECE: usize = SAMPLE_RATE as usize / 50;
@@ -95,7 +98,8 @@ struct Run {
     joined: bool,
     trimmed_secs: f64,
     tail_secs: f64,
-    /// Each transcribed piece's text, when it was ready (s) and how it ended (`--joins`).
+    /// Each transcribed piece's text, when it was ready (s) and how it ended (`--joins`,
+    /// `--segments`).
     pieces: Vec<(f64, Cut, String)>,
     /// The worker was still busy at release; else how long it had been idle (simulated ms).
     busy_at_release: bool,
@@ -133,7 +137,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut max_secs, mut idle_ms) = (f64::from(agt_stt::CHUNK_SECS), 4000u64);
     let (mut baseline, mut realtime, mut cuts_only, mut quiet) = (false, false, false, false);
     let (mut guards, mut joins) = (true, false);
-    let (mut only, mut texts, mut dir) = (None, None, None);
+    let (mut only, mut texts, mut segments, mut dir) = (None, None, None, None);
     while let Some(a) = args.next() {
         if crate::stt_flag(&mut cfg, &a, &mut args)? {
             continue;
@@ -153,6 +157,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--cuts-only" => cuts_only = true,
             "--only" => only = Some(val()?),
             "--texts" => texts = Some(PathBuf::from(val()?)),
+            "--segments" => segments = Some(PathBuf::from(val()?)),
             "--quiet" => quiet = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -244,16 +249,18 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     println!("engine: {}", engine.name());
     println!("load: {:.0} ms", crate::ms(t));
     engine.warmup().map_err(|e| e.to_string())?;
-    let mut texts = match texts {
-        Some(p) => Some(
+    let append = |p: Option<PathBuf>| {
+        p.map(|p| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&p)
-                .map_err(|e| format!("{}: {e}", p.display()))?,
-        ),
-        None => None,
+                .map_err(|e| format!("{}: {e}", p.display()))
+        })
+        .transpose()
     };
+    let mut texts = append(texts)?;
+    let mut segments = append(segments)?;
     let mut save = |label: &str, name: &str, text: &str| {
         if let Some(f) = &mut texts {
             let _ = writeln!(
@@ -301,6 +308,10 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 simulate(&mut engine, &c.audio, s.live(), idle_cap)?
             };
             save(&s.label, &c.name, &r.text);
+            if let Some(f) = &mut segments {
+                let pieces: Vec<&str> = r.pieces.iter().map(|(_, _, t)| t.trim()).collect();
+                let _ = writeln!(f, "{}\t{}", c.name, pieces.join("\t"));
+            }
             runs.push(r);
         }
         let base = (!base.is_empty()).then_some(&base[..]);

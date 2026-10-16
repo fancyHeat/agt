@@ -13,6 +13,7 @@
 //! [`guard`]). Every request has a hard deadline ([`PolishConfig::timeout`]) covering
 //! connect, send and the whole response.
 
+pub mod ahead;
 pub mod guard;
 pub mod managed;
 pub mod prompt;
