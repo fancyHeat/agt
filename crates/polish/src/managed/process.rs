@@ -83,6 +83,23 @@ impl LlamaLauncher {
             "--slots",
             // Never download anything (the model is a local file).
             "--offline",
+            // No copies of past prompts' KV cache in RAM (default: up to 8 GB). Every
+            // dictation is a new prompt and only the fixed prefix could be reused, which the
+            // slot's own cache already does; with it the server grew by ~25 MB per request.
+            "--cache-ram",
+            "0",
+            // The answer is mostly the transcript again, so draft from the prompt: find the
+            // last 3 tokens earlier in the context and propose the (up to) 24 that followed
+            // them; one batched pass checks them all and keeps what the model would have
+            // written anyway. 2-2.5x faster (docs/benchmarks.md, "Polish speed").
+            "--spec-type",
+            "ngram-simple",
+            "--spec-ngram-simple-size-n",
+            "3",
+            "--spec-ngram-simple-size-m",
+            "24",
+            "--spec-draft-n-max",
+            "24",
         ]
         .map(String::from)
         .into();
@@ -629,6 +646,8 @@ mod tests {
             "--host 127.0.0.1 --port 4242",
             r#"--jinja --chat-template-kwargs {"enable_thinking":false} --temp 0"#,
             "--n-gpu-layers all",
+            "--cache-ram 0",
+            "--spec-type ngram-simple",
         ] {
             assert!(a.contains(want), "{a}");
         }
