@@ -3,7 +3,7 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkey (event tap), swallowing F13-F20 and Fn, sending Cmd+V | Accessibility |
+//! | Seeing the hotkey (event tap), swallowing F13-F20 and the Globe key, sending Cmd+V | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
 //!
 //! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
@@ -54,6 +54,9 @@ const TAP_RETRY: Duration = Duration::from_secs(1);
 const KVK_COMMAND: u16 = 0x37;
 const KVK_ESCAPE: u16 = 0x35;
 const KVK_FUNCTION: u16 = 0x3F;
+/// The key event macOS sends right after Fn is released on its own, which apps act on with
+/// "Press 🌐 key to" (System Settings > Keyboard). Not in Carbon's list.
+const KVK_GLOBE: u16 = 0xB3;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
@@ -86,16 +89,6 @@ fn down_flag(code: u16) -> CGEventFlags {
     }
 }
 
-/// Whether apps never see the hotkey's key `i`: F13-F20, and Fn when it's the whole hotkey.
-/// Tapped alone, Fn makes apps do what "Press 🌐 key to" says (the emoji picker, by default),
-/// which a double tap always is and which then takes the paste. Fn+key still works: the flag
-/// on other keys comes from the HID state. In a chord, the other key already keeps Fn from
-/// counting as tapped alone.
-fn swallowed(hotkey: &Hotkey, i: usize) -> bool {
-    let keys = hotkey.keys();
-    keys[i].swallowed() || (keys.len() == 1 && keys[i].code == KVK_FUNCTION)
-}
-
 /// CoreFoundation objects owned by the hotkey thread but poked from others: enabling a tap
 /// and stopping a run loop are thread-safe.
 struct Cf<T>(T);
@@ -110,8 +103,12 @@ struct TapState {
 
 struct Shared {
     hotkey: Hotkey,
-    /// Whether any chord key is [`swallowed`], which takes an active tap.
+    /// Whether any chord key is swallowed (F13-F20), or `hide_globe`: both take an active tap.
     swallow: bool,
+    /// Whether the hotkey is Fn alone, whose every tap is followed by [`KVK_GLOBE`]: apps never
+    /// see that, or each dictation would also do what "Press 🌐 key to" says (the emoji
+    /// picker, by default), which then takes the paste. Fn itself still reaches apps.
+    hide_globe: bool,
     stop: AtomicBool,
     state: Mutex<TapState>,
 }
@@ -161,8 +158,10 @@ pub fn start_hotkey(
     hotkey: Hotkey,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
+    let hide_globe = matches!(hotkey.keys(), [k] if k.code == KVK_FUNCTION);
     let shared = Arc::new(Shared {
-        swallow: (0..hotkey.keys().len()).any(|i| swallowed(&hotkey, i)),
+        swallow: hotkey.keys().iter().any(Key::swallowed) || hide_globe,
+        hide_globe,
         stop: AtomicBool::new(false),
         state: Mutex::new(TapState {
             detector: HoldDetector::new(hotkey.keys().len()),
@@ -285,6 +284,12 @@ unsafe extern "C-unwind" fn tap_callback(
         return pass;
     }
     let code = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
+    if shared.hide_globe
+        && code == KVK_GLOBE
+        && matches!(ty, CGEventType::KeyDown | CGEventType::KeyUp)
+    {
+        return null_mut();
+    }
     let chord_key = shared.hotkey.index_of(code as u32);
     let down = match (ty, chord_key) {
         // Modifiers that aren't in the chord don't cancel: they're part of a shortcut only
@@ -316,8 +321,8 @@ unsafe extern "C-unwind" fn tap_callback(
     if let Some(e) = e {
         (st.on_event)(e);
     }
-    if swallow_esc || chord_key.is_some_and(|i| swallowed(&shared.hotkey, i)) {
-        // F13-F20, Fn alone, and the Esc that ends a hands-free recording: apps never see them.
+    if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
+        // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
         return null_mut();
     }
     pass

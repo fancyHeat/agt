@@ -10,7 +10,8 @@
 //!   release only the last few seconds are left to transcribe (see [`Feed`]). A double tap
 //!   (`hotkey.double_tap_ms`) records hands-free instead: the release doesn't end that
 //!   recording, the next press and release does (Esc cancels it, and so does
-//!   [`HANDS_FREE_MAX`]).
+//!   [`HANDS_FREE_MAX`]). After a tap the status stays "recording" for `double_tap_ms`, so
+//!   the bar doesn't flicker between the two taps.
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
 //!   system output volume down until the recording ends, however it ends.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
@@ -171,6 +172,9 @@ enum Engine {
 struct HubState {
     engine: Engine,
     recording: bool,
+    /// A tap just ended and a second one may still make it a double tap: still shown as
+    /// recording, so the bar doesn't hide and come back between the two.
+    lingering: bool,
     /// Jobs sent to `stt` and not yet pasted.
     pending: usize,
     /// Latest microphone/paste error, cleared by the next successful dictation.
@@ -200,7 +204,7 @@ impl Hub {
     fn update(&self, f: impl FnOnce(&mut HubState)) {
         let mut s = self.state.lock().unwrap();
         f(&mut s);
-        let status = if s.recording {
+        let status = if s.recording || s.lingering {
             Status::Recording
         } else if s.pending > 0 {
             Status::Transcribing
@@ -339,6 +343,7 @@ pub fn start(
         state: Arc::new(Mutex::new(HubState {
             engine: Engine::Loading("Loading model...".into()),
             recording: false,
+            lingering: false,
             pending: 0,
             error: None,
             missing: Vec::new(),
@@ -704,6 +709,8 @@ impl AudioThread {
         let mut latch = Latch::Off;
         // When the last tap was let go: maybe the first half of a double tap.
         let mut last_tap: Option<Instant> = None;
+        // Until when the bar stays up after that tap ([`HubState::lingering`]).
+        let mut linger: Option<Instant> = None;
         let double_tap = Duration::from_millis(self.config.hotkey.double_tap_ms);
         let tap = Duration::from_millis(self.config.hotkey.min_hold_ms).max(TAP);
 
@@ -754,6 +761,16 @@ impl AudioThread {
                     }
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
+            } else if let Some(until) = linger {
+                match events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                    Ok(ev) => (ev, false),
+                    Err(RecvTimeoutError::Timeout) => {
+                        linger = None;
+                        self.hub.update(|s| s.lingering = false);
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             } else {
                 match events.recv() {
                     Ok(ev) => (ev, false),
@@ -793,6 +810,11 @@ impl AudioThread {
                         let secs = f32::from_bits(self.chunk_secs.load(Relaxed));
                         (t, d, ducked, Feed::new(secs))
                     });
+                    // After `start_recording`: the status goes straight from lingering to
+                    // recording.
+                    if linger.take().is_some() {
+                        self.hub.update(|s| s.lingering = false);
+                    }
                     if double && holding.is_some() {
                         latch = Latch::Pressed;
                         tracing::info!(
@@ -816,6 +838,10 @@ impl AudioThread {
                     };
                     if held.is_some_and(|h| h < tap) {
                         last_tap = Some(released);
+                        if !double_tap.is_zero() {
+                            linger = Some(released + double_tap);
+                            self.hub.update(|s| s.lingering = true);
+                        }
                     }
                     d.missed_release = missed;
                     self.finish_recording(&mut recorder, down, released, d, feed);
