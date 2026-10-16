@@ -11,8 +11,10 @@
 //! - A muted output, or one already as low as the duck target, is left alone.
 //! - A dictation started before the previous one's volume came back keeps the original
 //!   from before the first one: pressing again and again never ratchets the volume down.
-//! - While ducked, the original volume is kept in a small marker file; if AGT dies before
-//!   restoring, the next start restores it (if the volume is still the ducked one).
+//! - While a device is ducked, its ID and original volume are kept in a small marker file.
+//!   If AGT dies before restoring, the next start restores it; if the device goes away while
+//!   ducked (a Bluetooth headset switched off), it's restored once it's back. Either way only
+//!   if its volume still looks like ours: between the ducked value and the original.
 
 use crate::imp;
 use std::{
@@ -27,9 +29,9 @@ const FADE_DOWN: Duration = Duration::from_millis(80);
 const FADE_UP: Duration = Duration::from_millis(250);
 /// Time between fade steps: 4 steps down, 12 up.
 const STEP: Duration = Duration::from_millis(20);
-/// How close the volume must be to the one we set to count as untouched by the user: well
-/// under the smallest step a volume key makes (Windows: 0.02; macOS: 1/16 or 1/64), well
-/// over the rounding of a set-then-get.
+/// How close the volume must be to the one we set (as read back) to count as untouched by
+/// the user: well under the smallest step a volume key makes (Windows: 0.02; macOS: 1/16 or
+/// 1/64).
 const TOLERANCE: f32 = 0.005;
 
 /// A duck level as a usable fraction: 0..=1, NaN as 0.
@@ -43,12 +45,28 @@ fn clamp_level(level: f32) -> f32 {
 
 /// What ducking needs from a volume control (the OS one, or a fake in tests).
 trait Output {
+    /// Stable across reconnects, to find the device again.
+    fn id(&self) -> String;
+    /// `None`: can't be read (e.g. the device went away).
     fn volume(&mut self) -> Option<f32>;
     fn muted(&mut self) -> bool;
     fn set_volume(&mut self, v: f32) -> bool;
 }
 
+/// Opens volume controls.
+trait Devices {
+    type Out: Output;
+    /// The default output, if its volume can be set.
+    fn open_default(&mut self) -> Option<Self::Out>;
+    /// The device with this [`Output::id`], if it's there now.
+    fn open(&mut self, id: &str) -> Option<Self::Out>;
+}
+
 impl Output for imp::OutputVolume {
+    fn id(&self) -> String {
+        imp::OutputVolume::id(self).to_owned()
+    }
+
     fn volume(&mut self) -> Option<f32> {
         imp::OutputVolume::volume(self)
             .inspect_err(|e| tracing::debug!("cannot read the output volume: {e}"))
@@ -66,56 +84,129 @@ impl Output for imp::OutputVolume {
     }
 }
 
-/// Where the original volume is kept while ducked (`None` in tests: no file).
+/// The OS's devices.
+#[derive(Default)]
+struct Real {
+    said_unsupported: bool,
+}
+
+impl Devices for Real {
+    type Out = imp::OutputVolume;
+
+    fn open_default(&mut self) -> Option<Self::Out> {
+        match imp::OutputVolume::open_default() {
+            Ok(Some(out)) => Some(out),
+            Ok(None) => {
+                if !self.said_unsupported {
+                    self.said_unsupported = true;
+                    tracing::debug!("the default output's volume can't be set; not ducking");
+                }
+                None
+            }
+            Err(e) => {
+                tracing::debug!("cannot open the default output's volume: {e}");
+                None
+            }
+        }
+    }
+
+    fn open(&mut self, id: &str) -> Option<Self::Out> {
+        imp::OutputVolume::open(id)
+            .inspect_err(|e| tracing::debug!("cannot open output device {id}: {e}"))
+            .ok()
+            .flatten()
+    }
+}
+
+/// A device we lowered, and what to put back.
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    original: f32,
+    ducked: f32,
+    id: String,
+}
+
+impl Entry {
+    /// Whether a volume of `v` is still ours to restore: between the ducked value and the
+    /// original (so a fade cut short by a crash counts too).
+    fn ours(&self, v: f32) -> bool {
+        v >= self.ducked - TOLERANCE && v <= self.original + TOLERANCE
+    }
+}
+
+/// The marker file: one [`Entry`] per line, `original ducked id` (`None` in tests: no file).
 struct Marker(Option<PathBuf>);
 
 impl Marker {
-    fn write(&self, original: f32, ducked: f32) {
-        if let Some(p) = &self.0
-            && let Err(e) = fs::write(p, format!("{original} {ducked}\n"))
-        {
-            tracing::debug!("cannot write {}: {e}", p.display());
+    fn save<'a>(&self, entries: impl IntoIterator<Item = &'a Entry>) {
+        let Some(p) = &self.0 else { return };
+        let text: String = entries
+            .into_iter()
+            .map(|e| format!("{} {} {}\n", e.original, e.ducked, e.id))
+            .collect();
+        let saved = if text.is_empty() {
+            match fs::remove_file(p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            }
+        } else {
+            fs::write(p, text)
+        };
+        if let Err(e) = saved {
+            tracing::debug!("cannot update {}: {e}", p.display());
         }
     }
 
-    fn remove(&self) {
-        if let Some(p) = &self.0 {
-            let _ = fs::remove_file(p);
-        }
+    fn load(&self) -> Vec<Entry> {
+        let Some(text) = self.0.as_ref().and_then(|p| fs::read_to_string(p).ok()) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, ' ');
+                Some(Entry {
+                    original: parts.next()?.parse().ok()?,
+                    ducked: parts.next()?.parse().ok()?,
+                    id: parts.next().unwrap_or_default().to_owned(),
+                })
+            })
+            .collect()
     }
+}
 
-    /// `(original, ducked)` from a previous run, if any.
-    fn read(&self) -> Option<(f32, f32)> {
-        let text = fs::read_to_string(self.0.as_ref()?).ok()?;
-        let mut parts = text.split_whitespace().map(str::parse::<f32>);
-        match (parts.next(), parts.next()) {
-            (Some(Ok(original)), Some(Ok(ducked))) => Some((original, ducked)),
-            _ => None,
-        }
-    }
+/// What a device's volume says about the session.
+#[derive(Debug, PartialEq)]
+enum Seen {
+    /// Still the last volume we set.
+    Untouched,
+    /// The user changed it: leave it alone.
+    Changed,
+    /// It can't be read: the device went away (or isn't answering).
+    Unreadable,
 }
 
 /// The volume we lowered, from the first duck until it's restored (or the user took over).
 struct Session<O> {
     out: O,
-    /// The volume before the first duck: what restoring goes back to.
-    original: f32,
-    /// The last volume we set.
+    /// `original`: the volume before the first duck, what restoring goes back to.
+    entry: Entry,
+    /// The volume after our last set, as read back (a device may round to its own steps).
     set: f32,
 }
 
 impl<O: Output> Session<O> {
-    /// Whether the volume is still the last one we set (the user hasn't changed it).
-    fn untouched(&mut self) -> bool {
-        self.out
-            .volume()
-            .is_some_and(|v| (v - self.set).abs() <= TOLERANCE)
+    fn seen(&mut self) -> Seen {
+        match self.out.volume() {
+            None => Seen::Unreadable,
+            Some(v) if (v - self.set).abs() <= TOLERANCE => Seen::Untouched,
+            Some(_) => Seen::Changed,
+        }
     }
 
     fn set(&mut self, v: f32) -> bool {
         let ok = self.out.set_volume(v);
         if ok {
-            self.set = v;
+            self.set = self.out.volume().unwrap_or(v);
         }
         ok
     }
@@ -147,8 +238,12 @@ impl Fade {
 }
 
 /// The ducking state machine, without the thread (see [`run`]).
-struct Duck<O> {
-    session: Option<Session<O>>,
+struct Duck<D: Devices> {
+    devices: D,
+    session: Option<Session<D::Out>>,
+    /// Devices still to restore once they're back: they went away while ducked, or a previous
+    /// run exited before restoring them.
+    lost: Vec<Entry>,
     fade: Option<Fade>,
     /// When the next fade step is due.
     next: Option<Instant>,
@@ -157,79 +252,132 @@ struct Duck<O> {
     fade_up: Duration,
 }
 
-impl<O: Output> Duck<O> {
-    fn new(marker: Marker, fade_down: Duration, fade_up: Duration) -> Self {
-        Self {
+impl<D: Devices> Duck<D> {
+    /// Starts with what the marker file says a previous run left lowered, restoring what it
+    /// can right away.
+    fn new(devices: D, marker: Marker, fade_down: Duration, fade_up: Duration) -> Self {
+        let mut duck = Self {
+            devices,
             session: None,
+            lost: marker.load(),
             fade: None,
             next: None,
             marker,
             fade_down,
             fade_up,
+        };
+        duck.retry_lost();
+        duck.save();
+        duck
+    }
+
+    fn save(&self) {
+        let session = self.session.as_ref().map(|s| &s.entry);
+        self.marker.save(session.into_iter().chain(&self.lost));
+    }
+
+    /// Restores each lost device that is back. One that's back with a volume that isn't ours
+    /// (the user changed it) is forgotten.
+    fn retry_lost(&mut self) {
+        let before = self.lost.len();
+        let devices = &mut self.devices;
+        self.lost.retain(|e| {
+            let Some(mut out) = devices.open(&e.id) else {
+                return true;
+            };
+            let Some(v) = out.volume() else { return true };
+            if e.ours(v) && v < e.original - TOLERANCE && out.set_volume(e.original) {
+                tracing::info!(
+                    "restored the output volume of a device left lowered (AGT exited, or the device went away, while ducked)"
+                );
+            }
+            false
+        });
+        if self.lost.len() != before {
+            self.save();
         }
     }
 
-    /// Lowers the volume to `level` × the original. `open` opens the default output (`None`:
-    /// there's none whose volume can be set).
-    fn duck(&mut self, level: f32, open: impl FnOnce() -> Option<O>, now: Instant) {
+    /// Lowers the volume to `level` × the original.
+    fn duck(&mut self, level: f32, now: Instant) {
+        self.retry_lost();
         let level = clamp_level(level);
         // Still ducked, or fading back up: keep the original from before the first duck.
-        let kept = self.session.as_mut().is_some_and(Session::untouched);
-        let session = match self.session.take() {
-            Some(s) if kept => s,
-            // None yet, or the user changed the volume since: that's the new original.
-            _ => {
-                self.marker.remove();
-                self.end();
-                let Some(mut out) = open() else { return };
-                if out.muted() {
-                    return;
-                }
-                let Some(v) = out.volume() else { return };
-                if v - v * level <= TOLERANCE {
-                    return; // already silent, or a level of (nearly) 1: nothing to lower
-                }
-                self.marker.write(v, v * level);
-                Session {
-                    out,
-                    original: v,
-                    set: v,
-                }
+        match self.session.as_mut().map(Session::seen) {
+            Some(Seen::Untouched) | None => {}
+            // The user changed it since: that's the new original.
+            Some(Seen::Changed) => self.end(),
+            Some(Seen::Unreadable) => self.lose(),
+        }
+        if self.session.is_none() {
+            let Some(mut out) = self.devices.open_default() else {
+                return;
+            };
+            if out.muted() {
+                return;
             }
-        };
-        let to = session.original * level;
-        tracing::debug!("ducking other audio: volume {:.3} -> {to:.3}", session.set);
-        self.fade = Some(Fade {
-            from: session.set,
-            to,
-            start: now,
-            len: self.fade_down,
-            restoring: false,
-        });
-        self.session = Some(session);
-        self.tick(now);
+            let Some(v) = out.volume() else { return };
+            let id = out.id();
+            // A device still lost to us that is the default again: its original stands.
+            let original = match self.lost.iter().position(|e| e.id == id) {
+                Some(i) => {
+                    let e = self.lost.remove(i);
+                    if e.ours(v) { e.original } else { v }
+                }
+                None => v,
+            };
+            if original - original * level <= TOLERANCE {
+                self.save();
+                return; // already silent, or a level of (nearly) 1: nothing to lower
+            }
+            self.session = Some(Session {
+                out,
+                entry: Entry {
+                    original,
+                    ducked: original * level,
+                    id,
+                },
+                set: v,
+            });
+            self.save();
+        }
+        let s = self.session.as_ref().expect("a session");
+        let to = s.entry.original * level;
+        tracing::debug!("ducking other audio: volume {:.3} -> {to:.3}", s.set);
+        self.start_fade(to, self.fade_down, false, now);
     }
 
     /// Fades back to the original volume, unless the user changed it meanwhile.
     fn restore(&mut self, now: Instant) {
         let Some(s) = &mut self.session else { return };
-        if !s.untouched() {
-            tracing::debug!("output volume changed while ducked; leaving it");
-            return self.end();
+        match s.seen() {
+            Seen::Untouched => {}
+            Seen::Changed => {
+                tracing::debug!("output volume changed while ducked; leaving it");
+                return self.end();
+            }
+            Seen::Unreadable => return self.lose(),
         }
-        tracing::debug!(
-            "restoring other audio: volume {:.3} -> {:.3}",
-            s.set,
-            s.original
-        );
+        let to = s.entry.original;
+        tracing::debug!("restoring other audio: volume {:.3} -> {to:.3}", s.set);
+        self.start_fade(to, self.fade_up, true, now);
+    }
+
+    fn start_fade(&mut self, to: f32, len: Duration, restoring: bool, now: Instant) {
+        let from = self.session.as_ref().expect("a session").set;
         self.fade = Some(Fade {
-            from: s.set,
-            to: s.original,
+            from,
+            to,
             start: now,
-            len: self.fade_up,
-            restoring: true,
+            len,
+            restoring,
         });
-        self.tick(now);
+        // The first step would set the volume it's at: take the next one.
+        if len.is_zero() {
+            self.tick(now);
+        } else {
+            self.next = Some(now + STEP);
+        }
     }
 
     /// Takes the fade's next step (due at [`Self::next`]).
@@ -238,13 +386,17 @@ impl<O: Output> Duck<O> {
         let (Some(s), Some(fade)) = (&mut self.session, &self.fade) else {
             return;
         };
-        if !s.untouched() {
-            tracing::debug!("output volume changed while ducking; leaving it");
-            return self.end();
+        match s.seen() {
+            Seen::Untouched => {}
+            Seen::Changed => {
+                tracing::debug!("output volume changed while ducking; leaving it");
+                return self.end();
+            }
+            Seen::Unreadable => return self.lose(),
         }
         let (v, done) = fade.at(now);
         if !s.set(v) {
-            return self.end(); // e.g. the device went away
+            return self.lose();
         }
         if !done {
             self.next = Some(now + STEP);
@@ -257,37 +409,40 @@ impl<O: Output> Duck<O> {
 
     /// Restores the original volume at once (no fade), e.g. when AGT exits.
     fn finish(&mut self) {
-        if let Some(s) = &mut self.session
-            && s.untouched()
-        {
-            let original = s.original;
-            s.set(original);
+        let Some(s) = &mut self.session else { return };
+        match s.seen() {
+            Seen::Untouched => {
+                let original = s.entry.original;
+                if s.set(original) {
+                    self.end();
+                } else {
+                    self.lose();
+                }
+            }
+            Seen::Changed => self.end(),
+            Seen::Unreadable => self.lose(),
+        }
+    }
+
+    /// The session is over: restored, or the user took over.
+    fn end(&mut self) {
+        self.session = None;
+        self.fade = None;
+        self.next = None;
+        self.save();
+    }
+
+    /// The session's device can't be read or set: keep its entry, to restore it once it's
+    /// back.
+    fn lose(&mut self) {
+        if let Some(s) = self.session.take() {
+            tracing::info!(
+                "output device unavailable while ducked; its volume is restored once it's back"
+            );
+            self.lost.push(s.entry);
         }
         self.end();
     }
-
-    fn end(&mut self) {
-        if self.session.take().is_some() {
-            self.marker.remove();
-        }
-        self.fade = None;
-        self.next = None;
-    }
-}
-
-/// Restores a volume a previous run left ducked (it died before restoring), if it's still the
-/// ducked one.
-fn recover<O: Output>(marker: &Marker, open: impl FnOnce() -> Option<O>) -> bool {
-    let Some((original, ducked)) = marker.read() else {
-        marker.remove(); // unreadable: nothing to go on
-        return false;
-    };
-    marker.remove();
-    let Some(mut out) = open() else { return false };
-    let restore = out
-        .volume()
-        .is_some_and(|v| (v - ducked).abs() <= TOLERANCE);
-    restore && out.set_volume(original)
 }
 
 enum Cmd {
@@ -319,10 +474,18 @@ impl Ducker {
     /// Starts the `duck` thread. `marker`: where to keep the original volume while ducked; a
     /// marker left by a previous run is acted on first.
     pub fn start(marker: PathBuf) -> Self {
+        Self::spawn(move || {
+            imp::init_volume_thread();
+            Duck::new(Real::default(), Marker(Some(marker)), FADE_DOWN, FADE_UP)
+        })
+    }
+
+    /// `make` runs on the new thread (the OS volume objects belong to the thread using them).
+    fn spawn<D: Devices>(make: impl FnOnce() -> Duck<D> + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel();
         let spawned = thread::Builder::new()
             .name("duck".into())
-            .spawn(move || run(rx, Marker(Some(marker))));
+            .spawn(move || run(rx, make()));
         if let Err(e) = spawned {
             tracing::warn!("cannot start the duck thread ({e}); other audio won't be lowered");
         }
@@ -348,27 +511,7 @@ impl Ducker {
     }
 }
 
-fn run(rx: Receiver<Cmd>, marker: Marker) {
-    imp::init_volume_thread();
-    let mut said_unsupported = false;
-    let mut open = || match imp::OutputVolume::open_default() {
-        Ok(Some(out)) => Some(out),
-        Ok(None) => {
-            if !said_unsupported {
-                said_unsupported = true;
-                tracing::debug!("the default output's volume can't be set; not ducking");
-            }
-            None
-        }
-        Err(e) => {
-            tracing::debug!("cannot open the default output's volume: {e}");
-            None
-        }
-    };
-    if recover(&marker, &mut open) {
-        tracing::info!("restored the output volume a previous run left lowered");
-    }
-    let mut duck = Duck::new(marker, FADE_DOWN, FADE_UP);
+fn run<D: Devices>(rx: Receiver<Cmd>, mut duck: Duck<D>) {
     loop {
         let cmd = match duck.next {
             Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
@@ -384,9 +527,13 @@ fn run(rx: Receiver<Cmd>, marker: Marker) {
         let now = Instant::now();
         match cmd {
             None => duck.tick(now),
-            Some(Cmd::Duck(level)) => duck.duck(level, &mut open, now),
+            Some(Cmd::Duck(level)) => duck.duck(level, now),
             Some(Cmd::Restore) => duck.restore(now),
-            Some(Cmd::Shutdown(_done)) => break,
+            Some(Cmd::Shutdown(done)) => {
+                duck.finish();
+                drop(done); // only now: `shutdown` waits for this
+                return;
+            }
         }
     }
     duck.finish();
@@ -395,64 +542,147 @@ fn run(rx: Receiver<Cmd>, marker: Marker) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, rc::Rc};
+    use std::sync::{Arc, Mutex};
 
     /// A volume control; clones share it, as with the real device.
-    #[derive(Clone, Default)]
-    struct Fake(Rc<RefCell<FakeState>>);
+    #[derive(Clone)]
+    struct Fake(Arc<Mutex<FakeState>>);
 
-    #[derive(Default)]
     struct FakeState {
+        id: String,
         volume: f32,
         muted: bool,
+        /// Unplugged: can't be read, set or opened.
+        gone: bool,
+        /// The device rounds what's set to multiples of this (0: exact).
+        grid: f32,
+        /// How long a set takes.
+        set_delay: Duration,
         sets: usize,
     }
 
     impl Fake {
-        fn new(volume: f32) -> Self {
-            let f = Self::default();
-            f.0.borrow_mut().volume = volume;
-            f
+        fn new(id: &str, volume: f32) -> Self {
+            Self(Arc::new(Mutex::new(FakeState {
+                id: id.into(),
+                volume,
+                muted: false,
+                gone: false,
+                grid: 0.0,
+                set_delay: Duration::ZERO,
+                sets: 0,
+            })))
+        }
+        fn s(&self) -> std::sync::MutexGuard<'_, FakeState> {
+            self.0.lock().unwrap()
         }
         fn get(&self) -> f32 {
-            self.0.borrow().volume
+            self.s().volume
         }
         /// The user moving the slider.
         fn user_sets(&self, v: f32) {
-            self.0.borrow_mut().volume = v;
+            self.s().volume = v;
+        }
+        fn sets(&self) -> usize {
+            self.s().sets
         }
     }
 
     impl Output for Fake {
+        fn id(&self) -> String {
+            self.s().id.clone()
+        }
         fn volume(&mut self) -> Option<f32> {
-            Some(self.0.borrow().volume)
+            let s = self.s();
+            (!s.gone).then_some(s.volume)
         }
         fn muted(&mut self) -> bool {
-            self.0.borrow().muted
+            self.s().muted
         }
         fn set_volume(&mut self, v: f32) -> bool {
-            let mut s = self.0.borrow_mut();
-            s.volume = v;
+            let delay = self.s().set_delay;
+            thread::sleep(delay);
+            let mut s = self.s();
+            if s.gone {
+                return false;
+            }
+            s.volume = if s.grid > 0.0 {
+                (v / s.grid).round() * s.grid
+            } else {
+                v
+            };
             s.sets += 1;
             true
         }
     }
 
+    /// Some devices; `default` is the default output.
+    struct FakeDevices {
+        all: Vec<Fake>,
+        default: usize,
+        /// Whether `open(id)` finds them.
+        by_id: bool,
+    }
+
+    impl FakeDevices {
+        fn new(all: Vec<Fake>) -> Self {
+            Self {
+                all,
+                default: 0,
+                by_id: true,
+            }
+        }
+    }
+
+    impl Devices for FakeDevices {
+        type Out = Fake;
+        fn open_default(&mut self) -> Option<Fake> {
+            let d = self.all.get(self.default)?;
+            (!d.s().gone).then(|| d.clone())
+        }
+        fn open(&mut self, id: &str) -> Option<Fake> {
+            if !self.by_id {
+                return None;
+            }
+            self.all
+                .iter()
+                .find(|d| d.s().id == id && !d.s().gone)
+                .cloned()
+        }
+    }
+
+    fn one(out: &Fake) -> FakeDevices {
+        FakeDevices::new(vec![out.clone()])
+    }
+
     /// No fades: every step lands at once.
-    fn instant() -> Duck<Fake> {
-        Duck::new(Marker(None), Duration::ZERO, Duration::ZERO)
+    fn instant(out: &Fake) -> Duck<FakeDevices> {
+        Duck::new(one(out), Marker(None), Duration::ZERO, Duration::ZERO)
+    }
+
+    /// Runs the fade in progress to its end.
+    fn settle(d: &mut Duck<FakeDevices>) {
+        while let Some(at) = d.next {
+            d.tick(at);
+        }
     }
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-6
     }
 
+    fn temp_marker(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agt-duck-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("ducked-volume")
+    }
+
     #[test]
     fn ducks_and_restores_exactly() {
-        let out = Fake::new(0.62);
-        let mut d = instant();
+        let out = Fake::new("a", 0.62);
+        let mut d = instant(&out);
         let now = Instant::now();
-        d.duck(0.1, || Some(out.clone()), now);
+        d.duck(0.1, now);
         assert!(close(out.get(), 0.062));
         d.restore(now);
         assert_eq!(out.get(), 0.62);
@@ -461,25 +691,30 @@ mod tests {
 
     #[test]
     fn a_volume_the_user_changed_is_left_alone() {
-        let out = Fake::new(0.5);
-        let mut d = instant();
+        let out = Fake::new("a", 0.5);
+        let mut d = instant(&out);
         let now = Instant::now();
-        d.duck(0.1, || Some(out.clone()), now);
+        d.duck(0.1, now);
         out.user_sets(0.3);
         d.restore(now);
         assert_eq!(out.get(), 0.3);
         assert!(d.session.is_none());
         // Also when it happens mid-fade.
-        let mut d = Duck::new(Marker(None), Duration::from_secs(1), Duration::from_secs(1));
+        let mut d = Duck::new(
+            one(&out),
+            Marker(None),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         out.user_sets(0.5);
-        d.duck(0.1, || Some(out.clone()), now);
+        d.duck(0.1, now);
         out.user_sets(0.8);
         d.tick(now + Duration::from_millis(500));
         assert_eq!(out.get(), 0.8);
         assert!(d.session.is_none());
         // And on exit.
-        let mut d = instant();
-        d.duck(0.1, || Some(out.clone()), now);
+        let mut d = instant(&out);
+        d.duck(0.1, now);
         out.user_sets(0.2);
         d.finish();
         assert_eq!(out.get(), 0.2);
@@ -487,20 +722,25 @@ mod tests {
 
     #[test]
     fn overlapping_dictations_do_not_ratchet() {
-        let out = Fake::new(0.8);
-        let mut d = Duck::new(Marker(None), Duration::ZERO, Duration::from_millis(100));
+        let out = Fake::new("a", 0.8);
+        let mut d = Duck::new(
+            one(&out),
+            Marker(None),
+            Duration::ZERO,
+            Duration::from_millis(100),
+        );
         let now = Instant::now();
-        d.duck(0.5, || Some(out.clone()), now);
+        d.duck(0.5, now);
         assert!(close(out.get(), 0.4));
         // Pressed again halfway through the fade back up...
         d.restore(now);
         d.tick(now + Duration::from_millis(50));
         assert!(out.get() > 0.4 && out.get() < 0.8);
-        d.duck(0.5, || panic!("the session continues"), now);
+        d.duck(0.5, now);
         // ...ducks to half the original, not half the current volume.
         assert!(close(out.get(), 0.4));
         // Pressed again with no restore in between (a never-released hold): same.
-        d.duck(0.5, || panic!("the session continues"), now);
+        d.duck(0.5, now);
         assert!(close(out.get(), 0.4));
         d.restore(now);
         d.tick(now + Duration::from_millis(200));
@@ -510,11 +750,12 @@ mod tests {
 
     #[test]
     fn fades_in_steps() {
-        let out = Fake::new(1.0);
-        let mut d = Duck::new(Marker(None), FADE_DOWN, FADE_UP);
+        let out = Fake::new("a", 1.0);
+        let mut d = Duck::new(one(&out), Marker(None), FADE_DOWN, FADE_UP);
         let now = Instant::now();
-        d.duck(0.0, || Some(out.clone()), now);
-        assert_eq!(out.get(), 1.0); // the first step is the starting volume
+        d.duck(0.0, now);
+        // No step at the start (it would set the volume it's at).
+        assert_eq!(out.sets(), 0);
         assert_eq!(d.next, Some(now + STEP));
         d.tick(now + FADE_DOWN / 2);
         assert!(close(out.get(), 0.5));
@@ -522,28 +763,59 @@ mod tests {
         assert_eq!(out.get(), 0.0);
         assert_eq!(d.next, None); // stays ducked
         assert!(d.session.is_some());
+        d.restore(now + FADE_DOWN);
+        settle(&mut d);
+        assert_eq!(out.get(), 1.0);
+        assert!(d.session.is_none());
+    }
+
+    #[test]
+    fn a_device_that_rounds_the_volume_is_not_a_user_change() {
+        let out = Fake::new("a", 0.6);
+        out.s().grid = 0.05;
+        let mut d = Duck::new(one(&out), Marker(None), FADE_DOWN, FADE_UP);
+        let now = Instant::now();
+        d.duck(0.1, now);
+        settle(&mut d);
+        assert!(
+            d.session.is_some(),
+            "every step read back off the requested value"
+        );
+        assert!(out.get() < 0.1);
+        d.restore(now);
+        settle(&mut d);
+        assert!(close(out.get(), 0.6));
+        assert!(d.session.is_none());
     }
 
     #[test]
     fn muted_or_already_low_output_is_left_alone() {
         let now = Instant::now();
-        let muted = Fake::new(0.7);
-        muted.0.borrow_mut().muted = true;
-        let mut d = instant();
-        d.duck(0.1, || Some(muted.clone()), now);
+        let muted = Fake::new("a", 0.7);
+        muted.s().muted = true;
+        let mut d = instant(&muted);
+        d.duck(0.1, now);
         d.restore(now);
-        assert_eq!(muted.0.borrow().sets, 0);
+        assert_eq!(muted.sets(), 0);
 
-        let silent = Fake::new(0.0);
-        d.duck(0.1, || Some(silent.clone()), now);
+        let silent = Fake::new("a", 0.0);
+        let mut d = instant(&silent);
+        d.duck(0.1, now);
         assert!(d.session.is_none());
-        let full = Fake::new(0.5);
-        d.duck(1.0, || Some(full.clone()), now);
+        let full = Fake::new("a", 0.5);
+        let mut d = instant(&full);
+        d.duck(1.0, now);
         assert!(d.session.is_none());
-        assert_eq!(silent.0.borrow().sets + full.0.borrow().sets, 0);
+        assert_eq!(silent.sets() + full.sets(), 0);
 
         // No settable output (HDMI): nothing happens.
-        d.duck(0.1, || None, now);
+        let mut d = Duck::new(
+            FakeDevices::new(Vec::new()),
+            Marker(None),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        d.duck(0.1, now);
         d.restore(now);
         assert!(d.session.is_none());
     }
@@ -554,10 +826,164 @@ mod tests {
         assert_eq!(clamp_level(2.0), 1.0);
         assert_eq!(clamp_level(f32::NAN), 0.0);
         assert_eq!(clamp_level(0.25), 0.25);
-        let out = Fake::new(0.6);
-        let mut d = instant();
-        d.duck(-3.0, || Some(out.clone()), Instant::now());
+        let out = Fake::new("a", 0.6);
+        let mut d = instant(&out);
+        d.duck(-3.0, Instant::now());
         assert_eq!(out.get(), 0.0);
+    }
+
+    #[test]
+    fn marker_lines_round_trip() {
+        let path = temp_marker("lines");
+        let m = Marker(Some(path.clone()));
+        let entries = vec![
+            Entry {
+                original: 0.75,
+                ducked: 0.075,
+                id: "{0.0.0.00000000}.{guid}".into(),
+            },
+            Entry {
+                original: 0.5,
+                ducked: 0.0,
+                id: "AppleUSBAudioEngine:My Headset:1".into(),
+            },
+        ];
+        m.save(&entries);
+        assert_eq!(m.load(), entries);
+        m.save([]);
+        assert!(!path.exists());
+        assert!(m.load().is_empty());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_crash_while_ducked_is_recovered_on_the_next_start() {
+        let path = temp_marker("crash");
+        let marker = || Marker(Some(path.clone()));
+        let now = Instant::now();
+        let start = |out: &Fake| Duck::new(one(out), marker(), Duration::ZERO, Duration::ZERO);
+
+        // Ducked, then "crashed" (never restored): the file holds the original.
+        let out = Fake::new("a", 0.75);
+        let mut d = start(&out);
+        d.duck(0.2, now);
+        assert!(path.exists());
+        std::mem::forget(d);
+        let d = start(&out);
+        assert_eq!(out.get(), 0.75);
+        assert!(!path.exists());
+        drop(d);
+
+        // Killed mid-fade: between the ducked value and the original still counts.
+        let mut d = start(&out);
+        d.duck(0.2, now);
+        std::mem::forget(d);
+        out.user_sets(0.4);
+        let d = start(&out);
+        assert_eq!(out.get(), 0.75);
+        drop(d);
+
+        // Changed by the user since (above the original): left alone, file gone.
+        let mut d = start(&out);
+        d.duck(0.2, now);
+        std::mem::forget(d);
+        out.user_sets(0.9);
+        let d = start(&out);
+        assert_eq!(out.get(), 0.9);
+        assert!(!path.exists());
+        drop(d);
+
+        // A normal restore removes the file.
+        let mut d = start(&out);
+        d.duck(0.2, now);
+        d.restore(now);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_device_that_goes_away_while_ducked_is_restored_once_back() {
+        let path = temp_marker("lost");
+        let marker = || Marker(Some(path.clone()));
+        let now = Instant::now();
+        let headset = Fake::new("headset", 0.6);
+        let speakers = Fake::new("speakers", 0.5);
+        let devices = || FakeDevices::new(vec![headset.clone(), speakers.clone()]);
+        let mut d = Duck::new(devices(), marker(), Duration::ZERO, Duration::ZERO);
+        d.duck(0.1, now);
+        assert!(close(headset.get(), 0.06));
+        // Switched off mid-hold (Windows and macOS keep its volume at 0.06).
+        headset.s().gone = true;
+        d.restore(now);
+        assert!(d.session.is_none());
+        let kept = marker().load();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "headset");
+
+        // While it's gone the default is the speakers: ducked and restored as usual, and the
+        // headset's entry stays.
+        d.devices.default = 1;
+        d.duck(0.1, now);
+        d.restore(now);
+        assert_eq!(speakers.get(), 0.5);
+        assert_eq!(marker().load(), kept);
+
+        // AGT restarts while it's still gone: still kept.
+        drop(d);
+        let mut d = Duck::new(devices(), marker(), Duration::ZERO, Duration::ZERO);
+        d.devices.default = 1;
+        assert_eq!(marker().load(), kept);
+
+        // Back: restored on the next dictation, then ducked from its real original.
+        headset.s().gone = false;
+        d.devices.default = 0;
+        d.duck(0.1, now);
+        assert!(close(headset.get(), 0.06));
+        assert!(close(d.session.as_ref().unwrap().entry.original, 0.6));
+        d.restore(now);
+        assert!(close(headset.get(), 0.6));
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_lost_device_back_as_the_default_keeps_its_original() {
+        // Not found by its ID (yet), but it's the default output again: a new session on it
+        // doesn't take the ducked volume for the original.
+        let out = Fake::new("a", 0.06);
+        let mut d = instant(&out);
+        d.devices.by_id = false;
+        d.lost.push(Entry {
+            original: 0.6,
+            ducked: 0.06,
+            id: "a".into(),
+        });
+        let now = Instant::now();
+        d.duck(0.1, now);
+        assert!(close(d.session.as_ref().unwrap().entry.original, 0.6));
+        assert!(close(out.get(), 0.06));
+        assert!(d.lost.is_empty());
+        d.restore(now);
+        assert!(close(out.get(), 0.6));
+    }
+
+    #[test]
+    fn shutdown_returns_after_the_volume_is_restored() {
+        let out = Fake::new("a", 0.8);
+        let fake = out.clone();
+        let ducker = Ducker::spawn(move || {
+            Duck::new(one(&fake), Marker(None), Duration::ZERO, Duration::ZERO)
+        });
+        let guard = ducker.duck(0.1);
+        let t = Instant::now();
+        while !close(out.get(), 0.08) {
+            assert!(t.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        out.s().set_delay = Duration::from_millis(100);
+        ducker.shutdown(Duration::from_secs(5));
+        assert_eq!(out.get(), 0.8);
+        drop(guard);
     }
 
     /// Ducks this machine's real default output and checks the volume comes back exactly.
@@ -571,59 +997,30 @@ mod tests {
             panic!("the default output's volume can't be set");
         };
         let before = out.volume().unwrap();
-        println!("before: {before} (muted: {})", out.muted().unwrap());
-        let dir = std::env::temp_dir().join(format!("agt-duck-real-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let ducker = Ducker::start(dir.join("ducked-volume"));
+        println!(
+            "device {}: before {before} (muted: {})",
+            out.id(),
+            out.muted().unwrap()
+        );
+        let again = imp::OutputVolume::open(out.id())
+            .unwrap()
+            .expect("found by ID");
+        assert_eq!(again.id(), out.id());
+        let path = temp_marker("real");
+        let ducker = Ducker::start(path.clone());
         let guard = ducker.duck(0.1);
         thread::sleep(Duration::from_millis(300));
         let during = out.volume().unwrap();
         println!("during: {during}");
+        println!("marker: {:?}", fs::read_to_string(&path).ok());
         drop(guard);
         thread::sleep(Duration::from_millis(500));
         let after = out.volume().unwrap();
         println!("after:  {after}");
         ducker.shutdown(Duration::from_secs(1));
-        let _ = fs::remove_dir_all(&dir);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
         assert!((during - before * 0.1).abs() <= TOLERANCE, "{during}");
         assert_eq!(after, before);
-    }
-
-    #[test]
-    fn a_crash_while_ducked_is_recovered_on_the_next_start() {
-        let dir = std::env::temp_dir().join(format!("agt-duck-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ducked-volume");
-        let marker = || Marker(Some(path.clone()));
-        let now = Instant::now();
-
-        // Ducked, then "crashed" (never restored): the file holds the original.
-        let out = Fake::new(0.75);
-        let mut d = Duck::new(marker(), Duration::ZERO, Duration::ZERO);
-        d.duck(0.2, || Some(out.clone()), now);
-        assert!(path.exists());
-        std::mem::forget(d);
-        assert!(recover(&marker(), || Some(out.clone())));
-        assert_eq!(out.get(), 0.75);
-        assert!(!path.exists());
-
-        // Changed by the user since: left alone, and the file is gone either way.
-        let mut d = Duck::new(marker(), Duration::ZERO, Duration::ZERO);
-        d.duck(0.2, || Some(out.clone()), now);
-        std::mem::forget(d);
-        out.user_sets(0.4);
-        assert!(!recover(&marker(), || Some(out.clone())));
-        assert_eq!(out.get(), 0.4);
-        assert!(!path.exists());
-
-        // A normal restore removes the file.
-        let mut d = Duck::new(marker(), Duration::ZERO, Duration::ZERO);
-        d.duck(0.2, || Some(out.clone()), now);
-        d.restore(now);
-        assert!(!path.exists());
-        assert!(!recover(&marker(), || -> Option<Fake> {
-            panic!("no marker")
-        }));
-        let _ = fs::remove_dir_all(&dir);
     }
 }

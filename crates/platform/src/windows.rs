@@ -12,7 +12,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{GetLastError, GlobalFree, HANDLE, LPARAM, LRESULT, WPARAM},
     System::{
-        Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx},
+        Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree},
         DataExchange::{
             CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
             GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -589,6 +589,7 @@ struct EnumeratorVtbl {
     _enum_audio_endpoints: Slot,
     get_default_audio_endpoint:
         unsafe extern "system" fn(*mut c_void, i32, i32, *mut *mut c_void) -> HRESULT,
+    get_device: unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> HRESULT,
 }
 
 #[repr(C)]
@@ -601,7 +602,13 @@ struct DeviceVtbl {
         *const c_void,
         *mut *mut c_void,
     ) -> HRESULT,
+    _open_property_store: Slot,
+    get_id: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> HRESULT,
+    get_state: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
 }
+
+/// `DEVICE_STATE_ACTIVE`: present and enabled (not unplugged or disabled).
+const DEVICE_STATE_ACTIVE: u32 = 1;
 
 #[repr(C)]
 struct EndpointVolumeVtbl {
@@ -645,8 +652,12 @@ fn check(hr: HRESULT, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The default output device's master volume. Lives on the thread that opened it.
-pub struct OutputVolume(Com<EndpointVolumeVtbl>);
+/// An output device's master volume. Lives on the thread that opened it.
+pub struct OutputVolume {
+    volume: Com<EndpointVolumeVtbl>,
+    /// The endpoint ID, to find the same device again ([`OutputVolume::open`]).
+    id: String,
+}
 
 /// Prepares the calling thread for [`OutputVolume`] (COM, multithreaded apartment).
 pub fn init_volume_thread() {
@@ -654,23 +665,27 @@ pub fn init_volume_thread() {
     unsafe { CoInitializeEx(null(), COINIT_MULTITHREADED as u32) };
 }
 
+fn enumerator() -> Result<Com<EnumeratorVtbl>, Error> {
+    let mut p = null_mut();
+    check(
+        unsafe {
+            CoCreateInstance(
+                &CLSID_MM_DEVICE_ENUMERATOR,
+                null_mut(),
+                CLSCTX_ALL,
+                &IID_IMM_DEVICE_ENUMERATOR,
+                &mut p,
+            )
+        },
+        "CoCreateInstance(MMDeviceEnumerator)",
+    )?;
+    Ok(Com(p, Default::default()))
+}
+
 impl OutputVolume {
     /// `Ok(None)`: there is no default output device.
     pub fn open_default() -> Result<Option<Self>, Error> {
-        let mut p = null_mut();
-        check(
-            unsafe {
-                CoCreateInstance(
-                    &CLSID_MM_DEVICE_ENUMERATOR,
-                    null_mut(),
-                    CLSCTX_ALL,
-                    &IID_IMM_DEVICE_ENUMERATOR,
-                    &mut p,
-                )
-            },
-            "CoCreateInstance(MMDeviceEnumerator)",
-        )?;
-        let enumerator = Com::<EnumeratorVtbl>(p, Default::default());
+        let enumerator = enumerator()?;
         let mut p = null_mut();
         let hr = unsafe {
             (enumerator.vtbl().get_default_audio_endpoint)(
@@ -680,11 +695,58 @@ impl OutputVolume {
                 &mut p,
             )
         };
-        if hr == E_NOTFOUND || p.is_null() {
+        if hr == E_NOTFOUND {
             return Ok(None);
         }
         check(hr, "GetDefaultAudioEndpoint")?;
+        if p.is_null() {
+            return Ok(None);
+        }
+        Self::activate(Com(p, Default::default()))
+    }
+
+    /// The device with this [`OutputVolume::id`]. `Ok(None)`: it's not there (unplugged,
+    /// disabled, or gone).
+    pub fn open(id: &str) -> Result<Option<Self>, Error> {
+        let enumerator = enumerator()?;
+        let wide: Vec<u16> = id.encode_utf16().chain([0]).collect();
+        let mut p = null_mut();
+        let hr = unsafe { (enumerator.vtbl().get_device)(enumerator.0, wide.as_ptr(), &mut p) };
+        if hr == E_NOTFOUND {
+            return Ok(None);
+        }
+        check(hr, "IMMDeviceEnumerator::GetDevice")?;
+        if p.is_null() {
+            return Ok(None);
+        }
         let device = Com::<DeviceVtbl>(p, Default::default());
+        let mut state = 0;
+        check(
+            unsafe { (device.vtbl().get_state)(device.0, &mut state) },
+            "IMMDevice::GetState",
+        )?;
+        if state != DEVICE_STATE_ACTIVE {
+            return Ok(None);
+        }
+        Self::activate(device)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn activate(device: Com<DeviceVtbl>) -> Result<Option<Self>, Error> {
+        let mut wide = null_mut();
+        check(
+            unsafe { (device.vtbl().get_id)(device.0, &mut wide) },
+            "IMMDevice::GetId",
+        )?;
+        let id = unsafe {
+            let len = (0..).take_while(|&i| *wide.add(i) != 0).count();
+            let id = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+            CoTaskMemFree(wide as *const c_void);
+            id
+        };
         let mut p = null_mut();
         check(
             unsafe {
@@ -698,14 +760,17 @@ impl OutputVolume {
             },
             "IMMDevice::Activate(IAudioEndpointVolume)",
         )?;
-        Ok(Some(Self(Com(p, Default::default()))))
+        Ok(Some(Self {
+            volume: Com(p, Default::default()),
+            id,
+        }))
     }
 
     /// The volume slider's position, 0..=1.
     pub fn volume(&self) -> Result<f32, Error> {
         let mut v = 0.0;
         check(
-            unsafe { (self.0.vtbl().get_master_volume_level_scalar)(self.0.0, &mut v) },
+            unsafe { (self.volume.vtbl().get_master_volume_level_scalar)(self.volume.0, &mut v) },
             "GetMasterVolumeLevelScalar",
         )?;
         Ok(v)
@@ -713,7 +778,9 @@ impl OutputVolume {
 
     pub fn set_volume(&self, v: f32) -> Result<(), Error> {
         check(
-            unsafe { (self.0.vtbl().set_master_volume_level_scalar)(self.0.0, v, null()) },
+            unsafe {
+                (self.volume.vtbl().set_master_volume_level_scalar)(self.volume.0, v, null())
+            },
             "SetMasterVolumeLevelScalar",
         )
     }
@@ -721,7 +788,7 @@ impl OutputVolume {
     pub fn muted(&self) -> Result<bool, Error> {
         let mut m = 0;
         check(
-            unsafe { (self.0.vtbl().get_mute)(self.0.0, &mut m) },
+            unsafe { (self.volume.vtbl().get_mute)(self.volume.0, &mut m) },
             "GetMute",
         )?;
         Ok(m != 0)

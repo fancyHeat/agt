@@ -82,6 +82,14 @@ impl OutputVolume {
         Ok(None)
     }
 
+    pub fn open(_id: &str) -> Result<Option<Self>, Error> {
+        Ok(None)
+    }
+
+    pub fn id(&self) -> &str {
+        ""
+    }
+
     pub fn volume(&self) -> Result<f32, Error> {
         Err(format!("volume control {MSG}").into())
     }

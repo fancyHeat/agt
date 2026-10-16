@@ -108,7 +108,7 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
     b.choice(
         menu,
         "Lower other audio to",
-        duck_levels(c.audio.duck_level),
+        duck_levels(c.audio.duck_level()),
     )?;
 
     // Speech-to-text.
@@ -536,8 +536,8 @@ fn numbers(
         .collect()
 }
 
-/// `audio.duck_level` presets (percent of the volume kept), plus the file's value if it's
-/// another one.
+/// `audio.duck_level` presets (percent of the volume kept), plus the level in use if it's
+/// another one. `current`: the clamped level ([`agt_core::config::AudioConfig::duck_level`]).
 fn duck_levels(current: f32) -> Vec<Choice> {
     let pct = |v: f32| (f64::from(v) * 100.0).round();
     let mut choices: Vec<Choice> = [0, 10, 25, 50]
@@ -558,7 +558,7 @@ fn duck_levels(current: f32) -> Vec<Choice> {
         })
         .collect();
     if !choices.iter().any(|c| c.checked) {
-        choices.push(Choice::current(&current.to_string()));
+        choices.push(Choice::current(&format!("{}%", pct(current))));
     }
     choices
 }
@@ -712,7 +712,7 @@ mod tests {
             &[0, 500],
             ms,
         ));
-        all.extend(duck_levels(c.audio.duck_level));
+        all.extend(duck_levels(c.audio.duck_level()));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
@@ -727,10 +727,19 @@ mod tests {
         let labels: Vec<_> = n.iter().map(|c| (c.label.as_str(), c.checked)).collect();
         assert_eq!(labels, [("0 ms", false), ("7 ms", true), ("500 ms", false)]);
         // The default duck level is a preset; another one is shown as is.
-        let levels = duck_levels(c.audio.duck_level);
+        let levels = duck_levels(c.audio.duck_level());
         assert_eq!(levels.iter().filter(|c| c.checked).count(), 1);
         assert!(levels.iter().any(|c| c.checked && c.label == "10%"));
         let levels = duck_levels(0.3);
         assert!(levels.last().unwrap().checked && levels.last().unwrap().changes.is_empty());
+        // What's shown is the level in use: out of range clamped, NaN the default.
+        let shown = |v: &str| {
+            let c = Config::parse(&format!("[audio]\nduck_level = {v}\n")).unwrap();
+            let levels = duck_levels(c.audio.duck_level());
+            levels.into_iter().find(|c| c.checked).unwrap().label
+        };
+        assert_eq!(shown("3"), "100% (from config.toml)");
+        assert_eq!(shown("nan"), "10%");
+        assert_eq!(shown("-1"), "Silent");
     }
 }

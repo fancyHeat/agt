@@ -725,6 +725,10 @@ const VIRTUAL_MAIN_VOLUME: u32 = fourcc(b"vmvc");
 /// `kAudioDevicePropertyVolumeScalar`.
 const VOLUME_SCALAR: u32 = fourcc(b"volm");
 const MUTE: u32 = fourcc(b"mute");
+/// `kAudioDevicePropertyDeviceUID`.
+const DEVICE_UID: u32 = fourcc(b"uid ");
+/// `kAudioHardwarePropertyTranslateUIDToDevice`.
+const TRANSLATE_UID_TO_DEVICE: u32 = fourcc(b"uidd");
 
 fn output_address(selector: u32) -> PropertyAddress {
     PropertyAddress {
@@ -753,24 +757,60 @@ fn get_property<T: Copy>(id: u32, address: &PropertyAddress, mut value: T) -> Re
     Ok(value)
 }
 
-/// The default output device's volume control.
+/// An output device's volume control.
 pub struct OutputVolume {
     device: u32,
     /// [`VIRTUAL_MAIN_VOLUME`] or [`VOLUME_SCALAR`].
     selector: u32,
+    /// The device's UID (stable across reconnects, unlike its `AudioDeviceID`), to find it
+    /// again ([`OutputVolume::open`]).
+    uid: String,
 }
 
 pub fn init_volume_thread() {}
 
+fn global_address(selector: u32) -> PropertyAddress {
+    PropertyAddress {
+        selector,
+        scope: SCOPE_GLOBAL,
+        element: ELEMENT_MAIN,
+    }
+}
+
 impl OutputVolume {
     /// `Ok(None)`: no output device, or its volume can't be set (HDMI/DisplayPort outputs).
     pub fn open_default() -> Result<Option<Self>, Error> {
-        let address = PropertyAddress {
-            selector: DEFAULT_OUTPUT_DEVICE,
-            scope: SCOPE_GLOBAL,
-            element: ELEMENT_MAIN,
+        let device = get_property(SYSTEM_OBJECT, &global_address(DEFAULT_OUTPUT_DEVICE), 0u32)?;
+        Self::for_device(device)
+    }
+
+    /// The device with this [`OutputVolume::id`]. `Ok(None)`: it's not connected now.
+    pub fn open(uid: &str) -> Result<Option<Self>, Error> {
+        let uid = CFString::from_str(uid);
+        let qualifier: *const CFString = &*uid;
+        let mut device = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &global_address(TRANSLATE_UID_TO_DEVICE),
+                size_of::<*const CFString>() as u32,
+                (&raw const qualifier).cast(),
+                &mut size,
+                (&raw mut device).cast(),
+            )
         };
-        let device = get_property(SYSTEM_OBJECT, &address, 0u32)?;
+        if status != 0 {
+            return Err(format!("translating a device UID failed (OSStatus {status})").into());
+        }
+        Self::for_device(device)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.uid
+    }
+
+    fn for_device(device: u32) -> Result<Option<Self>, Error> {
         if device == 0 {
             return Ok(None); // kAudioObjectUnknown
         }
@@ -781,7 +821,16 @@ impl OutputVolume {
                 && unsafe { AudioObjectIsPropertySettable(device, &address, &mut settable) } == 0
                 && settable != 0
             {
-                return Ok(Some(Self { device, selector }));
+                let uid: *const CFString =
+                    get_property(device, &global_address(DEVICE_UID), std::ptr::null())?;
+                let uid = NonNull::new(uid.cast_mut()).ok_or("the device has no UID")?;
+                // A copy we own (the property's rule for CFString values).
+                let uid = unsafe { CFRetained::from_raw(uid) }.to_string();
+                return Ok(Some(Self {
+                    device,
+                    selector,
+                    uid,
+                }));
             }
         }
         Ok(None)
