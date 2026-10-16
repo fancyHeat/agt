@@ -9,6 +9,9 @@
 //!                       this is `CutConfig::live`)
 //!   --pad-ms <n>        silence kept at a cut and either side of a trimmed pause (default 250)
 //!   --no-trim           transcribe the pauses instead of dropping them
+//!   --no-guards         transcribe every segment on its own: no skipping of segments without
+//!                       speech, no joining a short tail to the segment before it (see
+//!                       `agt_stt::chunk::Live`; the default is the app's path)
 //!   --max-secs <s>      segment limit (default 25, the app's chunk length; 10 for Core ML)
 //!   --idle-ms <n>       longest real sleep for an idle gap on the timeline (default 4000;
 //!                       0 = back to back, for WER sweeps)
@@ -18,13 +21,16 @@
 //!                       eval set inserted (`<name>.pauses`); no engine
 //!   --only <text>       only files whose name contains this
 //!   --texts <file>      append every transcript to this file (tab-separated)
+//!   --joins             print the text on either side of every join between segments, and
+//!                       count the sentence breaks there (period + capital)
 //!   --quiet             no per-file lines
 //! ```
 //!
 //! **Timeline** (default): each recording is replayed on a simulated clock. The audio goes
-//! into an [`agt_stt::chunk::Cutter`] in 20 ms pieces, like audio callbacks; a segment is
-//! ready when the cutter hands it out. One worker transcribes the segments in order, each when
-//! it is ready and the previous one is done, then the tail at release. The transcriptions are
+//! into an [`agt_stt::chunk::Live`] (the app's path: a cutter plus its guards) in 20 ms
+//! pieces, like audio callbacks; a segment is ready when it is handed out. One worker
+//! transcribes the segments in order, each when it is ready and the previous one is done,
+//! then the tail at release (or, as in the app, the whole recording if nothing was cut). The transcriptions are
 //! real and so is the idle time between them: it is slept (up to `--idle-ms`; an idle GPU pays
 //! the same after 3 s as after 30 s), so the engine sees the gaps it would in the app. Release
 //! -> text is when the last segment is done minus the end of the audio.
@@ -39,7 +45,7 @@ use agt_core::{
     config::SttConfig,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
-use agt_stt::chunk::{Cut, CutConfig, Cutter, PauseCut, Segment};
+use agt_stt::chunk::{Cut, CutConfig, Cutter, Live, LiveStats, PauseCut, Piece, Texts};
 use std::{
     collections::BTreeMap,
     io::Write,
@@ -52,7 +58,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const USAGE: &str = "usage: agt-bench live [stt flags] [--pause-ms list] [--min-secs list] [--pad-ms n] [--no-trim] [--max-secs s] [--idle-ms n] [--baseline] [--realtime] [--cuts-only] [--only text] [--texts file] [--quiet] <dir>";
+const USAGE: &str = "usage: agt-bench live [stt flags] [--pause-ms list] [--min-secs list] [--pad-ms n] [--no-trim] [--no-guards] [--max-secs s] [--idle-ms n] [--baseline] [--realtime] [--cuts-only] [--only text] [--texts file] [--joins] [--quiet] <dir>";
 
 /// Audio callback size.
 const PIECE: usize = SAMPLE_RATE as usize / 50;
@@ -60,6 +66,18 @@ const PIECE: usize = SAMPLE_RATE as usize / 50;
 struct Setup {
     label: String,
     cut: CutConfig,
+    guards: bool,
+}
+
+impl Setup {
+    fn live(&self) -> Live {
+        let live = Live::new(self.cut.clone());
+        if self.guards {
+            live
+        } else {
+            live.without_guards()
+        }
+    }
 }
 
 /// One dictation, one setup.
@@ -71,10 +89,14 @@ struct Run {
     compute_ms: f64,
     cpu_ms: f64,
     calls: usize,
-    /// Segments by [`Cut`]: pause, limit, end.
+    /// Segments by [`Cut`]: pause, limit, end; not transcribed (no speech); tail joined.
     cuts: [usize; 3],
+    skipped: usize,
+    joined: bool,
     trimmed_secs: f64,
     tail_secs: f64,
+    /// Each transcribed piece's text, when it was ready (s) and how it ended (`--joins`).
+    pieces: Vec<(f64, Cut, String)>,
     /// The worker was still busy at release; else how long it had been idle (simulated ms).
     busy_at_release: bool,
     idle_at_release_ms: f64,
@@ -110,6 +132,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut pauses, mut mins, mut pad_ms, mut trim) = (vec![1000.0], vec![8.0], 250.0, true);
     let (mut max_secs, mut idle_ms) = (f64::from(agt_stt::CHUNK_SECS), 4000u64);
     let (mut baseline, mut realtime, mut cuts_only, mut quiet) = (false, false, false, false);
+    let (mut guards, mut joins) = (true, false);
     let (mut only, mut texts, mut dir) = (None, None, None);
     while let Some(a) = args.next() {
         if crate::stt_flag(&mut cfg, &a, &mut args)? {
@@ -121,6 +144,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--min-secs" => mins = list(&a, val()?)?,
             "--pad-ms" => pad_ms = val()?.parse().map_err(|_| "bad --pad-ms")?,
             "--no-trim" => trim = false,
+            "--no-guards" => guards = false,
+            "--joins" => joins = true,
             "--max-secs" => max_secs = val()?.parse().map_err(|_| "bad --max-secs")?,
             "--idle-ms" => idle_ms = val()?.parse().map_err(|_| "bad --idle-ms")?,
             "--baseline" => baseline = true,
@@ -153,13 +178,16 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 pad: secs(pad_ms / 1000.0),
                 trim,
             });
-            let label = match &pause {
+            let mut label = match &pause {
                 None => "limit cuts only".to_owned(),
                 Some(_) => format!(
                     "pause {p:.0} ms, min {m} s, pad {pad_ms:.0} ms, {}",
                     if trim { "trim" } else { "no trim" }
                 ),
             };
+            if !guards {
+                label.push_str(", no guards");
+            }
             setups.push(Setup {
                 label,
                 cut: CutConfig {
@@ -167,6 +195,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     search_len: secs(search),
                     pause,
                 },
+                guards,
             });
         }
     }
@@ -267,15 +296,18 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         let mut runs = Vec::new();
         for c in &clips {
             let r = if realtime {
-                replay(&mut engine, &c.audio, &s.cut)?
+                replay(&mut engine, &c.audio, s.live())?
             } else {
-                simulate(&mut engine, &c.audio, &s.cut, idle_cap)?
+                simulate(&mut engine, &c.audio, s.live(), idle_cap)?
             };
             save(&s.label, &c.name, &r.text);
             runs.push(r);
         }
         let base = (!base.is_empty()).then_some(&base[..]);
         report(&s.label, &clips, &runs, &categories, quiet, base);
+        if joins {
+            join_report(&clips, &runs);
+        }
     }
 
     println!();
@@ -299,93 +331,110 @@ fn transcribe(engine: &mut Box<dyn SttEngine>, audio: &[f32]) -> Result<String, 
         .map_err(|e| e.to_string())
 }
 
-/// Appends a segment's text (trimmed, space-separated), like the app would join them.
-fn join(text: &mut String, piece: &str) {
-    let piece = piece.trim();
-    if !piece.is_empty() {
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(piece);
+/// At release, as the app does it: the tail if anything was cut before, else the whole
+/// recording (one piece; it goes to the engine as it would without `Live`).
+fn release(r: &mut Run, live: Live, audio: &[f32]) -> Vec<Piece> {
+    if !live.cut() {
+        (r.cuts[Cut::End as usize], r.tail_secs) = (1, audio.len() as f64 / SAMPLE_RATE as f64);
+        return vec![Piece {
+            audio: audio.to_vec(),
+            cut: Cut::End,
+            redo: false,
+        }];
     }
+    let (tail, stats) = live.finish();
+    r.count(&stats);
+    tail
 }
 
-fn count(r: &mut Run, seg: &Segment) {
-    r.cuts[seg.cut as usize] += 1;
+impl Run {
+    fn count(&mut self, s: &LiveStats) {
+        self.cuts = s.cuts;
+        self.skipped = s.skipped;
+        self.joined = s.tail_joined;
+        self.trimmed_secs = (s.received - s.kept) as f64 / SAMPLE_RATE as f64;
+        self.tail_secs = s.tail as f64 / SAMPLE_RATE as f64;
+    }
+
+    /// Adds a transcribed piece that was ready at `ready` (s).
+    fn add(&mut self, texts: &mut Texts, p: &Piece, text: String, ready: f64) {
+        if p.redo {
+            self.pieces.pop();
+        }
+        self.pieces.push((ready, p.cut, text.clone()));
+        texts.add(text, p.redo);
+    }
 }
 
 /// The timeline replay (see the module docs).
 fn simulate(
     engine: &mut Box<dyn SttEngine>,
     audio: &[f32],
-    cut: &CutConfig,
+    mut live: Live,
     idle_cap: Duration,
 ) -> Result<Run, String> {
     let mut r = Run::default();
-    let mut cutter = Cutter::new(cut.clone());
+    let mut texts = Texts::default();
     // Simulated seconds: when the worker is next free. It has been idle for long at the start.
     let mut free_at = f64::NEG_INFINITY;
-    let mut kept = 0;
-    let mut job = |r: &mut Run, free_at: &mut f64, seg: Segment, ready: f64| {
-        count(r, &seg);
-        kept += seg.audio.len();
+    let mut job = |r: &mut Run, free_at: &mut f64, p: Piece, ready: f64| {
         let start = ready.max(*free_at);
         std::thread::sleep(Duration::from_secs_f64(
             (start - *free_at).min(idle_cap.as_secs_f64()),
         ));
         let (t, cpu) = (Instant::now(), mem::cpu_time());
-        let text = transcribe(engine, &seg.audio)?;
+        let text = transcribe(engine, &p.audio)?;
         let took = t.elapsed().as_secs_f64();
         r.cpu_ms += (mem::cpu_time() - cpu).as_secs_f64() * 1e3;
         r.compute_ms += took * 1e3;
         r.calls += 1;
         *free_at = start + took;
-        join(&mut r.text, &text);
+        r.add(&mut texts, &p, text, ready);
         Ok::<_, String>(())
     };
+    let mut fed = 0;
     for piece in audio.chunks(PIECE) {
-        for seg in cutter.push(piece) {
-            let ready = seg.at as f64 / SAMPLE_RATE as f64;
-            job(&mut r, &mut free_at, seg, ready)?;
+        fed += piece.len();
+        for p in live.push(piece) {
+            job(&mut r, &mut free_at, p, fed as f64 / SAMPLE_RATE as f64)?;
         }
     }
-    let release = audio.len() as f64 / SAMPLE_RATE as f64;
-    r.busy_at_release = free_at > release;
-    r.idle_at_release_ms = ((release - free_at.max(0.0)) * 1e3).max(0.0);
-    for seg in cutter.finish() {
-        r.tail_secs += seg.audio.len() as f64 / SAMPLE_RATE as f64;
-        job(&mut r, &mut free_at, seg, release)?;
+    let at = audio.len() as f64 / SAMPLE_RATE as f64;
+    r.busy_at_release = free_at > at;
+    r.idle_at_release_ms = ((at - free_at.max(0.0)) * 1e3).max(0.0);
+    for p in release(&mut r, live, audio) {
+        job(&mut r, &mut free_at, p, at)?;
     }
-    r.trimmed_secs = (audio.len() - kept) as f64 / SAMPLE_RATE as f64;
-    r.latency_ms = (free_at.max(release) - release) * 1e3;
+    r.text = texts.join();
+    r.latency_ms = (free_at.max(at) - at) * 1e3;
     Ok(r)
 }
 
 /// The real-time replay (see the module docs).
-fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], cut: &CutConfig) -> Result<Run, String> {
+fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], mut live: Live) -> Result<Run, String> {
     let busy = AtomicBool::new(false);
     let done_at = Mutex::new(None::<Instant>);
     // Segments sent to the worker and not done yet (`busy` is only the one being transcribed).
     let queued = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
-    let (tx, rx) = mpsc::channel::<Segment>();
+    let (tx, rx) = mpsc::channel::<(Piece, f64)>();
     let mut r = Run::default();
     std::thread::scope(|sc| {
-        let worker = sc.spawn(|| -> Result<(String, f64, f64, usize, Instant), String> {
-            let (mut text, mut compute, mut cpu_ms, mut calls) = (String::new(), 0.0, 0.0, 0);
-            for seg in rx {
+        let worker = sc.spawn(|| -> Result<(Run, String, Instant), String> {
+            let (mut w, mut texts) = (Run::default(), Texts::default());
+            for (p, ready) in rx {
                 busy.store(true, Ordering::SeqCst);
                 let (t, cpu) = (Instant::now(), mem::cpu_time());
-                let piece = transcribe(engine, &seg.audio);
+                let piece = transcribe(engine, &p.audio);
                 *done_at.lock().unwrap() = Some(Instant::now());
                 queued.fetch_sub(1, Ordering::SeqCst);
                 busy.store(false, Ordering::SeqCst);
-                compute += crate::ms(t);
-                cpu_ms += (mem::cpu_time() - cpu).as_secs_f64() * 1e3;
-                calls += 1;
-                join(&mut text, &piece?);
+                w.compute_ms += crate::ms(t);
+                w.cpu_ms += (mem::cpu_time() - cpu).as_secs_f64() * 1e3;
+                w.calls += 1;
+                w.add(&mut texts, &p, piece?, ready);
             }
-            Ok((text, compute, cpu_ms, calls, Instant::now()))
+            Ok((w, texts.join(), Instant::now()))
         });
         let probe = sc.spawn(|| {
             let (mut on, mut off) = (Vec::new(), Vec::new());
@@ -403,9 +452,8 @@ fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], cut: &CutConfig) -> Re
             (on, off)
         });
 
-        let mut cutter = Cutter::new(cut.clone());
-        let mut kept = 0;
         let t0 = Instant::now();
+        let mut fed = 0;
         for (k, piece) in audio.chunks(PIECE).enumerate() {
             // A callback delivers a piece once it has been recorded.
             let due = t0 + Duration::from_secs_f64((k + 1) as f64 * PIECE as f64 / 16_000.0);
@@ -413,33 +461,29 @@ fn replay(engine: &mut Box<dyn SttEngine>, audio: &[f32], cut: &CutConfig) -> Re
                 std::thread::sleep(wait);
             }
             r.late_ms.push(crate::ms(due));
-            for seg in cutter.push(piece) {
-                count(&mut r, &seg);
-                kept += seg.audio.len();
+            fed += piece.len();
+            for p in live.push(piece) {
                 queued.fetch_add(1, Ordering::SeqCst);
-                let _ = tx.send(seg);
+                let _ = tx.send((p, fed as f64 / SAMPLE_RATE as f64));
             }
         }
-        let release = Instant::now();
+        let at = Instant::now();
         r.busy_at_release = queued.load(Ordering::SeqCst) > 0;
         if !r.busy_at_release {
             r.idle_at_release_ms = done_at.lock().unwrap().map_or(crate::ms(t0), crate::ms);
         }
-        for seg in cutter.finish() {
-            count(&mut r, &seg);
-            kept += seg.audio.len();
-            r.tail_secs += seg.audio.len() as f64 / SAMPLE_RATE as f64;
+        for p in release(&mut r, live, audio) {
             queued.fetch_add(1, Ordering::SeqCst);
-            let _ = tx.send(seg);
+            let _ = tx.send((p, fed as f64 / SAMPLE_RATE as f64));
         }
         drop(tx);
-        r.trimmed_secs = (audio.len() - kept) as f64 / SAMPLE_RATE as f64;
         let result = worker.join().expect("worker panicked");
         stop.store(true, Ordering::Relaxed);
         (r.probe_busy, r.probe_idle) = probe.join().expect("probe panicked");
-        let (text, compute, cpu_ms, calls, done) = result?;
-        (r.text, r.compute_ms, r.cpu_ms, r.calls) = (text, compute, cpu_ms, calls);
-        r.latency_ms = done.duration_since(release).as_secs_f64() * 1e3;
+        let (w, text, done) = result?;
+        (r.text, r.compute_ms, r.cpu_ms, r.calls) = (text, w.compute_ms, w.cpu_ms, w.calls);
+        r.pieces = w.pieces;
+        r.latency_ms = done.duration_since(at).as_secs_f64() * 1e3;
         Ok(r)
     })
 }
@@ -568,10 +612,12 @@ fn report(
                 .map(|r| r.idle_at_release_ms),
         );
         println!(
-            "segments: {} at pauses, {} at the limit, {} tails; tail p50 {:.1} s, p90 {:.1} s; worker busy at release {busy} of {}, else idle p50 {:.1} s",
+            "segments: {} at pauses, {} at the limit, {} tails; {} without speech skipped, {} short tails joined; tail p50 {:.1} s, p90 {:.1} s; worker busy at release {busy} of {}, else idle p50 {:.1} s",
             cuts[0],
             cuts[1],
             cuts[2],
+            runs.iter().map(|r| r.skipped).sum::<usize>(),
+            runs.iter().filter(|r| r.joined).count(),
             percentile(&tails, 0.5),
             percentile(&tails, 0.9),
             runs.len(),
@@ -617,6 +663,56 @@ fn report(
     println!(
         "row: | {label} | {p50:.0}/{p90:.0} | {} | {compute:.0} |{row_tail}",
         wer_cells.join(" | ")
+    );
+}
+
+/// `--joins`: the text either side of each join between transcribed pieces, and how often a
+/// piece ends a sentence there (`.`, `?`, `!`, and the next starts with a capital). A pause
+/// cut inside one of the eval set's inserted pauses is between two utterances; any other is
+/// inside one, where the reference rarely has a sentence break.
+fn join_report(clips: &[Clip], runs: &[Run]) {
+    println!(
+        "joins (where: inserted pause / pause inside an utterance / limit; B = sentence break):"
+    );
+    // [inserted, inside, limit] x (joins, breaks)
+    let mut n = [(0, 0); 3];
+    for (c, r) in clips.iter().zip(runs) {
+        for w in r.pieces.windows(2) {
+            let ((at, cut, left), (_, _, right)) = (&w[0], &w[1]);
+            let inserted = c.pauses.iter().any(|&(s, e)| *at >= s && *at <= e + 0.1);
+            let kind = match cut {
+                Cut::Pause if inserted => 0,
+                Cut::Pause => 1,
+                _ => 2,
+            };
+            let ends = left.trim_end().ends_with(['.', '?', '!']);
+            let capital = right.trim_start().starts_with(char::is_uppercase);
+            let brk = ends && capital;
+            n[kind].0 += 1;
+            n[kind].1 += brk as usize;
+            let words = |s: &str, last: bool| {
+                let w: Vec<&str> = s.split_whitespace().collect();
+                let k = w.len().min(6);
+                if last {
+                    w[w.len() - k..].join(" ")
+                } else {
+                    w[..k].join(" ")
+                }
+            };
+            println!(
+                "  {:<18} {:>6.1} s {:<8} {} ...{} | {}...",
+                c.name,
+                at,
+                ["inserted", "inside", "limit"][kind],
+                if brk { "B" } else { " " },
+                words(left, true),
+                words(right, false)
+            );
+        }
+    }
+    println!(
+        "joins: at inserted pauses {} ({} breaks), at pauses inside utterances {} ({} breaks), at the limit {} ({} breaks)",
+        n[0].0, n[0].1, n[1].0, n[1].1, n[2].0, n[2].1
     );
 }
 

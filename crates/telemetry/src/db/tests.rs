@@ -109,6 +109,45 @@ fn version_1_database_gets_the_new_columns() {
         )
         .unwrap();
     assert_eq!(row, (7, true));
+    let d = Dictation {
+        started_at: 4000,
+        audio_secs: Some(100.0),
+        stt_ms: Some(300.0),
+        release_to_text_ms: Some(320.0),
+        live_pause_cuts: Some(5),
+        live_limit_cuts: Some(1),
+        live_end_cuts: Some(1),
+        live_skipped: Some(0),
+        live_tail_joined: Some(false),
+        live_trimmed_secs: Some(30.5),
+        live_tail_secs: Some(9.5),
+        live_stt_ms: Some(2100.0),
+        live_busy_at_release: Some(false),
+        live_idle_ms: Some(4000.0),
+        live_max_queue: Some(1),
+        history_saved: true,
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let row: (f64, i64, bool, f64, Option<f64>, Option<f64>) = conn
+        .query_row(
+            "SELECT release_to_text_ms, live_pause_cuts, live_tail_joined, live_stt_ms, rtf,
+                live_discarded_ms FROM dictations WHERE started_at = 4000",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    // No RTF: `stt_ms` is only the tail's.
+    assert_eq!(row, (320.0, 5, false, 2100.0, None, None));
     // Rows from before the migration read as "not saved".
     assert_eq!(
         count(

@@ -41,8 +41,9 @@ pub use agt_core::stt::SAMPLE_RATE;
 
 /// Audio kept from before the key press when the mic stream stays open.
 pub const PREROLL_MS: usize = 300;
-/// Recordings are cut off after this long (memory and model-context safety valve).
-pub const MAX_SECONDS: usize = 5 * 60;
+/// Recordings are cut off after this long: a safety valve for memory (115 MB of samples).
+/// Long ones are transcribed while they're recorded, so release doesn't get slower.
+pub const MAX_SECONDS: usize = 30 * 60;
 /// A chosen microphone that failed to open is tried again after this long.
 const CHOSEN_RETRY: Duration = Duration::from_secs(60);
 
@@ -65,8 +66,9 @@ impl Level {
 struct Capture {
     recording: bool,
     resampler: Resampler,
-    /// 16 kHz output of the current recording.
+    /// 16 kHz output of the current recording, minus what [`Recorder::take_new`] took.
     samples: Vec<f32>,
+    taken: usize,
     /// Last `PREROLL_MS` of 16 kHz audio while not recording (keep-open mode only).
     preroll: VecDeque<f32>,
     keep_preroll: bool,
@@ -114,6 +116,7 @@ impl Recorder {
                 recording: false,
                 resampler: Resampler::new(SAMPLE_RATE, SAMPLE_RATE),
                 samples: Vec::new(),
+                taken: 0,
                 preroll: VecDeque::new(),
                 keep_preroll: keep_open,
                 mono: Vec::new(),
@@ -288,7 +291,7 @@ impl Recorder {
                     if c.first_audio.is_none() {
                         c.first_audio = c.started.map(|s| s.elapsed());
                     }
-                    if c.samples.len() < max_len {
+                    if c.taken + c.samples.len() < max_len {
                         c.resampler.process(&c.mono, &mut c.samples);
                     } else {
                         c.truncated = true;
@@ -323,6 +326,7 @@ impl Recorder {
         {
             let mut c = self.capture.lock().unwrap();
             c.samples.clear();
+            c.taken = 0;
             if c.keep_preroll {
                 let preroll: Vec<f32> = c.preroll.drain(..).collect();
                 c.samples.extend(preroll);
@@ -345,7 +349,18 @@ impl Recorder {
         Ok(())
     }
 
-    /// Ends the recording and returns its 16 kHz mono samples.
+    /// While recording: swaps the samples recorded since the last call (16 kHz mono) into
+    /// `buf`, which must be empty (its allocation is reused). Only a swap under the lock the
+    /// audio callback takes, and the callback's buffer stays small: a long recording is
+    /// never reallocated inside the callback, but by the caller, on its own thread.
+    pub fn take_new(&self, buf: &mut Vec<f32>) {
+        debug_assert!(buf.is_empty());
+        let mut c = self.capture.lock().unwrap();
+        std::mem::swap(&mut c.samples, buf);
+        c.taken += buf.len();
+    }
+
+    /// Ends the recording and returns its 16 kHz mono samples (those not taken yet).
     pub fn stop(&mut self) -> Recording {
         if !self.keep_open
             && let Some(live) = &self.live
@@ -394,7 +409,7 @@ fn device_name(device: &cpal::Device) -> Option<String> {
 }
 
 pub struct Recording {
-    /// 16 kHz mono.
+    /// 16 kHz mono (what [`Recorder::take_new`] hasn't taken).
     pub samples: Vec<f32>,
     /// Time from `start()` until the first audio arrived (`None` if none did).
     pub first_audio: Option<Duration>,

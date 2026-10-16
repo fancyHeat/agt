@@ -46,6 +46,13 @@ pub trait SttEngine: Send {
         None
     }
 
+    /// The longest audio (seconds) worth transcribing in one call: `agt-stt`'s chunked
+    /// engine says how long its chunks are (what the app cuts a recording into while it's
+    /// recorded). By default the hard limit, if any.
+    fn chunk_secs(&self) -> Option<f32> {
+        self.max_input_secs()
+    }
+
     /// A short note for the user about how the engine runs, if something didn't go as
     /// configured (e.g. "on the CPU, DirectML unavailable"). May change after a `transcribe`.
     fn notice(&self) -> Option<String> {
