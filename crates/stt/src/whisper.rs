@@ -46,6 +46,11 @@ const MODELS: &[(&str, ModelFile)] = &[
     ("whisper-small.en-q8_0", ggml!("ggml-small.en-q8_0.bin", 264477561, "67a179f608ea6114bd3fdb9060e762b588a3fb3bd00c4387971be4d177958067")),
 ];
 
+/// The `stt.model` names this engine knows.
+pub fn model_names() -> impl Iterator<Item = &'static str> {
+    MODELS.iter().map(|(n, _)| *n)
+}
+
 fn model_file(name: &str) -> Result<&'static ModelFile> {
     MODELS
         .iter()

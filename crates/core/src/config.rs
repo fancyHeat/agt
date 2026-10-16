@@ -1,5 +1,8 @@
 //! `config.toml`. Every field has a default, so a partial or empty file is valid.
 //! Unknown keys are rejected so typos surface instead of being silently ignored.
+//!
+//! The file is the only place settings live: the tray's Settings menu edits it through
+//! [`set`], which keeps the user's comments and layout.
 
 use serde::Deserialize;
 use std::{fs, io, path::Path, path::PathBuf};
@@ -23,8 +26,10 @@ pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
-    r#"# AGT configuration. Restart AGT after editing.
-# If this file has an error, AGT starts with defaults (updates off) and records the error.
+    r#"# AGT configuration. The tray menu's Settings change this file too. AGT applies a saved
+# change by restarting itself once you're not dictating.
+# If this file has an error, a running AGT keeps its settings until it's fixed; starting with
+# an error, AGT uses defaults (updates off). Either way it records the error.
 
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
@@ -156,6 +161,46 @@ enabled = true
 check_interval_minutes = 240
 "#
 );
+
+/// `ALL` variants and `as_str`, the name in the file (must match the serde renames; a test
+/// checks), for the tray's Settings menu.
+macro_rules! names {
+    ($ty:ident { $($variant:ident => $name:literal),+ $(,)? }) => {
+        impl $ty {
+            pub const ALL: &[Self] = &[$(Self::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
+        }
+    };
+}
+
+names!(Engine { Parakeet => "parakeet", Whisper => "whisper" });
+names!(Precision { Int8 => "int8", Fp32 => "fp32" });
+names!(Device {
+    Auto => "auto",
+    Cpu => "cpu",
+    DirectMl => "directml",
+    Cuda => "cuda",
+    CoreMl => "coreml",
+    Vulkan => "vulkan",
+    Metal => "metal",
+});
+names!(PolishProvider { S1Mini => "s1-mini", OpenAi => "openai", Anthropic => "anthropic" });
+names!(PolishStyle { Light => "light", Formal => "formal" });
+names!(S1Styling {
+    Casual => "casual",
+    SemiCasual => "semi-casual",
+    SemiFormal => "semi-formal",
+    Formal => "formal",
+});
+names!(S1Structure { Prose => "prose", Lists => "lists" });
+names!(S1Context { General => "general", Email => "email" });
+names!(S1Device { Auto => "auto", Cpu => "cpu" });
+names!(OverlayPosition { Bottom => "bottom", Top => "top" });
 
 /// Lower bound for `update.check_interval_minutes`.
 pub const MIN_CHECK_INTERVAL_MINUTES: u64 = 30;
@@ -334,21 +379,12 @@ impl S1MiniConfig {
     /// The first line of every S1-mini input, e.g.
     /// `[Styling: semi-formal] [Structure: prose] [Context: general]`.
     pub fn control_line(&self) -> String {
-        let styling = match self.styling {
-            S1Styling::Casual => "casual",
-            S1Styling::SemiCasual => "semi-casual",
-            S1Styling::SemiFormal => "semi-formal",
-            S1Styling::Formal => "formal",
-        };
-        let structure = match self.structure {
-            S1Structure::Prose => "prose",
-            S1Structure::Lists => "lists",
-        };
-        let context = match self.context {
-            S1Context::General => "general",
-            S1Context::Email => "email",
-        };
-        format!("[Styling: {styling}] [Structure: {structure}] [Context: {context}]")
+        format!(
+            "[Styling: {}] [Structure: {}] [Context: {}]",
+            self.styling.as_str(),
+            self.structure.as_str(),
+            self.context.as_str()
+        )
     }
 }
 
@@ -491,7 +527,8 @@ impl Default for OverlayConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
     pub enabled: bool,
-    check_interval_minutes: u64,
+    /// As written; the method floors it.
+    pub check_interval_minutes: u64,
 }
 
 impl Default for Config {
@@ -615,14 +652,18 @@ fn redact_values(message: &str) -> String {
 
 impl ConfigError {
     fn parse(e: toml::de::Error, text: &str) -> Self {
-        let at = e.span().map(|span| {
+        Self::at(e.message(), e.span(), text)
+    }
+
+    fn at(message: &str, span: Option<std::ops::Range<usize>>, text: &str) -> Self {
+        let at = span.map(|span| {
             let before = &text[..span.start.min(text.len())];
             let line = before.matches('\n').count() + 1;
             let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
             (line, column)
         });
         Self::Parse {
-            message: redact_values(e.message().trim()),
+            message: redact_values(message.trim()),
             at,
         }
     }
@@ -709,12 +750,108 @@ impl Config {
         Self::parse(&fs::read_to_string(path).map_err(ConfigError::Io)?)
     }
 
+    /// Load `path` as it is (see [`Config::load_or_create`] for the first run).
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::parse(&fs::read_to_string(path).map_err(ConfigError::Io)?)
+    }
+
     /// What to run with when the config file can't be loaded: defaults, but with
     /// updates off, since the user may have disabled them in the file we couldn't read.
     pub fn fallback() -> Self {
         let mut c = Self::default();
         c.update.enabled = false;
         c
+    }
+}
+
+/// A value to write with [`set`] (a string, integer or bool).
+pub use toml_edit::Value as SettingValue;
+
+/// A setting's place in the file, e.g. `&["polish", "s1-mini", "styling"]`.
+pub type SettingPath = &'static [&'static str];
+
+/// Returns `text` with each setting changed, keeping comments and layout (a value keeps its
+/// trailing comment). Missing tables and keys are added. Fails, quoting nothing, if `text`
+/// can't be parsed or the result isn't a valid config.
+pub fn with_settings(
+    text: &str,
+    changes: &[(SettingPath, SettingValue)],
+) -> Result<String, ConfigError> {
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ConfigError::at(e.message(), e.span(), text))?;
+    for (path, value) in changes {
+        let (key, tables) = path.split_last().expect("a setting path is not empty");
+        let mut table = doc.as_table_mut() as &mut dyn toml_edit::TableLike;
+        for name in tables {
+            if table.get(name).is_none() {
+                // Implicit: `[polish.s1-mini]` alone doesn't get an empty `[polish]` above it.
+                let mut new = toml_edit::Table::new();
+                new.set_implicit(true);
+                table.insert(name, toml_edit::Item::Table(new));
+            }
+            table = table
+                .get_mut(name)
+                .and_then(|t| t.as_table_like_mut())
+                .ok_or_else(|| ConfigError::Parse {
+                    message: format!("`{name}` is not a table"),
+                    at: None,
+                })?;
+        }
+        match table.get_mut(key).and_then(|v| v.as_value_mut()) {
+            Some(old) => {
+                let decor = old.decor().clone();
+                *old = value.clone();
+                *old.decor_mut() = decor;
+            }
+            None => {
+                table.insert(key, toml_edit::Item::Value(value.clone()));
+            }
+        }
+    }
+    let out = doc.to_string();
+    Config::parse(&out)?;
+    Ok(out)
+}
+
+/// Changes settings in the file at `path` (see [`with_settings`]; a missing file starts from
+/// [`DEFAULT_CONFIG`]) and returns the new config. The file is replaced in one step, so a
+/// crash can't leave it half-written; a symlink is followed, not replaced.
+pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Config, ConfigError> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DEFAULT_CONFIG.to_owned(),
+        Err(e) => return Err(ConfigError::Io(e)),
+    };
+    let out = with_settings(&text, changes)?;
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let tmp = target.with_extension("toml.tmp");
+    let written = fs::write(&tmp, &out).and_then(|()| {
+        // Keep the file's permissions (e.g. 0600 for a file holding an API key).
+        if let Ok(m) = fs::metadata(&target) {
+            fs::set_permissions(&tmp, m.permissions())?;
+        }
+        replace(&tmp, &target)
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(ConfigError::Io)?;
+    Config::parse(&out)
+}
+
+/// `fs::rename`, retried briefly: on Windows it fails while another process (a virus scanner,
+/// a sync client) has the target open.
+fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match fs::rename(from, to) {
+            Err(_) if cfg!(windows) && tries < 5 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            result => return result,
+        }
     }
 }
 
@@ -967,6 +1104,147 @@ mod tests {
         assert_eq!(c.polish.api_key().as_deref(), Some("sk-secret"));
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("sk-secret") && dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn names_match_the_file_format() {
+        fn check<T: serde::de::DeserializeOwned + PartialEq + std::fmt::Debug + Copy>(
+            all: &[T],
+            name: fn(T) -> &'static str,
+        ) {
+            for &v in all {
+                let parsed: T = toml::Value::String(name(v).into()).try_into().unwrap();
+                assert_eq!(parsed, v);
+            }
+        }
+        check(Engine::ALL, Engine::as_str);
+        check(Precision::ALL, Precision::as_str);
+        check(Device::ALL, Device::as_str);
+        check(PolishProvider::ALL, PolishProvider::as_str);
+        check(PolishStyle::ALL, PolishStyle::as_str);
+        check(S1Styling::ALL, S1Styling::as_str);
+        check(S1Structure::ALL, S1Structure::as_str);
+        check(S1Context::ALL, S1Context::as_str);
+        check(S1Device::ALL, S1Device::as_str);
+        check(OverlayPosition::ALL, OverlayPosition::as_str);
+    }
+
+    #[test]
+    fn settings_edits_keep_comments() {
+        let out = with_settings(
+            DEFAULT_CONFIG,
+            &[
+                (&["stt", "device"], "cpu".into()),
+                (&["polish", "enabled"], true.into()),
+                (&["polish", "s1-mini", "styling"], "casual".into()),
+                (&["paste", "restore_clipboard_ms"], 1000i64.into()),
+            ],
+        )
+        .unwrap();
+        // Only the four values changed: every comment line is still there.
+        let comments = |t: &str| t.lines().filter(|l| l.starts_with('#')).count();
+        assert_eq!(comments(&out), comments(DEFAULT_CONFIG));
+        assert!(out.contains("\ndevice = \"cpu\"\n# CPU threads"), "{out}");
+        let c = Config::parse(&out).unwrap();
+        assert_eq!(c.stt.device, Device::Cpu);
+        assert!(c.polish.enabled);
+        assert_eq!(c.polish.s1_mini.styling, S1Styling::Casual);
+        assert_eq!(c.paste.restore_clipboard_ms, 1000);
+        // Everything else is as before.
+        let mut expected = Config::default();
+        expected.stt.device = Device::Cpu;
+        expected.polish.enabled = true;
+        expected.polish.s1_mini.styling = S1Styling::Casual;
+        expected.paste.restore_clipboard_ms = 1000;
+        assert_eq!(c, expected);
+    }
+
+    #[test]
+    fn settings_edits_add_missing_keys_and_tables() {
+        let text = "# mine\n[stt]\nthreads = 2 # pinned\n";
+        let out = with_settings(
+            text,
+            &[
+                (&["stt", "threads"], 4i64.into()),
+                (&["stt", "device"], "cpu".into()),
+                (&["polish", "s1-mini", "context"], "email".into()),
+                (&["log_level"], "debug".into()),
+            ],
+        )
+        .unwrap();
+        // A new top-level key goes above the first table (and the comment that opens it).
+        assert!(
+            out.starts_with("log_level = \"debug\"\n# mine\n[stt]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("threads = 4 # pinned\ndevice = \"cpu\"\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("\n[polish.s1-mini]\ncontext = \"email\"\n"),
+            "{out}"
+        );
+        assert!(!out.contains("[polish]"), "{out}");
+        let c = Config::parse(&out).unwrap();
+        assert_eq!((c.stt.threads, c.stt.device), (4, Device::Cpu));
+        assert_eq!(c.polish.s1_mini.context, S1Context::Email);
+        assert_eq!(c.log_level, "debug");
+        // Inline and dotted tables are edited in place.
+        let out = with_settings(
+            "stt = { threads = 2 }\npolish.enabled = false\n",
+            &[
+                (&["stt", "threads"], 3i64.into()),
+                (&["polish", "enabled"], true.into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, "stt = { threads = 3 }\npolish.enabled = true\n");
+    }
+
+    #[test]
+    fn settings_edits_refuse_invalid_results() {
+        // A broken file is never rewritten, and the error doesn't quote it.
+        let e = with_settings(
+            "api_key = \"sk-SECRET\n",
+            &[(&["log_level"], "info".into())],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!e.contains("SECRET") && e.contains("line 1"), "{e}");
+        assert!(with_settings("", &[(&["stt", "device"], "gpu".into())]).is_err());
+        assert!(with_settings("stt = 1", &[(&["stt", "device"], "cpu".into())]).is_err());
+    }
+
+    #[test]
+    fn set_writes_the_file() {
+        let dir = std::env::temp_dir().join(format!("agt-set-test-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A missing file starts from the default one.
+        let c = set(&path, &[(&["overlay", "position"], "top".into())]).unwrap();
+        assert_eq!(c.overlay.position, OverlayPosition::Top);
+        assert_eq!(Config::load(&path).unwrap(), c);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# AGT configuration")
+        );
+        // The file's permissions are kept, and no temporary file is left behind.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            set(&path, &[(&["log_level"], "debug".into())]).unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::write(&path, "typo = 1").unwrap();
+        assert!(set(&path, &[(&["log_level"], "info".into())]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "typo = 1");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

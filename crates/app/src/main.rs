@@ -3,12 +3,15 @@
 
 mod logging;
 mod pipeline;
+mod settings;
 mod tray;
 mod update;
 
 use agt_core::{Config, config::OverlayPosition, paths};
+use settings::Action;
 use std::{
     fs::{File, TryLockError},
+    path::PathBuf,
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +30,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// update restart: covers the clipboard restore after a paste and back-to-back dictations.
 const RESTART_SETTLE: Duration = Duration::from_secs(5);
 
+/// Set for the instance a settings restart starts, so it waits for this one to exit and
+/// release the instance lock (for up to [`RELAUNCH_WAIT`]) instead of quitting at once.
+const RELAUNCH_ENV: &str = "AGT_RELAUNCH";
+const RELAUNCH_WAIT: Duration = Duration::from_secs(15);
+
+/// How often `config.toml` is checked for changes made outside AGT (one `stat`; a file
+/// watcher crate isn't worth it for this).
+const CONFIG_POLL: Duration = Duration::from_secs(2);
+
 /// Everything other threads post to the UI thread, via `EventLoopProxy<AppEvent>`.
 #[derive(Debug)]
 enum AppEvent {
@@ -34,6 +46,16 @@ enum AppEvent {
     Tray(TrayIconEvent),
     Pipeline(pipeline::Event),
     Update(UpdateEvent),
+    /// `config.toml` was modified (or appeared, or went away).
+    ConfigFile,
+}
+
+/// Why AGT is waiting to restart.
+enum Restart {
+    /// Into a downloaded update ("Update now"); it applies changed settings as well.
+    Update(VelopackAsset),
+    /// To apply changed settings: the file differs from what the pipeline runs with.
+    Settings,
 }
 
 /// Progress of an "Update now" check, from its worker thread.
@@ -43,7 +65,7 @@ enum UpdateEvent {
     Downloading(String),
     /// The update ready to apply (`None`: up to date), or the error.
     Done(Result<Option<VelopackAsset>, String>),
-    /// [`RESTART_SETTLE`] has passed since status change number `.0`.
+    /// [`RESTART_SETTLE`] has passed since change number `.0` (see [`App::changes`]).
     Settled(u64),
 }
 
@@ -64,7 +86,13 @@ fn main() {
 
     // One instance only (Phase 1 adds global hotkeys; two instances would both paste).
     // Held for the life of the process; the OS releases it on exit.
-    let Some(_instance_lock) = acquire_instance_lock() else {
+    let relaunched = std::env::var_os(RELAUNCH_ENV).is_some();
+    let wait = if relaunched {
+        RELAUNCH_WAIT
+    } else {
+        Duration::ZERO
+    };
+    let Some(_instance_lock) = acquire_instance_lock(wait) else {
         eprintln!("agt: AGT is already running; exiting");
         return;
     };
@@ -89,8 +117,9 @@ fn main() {
         "AGT {VERSION} starting; config at {}",
         config_path.display()
     );
-    let (config, config_error) = match config {
-        Ok(c) => (c, false),
+    let file = config.map_err(|e| e.to_string());
+    let (config, config_error) = match &file {
+        Ok(c) => (c.clone(), false),
         Err(e) => {
             tracing::error!("{e}");
             tracing::error!("running with defaults and updates OFF; the file was not modified");
@@ -127,6 +156,8 @@ fn main() {
         }
     }));
 
+    watch_config(config_path.clone(), event_loop.create_proxy());
+
     let proxy = event_loop.create_proxy();
     let pipeline = pipeline::start(&config, move |e| {
         let _ = proxy.send_event(AppEvent::Pipeline(e));
@@ -146,7 +177,10 @@ fn main() {
         proxy: event_loop.create_proxy(),
         updater,
         restart_with: None,
-        status_changes: 0,
+        changes: 0,
+        config_path,
+        file,
+        running: config.clone(),
         config_error,
         polish_info,
         status,
@@ -226,9 +260,10 @@ fn print_stats() {
     }
 }
 
-/// `None` if another instance holds the lock. `Some(None)` if locking failed for another
-/// reason; we run anyway rather than refuse to start.
-fn acquire_instance_lock() -> Option<Option<File>> {
+/// `None` if another instance holds the lock (still, after waiting up to `wait` for it to
+/// exit). `Some(None)` if locking failed for another reason; we run anyway rather than
+/// refuse to start.
+fn acquire_instance_lock(wait: Duration) -> Option<Option<File>> {
     let dir = paths::data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let file = match File::create(dir.join("agt.lock")) {
@@ -238,14 +273,57 @@ fn acquire_instance_lock() -> Option<Option<File>> {
             return Some(None);
         }
     };
-    match file.try_lock() {
-        Ok(()) => Some(Some(file)),
-        Err(TryLockError::WouldBlock) => None,
-        Err(TryLockError::Error(e)) => {
-            tracing::warn!("cannot take instance lock ({e}); continuing without it");
-            Some(None)
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(Some(file)),
+            Err(TryLockError::WouldBlock) if start.elapsed() < wait => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Error(e)) => {
+                tracing::warn!("cannot take instance lock ({e}); continuing without it");
+                return Some(None);
+            }
         }
     }
+}
+
+/// Posts [`AppEvent::ConfigFile`] whenever `config.toml`'s modification time or size
+/// changes (edits in an editor, and AGT's own from the Settings menu).
+fn watch_config(path: PathBuf, proxy: EventLoopProxy<AppEvent>) {
+    let stamp = move || {
+        std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()))
+    };
+    let spawned = thread::Builder::new()
+        .name("config-watch".into())
+        .spawn(move || {
+            let mut last = stamp();
+            loop {
+                thread::sleep(CONFIG_POLL);
+                let now = stamp();
+                if now != last {
+                    last = now;
+                    if proxy.send_event(AppEvent::ConfigFile).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("cannot watch config.toml ({e}); changes apply on the next start");
+    }
+}
+
+/// Starts a new instance with the same arguments; it takes over once this one has exited.
+fn relaunch() -> std::io::Result<()> {
+    std::process::Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .env(RELAUNCH_ENV, "1")
+        .spawn()
+        .map(drop)
 }
 
 struct App {
@@ -253,11 +331,18 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     /// `None` if this isn't a Velopack install.
     updater: Option<update::Updater>,
-    /// A downloaded update to restart into ("Update now"), once dictation has been idle for
-    /// [`RESTART_SETTLE`] or when the user clicks the item again.
-    restart_with: Option<VelopackAsset>,
-    /// Counts pipeline status changes: a restart timer is stale if this moved on.
-    status_changes: u64,
+    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (or for the user to
+    /// click "Update now" / "Restart now to apply" again).
+    restart_with: Option<Restart>,
+    /// Counts pipeline status changes and settings changes: a restart timer is stale if this
+    /// moved on.
+    changes: u64,
+    config_path: PathBuf,
+    /// `config.toml` as last read (or its error): what the Settings menu shows.
+    file: Result<Config, String>,
+    /// What the pipeline was started with (defaults if the file had an error then).
+    running: Config,
+    /// The file had an error at start-up (so updates are off).
     config_error: bool,
     /// Tray line about LLM polish.
     polish_info: String,
@@ -282,19 +367,14 @@ impl ApplicationHandler<AppEvent> for App {
             let installed = self.updater.is_some();
             // On macOS (and with AGT_HOME) the history is in the config folder: one item will do.
             let data_folder = paths::history_dir() != paths::config_dir();
-            let tray = tray::Tray::new(
-                VERSION,
-                self.config_error,
-                &self.polish_info,
-                installed,
-                data_folder,
-            );
+            let tray = tray::Tray::new(VERSION, &self.polish_info, installed, data_folder);
             match tray {
                 Ok(t) => {
                     if let Some(s) = &self.status {
                         t.set_status(&s.to_string());
                     }
                     self.tray = Some(t);
+                    self.show_settings();
                 }
                 Err(e) => {
                     tracing::error!("failed to create tray icon: {e}");
@@ -326,7 +406,7 @@ impl ApplicationHandler<AppEvent> for App {
                         tray.set_status(&s.to_string());
                     }
                     self.status = Some(s.clone());
-                    self.status_changes += 1;
+                    self.changes += 1;
                     self.start_restart_timer();
                 }
                 pipeline::Event::Rejected => {
@@ -347,6 +427,14 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             return;
+        }
+        if let AppEvent::ConfigFile = event {
+            return self.config_file_changed();
+        }
+        if let AppEvent::Menu(e) = &event
+            && let Some(action) = self.tray.as_ref().and_then(|t| t.settings.action(&e.id))
+        {
+            return self.settings_action(action.clone(), event_loop);
         }
         let Some(tray) = &self.tray else { return };
         match event {
@@ -381,10 +469,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Update(UpdateEvent::Done(Ok(Some(asset)))) => self.restart_when_idle(asset),
             AppEvent::Update(UpdateEvent::Settled(n)) => {
-                if n == self.status_changes
-                    && let Some(asset) = self.restart_with.take()
+                if n == self.changes
+                    && let Some(restart) = self.restart_with.take()
                 {
-                    self.restart_now(&asset, event_loop);
+                    self.restart_now(restart, event_loop);
                 }
             }
             AppEvent::Update(UpdateEvent::Done(Ok(None))) => {
@@ -398,7 +486,7 @@ impl ApplicationHandler<AppEvent> for App {
                 tray.set_update("Update failed - see log", true);
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
-            AppEvent::Menu(_) | AppEvent::Pipeline(_) => {}
+            AppEvent::Menu(_) | AppEvent::Pipeline(_) | AppEvent::ConfigFile => {}
         }
     }
 
@@ -430,8 +518,9 @@ impl App {
     /// with an update already downloaded, restarts into it once idle; else checks and
     /// downloads on a worker thread, which reports back as [`AppEvent::Update`].
     fn update_now(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(asset) = self.restart_with.take() {
-            return self.restart_now(&asset, event_loop);
+        if let Some(Restart::Update(_)) = self.restart_with {
+            let restart = self.restart_with.take().unwrap();
+            return self.restart_now(restart, event_loop);
         }
         let (Some(updater), Some(tray)) = (&self.updater, &self.tray) else {
             return;
@@ -464,20 +553,31 @@ impl App {
         if let Some(tray) = &self.tray {
             tray.set_update(&format!("Restart into {} now", asset.Version), true);
         }
-        self.restart_with = Some(asset);
+        self.restart_with = Some(Restart::Update(asset));
         self.start_restart_timer();
     }
 
     /// If a restart is waiting and dictation is idle, posts [`UpdateEvent::Settled`] after
     /// [`RESTART_SETTLE`]; any status change in between makes it stale.
     fn start_restart_timer(&self) {
-        // Idle: ready, or dictation unavailable altogether. Not on Error/Loading.
-        let idle =
-            self.pipeline.is_none() || matches!(self.status, Some(pipeline::Status::Ready(_)));
+        use pipeline::Status;
+        // Idle: ready, or dictation unavailable altogether. For an update not on Error
+        // (an error waits for the user, see above); for settings the user just changed, on
+        // Error too (a bad setting may be the error). Never while loading: a restart would
+        // start a model download over ("Restart now to apply" still does).
+        let idle = self.pipeline.is_none()
+            || match self.restart_with {
+                Some(Restart::Update(_)) => matches!(self.status, Some(Status::Ready(_))),
+                Some(Restart::Settings) => matches!(
+                    self.status,
+                    Some(Status::Ready(_) | Status::Error(_) | Status::NeedsPermission(_))
+                ),
+                None => false,
+            };
         if self.restart_with.is_none() || !idle {
             return;
         }
-        let (proxy, n) = (self.proxy.clone(), self.status_changes);
+        let (proxy, n) = (self.proxy.clone(), self.changes);
         // If this fails, the item still restarts on click.
         let _ = thread::Builder::new()
             .name("restart-timer".into())
@@ -487,8 +587,24 @@ impl App {
             });
     }
 
-    /// Applies `asset` and exits, so Velopack restarts into it.
-    fn restart_now(&mut self, asset: &VelopackAsset, event_loop: &ActiveEventLoop) {
+    /// Exits after applying the update (Velopack then starts it) or starting a new instance
+    /// (which reads the changed settings).
+    fn restart_now(&mut self, restart: Restart, event_loop: &ActiveEventLoop) {
+        let asset = match restart {
+            Restart::Update(asset) => asset,
+            Restart::Settings => {
+                match relaunch() {
+                    Ok(()) => {
+                        tracing::info!("restarting to apply changed settings");
+                        self.exit_reason = agt_telemetry::ExitReason::SettingsRestart;
+                        event_loop.exit();
+                    }
+                    Err(e) => tracing::error!("cannot restart to apply settings: {e}"),
+                }
+                return;
+            }
+        };
+        let asset = &asset;
         let (Some(updater), Some(tray)) = (&self.updater, &self.tray) else {
             return;
         };
@@ -503,6 +619,85 @@ impl App {
                 tray.set_update("Update failed - see log", true);
             }
         }
+    }
+
+    /// Re-reads `config.toml` after [`AppEvent::ConfigFile`].
+    fn config_file_changed(&mut self) {
+        let file = Config::load(&self.config_path).map_err(|e| e.to_string());
+        if file == self.file {
+            return;
+        }
+        if let Err(e) = &file {
+            tracing::error!("{e}; keeping the settings AGT runs with until it's fixed");
+        }
+        self.file = file;
+        self.settings_changed();
+    }
+
+    fn settings_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
+            Action::Set(changes) => match agt_core::config::set(&self.config_path, &changes) {
+                Ok(c) => {
+                    self.file = Ok(c);
+                    self.settings_changed();
+                }
+                Err(e) => {
+                    tracing::error!("cannot change config.toml: {e}");
+                    // Puts back the checkmark the click moved.
+                    self.show_settings();
+                }
+            },
+            Action::Toggle(path, get) => {
+                let file = Config::load(&self.config_path).map_err(|e| e.to_string());
+                match file {
+                    Ok(c) => self
+                        .settings_action(Action::Set(vec![(path, (!get(&c)).into())]), event_loop),
+                    Err(e) => {
+                        tracing::error!("cannot change config.toml: {e}");
+                        self.file = Err(e);
+                        self.settings_changed();
+                    }
+                }
+            }
+            Action::EditFile => open_in_editor(&self.config_path),
+            Action::ApplyNow => {
+                let restart = self.restart_with.take().unwrap_or(Restart::Settings);
+                self.restart_now(restart, event_loop);
+            }
+        }
+    }
+
+    /// The file's settings now differ from the running ones (restart once idle), or match
+    /// them again, or can't be read (keep running as is).
+    fn settings_changed(&mut self) {
+        let differs = self.file.as_ref().is_ok_and(|c| *c != self.running);
+        match self.restart_with {
+            // An update restart applies the settings too.
+            Some(Restart::Update(_)) => {}
+            _ => self.restart_with = differs.then_some(Restart::Settings),
+        }
+        // Debounces: a few changes in a row restart once.
+        self.changes += 1;
+        self.start_restart_timer();
+        self.show_settings();
+    }
+
+    /// Rebuilds the Settings submenu and the config error line from [`Self::file`].
+    fn show_settings(&mut self) {
+        let applying = self.file.as_ref().is_ok_and(|c| *c != self.running);
+        let Some(tray) = &mut self.tray else { return };
+        let (shown, editable) = match &self.file {
+            Ok(c) => (c, true),
+            Err(_) => (&self.running, false),
+        };
+        if let Err(e) = tray.settings.show(shown, editable, applying) {
+            tracing::error!("cannot build the Settings menu: {e}");
+        }
+        tray.set_warning(match (&self.file, self.config_error) {
+            (Ok(_), _) => None,
+            (Err(_), true) => Some("Config error (auto-updates off) - see log"),
+            (Err(_), false) => Some("config.toml has an error (not applied) - see log"),
+        });
     }
 
     fn update_overlay(&mut self, status: &pipeline::Status, failures: u64) {
@@ -537,6 +732,23 @@ impl App {
                 down.elapsed().as_secs_f64() * 1e3
             );
         }
+    }
+}
+
+/// Opens `file` in a text editor: the default one on macOS, Notepad on Windows (`.toml`
+/// usually has no app associated there).
+fn open_in_editor(file: &std::path::Path) {
+    let mut command = if cfg!(windows) {
+        std::process::Command::new("notepad")
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg("-t");
+        c
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    if let Err(e) = command.arg(file).spawn() {
+        tracing::error!("failed to open {}: {e}", file.display());
     }
 }
 
