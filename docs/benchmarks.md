@@ -840,9 +840,11 @@ punctuation; the raw STT text scores 7.19%, so polish's rewrites cost 0.7-0.9 po
 normalizer however it is split. "Words differing" counts exact word edits (case and
 punctuation included) between the joined pieces and the whole-text output.
 
-The speech recognizer ends every segment with a period, also when the pause was
-mid-sentence; polishing the whole text repairs those joins, polishing a segment alone can't:
-*each segment* left 10 of 92 joins broken (`My great-grandparents. | Died all of them...`,
+A segment polished on its own comes back as finished sentences, and the speech recognizer
+often closes a segment with a period already, also mid-sentence (these DirectML transcripts
+have more such joins than the CPU ones counted under "Sentence breaks at joins"). Polishing the
+whole text repairs those joins; polishing a segment alone can't: *each segment* left 10 of 92
+joins broken (`My great-grandparents. | Died all of them...`,
 `The face of someone. | Who, against all odds...`, `...the TV. | And as this is...`). *Ahead*
 never cuts there, so every segment join is polished with both sides and the piece joins are
 real sentence ends (0 of 62 differ from the whole text). Its other differences are the
@@ -903,7 +905,10 @@ same.
   greeting and sign-off around the whole text) and only for the managed or a local server (a
   cloud provider would bill a request per piece). Cancel drops the queue like STT's does. Worth
   it mostly on the Mac (p90 1.7 -> 0.44 s) and for multi-minute dictations; on Windows it saves
-  ~0.35 s p50 / 0.6 s p90 for 1-6 minute ones.
+  ~0.35 s p50 / 0.6 s p90 for 1-6 minute ones. It would also lift the 1,400-word cap on
+  polishing (`polish_outcome = too_long`): every piece is small, however long the dictation
+  (a piece only grows while no segment has a sentence end inside it; a safety cut at ~1,000
+  words would bound that).
 - **Telemetry** (metrics only): polish time at release, the release piece's word count, pieces
   polished ahead and their total time, guard fallbacks per piece, and draft acceptance
   (llama-server's `timings.draft_n` / `draft_n_accepted`) to see whether 24-token drafts suit

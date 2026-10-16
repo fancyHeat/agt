@@ -6,10 +6,10 @@
 //! polished right away, so that at release only the rest is left to polish.
 //!
 //! Pieces are cut only at a sentence end *inside* a segment, never at a segment boundary: a
-//! segment is cut at a pause, and the speech recognizer ends every segment with a period
-//! even when the pause was mid-sentence ("My great-grandparents. | Died all of them"). Polish
-//! repairs such a join only if it sees both sides, so each boundary stays inside one piece.
-//! The text after the last usable sentence end waits for the next segment.
+//! segment is cut at a pause, which may be mid-sentence, and the speech recognizer often
+//! closes a segment with a period anyway ("My great-grandparents. | Died all of them").
+//! Polish repairs such a join only if it sees both sides, so each boundary stays inside one
+//! piece. The text after the last usable sentence end waits for the next segment.
 //!
 //! Only for `[Context: general]`: S1-mini's email context writes a greeting and a sign-off,
 //! which needs the whole text.
