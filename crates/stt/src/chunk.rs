@@ -141,6 +141,9 @@ pub struct Segment {
     pub cut: Cut,
     /// Samples received when it was cut: a pause cut comes `PauseCut::len` after the speech.
     pub at: usize,
+    /// Speech was heard in it. Without: silence, or noise that never rose clearly above the
+    /// floor (always `true` without [`PauseCut`], which is what measures it).
+    pub speech: bool,
 }
 
 /// Cuts a recording into segments while it is still arriving: [`push`](Self::push) the
@@ -170,6 +173,8 @@ pub struct Cutter {
     silence: Option<Silence>,
     /// `buf[..speech_end]` contains speech; 0 if `buf` has none.
     speech_end: usize,
+    /// Where the first speech in `buf` starts (roughly: the level lags); `None` if none.
+    speech_from: Option<usize>,
     /// Speech has been heard at all. Until then the floor may be the speech itself (the user
     /// was already talking, quietly, when recording started), so nothing is trimmed.
     heard: bool,
@@ -206,9 +211,15 @@ impl Cutter {
             levels: VecDeque::with_capacity(FLOOR_BLOCKS),
             silence: None,
             speech_end: 0,
+            speech_from: None,
             heard: false,
             received: 0,
         }
+    }
+
+    /// Speech has been heard so far (see [`Segment::speech`]).
+    pub fn heard(&self) -> bool {
+        self.heard
     }
 
     /// Adds recorded audio; returns the segments that are finished now (usually none).
@@ -261,6 +272,11 @@ impl Cutter {
     fn take(&mut self, cut: usize, kind: Cut) -> Segment {
         let at = self.received - (self.buf.len() - self.scanned);
         let audio: Vec<f32> = self.buf.drain(..cut).collect();
+        let speech = self.cfg.pause.is_none() || self.speech_from.is_some_and(|f| f < cut);
+        self.speech_from = self
+            .speech_from
+            .filter(|_| self.speech_end > cut)
+            .map(|f| f.saturating_sub(cut));
         self.scanned = self.scanned.saturating_sub(cut);
         self.speech_end = self.speech_end.saturating_sub(cut);
         if let Some(s) = &mut self.silence {
@@ -271,7 +287,17 @@ impl Cutter {
             audio,
             cut: kind,
             at,
+            speech,
         }
+    }
+
+    /// The block that ends at `scanned` is speech (and so are the [`ONSET`] blocks before it,
+    /// after a silence).
+    fn speech(&mut self) {
+        self.speech_end = self.scanned;
+        self.speech_from
+            .get_or_insert(self.scanned.saturating_sub(ONSET * HOP));
+        self.heard = true;
     }
 
     /// Classifies the block that ends at `scanned` and acts on a pause.
@@ -298,11 +324,9 @@ impl Cutter {
         self.levels.push_back(level);
         let floor = self.levels.iter().copied().fold(f32::MAX, f32::min);
         let quiet = level < floor.clamp(FLOOR_DB.0, FLOOR_DB.1) + MARGIN_DB;
-
         let s = match (&mut self.silence, quiet) {
             (None, false) => {
-                self.speech_end = self.scanned;
-                self.heard = true;
+                self.speech();
                 return;
             }
             (None, true) => self.silence.insert(Silence {
@@ -320,8 +344,7 @@ impl Cutter {
             s.loud += 1;
             if s.loud >= ONSET {
                 self.silence = None;
-                self.speech_end = self.scanned;
-                self.heard = true;
+                self.speech();
                 return;
             }
         }
@@ -353,6 +376,203 @@ impl Cutter {
             self.buf.drain(from..to);
             self.scanned -= to - from;
         }
+    }
+}
+
+/// A tail at most this long (padding included) is transcribed together with the segment
+/// before it, if both fit in one: on its own, a cough or an "um" just before release comes
+/// back as made-up words, and a word or two loses its context.
+pub const SHORT_TAIL: usize = 2 * SAMPLE_RATE as usize;
+
+/// A recording transcribed while it is being made, as the app does it (and `agt-bench live`):
+/// a [`Cutter`] whose segments come out as [`Piece`]s to transcribe in order, with two guards:
+/// - a segment without speech ([`Segment::speech`]) is not transcribed: given only noise, the
+///   model tends to make words up ("Okay. Yeah."). Only once speech has been heard, though
+///   (the floor is then known to be below it): until then such segments are held back, and
+///   if none is ever heard they are transcribed after all, like the cutter keeps everything
+///   then (it may be speech too quiet to tell from the floor);
+/// - a short tail ([`SHORT_TAIL`]) is transcribed together with the segment before it.
+///
+/// Pure like the cutter; memory is the cutter's plus the last piece (at most `max_len`), and
+/// whatever is held back before any speech.
+pub struct Live {
+    cutter: Cutter,
+    max_len: usize,
+    /// The last piece handed out, for a short tail to join.
+    last: Option<Vec<f32>>,
+    /// Segments without speech before any was heard.
+    held: Vec<Vec<f32>>,
+    /// Off: every segment is transcribed on its own (`agt-bench live --no-guards`).
+    guards: bool,
+    stats: LiveStats,
+}
+
+/// What a [`Live`] did (counts only), for telemetry and the bench.
+#[derive(Debug, Clone, Default)]
+pub struct LiveStats {
+    /// Segments by [`Cut`] (`cut as usize`: pause, limit, end), skipped ones included.
+    pub cuts: [usize; 3],
+    /// Segments not transcribed: no speech in them, and speech was heard elsewhere.
+    pub skipped: usize,
+    /// The tail was transcribed together with the piece before it.
+    pub tail_joined: bool,
+    /// Samples received, handed out in segments (skipped ones included; the rest was trimmed
+    /// silence), and in the tail.
+    pub received: usize,
+    pub kept: usize,
+    pub tail: usize,
+}
+
+/// Audio to transcribe. With `redo`, it is the previous piece's audio plus a short tail, and
+/// its text replaces that piece's.
+#[derive(Debug)]
+pub struct Piece {
+    pub audio: Vec<f32>,
+    /// How its (last) segment ended.
+    pub cut: Cut,
+    pub redo: bool,
+}
+
+impl Live {
+    pub fn new(cfg: CutConfig) -> Self {
+        Self {
+            max_len: cfg.max_len,
+            cutter: Cutter::new(cfg),
+            last: None,
+            held: Vec::new(),
+            guards: true,
+            stats: LiveStats::default(),
+        }
+    }
+
+    /// Without the guards: every segment is transcribed, on its own (for comparison).
+    pub fn without_guards(mut self) -> Self {
+        self.guards = false;
+        self
+    }
+
+    /// Whether anything has been cut yet. If not by release, the recording fits in one
+    /// segment and is best transcribed whole, as if there were no `Live`.
+    pub fn cut(&self) -> bool {
+        self.stats.cuts.iter().any(|&n| n > 0)
+    }
+
+    /// What it did so far.
+    pub fn stats(&self) -> &LiveStats {
+        &self.stats
+    }
+
+    /// Adds recorded audio; returns the pieces to transcribe now (usually none).
+    pub fn push(&mut self, samples: &[f32]) -> Vec<Piece> {
+        self.stats.received += samples.len();
+        let mut out = Vec::new();
+        for seg in self.cutter.push(samples) {
+            self.stats.count(&seg);
+            if seg.speech || !self.guards {
+                out.push(Piece {
+                    audio: seg.audio.clone(),
+                    cut: seg.cut,
+                    redo: false,
+                });
+                self.last = Some(seg.audio);
+            } else {
+                self.held.push(seg.audio);
+                self.last = None;
+            }
+        }
+        if self.cutter.heard() && !self.held.is_empty() {
+            self.stats.skipped += self.held.len();
+            self.held.clear();
+        }
+        out
+    }
+
+    /// The hotkey was released: the last pieces (usually one, or none if nothing but silence
+    /// is left), and the stats.
+    pub fn finish(self) -> (Vec<Piece>, LiveStats) {
+        let Self {
+            cutter,
+            max_len,
+            last,
+            held,
+            guards,
+            mut stats,
+        } = self;
+        let keep_all = !cutter.heard() || !guards;
+        let tail = cutter.finish();
+        stats.tail = tail.iter().map(|s| s.audio.len()).sum();
+        let mut out: Vec<Piece> = held
+            .into_iter()
+            .map(|audio| Piece {
+                audio,
+                cut: Cut::Limit,
+                redo: false,
+            })
+            .collect();
+        for seg in tail {
+            stats.count(&seg);
+            if seg.speech || keep_all {
+                out.push(Piece {
+                    audio: seg.audio,
+                    cut: seg.cut,
+                    redo: false,
+                });
+            } else {
+                stats.skipped += 1;
+            }
+        }
+        if let ([t], Some(mut prev)) = (&mut out[..], last)
+            && guards
+            && t.audio.len() <= SHORT_TAIL
+            && prev.len() + t.audio.len() <= max_len
+        {
+            prev.append(&mut t.audio);
+            t.audio = prev;
+            t.redo = true;
+            stats.tail_joined = true;
+        }
+        (out, stats)
+    }
+}
+
+/// The texts of a [`Live`]'s pieces, in order.
+#[derive(Debug, Default)]
+pub struct Texts(pub Vec<String>);
+
+impl Texts {
+    /// Adds a piece's text (replacing the previous one's if the piece is a `redo`).
+    pub fn add(&mut self, text: String, redo: bool) {
+        if redo {
+            self.0.pop();
+        }
+        self.0.push(text);
+    }
+
+    /// The transcript: the texts trimmed and space-separated, as [`Chunked`] joins chunks.
+    pub fn join(&self) -> String {
+        let mut text = String::new();
+        for piece in &self.0 {
+            append(&mut text, piece);
+        }
+        text
+    }
+}
+
+/// Appends `piece` (trimmed) to `text`, space-separated; an empty piece adds nothing.
+fn append(text: &mut String, piece: &str) {
+    let piece = piece.trim();
+    if !piece.is_empty() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(piece);
+    }
+}
+
+impl LiveStats {
+    fn count(&mut self, seg: &Segment) {
+        self.cuts[seg.cut as usize] += 1;
+        self.kept += seg.audio.len();
     }
 }
 
@@ -401,6 +621,10 @@ impl SttEngine for Chunked {
         self.inner.notice()
     }
 
+    fn chunk_secs(&self) -> Option<f32> {
+        Some(self.limits().0 as f32 / SAMPLE_RATE as f32)
+    }
+
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOpts) -> Result<Transcript> {
         let (max_len, search_len) = self.limits();
         if audio.len() <= max_len {
@@ -414,14 +638,7 @@ impl SttEngine for Chunked {
         );
         let mut text = String::new();
         for r in ranges {
-            let piece = self.inner.transcribe(&audio[r], opts)?.text;
-            let piece = piece.trim();
-            if !piece.is_empty() {
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(piece);
-            }
+            append(&mut text, &self.inner.transcribe(&audio[r], opts)?.text);
         }
         Ok(Transcript { text })
     }
@@ -735,6 +952,97 @@ mod tests {
         );
     }
 
+    /// Pushes `audio` into a [`Live`] in 20 ms pieces; the pieces and the stats.
+    fn live_all(audio: &[f32]) -> (Vec<Piece>, LiveStats) {
+        let mut l = Live::new(CutConfig::live(25.0));
+        let mut out = Vec::new();
+        for piece in audio.chunks(S / 50) {
+            out.extend(l.push(piece));
+        }
+        let (tail, stats) = l.finish();
+        out.extend(tail);
+        (out, stats)
+    }
+
+    #[test]
+    fn segments_say_whether_they_hold_speech() {
+        // 30 s of nothing, then speech: the first limit cut has none, the rest has.
+        let audio = talk(40.0, &[(30.0, 40.0)]);
+        let segs = cut_all(CutConfig::live(25.0), &audio);
+        let found: Vec<(Cut, bool)> = segs.iter().map(|s| (s.cut, s.speech)).collect();
+        assert_eq!(found, [(Cut::Limit, false), (Cut::End, true)]);
+        // Speech on both sides of a limit cut.
+        let segs = cut_all(CutConfig::live(25.0), &talk(40.0, &[(0.0, 40.0)]));
+        assert!(segs.iter().all(|s| s.speech));
+    }
+
+    #[test]
+    fn live_skips_what_has_no_speech_once_speech_is_heard() {
+        // 30 s of room noise, then speech: the noise isn't transcribed.
+        let (pieces, stats) = live_all(&talk(40.0, &[(30.0, 40.0)]));
+        assert_eq!(pieces.len(), 1);
+        // From the limit cut (the quietest point of 20-25 s) to the end.
+        let len = pieces[0].audio.len();
+        assert!((15 * S..=20 * S).contains(&len), "{len}");
+        assert_eq!((stats.cuts, stats.skipped), ([0, 1, 1], 1));
+        // Nothing heard at all: it might be speech too quiet to tell, so all of it is.
+        let (pieces, stats) = live_all(&talk(60.0, &[]));
+        assert_eq!(pieces.iter().map(|p| p.audio.len()).sum::<usize>(), 60 * S);
+        assert_eq!((stats.cuts, stats.skipped), ([0, 2, 1], 0));
+    }
+
+    #[test]
+    fn live_keeps_quiet_speech_from_the_first_sample() {
+        // Talking from the first sample, quietly over the room noise (only the speech is
+        // scaled; at x0.03 the floor learned is the speech's own and it is never "heard"),
+        // long enough for limit cuts: nothing is dropped that the cutter keeps.
+        for gain in [0.05, 0.03, 0.02] {
+            let noise = talk(60.0, &[]);
+            let speech = talk(60.0, &[(0.0, 59.5)]);
+            let audio: Vec<f32> = noise
+                .iter()
+                .zip(&speech)
+                .map(|(n, s)| n + (s - n) * gain)
+                .collect();
+            let (pieces, stats) = live_all(&audio);
+            assert_eq!(stats.skipped, 0, "gain {gain}");
+            // The last piece may redo the one before it (a short tail joined to it).
+            let mut kept: usize = pieces.iter().map(|p| p.audio.len()).sum();
+            if let [.., prev, last] = &pieces[..]
+                && last.redo
+            {
+                kept -= prev.audio.len();
+            }
+            let cutter: usize = cut_all(CutConfig::live(25.0), &audio)
+                .iter()
+                .map(|s| s.audio.len())
+                .sum();
+            assert_eq!(kept, cutter, "gain {gain}");
+        }
+    }
+
+    #[test]
+    fn a_short_tail_joins_the_piece_before_it() {
+        // 10 s of speech, a pause (cut), then a 0.4 s cough just before release.
+        let (pieces, stats) = live_all(&talk(14.0, &[(0.5, 10.0), (13.2, 13.6)]));
+        assert!(stats.tail_joined);
+        assert_eq!(stats.cuts, [1, 0, 1]);
+        let redo: Vec<bool> = pieces.iter().map(|p| p.redo).collect();
+        assert_eq!(redo, [false, true]);
+        // The second is the first plus the tail (0.25 + 0.4 + 0.25 s).
+        let (a, b) = (pieces[0].audio.len(), pieces[1].audio.len());
+        assert_eq!(pieces[1].audio[..a], pieces[0].audio[..]);
+        assert!(near(b - a, 0.9), "{} s", (b - a) as f32 / S as f32);
+        // A longer tail is transcribed on its own.
+        let (pieces, stats) = live_all(&talk(17.0, &[(0.5, 10.0), (13.0, 16.5)]));
+        assert!(!stats.tail_joined);
+        assert!(pieces.iter().all(|p| !p.redo));
+        // No cut before release: nothing to join, and the recording is short.
+        let mut l = Live::new(CutConfig::live(25.0));
+        assert!(l.push(&talk(5.0, &[(0.5, 4.0)])).is_empty());
+        assert!(!l.cut());
+    }
+
     /// Records the lengths it was called with; returns "w<n>" per call.
     struct Fake(Vec<usize>);
     impl SttEngine for Fake {
@@ -797,6 +1105,7 @@ mod tests {
     fn chunks_fit_the_engines_window() {
         // A 10 s window (Core ML) under the 25 s default: 22 s of audio must be split.
         let mut c = Chunked::new(Box::new(Windowed(Vec::new(), Some(10.0))), 25.0, 5.0);
+        assert_eq!(c.chunk_secs(), Some(10.0)); // what the app cuts recordings into
         c.transcribe(
             &speech_with_gaps(22, &[8.0, 17.0]),
             &TranscribeOpts::default(),

@@ -182,6 +182,22 @@ ALTER TABLE dictations ADD COLUMN history_saved INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE app_sessions ADD COLUMN duck INTEGER;
 ALTER TABLE app_sessions ADD COLUMN duck_level REAL;
 "#,
+    // 4: release -> raw text, and long dictations transcribed while recording.
+    r#"
+ALTER TABLE dictations ADD COLUMN release_to_text_ms REAL;
+ALTER TABLE dictations ADD COLUMN live_pause_cuts INTEGER;
+ALTER TABLE dictations ADD COLUMN live_limit_cuts INTEGER;
+ALTER TABLE dictations ADD COLUMN live_end_cuts INTEGER;
+ALTER TABLE dictations ADD COLUMN live_skipped INTEGER;
+ALTER TABLE dictations ADD COLUMN live_tail_joined INTEGER;
+ALTER TABLE dictations ADD COLUMN live_trimmed_secs REAL;
+ALTER TABLE dictations ADD COLUMN live_tail_secs REAL;
+ALTER TABLE dictations ADD COLUMN live_stt_ms REAL;
+ALTER TABLE dictations ADD COLUMN live_busy_at_release INTEGER;
+ALTER TABLE dictations ADD COLUMN live_idle_ms REAL;
+ALTER TABLE dictations ADD COLUMN live_max_queue INTEGER;
+ALTER TABLE dictations ADD COLUMN live_discarded_ms REAL;
+"#,
 ];
 
 /// Opens (creating if needed) and migrates the database. A file that isn't a database or is
@@ -365,8 +381,9 @@ pub(crate) fn insert_dictation(
     d: &Dictation,
     outcome: Outcome,
 ) -> rusqlite::Result<()> {
+    // Not for a dictation transcribed while recording: `stt_ms` is only its tail's.
     let rtf = match (d.stt_ms, d.audio_secs) {
-        (Some(stt), Some(secs)) if secs > 0.0 => Some(stt / 1e3 / secs),
+        (Some(stt), Some(secs)) if secs > 0.0 && d.live_stt_ms.is_none() => Some(stt / 1e3 / secs),
         _ => None,
     };
     // The pipeline's latency: time the user still held a hotkey key isn't part of it.
@@ -378,9 +395,12 @@ pub(crate) fn insert_dictation(
             key_down_to_mic_ms, first_audio_ms, missed_release, queue_wait_ms, stt_ms, rtf,
             polish_ms, polish_outcome, hotkey_wait_ms, clipboard_save_ms, paste_ms,
             release_to_paste_ms, chars_out, words_out, stt_backend, latency_ms, words_raw,
-            history_saved)
+            history_saved, release_to_text_ms, live_pause_cuts, live_limit_cuts, live_end_cuts,
+            live_skipped, live_tail_joined, live_trimmed_secs, live_tail_secs, live_stt_ms,
+            live_busy_at_release, live_idle_ms, live_max_queue, live_discarded_ms)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24)",
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
+            ?36, ?37)",
         params![
             session,
             d.started_at,
@@ -406,6 +426,19 @@ pub(crate) fn insert_dictation(
             latency,
             d.words_raw,
             d.history_saved,
+            d.release_to_text_ms,
+            d.live_pause_cuts,
+            d.live_limit_cuts,
+            d.live_end_cuts,
+            d.live_skipped,
+            d.live_tail_joined,
+            d.live_trimmed_secs,
+            d.live_tail_secs,
+            d.live_stt_ms,
+            d.live_busy_at_release,
+            d.live_idle_ms,
+            d.live_max_queue,
+            d.live_discarded_ms,
         ],
     )?;
     Ok(())

@@ -600,7 +600,8 @@ default device, the 12 transcripts of 95-570 words): p50 1168 ms, p90 2145 ms, m
   segments cut at pauses, not the tail: 10 s of speech, a pause cut, then a cough or "um" just
   before release gives a ~1 s `End` segment, the kind of short segment that hallucinates. Not
   measured (every tail here is a whole utterance); the proposed tail-length telemetry will show
-  how often tails are that short.
+  how often tails are that short. (The app now joins such tails to the segment before them:
+  see "In the app" below.)
 - **No contention worth worrying about.** On the i9 the CPU worker uses 4-6 of 16 hardware
   threads while transcribing a segment, and neither the 20 ms feeds (p99 0.6 ms late) nor a
   foreground thread slowed measurably; `threads = 4` only made the tail 30-60 ms slower. On the
@@ -648,6 +649,62 @@ default device, the 12 transcripts of 95-570 words): p50 1168 ms, p90 2145 ms, m
   in-flight time. That shows the tail distribution and the idle-penalty share for real users,
   which this synthetic set can only approximate.
 
+### In the app (status)
+
+Wired in as recommended above (`pipeline.rs`, `agt_stt::chunk::Live`): every 250 ms the
+audio thread takes the new audio from the recorder and pushes it into the cutter
+(`CutConfig::live`, segments as long as the engine's chunks: 25 s, 10 s on Core ML); each
+finished segment goes to the STT worker at once; at release the tail goes, the texts are
+joined and polished once. A recording with no cut by release (anything under ~25 s without a
+1 s pause after 8 s) is transcribed whole after release, exactly as before. Cancelling drops
+the cutter; segments still queued are skipped and the text of one being transcribed is
+discarded (a flag per recording), while an earlier dictation still queued pastes in order.
+The recording cap went from 5 to 30 minutes (115 MB of samples at most; the recorder's
+callback buffer is emptied every 250 ms so a long recording is never reallocated inside the
+audio callback). Telemetry: `release_to_text_ms` and the `live_*` columns of `dictations` (for a cancelled one too, as
+far as it got). Polish is skipped (`polish_outcome = too_long`) for a transcript over 1,400
+words with S1-mini: its 4096-token context holds about that much plus the answer, and a
+longer one would only fail after generating until the timeout (25-70 s for 10-30 minutes,
+blocking the next dictation).
+`agt-bench live` runs the same `Live` (`--no-guards` for the bare cutter, `--joins` for the
+check below).
+
+`Live` adds two guards to the cutter (review follow-ups of the spike):
+
+- **Nothing worth transcribing.** A segment in which the cutter heard no speech (no 10 ms
+  level 15 dB over the floor) isn't transcribed, but only once speech has been heard in the
+  recording: until then the floor may be the speech itself (see above), so such segments are
+  held back and, if no speech is ever heard, transcribed after all. On the 12 dictations it
+  never fires (the WER is unchanged, 7.04/7.21% CPU, nothing skipped). On 21 clips made of a
+  long inserted pause (13-29 s) followed by 10 s of the next utterance it skipped 7 noise
+  segments, which removed "I'll hit the top." (LibriSpeech room noise, also in today's
+  output), and changed no word of the speech. It can't help a recording that is only noise
+  (nothing is heard, so everything is kept: the same as today), nor murmur, which counts as
+  speech: VoxPopuli's parliament murmur alone still comes back as "Send send send then."
+  where today's single pass returns nothing.
+- **Short tails.** A tail of 2 s or less (padding included: about 1.5 s of sound) after a
+  cut is transcribed together with the segment before it, whose text it replaces. On 46
+  dictations cut 0.5 or 1 s into the utterance after a long pause, 21 tails were joined; on
+  their own, six of those tails (half a second or so of a word) came back as made-up words,
+  "Mm-hmm." (4 times), "Yeah." or "That's why.", which the joined call didn't produce; the
+  rest differed by a few words at most (with the context, "presumption" became the right
+  "presentation" once).
+  The cost is the previous segment transcribed again at release: release -> text p50 106 ->
+  462 ms, worst ~1.3 s on the i9 CPU (DirectML ~0.2-0.3 s). The tails of the 12 dictations
+  are whole utterances: none was joined. `live_tail_secs` / `live_tail_joined` will show how
+  often real ones are this short.
+
+**Sentence breaks at joins** (`--joins`, CPU, the 12 dictations): 92 joins. At the 67 cuts
+inside an inserted pause the joined text has a sentence break (period or question mark, then
+a capital) 53 times, as expected between utterances. At the 13 pause cuts inside an
+utterance there are 7 breaks, all where the utterance itself ends a sentence ("...and our
+YouTube channel. | Let's get started."). At the 12 limit cuts there are 7, two of them stray:
+"according to the user. | Choice. So if he wants" and "He wanted to. | Capture the emotion of
+gaming", where the single pass has neither. So about 2 in 92, both at limit cuts (a
+monologue with no 1 s pause in 25 s), which today's post-release chunking makes the same way
+at its own 25 s cuts. Not fixed: lowercasing after a join would break the real sentence
+starts, which are far more common; polish sees the whole text and can repair it.
+
 ## Reproducing
 
 ```sh
@@ -666,6 +723,8 @@ target/release/agt-bench live --cuts-only --pause-ms 0,500,1000,2000 eval-data/l
 target/release/agt-bench live --device directml --baseline --pause-ms 0,1000 eval-data/long/clips
 target/release/agt-bench live --device cpu --idle-ms 0 --pause-ms 500,1000 --min-secs 0,8 eval-data/long/clips   # WER sweep
 target/release/agt-bench live --device cpu --realtime --only ted-dict-01 eval-data/long/clips
+target/release/agt-bench live --device cpu --idle-ms 0 --joins eval-data/long/clips   # the app's path, joins
+target/release/agt-bench live --device cpu --idle-ms 0 --no-guards eval-data/long/clips   # bare cutter
 target/release/agt-bench live --device coreml --precision fp32 --max-secs 10 eval-data/long/clips   # macOS
 
 # macOS (Apple Silicon): `brew install cmake` for whisper-metal
