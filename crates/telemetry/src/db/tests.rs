@@ -70,20 +70,30 @@ fn version_1_database_gets_the_new_columns() {
         polish_min_words: Some(4),
         polish_custom_prompt: Some(false),
         overlay_position: Some("bottom".into()),
+        audio_device: "Headset".into(),
         history_save_audio: true,
         history_keep_days: 30,
         ..Default::default()
     };
     let id = insert_session(&conn, &s, 2000).unwrap();
-    let row: (i64, bool, bool, i64, String) = conn
+    let row: (i64, bool, bool, i64, String, String) = conn
         .query_row(
             "SELECT polish_min_words, polish_custom_prompt, history_save_audio,
-                history_keep_days, overlay_position FROM app_sessions WHERE id = ?1",
+                history_keep_days, overlay_position, audio_device FROM app_sessions WHERE id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .unwrap();
-    assert_eq!(row, (4, false, true, 30, "bottom".into()));
+    assert_eq!(row, (4, false, true, 30, "bottom".into(), "Headset".into()));
     let d = Dictation {
         started_at: 3000,
         words_raw: Some(7),

@@ -250,6 +250,7 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         updates_enabled: config.update.enabled,
         log_level: config.log_level.clone(),
         config_error,
+        audio_device: config.audio.device.clone(),
         overlay_position: config
             .overlay
             .enabled
