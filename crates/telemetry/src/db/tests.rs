@@ -56,6 +56,60 @@ fn migrates_an_empty_database_once() {
 }
 
 #[test]
+fn version_1_database_gets_the_new_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    conn.execute(
+        "INSERT INTO dictations (started_at, outcome) VALUES (1000, 'pasted')",
+        [],
+    )
+    .unwrap();
+    migrate(&mut conn).unwrap();
+    let s = SessionStart {
+        polish_min_words: Some(4),
+        polish_custom_prompt: Some(false),
+        overlay_position: Some("bottom".into()),
+        history_save_audio: true,
+        history_keep_days: 30,
+        ..Default::default()
+    };
+    let id = insert_session(&conn, &s, 2000).unwrap();
+    let row: (i64, bool, bool, i64, String) = conn
+        .query_row(
+            "SELECT polish_min_words, polish_custom_prompt, history_save_audio,
+                history_keep_days, overlay_position FROM app_sessions WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (4, false, true, 30, "bottom".into()));
+    let d = Dictation {
+        started_at: 3000,
+        words_raw: Some(7),
+        history_saved: true,
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let row: (i64, bool) = conn
+        .query_row(
+            "SELECT words_raw, history_saved FROM dictations WHERE started_at = 3000",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (7, true));
+    // Rows from before the migration read as "not saved".
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM dictations WHERE history_saved = 0"
+        ),
+        1
+    );
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);

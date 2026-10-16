@@ -20,6 +20,8 @@ pub enum Action {
     Toggle(SettingPath, fn(&Config) -> bool),
     /// Open `config.toml` in a text editor.
     EditFile,
+    /// Open the saved dictations' folder (created if needed).
+    OpenHistory,
     /// Restart now instead of waiting for dictation to be idle.
     ApplyNow,
 }
@@ -222,6 +224,24 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
             },
         ),
     )?;
+
+    // History.
+    let history = b.submenu(menu, "History")?;
+    b.check(
+        &history,
+        "Save transcripts",
+        &["history", "save_text"],
+        |c| c.history.save_text,
+    )?;
+    b.check(&history, "Save audio", &["history", "save_audio"], |c| {
+        c.history.save_audio
+    })?;
+    b.choice(&history, "Keep for", keep_days(c.history.keep_days))?;
+    history.append(&PredefinedMenuItem::separator())?;
+    // Not a setting: works while the file has an error too.
+    let editable = std::mem::replace(&mut b.editable, true);
+    b.item(&history, "Open history folder", Action::OpenHistory)?;
+    b.editable = editable;
 
     // Updates.
     let update = b.submenu(menu, "Updates")?;
@@ -528,6 +548,19 @@ fn ms(n: u64) -> String {
     format!("{n} ms")
 }
 
+fn keep_days(current: u64) -> Vec<Choice> {
+    numbers(
+        &["history", "keep_days"],
+        current,
+        &[0, 7, 30, 90],
+        |n| match n {
+            0 => "Forever".into(),
+            1 => "1 day".into(),
+            n => format!("{n} days"),
+        },
+    )
+}
+
 /// The keys `agt-platform` accepts on their own, the default chord, and the file's value
 /// if it's another one (a chord the user wrote).
 fn hotkey_choices(current: &str) -> Vec<Choice> {
@@ -706,6 +739,7 @@ mod tests {
             "",
             vec![r#"Mic "A" \ (USB)"#.into(), "Headset".into()],
         ));
+        all.extend(keep_days(c.history.keep_days));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
@@ -732,5 +766,8 @@ mod tests {
         let n = numbers(&["x"], 7, &[0, 500], ms);
         let labels: Vec<_> = n.iter().map(|c| (c.label.as_str(), c.checked)).collect();
         assert_eq!(labels, [("0 ms", false), ("7 ms", true), ("500 ms", false)]);
+        // A custom history retention is kept; "Forever" is 0.
+        let days: Vec<_> = keep_days(14).into_iter().map(|c| c.label).collect();
+        assert_eq!(days, ["Forever", "7 days", "14 days", "30 days", "90 days"]);
     }
 }

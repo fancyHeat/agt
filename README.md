@@ -82,15 +82,45 @@ seconds after the last save for an edit to the file. You can change the hotkey, 
 overlay off, or enable optional AI clean-up of your text (removes "um"s, fixes punctuation;
 off by default, and it runs locally unless you point it at a cloud service).
 
+## Dictation history
+
+Off by default. Tray menu → **Settings → History** lets AGT keep a copy of each dictation:
+
+- **Save transcripts**: the transcript as recognized, the cleaned-up text (if AI clean-up is
+  on) and the text that was pasted.
+- **Save audio**: the recording, as a WAV file (about 1.9 MB per minute of speech).
+- **Keep for**: 7, 30 (the default) or 90 days, or forever. Older days are deleted
+  automatically.
+
+**Open history folder** takes you there: `dictations` next to `agt.db` (Windows:
+`%LOCALAPPDATA%\AGT-data\dictations`), one folder per day with a `dictations.jsonl` file (one
+dictation per line) and the WAV files. They stay on your computer as plain files and are never
+uploaded. Turning saving off keeps what's already there until it's due for deletion;
+uninstalling AGT removes it. In `config.toml` it's the `[history]` section.
+
+Each line looks like this (fields for what you chose not to save are left out):
+
+```json
+{"started_at":1792153385123,"time":"2026-10-16T14:23:05.123+02:00","audio":"142305-123.wav","audio_secs":3.52,"raw":"um so lets meet on tuesday","polished":"So, let's meet on Tuesday.","polish_outcome":"polished","pasted":"So, let's meet on Tuesday. "}
+```
+
+`polished` is `null` when clean-up was off, skipped or failed; `pasted` is `null` when nothing
+was pasted (no speech, or the paste failed). `started_at` matches the `dictations` table in
+`agt.db`, which has that dictation's timings and the settings it ran with (model, device,
+clean-up style, ...), so the two can be joined, e.g. to label data with a bigger model or to
+build a custom dictionary.
+
 ## Privacy
 
-- Transcription runs entirely on your computer. Audio is never saved or uploaded.
+- Transcription runs entirely on your computer. Audio is never uploaded, and only saved if you
+  turn on the [dictation history](#dictation-history).
 - AGT goes online only to download its models and to check for updates. If you turn on the
   local AI clean-up, it also downloads llama.cpp (12–32 MB) once to run it.
 - The one exception is opt-in: if you configure the optional clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
 - Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:
-  `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), never audio or text. `agt stats` sums it up;
+  `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), never audio or text (those only go
+  to the opt-in dictation history). `agt stats` sums it up;
   raw rows are kept 180 days (events 30, sessions 365), daily summaries for good.
 
 ## Building from source

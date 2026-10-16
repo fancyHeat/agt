@@ -157,6 +157,18 @@ enabled = true
 # "bottom" or "top" of the screen with the focused window (horizontally centered).
 position = "bottom"
 
+[history]
+# Keep a copy of each dictation, e.g. to look back at what you said or to build a custom
+# dictionary. Stored only on this machine, as plain files in the "dictations" folder next to
+# agt.db (tray: Settings > History > Open history folder); never uploaded. Turning saving off
+# keeps what's already there (it's still deleted after keep_days).
+# Save the transcript (before polish), the polished text and the pasted text (dictations.jsonl).
+save_text = false
+# Save the recording as a WAV file (16 kHz mono; about 1.9 MB per minute of speech).
+save_audio = false
+# Delete saved dictations after this many days; 0 = keep them forever.
+keep_days = 30
+
 [update]
 # Check GitHub Releases for updates on startup and periodically (tray "Update now" works
 # either way).
@@ -219,6 +231,7 @@ pub struct Config {
     pub paste: PasteConfig,
     pub polish: PolishConfig,
     pub overlay: OverlayConfig,
+    pub history: HistoryConfig,
     pub update: UpdateConfig,
     /// Why `[polish]` couldn't be used (see [`Config::parse`]); polish is then off.
     #[serde(skip)]
@@ -529,6 +542,33 @@ impl Default for OverlayConfig {
     }
 }
 
+/// `[history]`: optional copies of dictations on this machine (see `agt-history`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    pub save_text: bool,
+    pub save_audio: bool,
+    /// 0 = forever.
+    pub keep_days: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            save_text: false,
+            save_audio: false,
+            keep_days: 30,
+        }
+    }
+}
+
+impl HistoryConfig {
+    /// Whether dictations are saved at all.
+    pub fn enabled(&self) -> bool {
+        self.save_text || self.save_audio
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -547,6 +587,7 @@ impl Default for Config {
             paste: PasteConfig::default(),
             polish: PolishConfig::default(),
             overlay: OverlayConfig::default(),
+            history: HistoryConfig::default(),
             update: UpdateConfig::default(),
             polish_error: None,
             polish_notice: None,
@@ -1029,6 +1070,23 @@ mod tests {
         assert!(!c.overlay.enabled);
         assert_eq!(c.overlay.position, OverlayPosition::Top);
         assert!(Config::parse("[overlay]\nposition = \"left\"").is_err());
+    }
+
+    #[test]
+    fn history_settings() {
+        let c = Config::default().history;
+        assert!(!c.save_text && !c.save_audio && !c.enabled());
+        assert_eq!(c.keep_days, 30);
+        let c = Config::parse("[history]\nsave_audio = true\nkeep_days = 0\n")
+            .unwrap()
+            .history;
+        assert!(c.enabled() && !c.save_text);
+        assert_eq!(c.keep_days, 0);
+        assert!(Config::parse("[history]\ntypo = 1").is_err());
+        assert!(Config::parse("[history]\nkeep_days = -1").is_err());
+        let out =
+            with_settings(DEFAULT_CONFIG, &[(&["history", "keep_days"], 7i64.into())]).unwrap();
+        assert_eq!(Config::parse(&out).unwrap().history.keep_days, 7);
     }
 
     #[test]
