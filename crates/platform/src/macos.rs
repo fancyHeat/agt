@@ -48,6 +48,7 @@ const TAP_RETRY: Duration = Duration::from_secs(1);
 
 // Virtual key codes (Carbon `kVK_*`).
 const KVK_COMMAND: u16 = 0x37;
+const KVK_ESCAPE: u16 = 0x35;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
@@ -283,10 +284,11 @@ unsafe extern "C-unwind" fn tap_callback(
     let Ok(mut st) = shared.state.lock() else {
         return pass;
     };
-    if let Some(e) = st
+    let e = st
         .detector
         .on_key(chord_key, down, now_ms(), Instant::now())
-    {
+        .or_else(|| (down && code == KVK_ESCAPE).then(|| st.detector.on_escape())?);
+    if let Some(e) = e {
         (st.on_event)(e);
     }
     if chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {

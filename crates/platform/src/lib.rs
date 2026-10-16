@@ -48,6 +48,9 @@ pub enum HotkeyEvent {
     /// or the hold turned out to be stale (a chord key was pressed again long after its
     /// release was missed): the hold is not a dictation. No `Up` follows.
     Cancel,
+    /// Esc was pressed while the hotkey wasn't held (with it held, that's a `Cancel`): ends a
+    /// hands-free recording. Every such press is reported; ignore it otherwise.
+    Escape,
 }
 
 /// A single key, by name. See [`KEYS`]. The configured hotkey is a [`Hotkey`]: one key or a
@@ -564,6 +567,12 @@ impl HoldDetector {
         self.down & (1 << i) != 0 && self.state != Hold::Idle
     }
 
+    /// After [`Self::on_key`] returned nothing for an Esc press: [`HotkeyEvent::Escape`] if no
+    /// chord key is down (with the hotkey held, Esc was a `Cancel`).
+    pub(crate) fn on_escape(&self) -> Option<HotkeyEvent> {
+        (self.state == Hold::Idle && self.down == 0).then_some(HotkeyEvent::Escape)
+    }
+
     /// Forget any hold in progress.
     pub(crate) fn reset(&mut self) {
         self.state = Hold::Idle;
@@ -689,6 +698,30 @@ mod tests {
         assert_eq!(d.on_key(HOT, false, 40, t), None);
         // Next hold works normally.
         assert_eq!(d.on_key(HOT, true, 50, t), Some(HotkeyEvent::Down(t)));
+    }
+
+    #[test]
+    fn escape_is_reported_only_without_a_hold() {
+        let t = Instant::now();
+        let mut d = HoldDetector::new(1);
+        // Esc while the hotkey is up: ends a hands-free recording.
+        assert_eq!(d.on_key(OTHER, true, 0, t), None);
+        assert_eq!(d.on_escape(), Some(HotkeyEvent::Escape));
+        // Esc while it's held is the hold's cancel, not an Escape too.
+        assert_eq!(d.on_key(HOT, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(OTHER, true, 20, t), Some(HotkeyEvent::Cancel));
+        assert_eq!(
+            d.on_escape(),
+            None,
+            "still waiting for the hotkey's release"
+        );
+        assert_eq!(d.on_key(HOT, false, 30, t), None);
+        assert_eq!(d.on_escape(), Some(HotkeyEvent::Escape));
+        // Part of a chord down: a shortcut, not an Escape.
+        let mut d = HoldDetector::new(2);
+        d.on_key(HOT, true, 0, t);
+        assert_eq!(d.on_key(OTHER, true, 10, t), None);
+        assert_eq!(d.on_escape(), None);
     }
 
     #[test]

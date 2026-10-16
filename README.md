@@ -42,6 +42,9 @@ Good to know:
   unpolished: it doesn't fit the model's context. Settings → Polish → **Fast drafting**
   (`fast_drafting` under `[polish.s1-mini]`) polishes long text about twice as fast on a GPU,
   at the cost of an occasional different word or comma; it's off by default.
+- **Hands-free:** tap the hotkey twice quickly and AGT keeps recording after you let go; press
+  it once more to stop and paste (Esc cancels). `double_tap_ms` under `[hotkey]` in
+  `config.toml` sets how quick (0 turns it off).
 - While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
   and comes back when you let go. Settings → **Lower other audio while dictating** turns this
   off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
@@ -61,6 +64,7 @@ Until everything is granted, the menu-bar item says which permission is missing,
 
 The default hotkey is **Fn** (the 🌐 Globe key). Set System Settings > Keyboard > "Press 🌐 key
 to" to **Do Nothing**, or releasing it also opens the emoji picker or starts Apple's dictation.
+That matters most for hands-free: a double tap is two quick taps, and macOS acts on each.
 Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
 `"Fn+RightOption"`.
 

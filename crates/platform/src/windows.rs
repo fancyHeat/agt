@@ -27,8 +27,8 @@ use windows_sys::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VK_CONTROL, VK_LCONTROL, VK_LMENU,
-            VK_LSHIFT, VK_LWIN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
+            MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VK_CONTROL, VK_ESCAPE, VK_LCONTROL,
+            VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, HC_ACTION, HHOOK,
@@ -272,7 +272,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                             let _ = mask.send(());
                         }
                     }
-                    if let Some(ev) = s.detector.on_key(chord_key, down, kb.time, Instant::now()) {
+                    let ev = s
+                        .detector
+                        .on_key(chord_key, down, kb.time, Instant::now())
+                        .or_else(|| {
+                            (down && kb.vkCode == VK_ESCAPE as u32)
+                                .then(|| s.detector.on_escape())?
+                        });
+                    if let Some(ev) = ev {
                         if let (HotkeyEvent::Down(_), Some(mask)) = (ev, &s.mask) {
                             // Covers both a dictation and a hold later cancelled by another
                             // key (Ctrl+Win+D, ...). Non-blocking.

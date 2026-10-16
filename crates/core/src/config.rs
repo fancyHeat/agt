@@ -52,6 +52,10 @@ key = ""#,
     r#""
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
+# Hands-free: tap the hotkey twice (the second press within this many milliseconds of letting
+# go of the first) and AGT keeps recording after you let go, until you press the hotkey
+# again; that press pastes. Esc cancels. Stops on its own after 30 minutes. 0: off.
+double_tap_ms = 400
 
 [audio]
 # Microphone to record from, by name as the Settings menu lists it. "": the system's default
@@ -261,6 +265,8 @@ pub struct HotkeyConfig {
     /// Key name or `+`-separated chord; parsed (and rejected if invalid) by `agt-platform`.
     pub key: String,
     pub min_hold_ms: u64,
+    /// Max gap between a tap's release and the next press for a double tap; 0 = off.
+    pub double_tap_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -645,6 +651,7 @@ impl Default for HotkeyConfig {
         Self {
             key: DEFAULT_HOTKEY.into(),
             min_hold_ms: 150,
+            double_tap_ms: 400,
         }
     }
 }
