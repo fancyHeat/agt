@@ -80,6 +80,10 @@ pub enum Outcome {
     TooShort,
     /// Another key was pressed during the hold.
     Cancelled,
+    /// Esc during a hands-free recording.
+    EscCancelled,
+    /// A hands-free recording reached its time limit: discarded.
+    TimedOut,
     /// The release was never seen; the recording was discarded at the next press.
     StaleDiscarded,
     MicFailed,
@@ -101,6 +105,8 @@ impl Outcome {
             Outcome::NoSpeech => "no_speech",
             Outcome::TooShort => "too_short",
             Outcome::Cancelled => "cancelled",
+            Outcome::EscCancelled => "esc_cancelled",
+            Outcome::TimedOut => "timed_out",
             Outcome::StaleDiscarded => "stale_discarded",
             Outcome::MicFailed => "mic_failed",
             Outcome::NotReady => "not_ready",

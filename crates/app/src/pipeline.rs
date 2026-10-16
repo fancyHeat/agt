@@ -7,7 +7,10 @@
 //!   also polls the key, in case the hook missed the release (see [`RELEASE_POLL`]), and
 //!   takes the new audio: a long recording is cut into segments as it comes in
 //!   (`agt_stt::chunk::Live`, cheap), and each finished one goes to `stt` right away, so at
-//!   release only the last few seconds are left to transcribe (see [`Feed`]).
+//!   release only the last few seconds are left to transcribe (see [`Feed`]). A double tap
+//!   (`hotkey.double_tap_ms`) records hands-free instead: the release doesn't end that
+//!   recording, the next press and release does (Esc cancels it, and so does
+//!   [`HANDS_FREE_MAX`]).
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
 //!   system output volume down until the recording ends, however it ends.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
@@ -76,6 +79,15 @@ pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 /// what they meant to dictate (at most ~250 ms of extra audio). The hook is then re-installed.
 /// It's also how often the new audio is taken and cut ([`Feed`]).
 const RELEASE_POLL: Duration = Duration::from_millis(250);
+
+/// A hands-free recording (double tap) that nobody ends is discarded after this, the longest
+/// recording: it was most likely forgotten, and pasting it would put whatever was said since
+/// into whatever window has focus by then.
+const HANDS_FREE_MAX: Duration = Duration::from_secs(agt_audio::MAX_SECONDS as u64);
+
+/// A press shorter than this (or than `min_hold_ms`, if that's longer) is a tap: a double tap
+/// is two of them. Not tied to `min_hold_ms` alone, which may be 0.
+const TAP: Duration = Duration::from_millis(150);
 
 /// While a permission is missing (macOS), how often it's checked again.
 const PERMISSION_POLL: Duration = Duration::from_secs(1);
@@ -545,6 +557,28 @@ impl ReleaseWatch {
     }
 }
 
+/// Hands-free recording (double tap): how the recording in progress ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Latch {
+    /// Holding to talk: the release ends it.
+    Off,
+    /// The double tap's second press is still down: if it's a tap, its release doesn't end
+    /// it (if it's held, it was a hold after all).
+    Pressed,
+    /// Recording with the hotkey up: the next press's release ends it.
+    On,
+    /// That press is down: its release ends it. Another press meanwhile (an auto-repeat after
+    /// a missed press re-installed the hook) changes nothing; another key (a shortcut with the
+    /// hotkey, or Esc) goes back to `On`.
+    Ending,
+}
+
+/// Whether a press at `now` may be the second tap of a double tap: a tap (see [`TAP`]) was
+/// let go at most `gap` before (`last_tap`). A zero `gap` turns it off.
+fn is_double_tap(last_tap: Option<Instant>, now: Instant, gap: Duration) -> bool {
+    !gap.is_zero() && last_tap.is_some_and(|up| now.saturating_duration_since(up) <= gap)
+}
+
 struct AudioThread {
     config: Config,
     key: Hotkey,
@@ -654,15 +688,53 @@ impl AudioThread {
         // hold ends (including this thread exiting or panicking).
         let mut holding: Option<(Instant, Box<Dictation>, Option<Ducked>, Feed)> = None;
         let mut watch = ReleaseWatch::new(&self.key, 0);
+        let mut latch = Latch::Off;
+        // When the last tap was let go: maybe the first half of a double tap.
+        let mut last_tap: Option<Instant> = None;
+        let double_tap = Duration::from_millis(self.config.hotkey.double_tap_ms);
+        let tap = Duration::from_millis(self.config.hotkey.min_hold_ms).max(TAP);
 
         loop {
+            let hands_free = latch == Latch::On && holding.is_some();
+            // Esc is ours only while it can end something.
+            agt_platform::arm_escape(hands_free);
             // `missed`: a release synthesized after the hook missed the real one.
-            let (ev, missed) = if let Some((.., feed)) = &mut holding {
-                match events.recv_timeout(RELEASE_POLL) {
+            let (ev, missed) = if let Some((down, .., feed)) = &mut holding {
+                // Hands-free, the hotkey is up: no release to watch for, but a press the hook
+                // missed, and the time limit.
+                let until = *down + HANDS_FREE_MAX;
+                let wait = match hands_free {
+                    true => until.saturating_duration_since(Instant::now()),
+                    false => RELEASE_POLL,
+                };
+                match events.recv_timeout(wait.min(RELEASE_POLL)) {
                     Ok(ev) => (ev, false),
+                    Err(RecvTimeoutError::Timeout) if hands_free && Instant::now() >= until => {
+                        tracing::warn!(
+                            "hands-free recording reached {} minutes; discarded it",
+                            HANDS_FREE_MAX.as_secs() / 60
+                        );
+                        latch = Latch::Off;
+                        if let Some((down, d, _ducked, feed)) = holding.take() {
+                            let now = Instant::now();
+                            self.abort_recording(
+                                &mut recorder,
+                                down,
+                                now,
+                                d,
+                                feed,
+                                Ended::TimedOut,
+                            );
+                        }
+                        continue;
+                    }
                     Err(RecvTimeoutError::Timeout) => {
                         feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
-                        match self.missed_release(&events, &watch) {
+                        let missed = match hands_free {
+                            true => self.missed_press(&events).map(|ev| (ev, false)),
+                            false => self.missed_release(&events, &watch),
+                        };
+                        match missed {
                             Some(ev) => ev,
                             None => continue,
                         }
@@ -678,18 +750,27 @@ impl AudioThread {
             match ev {
                 HotkeyEvent::Down(t) => {
                     *self.key_down.lock().unwrap() = Some(t);
-                    if let Some((down, mut d, _ducked, feed)) = holding.take() {
+                    if matches!(latch, Latch::On | Latch::Ending) && holding.is_some() {
+                        // Ends the hands-free recording on its release, like a hold: every
+                        // paste comes after the hotkey is let go.
+                        if latch == Latch::On {
+                            tracing::debug!("hands-free recording ending: {} pressed", self.key);
+                        }
+                        latch = Latch::Ending;
+                        continue;
+                    }
+                    latch = Latch::Off;
+                    if let Some((down, d, _ducked, feed)) = holding.take() {
                         // The previous hold's release was never seen (and the poll couldn't
                         // tell, e.g. a swallowed F13-F24 key). Its audio may span minutes of
                         // unrelated speech: discard it rather than paste it.
-                        recorder.stop();
                         tracing::warn!("previous hold was never released; discarded it");
-                        self.hub.update(|s| s.recording = false);
-                        d.hold_ms = Some(ms(t.saturating_duration_since(down)));
-                        self.drop_dictation(feed, d, Ended::StaleDiscarded);
+                        let outcome = Ended::StaleDiscarded;
+                        self.abort_recording(&mut recorder, down, t, d, feed, outcome);
                     }
                     // Before starting: any paste from here on counts as "during this recording".
                     watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
+                    let double = is_double_tap(last_tap.take(), t, double_tap);
                     holding = self.start_recording(&mut recorder, t).map(|d| {
                         // Only once the microphone runs: never delays it (a channel send).
                         let ducked = self
@@ -699,23 +780,58 @@ impl AudioThread {
                         let secs = f32::from_bits(self.chunk_secs.load(Relaxed));
                         (t, d, ducked, Feed::new(secs))
                     });
+                    if double && holding.is_some() {
+                        latch = Latch::Pressed;
+                        tracing::info!(
+                            "double tap: recording hands-free until {} is pressed again",
+                            self.key
+                        );
+                    }
                 }
                 HotkeyEvent::Up(released) => {
+                    let held = holding
+                        .as_ref()
+                        .map(|(down, ..)| released.saturating_duration_since(*down));
+                    if latch == Latch::Pressed && held.is_some_and(|h| h < tap) {
+                        latch = Latch::On;
+                        continue;
+                    }
+                    // A second press held down was a hold: a tap just before doesn't matter.
+                    latch = Latch::Off;
                     let Some((down, mut d, _ducked, feed)) = holding.take() else {
                         continue;
                     };
+                    if held.is_some_and(|h| h < tap) {
+                        last_tap = Some(released);
+                    }
                     d.missed_release = missed;
                     self.finish_recording(&mut recorder, down, released, d, feed);
                 }
+                HotkeyEvent::Cancel if latch == Latch::Ending && holding.is_some() => {
+                    // A shortcut with the hotkey while hands-free: not the end of it.
+                    tracing::debug!("{} was part of a shortcut; still hands-free", self.key);
+                    latch = Latch::On;
+                }
                 HotkeyEvent::Cancel => {
-                    if let Some((down, mut d, _ducked, feed)) = holding.take() {
-                        recorder.stop();
+                    latch = Latch::Off;
+                    if let Some((down, d, _ducked, feed)) = holding.take() {
                         tracing::info!(
                             "dictation cancelled (another key was pressed, or the hold was stale)"
                         );
-                        self.hub.update(|s| s.recording = false);
-                        d.hold_ms = Some(ms(down.elapsed()));
-                        self.drop_dictation(feed, d, Ended::Cancelled);
+                        let now = Instant::now();
+                        self.abort_recording(&mut recorder, down, now, d, feed, Ended::Cancelled);
+                    }
+                }
+                HotkeyEvent::Escape => {
+                    if latch != Latch::On {
+                        continue; // only sent while armed; a late one
+                    }
+                    latch = Latch::Off;
+                    if let Some((down, d, _ducked, feed)) = holding.take() {
+                        tracing::info!("hands-free dictation cancelled (Esc)");
+                        let now = Instant::now();
+                        let outcome = Ended::EscCancelled;
+                        self.abort_recording(&mut recorder, down, now, d, feed, outcome);
                     }
                 }
             }
@@ -748,6 +864,47 @@ impl AudioThread {
         );
         self.reset.reset();
         Some((HotkeyEvent::Up(Instant::now()), true))
+    }
+
+    /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
+    /// synthesized press if the hotkey turns out to be down without the hook having said so
+    /// (macOS disabled the event tap after a timeout, Windows dropped the hook), so the
+    /// recording can still be ended.
+    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<HotkeyEvent> {
+        let keys = self.key.keys();
+        if !keys
+            .iter()
+            .all(|&k| agt_platform::key_down(k) == Some(true))
+        {
+            return None; // up, or can't tell
+        }
+        // As in `missed_release`: a real press would normally be queued already.
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
+            return Some(ev);
+        }
+        tracing::warn!(
+            "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
+            self.key
+        );
+        self.reset.reset();
+        Some(HotkeyEvent::Down(Instant::now()))
+    }
+
+    /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded
+    /// as `outcome`.
+    fn abort_recording(
+        &self,
+        recorder: &mut Recorder,
+        down: Instant,
+        end: Instant,
+        mut d: Box<Dictation>,
+        feed: Feed,
+        outcome: Ended,
+    ) {
+        recorder.stop();
+        self.hub.update(|s| s.recording = false);
+        d.hold_ms = Some(ms(end.saturating_duration_since(down)));
+        self.drop_dictation(feed, d, outcome);
     }
 
     /// Returns the new dictation's record if recording started.
@@ -1694,6 +1851,20 @@ fn wall_clock(t: Instant) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_tap_is_a_press_soon_after_a_tap() {
+        let t = Instant::now();
+        let gap = Duration::from_millis(400);
+        assert!(is_double_tap(Some(t), t + gap, gap));
+        assert!(!is_double_tap(
+            Some(t),
+            t + gap + Duration::from_millis(1),
+            gap
+        ));
+        assert!(!is_double_tap(None, t, gap), "no tap before");
+        assert!(!is_double_tap(Some(t), t, Duration::ZERO), "turned off");
+    }
 
     #[test]
     fn text_is_normalized() {

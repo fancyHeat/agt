@@ -27,8 +27,8 @@ use windows_sys::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VK_CONTROL, VK_LCONTROL, VK_LMENU,
-            VK_LSHIFT, VK_LWIN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_V,
+            MAPVK_VK_TO_VSC, MapVirtualKeyW, SendInput, VK_CONTROL, VK_ESCAPE, VK_LCONTROL,
+            VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_V,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, HC_ACTION, HHOOK,
@@ -272,7 +272,22 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                             let _ = mask.send(());
                         }
                     }
-                    if let Some(ev) = s.detector.on_key(chord_key, down, kb.time, Instant::now()) {
+                    let esc = kb.vkCode == VK_ESCAPE as u32;
+                    let armed = esc
+                        && crate::escape_armed()
+                        && ![VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                            .into_iter()
+                            .any(vk_down);
+                    let (ev, swallow_esc) = s.detector.on_hook_key(
+                        chord_key,
+                        esc,
+                        armed,
+                        down,
+                        kb.time,
+                        Instant::now(),
+                    );
+                    swallow |= swallow_esc;
+                    if let Some(ev) = ev {
                         if let (HotkeyEvent::Down(_), Some(mask)) = (ev, &s.mask) {
                             // Covers both a dictation and a hold later cancelled by another
                             // key (Ctrl+Win+D, ...). Non-blocking.
@@ -286,7 +301,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         }
     }
     if swallow {
-        // F13-F24 hotkeys: apps never see them.
+        // F13-F24 hotkeys, and the Esc that ends a hands-free recording: apps never see them.
         return 1;
     }
     // Ctrl/Shift/Win hotkey keys and every other key pass through.
