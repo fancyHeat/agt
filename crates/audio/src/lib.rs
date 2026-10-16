@@ -18,7 +18,7 @@
 //! unplugged) or, when on the default device, if the default changed since it was built; on
 //! the fallback, each recording checks whether the chosen device is back (an enumeration, a
 //! few ms) and switches to it. A chosen device that is connected but fails to open also
-//! falls back, until it has been unplugged and reconnected.
+//! falls back, and is tried again a minute later or once it has been reconnected.
 
 pub mod resample;
 pub mod wav;
@@ -43,6 +43,8 @@ pub use agt_core::stt::SAMPLE_RATE;
 pub const PREROLL_MS: usize = 300;
 /// Recordings are cut off after this long (memory and model-context safety valve).
 pub const MAX_SECONDS: usize = 5 * 60;
+/// A chosen microphone that failed to open is tried again after this long.
+const CHOSEN_RETRY: Duration = Duration::from_secs(60);
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -89,8 +91,9 @@ pub struct Recorder {
     device: String,
     /// The chosen device's absence was logged (once, not on every recording).
     missing_logged: bool,
-    /// The chosen device failed to open; it's retried once it was unplugged and is back.
-    chosen_broken: bool,
+    /// When the chosen device last failed to open: it is retried after [`CHOSEN_RETRY`], or
+    /// as soon as it was unplugged and is back.
+    chosen_failed: Option<Instant>,
     live: Option<Live>,
     capture: Arc<Mutex<Capture>>,
     failed: Arc<AtomicBool>,
@@ -105,7 +108,7 @@ impl Recorder {
             keep_open,
             device,
             missing_logged: false,
-            chosen_broken: false,
+            chosen_failed: None,
             live: None,
             capture: Arc::new(Mutex::new(Capture {
                 recording: false,
@@ -154,12 +157,12 @@ impl Recorder {
         match self.open(&device, device_id, chosen) {
             Err(e) if chosen => {
                 // Connected but unusable (held exclusively, broken driver): the default until
-                // the chosen device is unplugged and back, rather than failing every press.
+                // a retry, rather than failing every press.
                 tracing::warn!(
                     "cannot open microphone \"{}\": {e}; using the default input device",
                     self.device
                 );
-                self.chosen_broken = true;
+                self.chosen_failed = Some(Instant::now());
                 let device = host
                     .default_input_device()
                     .ok_or("no microphone (default input device) found")?;
@@ -214,23 +217,26 @@ impl Recorder {
     }
 
     /// The chosen device if it's connected (`true`), else the default input device.
-    /// (If it failed to open, the default until it has been seen missing.)
+    /// (If it failed to open, the default until [`CHOSEN_RETRY`] passed or it was unplugged.)
     fn pick_device(&mut self, host: &cpal::Host) -> Result<(cpal::Device, bool), Error> {
         if !self.device.is_empty() {
+            let broken = self
+                .chosen_failed
+                .is_some_and(|t| t.elapsed() < CHOSEN_RETRY);
             match host.input_devices() {
                 Ok(mut all) => {
                     match all.find(|d| device_name(d).as_deref() == Some(&self.device)) {
-                        Some(d) if !self.chosen_broken => {
+                        Some(d) if !broken => {
                             self.missing_logged = false;
                             return Ok((d, true));
                         }
                         Some(_) => {}
-                        None => self.chosen_broken = false,
+                        None => self.chosen_failed = None,
                     }
                 }
                 Err(e) => tracing::warn!("cannot list microphones: {e}"),
             }
-            if !self.missing_logged && !self.chosen_broken {
+            if !self.missing_logged && !broken {
                 tracing::warn!(
                     "microphone \"{}\" not found; using the default input device",
                     self.device
