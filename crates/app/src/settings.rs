@@ -99,6 +99,17 @@ fn add_all(b: &mut Builder, menu: &Submenu, c: &Config) -> Result<(), Error> {
         &["audio", "keep_mic_open"],
         |c| c.audio.keep_mic_open,
     )?;
+    b.check(
+        menu,
+        "Lower other audio while dictating",
+        &["audio", "duck"],
+        |c| c.audio.duck,
+    )?;
+    b.choice(
+        menu,
+        "Lower other audio to",
+        duck_levels(c.audio.duck_level),
+    )?;
 
     // Speech-to-text.
     let stt = b.submenu(menu, "Speech-to-text")?;
@@ -525,6 +536,33 @@ fn numbers(
         .collect()
 }
 
+/// `audio.duck_level` presets (percent of the volume kept), plus the file's value if it's
+/// another one.
+fn duck_levels(current: f32) -> Vec<Choice> {
+    let pct = |v: f32| (f64::from(v) * 100.0).round();
+    let mut choices: Vec<Choice> = [0, 10, 25, 50]
+        .into_iter()
+        .map(|p| {
+            let label = if p == 0 {
+                "Silent".into()
+            } else {
+                format!("{p}%")
+            };
+            let value = SettingValue::from(f64::from(p) / 100.0);
+            Choice::set(
+                &["audio", "duck_level"],
+                label,
+                value,
+                pct(current) == f64::from(p),
+            )
+        })
+        .collect();
+    if !choices.iter().any(|c| c.checked) {
+        choices.push(Choice::current(&current.to_string()));
+    }
+    choices
+}
+
 fn ms(n: u64) -> String {
     format!("{n} ms")
 }
@@ -674,6 +712,7 @@ mod tests {
             &[0, 500],
             ms,
         ));
+        all.extend(duck_levels(c.audio.duck_level));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
@@ -687,5 +726,11 @@ mod tests {
         let n = numbers(&["x"], 7, &[0, 500], ms);
         let labels: Vec<_> = n.iter().map(|c| (c.label.as_str(), c.checked)).collect();
         assert_eq!(labels, [("0 ms", false), ("7 ms", true), ("500 ms", false)]);
+        // The default duck level is a preset; another one is shown as is.
+        let levels = duck_levels(c.audio.duck_level);
+        assert_eq!(levels.iter().filter(|c| c.checked).count(), 1);
+        assert!(levels.iter().any(|c| c.checked && c.label == "10%"));
+        let levels = duck_levels(0.3);
+        assert!(levels.last().unwrap().checked && levels.last().unwrap().changes.is_empty());
     }
 }

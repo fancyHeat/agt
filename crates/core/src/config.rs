@@ -59,6 +59,13 @@ min_hold_ms = 150
 # (start-up takes a few milliseconds, measured on the first dictation and logged).
 # On: no start-up delay, at the cost of the indicator being on whenever AGT runs.
 keep_mic_open = false
+# Turn other audio (music, videos, calls) down while the hotkey is held, so it doesn't talk
+# over you; it comes back up when you let go. This lowers the system output volume: if you
+# change the volume yourself while dictating, AGT leaves it where you put it.
+duck = true
+# How much of the volume to keep while dictating, from 0 (silence) to 1 (unchanged): 0.1 turns
+# the volume slider down to a tenth of where it was.
+duck_level = 0.1
 
 [stt]
 # Speech-to-text engine: "parakeet" (NVIDIA Parakeet TDT via ONNX Runtime), or "whisper"
@@ -232,10 +239,37 @@ pub struct HotkeyConfig {
     pub min_hold_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
     pub keep_mic_open: bool,
+    pub duck: bool,
+    /// As written; the method clamps it.
+    pub duck_level: f32,
+}
+
+/// Default `audio.duck_level`.
+pub const DEFAULT_DUCK_LEVEL: f32 = 0.1;
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            keep_mic_open: false,
+            duck: true,
+            duck_level: DEFAULT_DUCK_LEVEL,
+        }
+    }
+}
+
+impl AudioConfig {
+    /// The configured duck level, clamped to 0..=1 (NaN: the default).
+    pub fn duck_level(&self) -> f32 {
+        if self.duck_level.is_nan() {
+            DEFAULT_DUCK_LEVEL
+        } else {
+            self.duck_level.clamp(0.0, 1.0)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -871,6 +905,25 @@ mod tests {
         assert_eq!(c.update.check_interval_minutes(), 240);
         assert_eq!(c.log_level, "info");
         assert_eq!(c.stt, SttConfig::default());
+    }
+
+    #[test]
+    fn duck_level_is_clamped() {
+        let level = |v: &str| {
+            Config::parse(&format!("[audio]\nduck_level = {v}\n"))
+                .unwrap()
+                .audio
+                .duck_level()
+        };
+        assert_eq!(level("0.25"), 0.25);
+        assert_eq!(level("0"), 0.0); // an integer is fine too
+        assert_eq!(level("1"), 1.0);
+        assert_eq!(level("-0.5"), 0.0);
+        assert_eq!(level("3.0"), 1.0);
+        assert_eq!(level("nan"), DEFAULT_DUCK_LEVEL);
+        let c = Config::parse("[audio]\nduck = false\n").unwrap();
+        assert!(!c.audio.duck);
+        assert_eq!(c.audio.duck_level(), DEFAULT_DUCK_LEVEL);
     }
 
     #[test]

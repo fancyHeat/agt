@@ -154,6 +154,8 @@ pub struct SessionStart {
     pub hotkey: String,
     pub min_hold_ms: i64,
     pub keep_mic_open: bool,
+    pub duck: bool,
+    pub duck_level: f64,
     pub stt_engine: String,
     pub stt_model: String,
     pub stt_precision: String,

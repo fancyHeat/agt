@@ -36,6 +36,10 @@ text **on your own computer**; your voice never leaves it.
 Good to know:
 
 - Press **Esc** while holding the hotkey to cancel.
+- While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
+  and comes back when you let go. Settings → **Lower other audio while dictating** turns this
+  off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
+  in `config.toml`).
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
 
 ## macOS

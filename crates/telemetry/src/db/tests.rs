@@ -56,6 +56,33 @@ fn migrates_an_empty_database_once() {
 }
 
 #[test]
+fn a_version_1_database_gains_the_duck_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(MIGRATIONS[0]).unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    conn.execute(
+        "INSERT INTO app_sessions (started_at, app_version, os, arch) VALUES (1, 'old', 'x', 'y')",
+        [],
+    )
+    .unwrap();
+    migrate(&mut conn).unwrap();
+    let s = SessionStart {
+        duck: true,
+        duck_level: 0.25,
+        ..Default::default()
+    };
+    insert_session(&conn, &s, 2).unwrap();
+    let rows: Vec<(Option<bool>, Option<f64>)> = conn
+        .prepare("SELECT duck, duck_level FROM app_sessions ORDER BY started_at")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [(None, None), (Some(true), Some(0.25))]);
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);

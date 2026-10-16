@@ -5,6 +5,8 @@
 //! - `audio`: owns the microphone. Starts recording on key down, and on release hands the
 //!   samples to `stt`. Short taps and cancelled holds are dropped here. While recording it
 //!   also polls the key, in case the hook missed the release (see [`RELEASE_POLL`]).
+//! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
+//!   system output volume down until the recording ends, however it ends.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
 //!   recording may start while the previous one is still being transcribed: jobs queue up
 //!   and are pasted in order (nothing is dropped). Long recordings are chunked by `agt-stt`.
@@ -36,8 +38,8 @@ use agt_core::{
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
 use agt_platform::{
-    ClipboardSnapshot, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key, MAX_CHORD, PasteToken,
-    Permission,
+    ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key,
+    MAX_CHORD, PasteToken, Permission,
 };
 use agt_polish::Outcome;
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
@@ -81,6 +83,9 @@ const BUSY_SAVE_WAIT: Duration = Duration::from_secs(2);
 /// After [`HOTKEY_RELEASE_MAX`] it pastes anyway (releasing them, as before).
 const HOTKEY_RELEASE_POLL: Duration = Duration::from_millis(15);
 const HOTKEY_RELEASE_MAX: Duration = Duration::from_secs(10);
+
+/// On exit, how long to wait for a ducked volume to be put back.
+const DUCK_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
@@ -216,9 +221,15 @@ pub struct Pipeline {
     pub polish_info: String,
     to_paste: Sender<ToPaste>,
     key_down: Arc<Mutex<Option<Instant>>>,
+    ducker: Ducker,
 }
 
 impl Pipeline {
+    /// Before exiting: puts the output volume back if a dictation in progress lowered it.
+    pub fn shutdown(&self) {
+        self.ducker.shutdown(DUCK_SHUTDOWN_WAIT);
+    }
+
     /// Puts the last transcript (pasted or not) on the clipboard, for the user to paste by
     /// hand: the recovery path when a paste failed. It's kept in memory only, for
     /// [`LAST_TRANSCRIPT_TTL`] ([`Event::CopyAvailable`] says when there is one).
@@ -277,6 +288,8 @@ pub fn start(
         })),
         notify: Arc::new(notify),
     };
+    // First: it also puts back a volume a previous run left ducked, even if the rest fails.
+    let ducker = Ducker::start(paths::ducked_volume_file());
     let key = Hotkey::parse(&config.hotkey.key)?;
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);
@@ -302,6 +315,7 @@ pub fn start(
         to_paste: to_paste.clone(),
         test_wav,
         key_down: key_down.clone(),
+        ducker: config.audio.duck.then(|| ducker.clone()),
     };
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
@@ -320,6 +334,7 @@ pub fn start(
         polish_info,
         to_paste,
         key_down,
+        ducker,
     })
 }
 
@@ -500,6 +515,8 @@ struct AudioThread {
     to_paste: Sender<ToPaste>,
     test_wav: Option<Vec<f32>>,
     key_down: Arc<Mutex<Option<Instant>>>,
+    /// `None` with `audio.duck` off.
+    ducker: Option<Ducker>,
 }
 
 impl AudioThread {
@@ -512,8 +529,10 @@ impl AudioThread {
         } else if let Err(e) = recorder.prepare() {
             tracing::warn!("microphone not available yet: {e}");
         }
-        // The hold in progress: when the key went down, and its measurements so far.
-        let mut holding: Option<(Instant, Box<Dictation>)> = None;
+        // The hold in progress: when the key went down, its measurements so far, and the
+        // ducked output volume. Dropping that guard puts the volume back, however the hold
+        // ends (including this thread exiting or panicking).
+        let mut holding: Option<(Instant, Box<Dictation>, Option<Ducked>)> = None;
         let mut watch = ReleaseWatch::new(&self.key, 0);
 
         loop {
@@ -536,7 +555,7 @@ impl AudioThread {
             match ev {
                 HotkeyEvent::Down(t) => {
                     *self.key_down.lock().unwrap() = Some(t);
-                    if let Some((down, mut d)) = holding.take() {
+                    if let Some((down, mut d, _ducked)) = holding.take() {
                         // The previous hold's release was never seen (and the poll couldn't
                         // tell, e.g. a swallowed F13-F24 key). Its audio may span minutes of
                         // unrelated speech: discard it rather than paste it.
@@ -548,17 +567,24 @@ impl AudioThread {
                     }
                     // Before starting: any paste from here on counts as "during this recording".
                     watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
-                    holding = self.start_recording(&mut recorder, t).map(|d| (t, d));
+                    holding = self.start_recording(&mut recorder, t).map(|d| {
+                        // Only once the microphone runs: never delays it (a channel send).
+                        let ducked = self
+                            .ducker
+                            .as_ref()
+                            .map(|k| k.duck(self.config.audio.duck_level()));
+                        (t, d, ducked)
+                    });
                 }
                 HotkeyEvent::Up(released) => {
-                    let Some((down, mut d)) = holding.take() else {
+                    let Some((down, mut d, _ducked)) = holding.take() else {
                         continue;
                     };
                     d.missed_release = missed;
                     self.finish_recording(&mut recorder, down, released, d);
                 }
                 HotkeyEvent::Cancel => {
-                    if let Some((down, mut d)) = holding.take() {
+                    if let Some((down, mut d, _ducked)) = holding.take() {
                         recorder.stop();
                         tracing::info!(
                             "dictation cancelled (another key was pressed, or the hold was stale)"

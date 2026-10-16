@@ -3,6 +3,7 @@
 use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
 use std::{
     cell::RefCell,
+    ffi::c_void,
     ptr::{null, null_mut},
     sync::mpsc,
     thread,
@@ -11,6 +12,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{GetLastError, GlobalFree, HANDLE, LPARAM, LRESULT, WPARAM},
     System::{
+        Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx},
         DataExchange::{
             CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
             GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -35,6 +37,7 @@ use windows_sys::Win32::{
         },
     },
 };
+use windows_sys::core::{GUID, HRESULT};
 
 /// `dwExtraInfo` tag on the keystrokes we synthesize, so our own hook ignores them.
 const INJECTED_MARK: usize = 0x4147_5421; // "AGT!"
@@ -556,6 +559,174 @@ pub fn missing_permissions() -> Vec<Permission> {
 pub fn request_permissions(_missing: &[Permission]) {}
 
 pub fn open_permission_settings(_permission: Permission) {}
+
+// ---------------------------------------------------------------------------------------
+// Output volume (ducking): the default render endpoint's IAudioEndpointVolume, through
+// hand-written vtables (windows-sys has no COM interfaces, and the `windows` crate is a lot of
+// code for three calls).
+
+const CLSID_MM_DEVICE_ENUMERATOR: GUID = GUID::from_u128(0xBCDE0395_E52F_467C_8E3D_C4579291692E);
+const IID_IMM_DEVICE_ENUMERATOR: GUID = GUID::from_u128(0xA95664D2_9614_4F35_A746_DE8DB63617E6);
+const IID_IAUDIO_ENDPOINT_VOLUME: GUID = GUID::from_u128(0x5CDF2C82_841E_4546_9722_0CF74078229A);
+const E_RENDER: i32 = 0;
+const E_CONSOLE: i32 = 0;
+/// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`: no output device at all.
+const E_NOTFOUND: HRESULT = 0x8007_0490_u32 as HRESULT;
+
+type Fn0 = unsafe extern "system" fn(*mut c_void) -> u32;
+type Slot = usize; // a vtable entry we never call
+
+#[repr(C)]
+struct UnknownVtbl {
+    _query_interface: Slot,
+    _add_ref: Fn0,
+    release: Fn0,
+}
+
+#[repr(C)]
+struct EnumeratorVtbl {
+    unknown: UnknownVtbl,
+    _enum_audio_endpoints: Slot,
+    get_default_audio_endpoint:
+        unsafe extern "system" fn(*mut c_void, i32, i32, *mut *mut c_void) -> HRESULT,
+}
+
+#[repr(C)]
+struct DeviceVtbl {
+    unknown: UnknownVtbl,
+    activate: unsafe extern "system" fn(
+        *mut c_void,
+        *const GUID,
+        u32,
+        *const c_void,
+        *mut *mut c_void,
+    ) -> HRESULT,
+}
+
+#[repr(C)]
+struct EndpointVolumeVtbl {
+    unknown: UnknownVtbl,
+    _register_control_change_notify: Slot,
+    _unregister_control_change_notify: Slot,
+    _get_channel_count: Slot,
+    _set_master_volume_level: Slot,
+    set_master_volume_level_scalar:
+        unsafe extern "system" fn(*mut c_void, f32, *const GUID) -> HRESULT,
+    _get_master_volume_level: Slot,
+    get_master_volume_level_scalar: unsafe extern "system" fn(*mut c_void, *mut f32) -> HRESULT,
+    _set_channel_volume_level: Slot,
+    _set_channel_volume_level_scalar: Slot,
+    _get_channel_volume_level: Slot,
+    _get_channel_volume_level_scalar: Slot,
+    _set_mute: Slot,
+    get_mute: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
+}
+
+/// An owned COM interface pointer whose vtable is `V`; released on drop.
+struct Com<V>(*mut c_void, std::marker::PhantomData<V>);
+
+impl<V> Com<V> {
+    fn vtbl(&self) -> &V {
+        unsafe { &**(self.0 as *const *const V) }
+    }
+}
+
+impl<V> Drop for Com<V> {
+    fn drop(&mut self) {
+        let unknown = unsafe { &**(self.0 as *const *const UnknownVtbl) };
+        unsafe { (unknown.release)(self.0) };
+    }
+}
+
+fn check(hr: HRESULT, what: &str) -> Result<(), Error> {
+    if hr < 0 {
+        return Err(format!("{what} failed (HRESULT {:#010x})", hr as u32).into());
+    }
+    Ok(())
+}
+
+/// The default output device's master volume. Lives on the thread that opened it.
+pub struct OutputVolume(Com<EndpointVolumeVtbl>);
+
+/// Prepares the calling thread for [`OutputVolume`] (COM, multithreaded apartment).
+pub fn init_volume_thread() {
+    // S_FALSE (already initialized) is fine; on failure, opening the device reports it.
+    unsafe { CoInitializeEx(null(), COINIT_MULTITHREADED as u32) };
+}
+
+impl OutputVolume {
+    /// `Ok(None)`: there is no default output device.
+    pub fn open_default() -> Result<Option<Self>, Error> {
+        let mut p = null_mut();
+        check(
+            unsafe {
+                CoCreateInstance(
+                    &CLSID_MM_DEVICE_ENUMERATOR,
+                    null_mut(),
+                    CLSCTX_ALL,
+                    &IID_IMM_DEVICE_ENUMERATOR,
+                    &mut p,
+                )
+            },
+            "CoCreateInstance(MMDeviceEnumerator)",
+        )?;
+        let enumerator = Com::<EnumeratorVtbl>(p, Default::default());
+        let mut p = null_mut();
+        let hr = unsafe {
+            (enumerator.vtbl().get_default_audio_endpoint)(
+                enumerator.0,
+                E_RENDER,
+                E_CONSOLE,
+                &mut p,
+            )
+        };
+        if hr == E_NOTFOUND || p.is_null() {
+            return Ok(None);
+        }
+        check(hr, "GetDefaultAudioEndpoint")?;
+        let device = Com::<DeviceVtbl>(p, Default::default());
+        let mut p = null_mut();
+        check(
+            unsafe {
+                (device.vtbl().activate)(
+                    device.0,
+                    &IID_IAUDIO_ENDPOINT_VOLUME,
+                    CLSCTX_ALL,
+                    null(),
+                    &mut p,
+                )
+            },
+            "IMMDevice::Activate(IAudioEndpointVolume)",
+        )?;
+        Ok(Some(Self(Com(p, Default::default()))))
+    }
+
+    /// The volume slider's position, 0..=1.
+    pub fn volume(&self) -> Result<f32, Error> {
+        let mut v = 0.0;
+        check(
+            unsafe { (self.0.vtbl().get_master_volume_level_scalar)(self.0.0, &mut v) },
+            "GetMasterVolumeLevelScalar",
+        )?;
+        Ok(v)
+    }
+
+    pub fn set_volume(&self, v: f32) -> Result<(), Error> {
+        check(
+            unsafe { (self.0.vtbl().set_master_volume_level_scalar)(self.0.0, v, null()) },
+            "SetMasterVolumeLevelScalar",
+        )
+    }
+
+    pub fn muted(&self) -> Result<bool, Error> {
+        let mut m = 0;
+        check(
+            unsafe { (self.0.vtbl().get_mute)(self.0.0, &mut m) },
+            "GetMute",
+        )?;
+        Ok(m != 0)
+    }
+}
 
 #[cfg(test)]
 mod tests {

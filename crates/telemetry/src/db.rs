@@ -160,6 +160,11 @@ CREATE TABLE metric_rollups (
     PRIMARY KEY (day, metric)
 ) WITHOUT ROWID;
 "#,
+    // 2: audio.duck and audio.duck_level.
+    r#"
+ALTER TABLE app_sessions ADD COLUMN duck INTEGER;
+ALTER TABLE app_sessions ADD COLUMN duck_level REAL;
+"#,
 ];
 
 /// Opens (creating if needed) and migrates the database. A file that isn't a database or is
@@ -258,9 +263,9 @@ pub(crate) fn insert_session(
             keep_mic_open, stt_engine, stt_model, stt_precision, stt_device, stt_threads,
             polish_enabled, polish_provider, polish_model, polish_style, restore_clipboard_ms,
             trailing_space, overlay_enabled, updates_enabled, log_level, config_error,
-            s1_styling, s1_structure, s1_context, s1_device)
+            s1_styling, s1_structure, s1_context, s1_device, duck, duck_level)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             at,
             s.app_version,
@@ -288,6 +293,8 @@ pub(crate) fn insert_session(
             s.s1_structure,
             s.s1_context,
             s.s1_device,
+            s.duck,
+            s.duck_level,
         ],
     )?;
     Ok(conn.last_insert_rowid())
