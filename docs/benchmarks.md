@@ -902,9 +902,9 @@ Mac, below).
 
 | | Windows release p50/p90/max ms | Mac release p50/p90/max ms | background requests p50/p90 ms (Win, Mac) | words at release p50/p90 | words differing from whole (Win, Mac) | sentence breaks at piece joins (extra/lost vs whole) | WER (Win, Mac) |
 |---|---|---|---|---|---|---|---|
-| whole text (today's path, drafting on) | 509/885/1152 | 870/1682/2173 | - | 278/566 | - | - | 8.04%, 7.91% |
-| each segment | 70/116/185 | 123/191/253 | 95/149, 154/234 (92) | 27/51 | 3.08%, 2.86% | 10/2 of 92 | 8.07%, 8.04% |
-| **ahead** | **172/284/289** | **281/438/446** | 106/191, 161/297 (62) | 62/108 | 2.05%, 1.86% | **0/0 of 62** | **7.99%, 7.99%** |
+| whole text (today's path, drafting on) | 508/895/1157 | 878/1690/2135 | - | 278/566 | - | - | 8.04%, 7.91% |
+| each segment | 67/146/168 | 122/185/254 | 90/146, 152/232 (92) | 27/51 | 3.08%, 2.86% | 10/2 of 92 | 8.07%, 8.04% |
+| **ahead** | **174/293/320** | **277/443/461** | 102/191, 160/294 (62) | 62/108 | 2.05%, 1.89% | **0/0 of 62** | **7.99%, 7.99%** |
 
 WER is against the eval set's references with the normalizer above, which ignores case and
 punctuation; the raw STT text scores 7.19%, so polish's rewrites cost 0.7-0.9 points under this
@@ -962,10 +962,10 @@ same.
   **Skipping polish** when it can't change anything isn't possible to know in advance: STT
   output with correct punctuation still gets numbers, repeats and false starts rewritten.
 - **Polishing ahead turns release -> polished text into a tail-sized request.** With drafting,
-  *ahead* takes long dictations from 0.5/0.9 s to 0.17/0.28 s (p50/p90) on Windows and from
+  *ahead* takes long dictations from 0.5/0.9 s to 0.17/0.29 s (p50/p90) on Windows and from
   0.9/1.7 s to 0.28/0.44 s on the Mac, with the same WER and no broken joins; the release piece
   is the last sentence of the previous segment plus the tail (62 words p50). Polishing each
-  segment on its own is faster still (0.07/0.12 s) but leaves ~1 in 9 segment joins as a
+  segment on its own is faster still (0.07/0.15 s) but leaves ~1 in 9 segment joins as a
   sentence break mid-sentence, which is exactly the boundary artifact whole-text polish was
   repairing. The cost is background work: about one 0.1-0.2 s request per segment that has a
   sentence end (62 requests in 35 min of dictation, ~6.5 s of GPU time on Windows), each with
