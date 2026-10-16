@@ -76,9 +76,11 @@ Settings live in a plain text file, `config.toml`, with a comment on every optio
 - Windows: `%APPDATA%\AGT\config.toml`
 - macOS: `~/Library/Application Support/AGT/config.toml`
 
-Tray menu → **Open config folder** takes you there. Restart AGT after editing. You can change
-the hotkey, turn the overlay off, or enable optional AI clean-up of your text (removes "um"s,
-fixes punctuation; off by default, and it runs locally unless you point it at a cloud service).
+Tray menu → **Open config folder** takes you there. AGT restarts on its own to apply a change
+(once dictation is idle): right away for one made in the tray's **Settings** menu, a few
+seconds after the last save for an edit to the file. You can change the hotkey, turn the
+overlay off, or enable optional AI clean-up of your text (removes "um"s, fixes punctuation;
+off by default, and it runs locally unless you point it at a cloud service).
 
 ## Privacy
 

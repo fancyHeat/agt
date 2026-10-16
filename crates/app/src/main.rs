@@ -27,8 +27,11 @@ use winit::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long dictation must be idle (no status change) before a restart: covers the clipboard
-/// restore after a paste and back-to-back dictations.
+/// restore after a paste and back-to-back dictations. A settings click in the tray only waits
+/// for the clipboard restore.
 const RESTART_SETTLE: Duration = Duration::from_secs(5);
+/// Allowance on top of `restore_clipboard_ms`: for the paste thread to wake and the restore to run.
+const RESTORE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Set for the instance a settings restart starts, so it waits for this one to exit and
 /// release the instance lock (for up to [`RELAUNCH_WAIT`]) instead of quitting at once.
@@ -183,6 +186,7 @@ fn main() {
         restart_with: None,
         changes: 0,
         changed_at: Instant::now(),
+        status_at: Instant::now(),
         config_path,
         file,
         running: config.clone(),
@@ -337,14 +341,17 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     /// `None` if this isn't a Velopack install.
     updater: Option<update::Updater>,
-    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (or for the user to
-    /// click "Install update X now" / "Restart now to apply").
+    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (a settings click
+    /// skips that, see [`Self::settings_action`]; "Install update X now" / "Restart now to
+    /// apply" restart regardless).
     restart_with: Option<Restart>,
     /// Counts pipeline status changes and settings changes: a restart timer is stale if this
     /// moved on.
     changes: u64,
     /// When [`Self::changes`] last moved on.
     changed_at: Instant,
+    /// When the pipeline status last changed (a paste's clipboard restore follows its Ready).
+    status_at: Instant,
     config_path: PathBuf,
     /// `config.toml` as last read (or its error): what the Settings menu shows.
     file: Result<Config, String>,
@@ -416,6 +423,7 @@ impl ApplicationHandler<AppEvent> for App {
                         tray.set_status(&s.to_string());
                     }
                     self.status = Some(s.clone());
+                    self.status_at = Instant::now();
                     self.changes += 1;
                     self.changed_at = Instant::now();
                     self.start_restart_timer();
@@ -575,29 +583,36 @@ impl App {
         self.start_restart_timer();
     }
 
-    /// If a restart is waiting and dictation is idle, posts [`UpdateEvent::Settled`] once it
-    /// has been idle for [`RESTART_SETTLE`]; any status change in between makes it stale.
-    fn start_restart_timer(&self) {
+    /// Whether dictation is idle enough for the pending restart: ready, errored or waiting for
+    /// permissions, or unavailable altogether. For an update, not on an error while a
+    /// transcript can still be copied: it may be a failed paste's, and a restart would lose it
+    /// (for settings the user just changed, on an error anyway: a bad setting may be the
+    /// error). Never while loading: a restart would start a model download over. Clicking
+    /// "Install update X now" / "Restart now to apply" restarts regardless.
+    fn idle(&self) -> bool {
         use pipeline::Status;
-        // Idle: ready, errored or waiting for permissions, or dictation unavailable altogether.
-        // Not on an error while a transcript can still be copied: it may be a failed paste's,
-        // and a restart would lose it (for settings the user just changed, on Error anyway: a
-        // bad setting may be the error). Never while loading: a restart would start a model
-        // download over. Clicking "Install update X now" / "Restart now to apply" restarts
-        // regardless.
-        let idle = self.pipeline.is_none()
+        self.pipeline.is_none()
             || match &self.status {
-                Some(Status::Ready(_) | Status::NeedsPermission(_)) => true,
-                Some(Status::Error(_)) => {
+                Some(Status::Ready(_)) => true,
+                Some(Status::Error(_) | Status::NeedsPermission(_)) => {
                     !self.copy_available || matches!(self.restart_with, Some(Restart::Settings))
                 }
                 _ => false,
-            };
-        if self.restart_with.is_none() || !idle {
+            }
+    }
+
+    /// If a restart is waiting and dictation is idle, posts [`UpdateEvent::Settled`] once it
+    /// has been idle for [`RESTART_SETTLE`]; any status change in between makes it stale.
+    fn start_restart_timer(&self) {
+        if self.restart_with.is_none() || !self.idle() {
             return;
         }
+        self.restart_timer(RESTART_SETTLE.saturating_sub(self.changed_at.elapsed()));
+    }
+
+    /// Posts [`UpdateEvent::Settled`] after `wait`, unless something changes in between.
+    fn restart_timer(&self, wait: Duration) {
         let (proxy, n) = (self.proxy.clone(), self.changes);
-        let wait = RESTART_SETTLE.saturating_sub(self.changed_at.elapsed());
         // If this fails, the item still restarts on click.
         let _ = thread::Builder::new()
             .name("restart-timer".into())
@@ -619,7 +634,11 @@ impl App {
                         self.exit_reason = agt_telemetry::ExitReason::SettingsRestart;
                         event_loop.exit();
                     }
-                    Err(e) => tracing::error!("cannot restart to apply settings: {e}"),
+                    Err(e) => {
+                        tracing::error!("cannot restart to apply settings: {e}");
+                        // Retried after the next settle (or on "Restart now to apply").
+                        self.restart_with = Some(Restart::Settings);
+                    }
                 }
                 return;
             }
@@ -665,6 +684,21 @@ impl App {
                 Ok(c) => {
                     self.file = Ok(c);
                     self.settings_changed();
+                    // A click is an explicit request: apply it now, without the settle wait
+                    // (that's for edits to the file, which may come in a few saves). Only a
+                    // paste's clipboard restore, if one may still be pending, is waited for.
+                    if matches!(self.restart_with, Some(Restart::Settings)) && self.idle() {
+                        let restore =
+                            Duration::from_millis(self.running.paste.restore_clipboard_ms);
+                        let wait =
+                            (restore + RESTORE_MARGIN).saturating_sub(self.status_at.elapsed());
+                        if wait.is_zero() {
+                            let restart = self.restart_with.take().unwrap();
+                            self.restart_now(restart, event_loop);
+                        } else {
+                            self.restart_timer(wait);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!("cannot change config.toml: {e}");

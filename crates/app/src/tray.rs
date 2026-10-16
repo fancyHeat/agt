@@ -141,7 +141,8 @@ impl Tray {
         }
     }
 
-    /// Shows update progress or a result on the "Update now" item; clickable only when idle.
+    /// Shows update progress or a result on the "Update now" item; clickable when idle or
+    /// while an install waits ("Install update X now").
     pub fn set_update(&self, text: &str, enabled: bool) {
         self.update_item.set_text(text);
         self.update_item.set_enabled(enabled);
