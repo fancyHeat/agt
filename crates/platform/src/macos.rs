@@ -53,6 +53,7 @@ const TAP_RETRY: Duration = Duration::from_secs(1);
 // Virtual key codes (Carbon `kVK_*`).
 const KVK_COMMAND: u16 = 0x37;
 const KVK_ESCAPE: u16 = 0x35;
+const KVK_FUNCTION: u16 = 0x3F;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
@@ -307,6 +308,12 @@ unsafe extern "C-unwind" fn tap_callback(
     }
     if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
         // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
+        return null_mut();
+    }
+    if code == KVK_FUNCTION && chord_key.is_some() {
+        // Fn's own press and release: an app that sees Fn tapped alone acts on "Press 🌐 key
+        // to" (the emoji picker, by default), which a double tap always does, and then takes
+        // the paste. Fn+key still works: the flag on other keys comes from the HID state.
         return null_mut();
     }
     pass

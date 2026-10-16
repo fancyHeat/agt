@@ -66,9 +66,10 @@ AGT asks for two permissions on first launch, one after the other:
 Until everything is granted, the menu-bar item says which permission is missing, and its
 "Privacy & Security settings..." item opens the right page.
 
-The default hotkey is **Fn** (the 🌐 Globe key). Set System Settings > Keyboard > "Press 🌐 key
-to" to **Do Nothing**, or releasing it also opens the emoji picker or starts Apple's dictation.
-That matters most for hands-free: a double tap is two quick taps, and macOS acts on each.
+The default hotkey is **Fn** (the 🌐 Globe key). With Accessibility granted, AGT keeps Fn's
+own presses from apps, so tapping it doesn't also open the emoji picker or start Apple's
+dictation (System Settings > Keyboard > "Press 🌐 key to"), and Fn+key shortcuts still work.
+While AGT runs, tapping 🌐 alone does nothing else; to use it again, pick another hotkey.
 Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
 `"Fn+RightOption"`.
 

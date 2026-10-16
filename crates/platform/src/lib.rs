@@ -128,11 +128,12 @@ const CHORD_EXAMPLE: &str = "LeftCtrl+LeftWin";
 /// Supported hotkey keys (names are case-insensitive), their macOS virtual key codes and
 /// kinds.
 ///
-/// - Fn (the Globe key on newer keyboards), Right Option and Right Command are passed through
-///   to apps (holding them alone does nothing; Option+letter or Command+letter while holding
-///   cancels the dictation). For Fn, set System Settings > Keyboard > "Press 🌐 key to" to
-///   "Do Nothing", or releasing it also opens the emoji picker / switches the input source /
-///   starts Apple's dictation.
+/// - Right Option and Right Command are passed through to apps (holding them alone does
+///   nothing; Option+letter or Command+letter while holding cancels the dictation).
+/// - Fn (the Globe key on newer keyboards): its own press and release are kept from apps, or
+///   tapping it would also do what "Press 🌐 key to" says (the emoji picker, by default),
+///   which then takes the paste. Fn+key still reaches apps. Needs Accessibility; with only
+///   Input Monitoring the tap can't keep anything, and "Press 🌐 key to" should be "Do Nothing".
 /// - F13-F20 are swallowed: apps never see them while AGT runs.
 ///
 /// Deliberately absent: the left modifiers and Control/Shift (used in everyday shortcuts and
