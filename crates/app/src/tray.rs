@@ -1,17 +1,17 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, a config
-//! error line (while there is one), "Copy last transcript", "Update now", "Settings..." (the
-//! settings window), "Metrics..." (the same window on its Metrics page) and "Quick settings"
-//! (see [`crate::settings`]), (macOS) "Privacy & Security settings", "Open config folder",
-//! "Open data folder" (where it differs) and "Quit".
+//! error line (while there is one), "Restart now to apply settings" (while changed settings
+//! wait for a restart), "Copy last transcript", "Check for updates", "Settings..." (the
+//! settings window, see [`crate::settings`]), "Metrics..." (the same window on its Metrics
+//! page), (macOS) "Privacy & Security settings", "Open config folder", "Open data folder"
+//! (where it differs) and "Quit".
 
-use crate::settings::Settings;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
 };
 
-/// Label of the "Update now" item when it's idle.
-pub const UPDATE_NOW: &str = "Update now";
+/// Label of the update item when it's idle.
+const CHECK_FOR_UPDATES: &str = "Check for updates";
 
 /// Where the config error line goes: after the title, status, polish line and separator.
 const WARNING_AT: usize = 4;
@@ -24,11 +24,14 @@ pub struct Tray {
     polish: MenuItem,
     warning: MenuItem,
     warning_shown: bool,
-    pub settings: Settings,
+    apply_item: MenuItem,
+    apply_shown: bool,
     copy_last_item: MenuItem,
     update_item: MenuItem,
     pub copy_last: MenuId,
     pub update: MenuId,
+    /// "Restart now to apply settings": restarts without waiting for dictation to be idle.
+    pub apply_now: MenuId,
     /// "Settings...": opens the settings window.
     pub open_settings: MenuId,
     /// "Metrics...": opens the settings window on its Metrics page.
@@ -43,9 +46,8 @@ pub struct Tray {
 
 impl Tray {
     /// `polish`: a disabled info line, e.g. "Polish: off".
-    /// `installed`: whether this is a Velopack install (else "Update now" is disabled).
+    /// `installed`: whether this is a Velopack install (else "Check for updates" is disabled).
     /// `data_folder`: whether to offer "Open data folder".
-    /// The Settings submenu starts empty: fill it with [`Settings::show`].
     pub fn new(
         version: &str,
         polish: &str,
@@ -57,18 +59,19 @@ impl Tray {
         let status = MenuItem::new("Starting...", false, None);
         let warning = MenuItem::new("", false, None);
         let polish = MenuItem::new(polish, false, None);
+        let apply = MenuItem::new("Restart now to apply settings", true, None);
         // Recovery path when a paste failed; enabled once there is a transcript.
         let copy_last = MenuItem::new("Copy last transcript", false, None);
         let update = if installed {
-            MenuItem::new(UPDATE_NOW, true, None)
+            MenuItem::new(CHECK_FOR_UPDATES, true, None)
         } else {
-            MenuItem::new("Update now (not installed)", false, None)
+            MenuItem::new(format!("{CHECK_FOR_UPDATES} (not installed)"), false, None)
         };
         let open_settings = MenuItem::new("Settings...", true, None);
         let open_metrics = MenuItem::new("Metrics...", true, None);
-        let settings = Settings::new();
+        // "&&": a lone "&" marks a mnemonic and is dropped from the text.
         let privacy = cfg!(target_os = "macos")
-            .then(|| MenuItem::new("Privacy & Security settings...", true, None));
+            .then(|| MenuItem::new("Privacy && Security settings...", true, None));
         let open_config = MenuItem::new("Open config folder", true, None);
         let open_data = data_folder.then(|| MenuItem::new("Open data folder", true, None));
         let quit = MenuItem::new("Quit", true, None);
@@ -78,13 +81,7 @@ impl Tray {
             &polish,
             &PredefinedMenuItem::separator(),
         ])?;
-        menu.append_items(&[
-            &copy_last,
-            &update,
-            &open_settings,
-            &open_metrics,
-            &settings.menu,
-        ])?;
+        menu.append_items(&[&copy_last, &update, &open_settings, &open_metrics])?;
         if let Some(p) = &privacy {
             menu.append(p)?;
         }
@@ -111,7 +108,9 @@ impl Tray {
             polish,
             warning,
             warning_shown: false,
-            settings,
+            apply_now: apply.id().clone(),
+            apply_item: apply,
+            apply_shown: false,
             copy_last: copy_last.id().clone(),
             copy_last_item: copy_last,
             update: update.id().clone(),
@@ -145,6 +144,24 @@ impl Tray {
         }
     }
 
+    /// Shows "Restart now to apply settings" (after the config error line, if any) while
+    /// changed settings wait for a restart, or removes it.
+    pub fn set_applying(&mut self, applying: bool) {
+        if applying == self.apply_shown {
+            return;
+        }
+        let result = if applying {
+            let at = WARNING_AT + usize::from(self.warning_shown);
+            self.menu.insert(&self.apply_item, at)
+        } else {
+            self.menu.remove(&self.apply_item)
+        };
+        match result {
+            Ok(()) => self.apply_shown = applying,
+            Err(e) => tracing::debug!("cannot update the restart item: {e}"),
+        }
+    }
+
     /// Replaces the polish info line (the managed S1-mini reports its progress there).
     pub fn set_polish(&self, polish: &str) {
         self.polish.set_text(polish);
@@ -156,11 +173,36 @@ impl Tray {
         }
     }
 
-    /// Shows update progress or a result on the "Update now" item; clickable when idle or
-    /// while an install waits ("Install update X now").
+    /// Shows update progress or a result on the "Check for updates" item; clickable when idle
+    /// or while an install waits ("Install update X now").
     pub fn set_update(&self, text: &str, enabled: bool) {
         self.update_item.set_text(text);
         self.update_item.set_enabled(enabled);
+    }
+
+    /// Opens the menu again (clicking an item closes it), so what the click started, such as
+    /// an update check, can be watched. macOS only. Deferred to the run loop: the open menu
+    /// runs a loop of its own, and inside an event handler it would hold back every other
+    /// event (the check's progress among them) until it closed.
+    pub fn reopen_menu(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_core_foundation::{CFRunLoop, kCFRunLoopCommonModes};
+            let Some(main) = CFRunLoop::main() else {
+                return;
+            };
+            let icon = std::cell::Cell::new(Some(self.icon.clone()));
+            let block = block2::RcBlock::new(move || {
+                if let Some(icon) = icon.take() {
+                    icon.show_menu();
+                }
+            });
+            // SAFETY: the main run loop, a run loop mode, a block that takes nothing.
+            unsafe {
+                main.perform_block(kCFRunLoopCommonModes.map(|m| &**m), Some(&block));
+            }
+            main.wake_up();
+        }
     }
 
     /// Shows `status` in the menu and the tooltip.

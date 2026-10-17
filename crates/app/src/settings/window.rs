@@ -92,6 +92,7 @@ pub fn run() {
         actions: Vec::new(),
         stamp: None,
         metrics: metrics::Metrics::new(paths::db_file()),
+        advanced: false,
     };
     if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page)) {
         eprintln!("agt settings: {e}");
@@ -107,6 +108,8 @@ enum Act {
     Text(SettingPath, bool),
     Button(Action),
     Metrics(metrics::Act),
+    /// "Show advanced settings" / "Hide advanced settings".
+    Advanced,
     None,
 }
 
@@ -117,6 +120,8 @@ struct Model {
     /// The file's modification time and size when last read or written.
     stamp: Option<(Option<SystemTime>, u64)>,
     metrics: metrics::Metrics,
+    /// Showing every setting, not just the basic ones (until the window closes).
+    advanced: bool,
 }
 
 impl Model {
@@ -189,6 +194,28 @@ impl Model {
         }
     }
 
+    /// A section with the button that shows or hides the advanced settings (the last of
+    /// every settings page).
+    fn advanced_section(&mut self) -> Section {
+        let id = self.actions.len();
+        self.actions.push(Act::Advanced);
+        let label = if self.advanced {
+            "Hide advanced settings"
+        } else {
+            "Show advanced settings"
+        };
+        Section {
+            title: String::new(),
+            rows: vec![Row {
+                id,
+                label: String::new(),
+                control: Control::Button(label.into()),
+                note: String::new(),
+                enabled: true,
+            }],
+        }
+    }
+
     fn set(&mut self, changes: &[(SettingPath, SettingValue)]) -> Result<(), String> {
         let result = config::set(&self.path, changes);
         self.stamp = self.stamp();
@@ -213,6 +240,7 @@ impl agt_settings_ui::Model for Model {
                                 "config.toml has an error; fix it to change settings here.\n\n{e}"
                             )),
                             note: String::new(),
+                            advanced: false,
                         },
                         false,
                     ),
@@ -231,19 +259,28 @@ impl agt_settings_ui::Model for Model {
                 ];
             }
         };
-        let mut pages: Vec<Page> = schema::pages(&config)
+        let pages = schema::pages(&config, self.advanced);
+        // The buttons' ids come first, so they're the same either way: the focus (by id)
+        // stays on the button that was clicked.
+        let buttons: Vec<Section> = pages.iter().map(|_| self.advanced_section()).collect();
+        let mut pages: Vec<Page> = pages
             .into_iter()
-            .map(|page| Page {
-                title: page.title.into(),
-                symbol: page.symbol,
-                sections: page
+            .zip(buttons)
+            .map(|(page, button)| {
+                let mut sections: Vec<Section> = page
                     .sections
                     .into_iter()
                     .map(|s| Section {
                         title: s.title.into(),
                         rows: s.items.into_iter().map(|i| self.row(i, true)).collect(),
                     })
-                    .collect(),
+                    .collect();
+                sections.push(button);
+                Page {
+                    title: page.title.into(),
+                    symbol: page.symbol,
+                    sections,
+                }
             })
             .collect();
         pages.push(self.metrics_page());
@@ -277,8 +314,12 @@ impl agt_settings_ui::Model for Model {
                 match action {
                     Action::EditFile => crate::open_in_editor(&self.path),
                     Action::OpenHistory => crate::open_history(),
-                    _ => {}
                 }
+                return Ok(());
+            }
+            // The window asks for the pages again after this.
+            (Some(Act::Advanced), Event::Click(_)) => {
+                self.advanced = !self.advanced;
                 return Ok(());
             }
             _ => return Ok(()),
