@@ -2,10 +2,10 @@
 
 use crate::{Error, Model};
 
-pub fn run(_: &str, _: Box<dyn Model>) -> Result<(), Error> {
+pub fn run(_: &str, _: Box<dyn Model>, _: Option<&str>) -> Result<(), Error> {
     Err("the settings window isn't available on this platform; edit config.toml".into())
 }
 
-pub fn activate(_: u32) -> bool {
+pub fn activate(_: u32, _: Option<&str>) -> bool {
     false
 }

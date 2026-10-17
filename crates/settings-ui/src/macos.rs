@@ -11,7 +11,7 @@
 //! page is then rebuilt from the model on the next run-loop turn (never inside the control's
 //! own action or a text field's end-of-editing), with the focused control focused again.
 
-use crate::{Control, Error, Event, Model, Page};
+use crate::{Control, Error, Event, Model, Page, Stat};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
@@ -40,6 +40,10 @@ const LABEL_WIDTH: f64 = 170.0;
 const CONTROL_WIDTH: f64 = 320.0;
 const LONG_TEXT_HEIGHT: f64 = 84.0;
 const MARGIN: f64 = 20.0;
+/// A full-width row (a table, figures): both columns and the gap between them.
+const FULL_WIDTH: f64 = LABEL_WIDTH + 8.0 + CONTROL_WIDTH;
+/// A table's columns after the first.
+const TABLE_COLUMN_WIDTH: f64 = 70.0;
 /// Posted by [`activate`]: the window comes to the front.
 const RAISE: &str = "io.notics.agt.settings.raise";
 /// How often [`Model::changed_elsewhere`] is asked.
@@ -118,7 +122,20 @@ define_class!(
         }
 
         #[unsafe(method(raise:))]
-        fn raise(&self, _notification: &NSNotification) {
+        fn raise(&self, notification: &NSNotification) {
+            // The page to show, if [`activate`] named one.
+            let page = notification
+                .object()
+                .and_then(|o| o.downcast::<NSString>().ok())
+                .map(|t| t.to_string());
+            let index = self
+                .with(|s| crate::page_index(&s.pages, page.as_deref()).filter(|&i| i != s.current))
+                .flatten();
+            if let Some(index) = index {
+                self.end_editing();
+                self.with(|s| s.current = index);
+                self.rebuild(true);
+            }
             if let Some(window) = self.with(|s| s.window.clone()).flatten() {
                 bring_forward(&window);
             }
@@ -324,6 +341,17 @@ impl Controller {
             return;
         };
         let focused = focused_id(&window, self);
+        // The same page shown afresh (e.g. new figures) keeps its scroll position: how far
+        // its visible part is below the top.
+        let below_top = window
+            .contentView()
+            .filter(|_| !force)
+            .and_then(|v| v.downcast::<NSScrollView>().ok())
+            .and_then(|scroll| {
+                let doc = scroll.documentView()?;
+                let visible = scroll.documentVisibleRect();
+                Some(doc.frame().size.height - visible.origin.y - visible.size.height)
+            });
         let Some(view) = self.with(|s| {
             s.stale = false;
             let pages = s.model.pages();
@@ -380,8 +408,11 @@ impl Controller {
         window.setContentView(Some(&content_view));
         window.setFrame_display_animate(frame, true, window.isVisible());
         if scrolls {
-            // To the top (not flipped: the top is at the largest y; the clip view clamps).
-            view.scrollPoint(NSPoint::new(0.0, view.frame().size.height));
+            // To the top (not flipped: the top is at the largest y; the clip view clamps),
+            // or where it was.
+            let height = view.frame().size.height;
+            let y = below_top.map_or(height, |below| (height - size.height - below).max(0.0));
+            view.scrollPoint(NSPoint::new(0.0, y));
         }
 
         if let Some(id) = focused {
@@ -472,6 +503,17 @@ fn page_view(
             }
         }
         for r in &section.rows {
+            if let Some(wide) = full_width_view(mtm, &r.control) {
+                let row = grid.addRowWithViews(&NSArray::from_retained_slice(&[wide, empty()]));
+                row.mergeCellsInRange(NSRange::new(0, 2));
+                row.cellAtIndex(0)
+                    .setXPlacement(NSGridCellPlacement::Leading);
+                if section_top {
+                    row.setTopPadding(14.0);
+                    section_top = false;
+                }
+                continue;
+            }
             let label: Retained<NSView> = if r.label.is_empty() {
                 empty()
             } else {
@@ -527,6 +569,94 @@ fn page_view(
             .constraintEqualToAnchor_constant(&grid.bottomAnchor(), MARGIN),
     ]));
     view
+}
+
+/// The system font at `size` and `weight` (`NSFontWeight`: 0 regular, 0.3 semibold), with
+/// evenly spaced digits if `digits`. Through `msg_send!`: objc2-app-kit puts `NSFontWeight`
+/// behind a feature of its own.
+fn font(size: f64, weight: f64, digits: bool) -> Retained<NSFont> {
+    unsafe {
+        if digits {
+            msg_send![NSFont::class(), monospacedDigitSystemFontOfSize: size, weight: weight]
+        } else {
+            msg_send![NSFont::class(), systemFontOfSize: size, weight: weight]
+        }
+    }
+}
+
+/// The view of a control that spans both columns ([`Control::Stats`], [`Control::Table`]).
+fn full_width_view(mtm: MainThreadMarker, control: &Control) -> Option<Retained<NSView>> {
+    let label = |text: &str, font: &NSFont, secondary: bool| {
+        let l = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        l.setFont(Some(font));
+        if secondary {
+            l.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        }
+        l.setSelectable(true);
+        Retained::into_super(Retained::into_super(l))
+    };
+    let grid = match control {
+        Control::Stats(stats) => stats_grid(mtm, stats, &label),
+        Control::Table { columns, rows } => {
+            let header = font(NSFont::smallSystemFontSize(), 0.3, false);
+            let body = font(NSFont::systemFontSize(), 0.0, true);
+            let grid = NSGridView::initWithFrame(NSGridView::alloc(mtm), NSRect::ZERO);
+            grid.setRowSpacing(4.0);
+            grid.setColumnSpacing(8.0);
+            let cells: Vec<_> = columns.iter().map(|c| label(c, &header, true)).collect();
+            grid.addRowWithViews(&NSArray::from_retained_slice(&cells));
+            for row in rows {
+                let cells: Vec<_> = (0..columns.len())
+                    .map(|i| label(row.get(i).map_or("", String::as_str), &body, false))
+                    .collect();
+                grid.addRowWithViews(&NSArray::from_retained_slice(&cells));
+            }
+            let rest = columns.len().saturating_sub(1) as f64;
+            for i in 0..grid.numberOfColumns() {
+                let column = grid.columnAtIndex(i);
+                if i == 0 {
+                    column.setXPlacement(NSGridCellPlacement::Leading);
+                    column.setWidth(FULL_WIDTH - rest * (TABLE_COLUMN_WIDTH + 8.0));
+                } else {
+                    column.setXPlacement(NSGridCellPlacement::Trailing);
+                    column.setWidth(TABLE_COLUMN_WIDTH);
+                }
+            }
+            if grid.numberOfRows() > 1 {
+                grid.rowAtIndex(1).setTopPadding(2.0);
+            }
+            grid
+        }
+        _ => return None,
+    };
+    Some(Retained::into_super(grid))
+}
+
+/// Large figures over their captions, in equal columns.
+fn stats_grid(
+    mtm: MainThreadMarker,
+    stats: &[Stat],
+    label: &dyn Fn(&str, &NSFont, bool) -> Retained<NSView>,
+) -> Retained<NSGridView> {
+    let big = font(22.0, 0.3, true);
+    let small = font(NSFont::smallSystemFontSize(), 0.0, false);
+    let grid = NSGridView::initWithFrame(NSGridView::alloc(mtm), NSRect::ZERO);
+    grid.setRowSpacing(0.0);
+    grid.setColumnSpacing(8.0);
+    let values: Vec<_> = stats.iter().map(|s| label(&s.value, &big, false)).collect();
+    let captions: Vec<_> = stats
+        .iter()
+        .map(|s| label(&s.caption, &small, true))
+        .collect();
+    grid.addRowWithViews(&NSArray::from_retained_slice(&values));
+    grid.addRowWithViews(&NSArray::from_retained_slice(&captions));
+    let n = stats.len().max(1) as f64;
+    for i in 0..grid.numberOfColumns() {
+        let column = grid.columnAtIndex(i);
+        column.setXPlacement(NSGridCellPlacement::Center);
+        column.setWidth((FULL_WIDTH - (n - 1.0) * 8.0) / n);
+    }
+    grid
 }
 
 #[allow(non_snake_case)]
@@ -664,6 +794,10 @@ fn control_view(
             };
             Retained::into_super(b)
         }
+        // Shown by `full_width_view`.
+        Control::Stats(_) | Control::Table { .. } => {
+            return unsafe { NSGridCell_emptyContentView(mtm) };
+        }
     };
     view.setTag(id as isize + 1);
     view.setEnabled(enabled);
@@ -716,7 +850,7 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     bar
 }
 
-pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
+pub fn run(title: &str, mut model: Box<dyn Model>, page: Option<&str>) -> Result<(), Error> {
     let mtm = MainThreadMarker::new().ok_or("the settings window must run on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -726,12 +860,13 @@ pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
     if pages.is_empty() {
         return Err("no settings to show".into());
     }
+    let current = crate::page_index(&pages, page).unwrap_or(0);
     let controller = Controller::new(
         mtm,
         State {
             model,
             pages,
-            current: 0,
+            current,
             window: None,
             shown_text: HashMap::new(),
             text_views: Vec::new(),
@@ -804,7 +939,7 @@ fn bring_forward(window: &NSWindow) {
     app.activateIgnoringOtherApps(true);
 }
 
-pub fn activate(pid: u32) -> bool {
+pub fn activate(pid: u32, page: Option<&str>) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -816,7 +951,7 @@ pub fn activate(pid: u32) -> bool {
         NSDistributedNotificationCenter::defaultCenter()
             .postNotificationName_object_userInfo_deliverImmediately(
                 &NSString::from_str(RAISE),
-                None,
+                page.map(NSString::from_str).as_deref(),
                 None,
                 true,
             );

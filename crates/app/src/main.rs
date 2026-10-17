@@ -531,7 +531,8 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
-            AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(),
+            AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(false),
+            AppEvent::Menu(e) if e.id == tray.open_metrics => settings::window::open(true),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
                 // The page for the first missing permission (or Accessibility, to review).
@@ -898,7 +899,7 @@ pub(crate) fn open_history() {
     open_folder(&dir);
 }
 
-fn open_folder(dir: &std::path::Path) {
+pub(crate) fn open_folder(dir: &std::path::Path) {
     let opener = if cfg!(windows) {
         "explorer"
     } else if cfg!(target_os = "macos") {
