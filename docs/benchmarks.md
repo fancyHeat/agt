@@ -1001,9 +1001,9 @@ same.
   segment before the last, plus the last segment and the tail: about one segment more than
   measured here. Telemetry: `polish_ahead_pieces`, `polish_ahead_ms`, `polish_release_words`,
   `polish_fallbacks`, `polish_wait_ms` (waiting for a request still running) and
-  `polish_outcome = partial`. After a failed request (`Outcome::Failed`: an error or a
-  timeout) the dictation's remaining pieces stay raw, so a hung server costs one deadline,
-  not one per piece.
+  `polish_outcome = partial`. After a request that runs out of time the dictation's remaining
+  pieces stay raw, so a hung server costs one deadline, not one per piece; a quick failure (a
+  server restarting) doesn't stop the rest.
 - **Telemetry** (metrics only): polish time at release, the release piece's word count, pieces
   polished ahead and their total time, guard fallbacks per piece, and draft acceptance
   (llama-server's `timings.draft_n` / `draft_n_accepted`) to see whether 24-token drafts suit

@@ -1444,8 +1444,8 @@ struct Pieces {
     raw_words: usize,
     /// Time spent on the pieces polished in the background, before the transcript was ready.
     ahead_ms: f64,
-    /// A request failed: the rest of the pieces stay raw.
-    failed: bool,
+    /// A request ran out of time: the rest of the pieces stay raw.
+    timed_out: bool,
 }
 
 impl Pieces {
@@ -1456,24 +1456,27 @@ impl Pieces {
             outcomes: Vec::new(),
             raw_words: 0,
             ahead_ms: 0.0,
-            failed: false,
+            timed_out: false,
         }
     }
 
-    /// Polishes the next piece, or keeps it raw once a request for this dictation failed: a
-    /// server that is down or hung would make every piece wait out its own deadline, one
-    /// after the other.
+    /// Polishes the next piece, or keeps it raw once a request for this dictation failed by
+    /// running out of time: a hung server would make every piece wait out its own deadline,
+    /// one after the other. A quick failure (a server restarting) doesn't stop the rest.
     fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
-        self.raw_words += piece.split_whitespace().count();
-        let (text, outcome) = if self.failed {
-            let why = "an earlier piece failed".to_owned();
+        let words = piece.split_whitespace().count();
+        self.raw_words += words;
+        let (text, outcome) = if self.timed_out {
+            let why = "an earlier piece timed out".to_owned();
             (piece.to_owned(), Outcome::Failed(why))
         } else {
+            let t = Instant::now();
             let (text, outcome) = agt_polish::polish_or_raw(p, piece, cfg);
             log_outcome(&outcome, piece, "piece");
+            self.timed_out =
+                matches!(outcome, Outcome::Failed(_)) && t.elapsed() >= cfg.timeout(words);
             (text, outcome)
         };
-        self.failed |= matches!(outcome, Outcome::Failed(_));
         self.texts.push(text);
         self.outcomes.push(outcome);
     }
@@ -2235,8 +2238,8 @@ mod tests {
     }
 
     /// Ends each text with " ok." (one more word, so the guard accepts it). Fails texts with
-    /// "FAIL" in them, and answers those with "REPLY" like an assistant (the guard rejects
-    /// that).
+    /// "FAIL" in them at once and those with "HANG" after the deadline ([`TEST_TIMEOUT`]),
+    /// and answers those with "REPLY" like an assistant (the guard rejects that).
     struct Marks;
     impl Polisher for Marks {
         fn name(&self) -> String {
@@ -2247,7 +2250,10 @@ mod tests {
             text: &str,
             _: &agt_core::polish::PolishCtx,
         ) -> agt_core::polish::Result<String> {
-            if text.contains("FAIL") {
+            if text.contains("HANG") {
+                thread::sleep(TEST_TIMEOUT + Duration::from_millis(5));
+                Err("timed out".into())
+            } else if text.contains("FAIL") {
                 Err("failed".into())
             } else if text.contains("REPLY") {
                 Ok("Sure! Here you go.".into())
@@ -2256,6 +2262,8 @@ mod tests {
             }
         }
     }
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(20);
 
     /// Runs the polish thread over `msgs`; returns what it hands to `paste`.
     fn polish_all(msgs: Vec<ToPolish>) -> Vec<(String, Box<Dictation>)> {
@@ -2267,6 +2275,8 @@ mod tests {
         drop(tx);
         let mut config = Config::default();
         config.paste.trailing_space = false;
+        config.polish.timeout_ms = TEST_TIMEOUT.as_millis() as u64;
+        config.polish.timeout_per_word_ms = 0;
         polish_thread(config, rx, to_paste, Some(Arc::new(Marks)));
         pasted
             .try_iter()
@@ -2346,9 +2356,9 @@ mod tests {
     }
 
     #[test]
-    fn after_a_failed_request_the_rest_of_the_pieces_stay_raw() {
+    fn after_a_timed_out_request_the_rest_of_the_pieces_stay_raw() {
         let a = Arc::<Shared>::default();
-        let one = format!("{} FAIL.", sentences(25, "one"));
+        let one = format!("{} HANG.", sentences(25, "one"));
         let two = sentences(25, "two");
         let out = polish_all(vec![
             piece(&one, &a),
@@ -2361,6 +2371,22 @@ mod tests {
         // All raw: the failure's own outcome.
         assert_eq!(d.polish_outcome, Some("fallback"));
         assert_eq!(d.polish_fallbacks, Some(3));
+    }
+
+    #[test]
+    fn a_quick_failure_doesnt_stop_the_rest() {
+        let a = Arc::<Shared>::default();
+        let one = format!("{} FAIL.", sentences(25, "one"));
+        let two = sentences(25, "two");
+        let out = polish_all(vec![
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["the end"], &a),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        assert_eq!(text, &format!("{one} {two} ok. the end ok."));
+        assert_eq!(d.polish_outcome, Some("partial"));
+        assert_eq!(d.polish_fallbacks, Some(1));
     }
 
     #[test]

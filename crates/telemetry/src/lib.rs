@@ -191,9 +191,10 @@ pub struct Dictation {
     /// Cancelled while a segment was being transcribed: the time that call took, wasted.
     pub live_discarded_ms: Option<f64>,
     /// Polished in pieces, some in the background (`agt_polish::ahead`; `None` otherwise):
-    /// the pieces polished before the transcript was ready (while recording, or after release
-    /// while the tail was transcribed) and the time they took, the words left to polish then,
-    /// and the pieces (of all) pasted raw after a failure.
+    /// the pieces polished before the polish thread got to the transcript (most while
+    /// recording; one still queued when the transcript was ready also counts in
+    /// `polish_wait_ms`) and the time they took, the words left to polish after that, and
+    /// the pieces (of all) pasted raw after a failure.
     pub polish_ahead_pieces: Option<i64>,
     pub polish_ahead_ms: Option<f64>,
     pub polish_release_words: Option<i64>,
