@@ -1,5 +1,5 @@
-//! Polishing a long dictation while it is still being recorded (not wired into the app yet;
-//! see docs/benchmarks.md, "Polish speed").
+//! Polishing a long dictation while it is still being recorded (see docs/benchmarks.md,
+//! "Polish speed").
 //!
 //! The pipeline transcribes finished segments of a long dictation while the user is still
 //! talking. [`Ahead`] takes those transcripts in order and hands out pieces that can be
@@ -32,16 +32,30 @@ pub const MAX_PIECE_WORDS: usize = 1000;
 
 /// Abbreviations that end with a period but don't end a sentence before a capital. Words
 /// with a period inside (`U.S.`, `a.m.`, `Ph.D.`) and initials are recognized without a list.
+/// An abbreviation that is also a word (`sun.`, `sat.`, `in.`) is left out: it ends sentences
+/// far more often.
+#[rustfmt::skip]
 const ABBREVIATIONS: &[&str] = &[
-    "mr.", "mrs.", "ms.", "dr.", "prof.", "st.", "jr.", "sr.", "mt.", "vs.", "no.", "etc.",
-    "approx.", "fig.", "figs.", "inc.", "ltd.", "co.", "corp.", "dept.", "est.", "vol.",
+    // Titles (English, German, Dutch).
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "jr.", "sr.", "sen.", "rep.", "gov.", "pres.",
+    "gen.", "col.", "capt.", "cpt.", "lt.", "sgt.", "maj.", "adm.", "cmdr.", "rev.", "hon.",
+    "hr.", "hrn.", "fr.", "frl.", "mevr.", "dhr.",
+    // Places and addresses.
+    "st.", "mt.", "ft.", "rd.", "ave.", "blvd.", "ln.", "hwy.", "str.", "nr.",
+    // Months and weekdays.
+    "jan.", "feb.", "mar.", "apr.", "jun.", "jul.", "aug.", "sep.", "sept.", "oct.", "nov.",
+    "dec.", "mon.", "tue.", "tues.", "thu.", "thur.", "thurs.", "fri.",
+    // References and the rest.
+    "vs.", "no.", "nos.", "etc.", "approx.", "ca.", "cf.", "al.", "fig.", "figs.", "vol.",
+    "pp.", "ch.", "sec.", "eq.", "ref.", "ext.", "tel.", "inc.", "ltd.", "co.", "corp.",
+    "bros.", "dept.", "univ.", "est.", "bzw.", "usw.", "evtl.",
 ];
 
 /// Splits a dictation's segment transcripts into pieces to polish ahead of release.
 ///
 /// ```text
 /// let Some(mut ahead) = Ahead::new(&cfg) else { polish the whole text at release, as today };
-/// for each segment transcript:  if let Some(piece) = ahead.push(text) { polish piece now }
+/// for each segment transcript:  for piece in ahead.push(text) { polish piece now }
 /// at release:                   polish each of ahead.finish(tail's transcript)
 /// ```
 /// The polished pieces, joined with spaces in order, are the polished dictation.
@@ -56,32 +70,45 @@ pub struct Ahead {
 impl Ahead {
     /// `None` when the output needs the whole text: S1-mini's email context (a greeting and
     /// a sign-off around everything) and its list structure (bullets need all the items).
-    /// Whether pieces are worth a request each (a cloud provider bills them) is the caller's
-    /// call.
+    /// Also `None` for a server that isn't on this machine (a cloud provider bills every
+    /// piece as a request); S1-mini always is.
     pub fn new(cfg: &PolishConfig) -> Option<Self> {
         let s1 = &cfg.s1_mini;
-        let whole_only = cfg.provider == PolishProvider::S1Mini
-            && (s1.context == S1Context::Email || s1.structure == S1Structure::Lists);
-        (!whole_only).then(Self::default)
+        let ok = match cfg.provider {
+            PolishProvider::S1Mini => {
+                s1.context != S1Context::Email && s1.structure != S1Structure::Lists
+            }
+            PolishProvider::OpenAi | PolishProvider::Anthropic => {
+                crate::is_loopback(cfg.base_url())
+            }
+        };
+        ok.then(Self::default)
     }
 
-    /// Adds the next segment's transcript. Returns the text that is ready to polish: up to
-    /// the last sentence end that isn't at a segment boundary, if that gives a piece of at
-    /// least [`MIN_PIECE_WORDS`] words (or a forced cut, see the module docs).
-    pub fn push(&mut self, segment: &str) -> Option<String> {
+    /// Adds the next segment's transcript. Returns the text that is ready to polish (usually
+    /// one piece or none): up to the last sentence end that isn't at a segment boundary, if
+    /// that gives a piece of at least [`MIN_PIECE_WORDS`] words (or a forced cut, see the
+    /// module docs), in pieces of at most [`MAX_PIECE_WORDS`].
+    pub fn push(&mut self, segment: &str) -> Vec<String> {
         let before = self.words.len();
         self.words
             .extend(segment.split_whitespace().map(str::to_owned));
         if self.words.len() == before {
-            return None;
+            return Vec::new();
         }
         self.seams.push(self.words.len());
-        let held = self.words.len();
-        let cut = self.sentence_cut(held - 1).or_else(|| {
-            // The last boundary before this segment, so only this segment stays held.
-            (held > MAX_HELD_WORDS).then(|| self.forced_cut(held - 1))
-        })?;
-        Some(self.take(cut))
+        let mut pieces = Vec::new();
+        loop {
+            let held = self.words.len();
+            let max = (held - 1).min(MAX_PIECE_WORDS);
+            let Some(cut) = self.sentence_cut(max).or_else(|| {
+                // The last boundary before this segment, so only this segment stays held.
+                (held > MAX_HELD_WORDS).then(|| self.forced_cut(max))
+            }) else {
+                return pieces;
+            };
+            pieces.push(self.take(cut));
+        }
     }
 
     /// At release: everything not handed out yet followed by the tail's transcript, as the
@@ -135,12 +162,16 @@ impl Ahead {
     }
 }
 
-/// `end.`, `why?"`, `no!)`, `3.5.`, but not `Mr.`, `U.S.`, `a.m.` or an initial (`J.`).
+/// `end.`, `why?"`, `no!)`, `3.5.`, but not `Mr.`, `U.S.`, `a.m.`, an initial (`J.`) or
+/// punctuation on its own (`...`, `?`).
 fn ends_sentence(word: &str) -> bool {
     let w = word.trim_end_matches(['"', '\'', ')', '\u{201d}', '\u{2019}']);
     let Some(body) = w.strip_suffix(['.', '?', '!']) else {
         return false;
     };
+    if !body.contains(char::is_alphanumeric) {
+        return false;
+    }
     if w.ends_with('.') {
         let number = body
             .chars()
@@ -172,14 +203,16 @@ mod tests {
         Ahead::new(&PolishConfig::default()).unwrap()
     }
 
+    fn one(pieces: Vec<String>) -> String {
+        assert_eq!(pieces.len(), 1, "{pieces:?}");
+        pieces.into_iter().next().unwrap()
+    }
+
     #[test]
     fn cuts_at_the_last_sentence_end_inside_a_segment() {
         let mut a = ahead();
         let seg = format!("{}. Then we left. And then", words(20, "a"));
-        assert_eq!(
-            a.push(&seg).as_deref(),
-            Some(format!("{}. Then we left.", words(20, "a")).as_str())
-        );
+        assert_eq!(a.push(&seg), [format!("{}. Then we left.", words(20, "a"))]);
         assert_eq!(a.finish("we went home."), ["And then we went home."]);
     }
 
@@ -187,12 +220,12 @@ mod tests {
     fn never_cuts_at_a_segment_boundary() {
         let mut a = ahead();
         // The recognizer's period at the end of a segment may be a pause mid-sentence.
-        assert_eq!(
-            a.push(&format!("{} My great-grandparents.", words(25, "a"))),
-            None
+        assert!(
+            a.push(&format!("{} My great-grandparents.", words(25, "a")))
+                .is_empty()
         );
         // The boundary goes to the model inside one piece, with both sides.
-        let piece = a.push("Died all of them. Here").unwrap();
+        let piece = one(a.push("Died all of them. Here"));
         assert!(
             piece.ends_with("My great-grandparents. Died all of them."),
             "{piece}"
@@ -203,10 +236,8 @@ mod tests {
     #[test]
     fn a_later_segment_releases_text_held_back_earlier() {
         let mut a = ahead();
-        assert_eq!(a.push(&format!("{} end.", words(5, "a"))), None); // too short to cut
-        let piece = a
-            .push(&format!("More {}. Next one", words(20, "bee")))
-            .unwrap();
+        assert!(a.push(&format!("{} end.", words(5, "a"))).is_empty()); // too short to cut
+        let piece = one(a.push(&format!("More {}. Next one", words(20, "bee"))));
         assert!(piece.starts_with("a a a a a end. More bee"), "{piece}");
         assert!(piece.ends_with("bee."), "{piece}");
         assert_eq!(a.finish(""), ["Next one"]);
@@ -225,17 +256,24 @@ mod tests {
             "met Mr. Smith and J. K. Rowling",
             "it costs 3.5 Euros",
             "and this. then that",
+            "asked Sen. Warren and Gen. Milley",
+            "due Jan. Fifth or Sept. First",
+            "at 5 Elm Rd. Springfield",
+            "sagte Hr. Müller zu Nr. Fünf",
+            "and then ... Later we",
+            "what ? Nobody knew",
         ] {
             let mut a = ahead();
-            assert_eq!(
-                a.push(&format!("{} {phrase} and more", words(20, "a"))),
-                None,
+            assert!(
+                a.push(&format!("{} {phrase} and more", words(20, "a")))
+                    .is_empty(),
                 "{phrase}"
             );
         }
         assert!(ends_sentence("left.\"") && ends_sentence("why?") && ends_sentence("3.5."));
         // An ellipsis may trail off mid-sentence: not a cut.
         assert!(!ends_sentence("wait...") && !ends_sentence("met,") && !ends_sentence("É."));
+        assert!(!ends_sentence("...") && !ends_sentence("?!") && !ends_sentence(".\""));
         assert!(starts_sentence("\"Hello") && !starts_sentence("2021") && !starts_sentence("and"));
     }
 
@@ -279,9 +317,81 @@ mod tests {
     }
 
     #[test]
+    fn only_servers_on_this_machine_get_pieces() {
+        let cfg = |provider, base_url: &str| PolishConfig {
+            provider,
+            base_url: base_url.into(),
+            ..PolishConfig::default()
+        };
+        for local in ["", "http://127.0.0.1:8080/v1", "http://[::1]:1234/v1"] {
+            assert!(
+                Ahead::new(&cfg(PolishProvider::OpenAi, local)).is_some(),
+                "{local}"
+            );
+        }
+        assert!(Ahead::new(&cfg(PolishProvider::OpenAi, "https://api.openai.com/v1")).is_none());
+        assert!(Ahead::new(&cfg(PolishProvider::OpenAi, "http://192.168.1.5:11434/v1")).is_none());
+        assert!(Ahead::new(&cfg(PolishProvider::Anthropic, "")).is_none());
+    }
+
+    #[test]
     fn empty_segments_change_nothing() {
         let mut a = ahead();
-        assert_eq!(a.push("   "), None);
+        assert!(a.push("   ").is_empty());
         assert_eq!(a.finish(""), [""]);
+    }
+
+    #[test]
+    fn no_piece_from_push_is_over_the_cap() {
+        // One huge segment whose only sentence end is past the cap.
+        let mut a = ahead();
+        let seg = format!("{} end. Then {}", words(1099, "a"), words(50, "b"));
+        let pieces = a.push(&seg);
+        let lens: Vec<usize> = pieces
+            .iter()
+            .map(|p| p.split_whitespace().count())
+            .collect();
+        assert_eq!(lens, [1000, 100]);
+        let mut all = pieces;
+        all.extend(a.finish(""));
+        assert_eq!(all.join(" "), seg);
+    }
+
+    #[test]
+    fn joined_pieces_are_the_input() {
+        let text = "So um I talked to Dr. Smith at 9 a.m. today. She said the U.S. office \
+            moved to 5 Elm Rd. in Springfield... Anyway! \"Why?\" he asked. It costs approx. \
+            3.5 million, i.e. a lot. Mr. J. K. Rowling wrote it ... and then ? Nothing. \
+            We met Sen. Warren on Jan. Fifth. Then Gen. Milley (the chairman) left. OK. \
+            Fine. 2021 was the year. No. 5 is next. That's it.";
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        // The text six times over, cut into segments at random words, the last few words
+        // left for the tail; many times over.
+        let all = words.repeat(6);
+        for _ in 0..200 {
+            let mut a = ahead();
+            let mut pieces = Vec::new();
+            let tail_at = all.len() - next(10);
+            let mut at = 0;
+            while at < tail_at {
+                let end = (at + 1 + next(40)).min(tail_at);
+                pieces.extend(a.push(&all[at..end].join(" ")));
+                at = end;
+                if next(10) == 0 {
+                    pieces.extend(a.push(""));
+                }
+            }
+            pieces.extend(a.finish(&all[tail_at..].join(" ")));
+            assert!(pieces.iter().all(|p| !p.is_empty()), "{pieces:?}");
+            assert!(pieces.len() > 1);
+            assert_eq!(pieces.join(" "), all.join(" "));
+        }
     }
 }

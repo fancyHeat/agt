@@ -38,7 +38,9 @@
 //!   length.
 //! - With `save_text` only: `raw`, the transcript before polish (whitespace collapsed);
 //!   `polished`, the polish output, or `null` when polish was off, skipped (short) or failed;
-//!   `polish_outcome`: `"polished"`, `"skipped"`, `"too_long"`, `"fallback"`, or `null` (polish off);
+//!   `polish_outcome`: `"polished"`, `"skipped"`, `"too_long"`, `"fallback"`, `"partial"` (a
+//!   long dictation polished in pieces, some of which failed and are raw in `polished`), or
+//!   `null` (polish off);
 //!   `pasted`, exactly what was pasted (trailing space included), or `null` if nothing was
 //!   (no speech, or the paste failed).
 

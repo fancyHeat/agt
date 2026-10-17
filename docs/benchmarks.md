@@ -995,6 +995,13 @@ same.
   multi-minute dictations; on Windows it saves ~0.3 s p50 / ~0.6 s p90 for 1-6 minute ones in
   the best case (see the caveat above). It would also lift the 1,400-word cap on polishing
   (`polish_outcome = too_long`): no piece is over 1,000 words, however long the dictation.
+  *Wired (#46)* as described, with one difference: the STT worker feeds `Ahead` one segment
+  behind, because at release a short tail may be transcribed again together with the last
+  segment and replace its text (`Piece::redo`). So the release piece is the rest of the
+  segment before the last, plus the last segment and the tail: about one segment more than
+  measured here. Telemetry: `polish_ahead_pieces`, `polish_ahead_ms`, `polish_release_words`,
+  `polish_fallbacks` and `polish_outcome = partial`; `polish_ms` now runs from the raw text to
+  the polished one, waits included.
 - **Telemetry** (metrics only): polish time at release, the release piece's word count, pieces
   polished ahead and their total time, guard fallbacks per piece, and draft acceptance
   (llama-server's `timings.draft_n` / `draft_n_accepted`) to see whether 24-token drafts suit
