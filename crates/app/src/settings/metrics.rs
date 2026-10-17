@@ -59,14 +59,21 @@ impl Metrics {
 
     /// Reloads if the database changed (or the period moved on). Whether the figures did.
     pub fn refresh(&mut self) -> bool {
+        let mut open_error = None;
         if self.conn.is_none() && self.path.exists() {
-            self.conn = Reader::open(&self.path).ok();
+            match Reader::open(&self.path) {
+                Ok(r) => self.conn = Some(r),
+                Err(e) => open_error = Some(e),
+            }
         }
         let Some(conn) = &self.conn else {
-            let none = Err(format!(
-                "No usage recorded yet: {} doesn't exist.",
-                self.path.display()
-            ));
+            let none = Err(match open_error {
+                Some(e) => format!("Cannot open {}: {e}", self.path.display()),
+                None => format!(
+                    "No usage recorded yet: {} doesn't exist.",
+                    self.path.display()
+                ),
+            });
             let changed = self.data != none;
             self.data = none;
             return changed;

@@ -48,7 +48,13 @@ pub fn open(metrics: bool) {
 /// `agt settings [metrics]`. One window at a time: if one is open, this brings it to the
 /// front (on the Metrics page if asked for).
 pub fn run() {
-    let page = (std::env::args().nth(2).as_deref() == Some("metrics")).then_some(metrics::TITLE);
+    // Any title but the Metrics page's shows the first page: "Settings..." while the window
+    // is open on Metrics goes back to the settings.
+    let page = if std::env::args().nth(2).as_deref() == Some("metrics") {
+        metrics::TITLE
+    } else {
+        "Settings"
+    };
     let dir = paths::data_dir();
     let _ = fs::create_dir_all(&dir);
     let pid_file = dir.join("settings.pid");
@@ -63,7 +69,7 @@ pub fn run() {
                     let pid = fs::read_to_string(&pid_file).ok();
                     if pid
                         .and_then(|p| p.trim().parse().ok())
-                        .is_some_and(|pid| agt_settings_ui::activate(pid, page))
+                        .is_some_and(|pid| agt_settings_ui::activate(pid, Some(page)))
                     {
                         break;
                     }
@@ -87,7 +93,7 @@ pub fn run() {
         stamp: None,
         metrics: metrics::Metrics::new(paths::db_file()),
     };
-    if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), page) {
+    if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page)) {
         eprintln!("agt settings: {e}");
     }
 }

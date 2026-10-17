@@ -321,12 +321,13 @@ fn set_fonts(dpi: u32) {
     }
 }
 
-/// Sizes the window for the tallest page (up to most of the screen), the list and the pane
-/// in it. `center`: also centers it on its monitor.
+/// Sizes the window for the current page (up to most of the screen; another page resizes
+/// it, like the macOS window), the list and the pane in it. `center`: also centers it on
+/// its monitor.
 fn place(window: HWND, center: bool) {
-    let Some((dpi, list, pane, heights)) = with(|s| {
-        let heights: Vec<i32> = s.pages.iter().map(|p| layout(p, s.dpi).1).collect();
-        (s.dpi, s.list, s.pane, heights)
+    let Some((dpi, list, pane, page_height)) = with(|s| {
+        let height = s.pages.get(s.current).map_or(0, |p| layout(p, s.dpi).1);
+        (s.dpi, s.list, s.pane, height)
     }) else {
         return;
     };
@@ -350,8 +351,7 @@ fn place(window: HWND, center: bool) {
             dpi,
         );
         let width = dip(LIST_WIDTH, dpi) + pane_width;
-        let tallest = heights.into_iter().max().unwrap_or(0);
-        let height = tallest.min((work.bottom - work.top) * 85 / 100);
+        let height = page_height.min((work.bottom - work.top) * 85 / 100);
         let mut frame = RECT {
             left: 0,
             top: 0,
@@ -445,7 +445,7 @@ fn layout(page: &Page, dpi: u32) -> (Vec<(Placed, RECT)>, i32) {
                 Control::LongText { .. } => d(LONG_TEXT_HEIGHT),
                 Control::Button(_) => d(26),
                 Control::Value(text) => measure(text, control_width, false).max(d(20)),
-                Control::Stats(_) | Control::Table { .. } => 0,
+                Control::Stats(_) | Control::Table { .. } => unreachable!("laid out above"),
             };
             if !row.label.is_empty() {
                 // Centered on a one-line control, level with the first line otherwise.
@@ -929,6 +929,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                             s.scroll = 0;
                         });
                         rebuild(true);
+                        place(hwnd, false);
                     }
                 } else if id == IDOK {
                     // Enter in a one-line field: report it now.
@@ -1001,6 +1002,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                         s.scroll = 0;
                     });
                     rebuild(true);
+                    place(hwnd, false);
                 }
                 1
             }

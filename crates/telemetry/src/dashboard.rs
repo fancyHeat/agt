@@ -152,15 +152,22 @@ pub fn load(conn: &Connection, now: i64, days: Option<i64>) -> rusqlite::Result<
     d.outcomes = counts(conn, "dictations", "outcome", "started_at", start)?;
     d.polish_outcomes = counts(conn, "dictations", "polish_outcome", "started_at", start)?;
     d.stt_backends = counts(conn, "dictations", "stt_backend", "started_at", start)?;
-    for &metric in DICTATION_METRICS {
-        if let Some(s) = Summary::of(values(
-            conn,
-            "dictations",
-            metric,
-            "started_at",
-            start,
-            true,
-        )?) {
+    // One pass over the pasted dictations for every column.
+    let mut columns = vec![Vec::new(); DICTATION_METRICS.len()];
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM dictations WHERE started_at >= ?1 AND outcome = 'pasted'",
+        DICTATION_METRICS.join(", ")
+    ))?;
+    let mut rows = stmt.query([start])?;
+    while let Some(row) = rows.next()? {
+        for (i, column) in columns.iter_mut().enumerate() {
+            if let Some(v) = row.get::<_, Option<f64>>(i)? {
+                column.push(v);
+            }
+        }
+    }
+    for (&metric, values) in DICTATION_METRICS.iter().zip(columns) {
+        if let Some(s) = Summary::of(values) {
             d.metrics.push((metric, s));
         }
     }
@@ -182,14 +189,7 @@ pub fn load(conn: &Connection, now: i64, days: Option<i64>) -> rusqlite::Result<
     )?;
     d.exit_reasons = counts(conn, "app_sessions", "exit_reason", "started_at", start)?;
     for &metric in SESSION_METRICS {
-        if let Some(s) = Summary::of(values(
-            conn,
-            "app_sessions",
-            metric,
-            "started_at",
-            start,
-            false,
-        )?) {
+        if let Some(s) = Summary::of(values(conn, "app_sessions", metric, "started_at", start)?) {
             d.session_metrics.push((metric, s));
         }
     }
@@ -267,19 +267,16 @@ fn counts(
         .collect()
 }
 
-/// `column`'s non-null values in `table` since `start` (`pasted`: of pasted dictations only,
-/// like the rollups).
+/// `column`'s non-null values in `table` since `start`.
 fn values(
     conn: &Connection,
     table: &str,
     column: &str,
     time: &str,
     start: i64,
-    pasted: bool,
 ) -> rusqlite::Result<Vec<f64>> {
-    let filter = if pasted { "AND outcome = 'pasted'" } else { "" };
     let mut stmt = conn.prepare(&format!(
-        "SELECT {column} FROM {table} WHERE {time} >= ?1 AND {column} IS NOT NULL {filter}"
+        "SELECT {column} FROM {table} WHERE {time} >= ?1 AND {column} IS NOT NULL"
     ))?;
     stmt.query_map([start], |r| r.get::<_, f64>(0))?.collect()
 }

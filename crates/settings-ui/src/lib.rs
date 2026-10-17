@@ -130,20 +130,22 @@ pub(crate) fn note(pages: &mut [Page], event: &Event) {
     }
 }
 
-/// Shows the window, on the page titled `page` (else the first), and runs until it's
+/// Shows the window, on the page titled `page` (else the first, see [`activate`]), and runs until it's
 /// closed. Must be called on the main thread, once.
 pub fn run(title: &str, model: Box<dyn Model>, page: Option<&str>) -> Result<(), Error> {
     platform::run(title, model, page)
 }
 
 /// Brings the window of another process running [`run`] (`pid`) to the front, showing the
-/// page titled `page` if given. False if it couldn't be found.
+/// page titled `page` if given (a title no page has: the first page). False if it couldn't
+/// be found.
 pub fn activate(pid: u32, page: Option<&str>) -> bool {
     platform::activate(pid, page)
 }
 
-/// The index of the page titled `title`, if any.
+/// The index of the page titled `title` (a title no page has: the first page); `None` for
+/// no title.
 pub(crate) fn page_index(pages: &[Page], title: Option<&str>) -> Option<usize> {
     let title = title?;
-    pages.iter().position(|p| p.title == title)
+    Some(pages.iter().position(|p| p.title == title).unwrap_or(0))
 }
