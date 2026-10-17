@@ -664,3 +664,36 @@ fn senders_never_wait_for_the_disk() {
     drop(conn);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn dashboard_summarizes_the_window() {
+    let conn = memory();
+    let now = 100 * DAY_MS;
+    insert_session(&conn, &SessionStart::default(), now - 1000).unwrap();
+    dictation(&conn, now - 2 * DAY_MS, 400.0, Outcome::Pasted);
+    dictation(&conn, now - 1000, 200.0, Outcome::Pasted);
+    dictation(&conn, now - 900, 100.0, Outcome::NoSpeech);
+    conn.execute(
+        "INSERT INTO events (ts, level, target, message) VALUES (?1, 'WARN', 't', 'careful')",
+        [now - 500],
+    )
+    .unwrap();
+
+    let d = crate::dashboard::load(&conn, now, Some(1)).unwrap();
+    assert_eq!((d.dictations, d.pasted, d.sessions), (2, 1, 1));
+    assert_eq!(d.audio_secs, 2.0);
+    assert_eq!(
+        d.outcomes,
+        vec![("no_speech".into(), 1), ("pasted".into(), 1)]
+    );
+    // Only pasted dictations count toward the metrics.
+    let stt = d.metrics.iter().find(|(m, _)| *m == "stt_ms").unwrap();
+    assert_eq!((stt.1.count, stt.1.max), (1, 100.0));
+    assert!(d.metrics.iter().all(|(m, _)| *m != "live_stt_ms"));
+    assert_eq!(d.problems.len(), 1);
+    assert_eq!(d.problems[0].2, "careful");
+    assert!(d.latest_session.is_some());
+
+    let all = crate::dashboard::load(&conn, now, None).unwrap();
+    assert_eq!((all.dictations, all.pasted), (3, 2));
+}

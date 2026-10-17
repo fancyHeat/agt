@@ -72,6 +72,21 @@ pub enum Control {
     Value(String),
     /// A push button with this title.
     Button(String),
+    /// Read-only figures in a row, each a large value over a small caption, across the
+    /// whole width (the row's label is ignored).
+    Stats(Vec<Stat>),
+    /// A read-only table across the whole width (the row's label is ignored): the first
+    /// column left-aligned, the others right-aligned (numbers), digits evenly spaced.
+    Table {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stat {
+    pub value: String,
+    pub caption: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,13 +130,22 @@ pub(crate) fn note(pages: &mut [Page], event: &Event) {
     }
 }
 
-/// Shows the window and runs until it's closed. Must be called on the main thread, once.
-pub fn run(title: &str, model: Box<dyn Model>) -> Result<(), Error> {
-    platform::run(title, model)
+/// Shows the window, on the page titled `page` (else the first, see [`activate`]), and runs until it's
+/// closed. Must be called on the main thread, once.
+pub fn run(title: &str, model: Box<dyn Model>, page: Option<&str>) -> Result<(), Error> {
+    platform::run(title, model, page)
 }
 
-/// Brings the window of another process running [`run`] (`pid`) to the front. False if it
-/// couldn't be found.
-pub fn activate(pid: u32) -> bool {
-    platform::activate(pid)
+/// Brings the window of another process running [`run`] (`pid`) to the front, showing the
+/// page titled `page` if given (a title no page has: the first page). False if it couldn't
+/// be found.
+pub fn activate(pid: u32, page: Option<&str>) -> bool {
+    platform::activate(pid, page)
+}
+
+/// The index of the page titled `title` (a title no page has: the first page); `None` for
+/// no title.
+pub(crate) fn page_index(pages: &[Page], title: Option<&str>) -> Option<usize> {
+    let title = title?;
+    Some(pages.iter().position(|p| p.title == title).unwrap_or(0))
 }

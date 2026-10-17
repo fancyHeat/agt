@@ -51,6 +51,7 @@
 //! FROM events WHERE level IN ('WARN', 'ERROR') ORDER BY ts DESC LIMIT 50;
 //! ```
 
+pub mod dashboard;
 mod db;
 pub mod stats;
 

@@ -8,7 +8,7 @@
 //! zero-length timer, whose message comes after any input still queued (so a click that moved
 //! focus out of an edit field, which reported its text, still reaches the control it was on).
 
-use crate::{Control, Error, Event, Model, Page, Row};
+use crate::{Control, Error, Event, Model, Page, Row, Stat};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -24,7 +24,7 @@ use windows_sys::Win32::{
         MONITORINFO, MonitorFromPoint, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
         TRANSPARENT,
     },
-    System::LibraryLoader::GetModuleHandleW,
+    System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW},
     UI::{
         Controls::{
             BST_CHECKED, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
@@ -60,10 +60,18 @@ const SCROLLBAR: i32 = 17;
 const ROW_SPACING: i32 = 8;
 const SECTION_SPACING: i32 = 14;
 const LONG_TEXT_HEIGHT: i32 = 72;
+/// A full-width row (a table, figures): both columns and the gap between them.
+const FULL_WIDTH: i32 = LABEL_WIDTH + GAP + CONTROL_WIDTH;
+/// A table's columns after the first.
+const TABLE_COLUMN_WIDTH: i32 = 70;
+
+/// `WM_COPYDATA` from [`activate`]: the page to show (its title, UTF-16).
+const SHOW_PAGE: usize = 0x4147_5450;
 
 const EN_KILLFOCUS: u32 = 0x0200;
 // Static control styles (in windows-sys' System_SystemServices, not worth the feature).
 const SS_LEFT: u32 = 0;
+const SS_CENTER: u32 = 1;
 const SS_RIGHT: u32 = 2;
 const SS_NOPREFIX: u32 = 0x80;
 const EM_SETCUEBANNER: u32 = 0x1501;
@@ -91,9 +99,29 @@ struct State {
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     /// Kept apart from [`STATE`]: controls ask for them while it's borrowed (being created).
-    static FONTS: Cell<(HFONT, HFONT)> = const { Cell::new((null_mut(), null_mut())) };
+    /// The dialog font, its semibold, and a large semibold for figures.
+    static FONTS: Cell<(HFONT, HFONT, HFONT)> =
+        const { Cell::new((null_mut(), null_mut(), null_mut())) };
     static NOTES: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
     static BACKGROUND: Cell<HBRUSH> = const { Cell::new(null_mut()) };
+}
+
+#[derive(Clone, Copy)]
+enum Font {
+    Normal,
+    Bold,
+    Big,
+}
+
+impl Font {
+    fn handle(self) -> HFONT {
+        let (font, bold, big) = FONTS.get();
+        match self {
+            Font::Normal => font,
+            Font::Bold => bold,
+            Font::Big => big,
+        }
+    }
 }
 
 /// Runs `f` on the state unless it's borrowed (a message sent while handling another): `None`.
@@ -112,7 +140,7 @@ fn dip(px: i32, dpi: u32) -> i32 {
     (px as i64 * dpi as i64 / 96) as i32
 }
 
-pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
+pub fn run(title: &str, mut model: Box<dyn Model>, page: Option<&str>) -> Result<(), Error> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let icc = INITCOMMONCONTROLSEX {
@@ -146,6 +174,7 @@ pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
         if pages.is_empty() {
             return Err("no settings to show".into());
         }
+        let current = crate::page_index(&pages, page).unwrap_or(0);
         let title = wide(title);
         let window = CreateWindowExW(
             WS_EX_CONTROLPARENT,
@@ -197,7 +226,7 @@ pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
             *s.borrow_mut() = Some(State {
                 model,
                 pages,
-                current: 0,
+                current,
                 window,
                 pane,
                 list,
@@ -225,14 +254,15 @@ pub fn run(title: &str, mut model: Box<dyn Model>) -> Result<(), Error> {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let (font, bold) = FONTS.get();
+        let (font, bold, big) = FONTS.get();
         DeleteObject(font as HGDIOBJ);
         DeleteObject(bold as HGDIOBJ);
+        DeleteObject(big as HGDIOBJ);
     }
     Ok(())
 }
 
-pub fn activate(_pid: u32) -> bool {
+pub fn activate(_pid: u32, page: Option<&str>) -> bool {
     unsafe {
         let window = FindWindowW(wide(CLASS).as_ptr(), null());
         if window.is_null() {
@@ -242,6 +272,24 @@ pub fn activate(_pid: u32) -> bool {
             ShowWindow(window, SW_RESTORE);
         }
         SetForegroundWindow(window);
+        if let Some(page) = page {
+            let title: Vec<u16> = page.encode_utf16().collect();
+            let data = COPYDATASTRUCT {
+                dwData: SHOW_PAGE,
+                cbData: (title.len() * 2) as u32,
+                lpData: title.as_ptr() as _,
+            };
+            let mut result = 0;
+            SendMessageTimeoutW(
+                window,
+                WM_COPYDATA,
+                0,
+                &data as *const _ as LPARAM,
+                SMTO_ABORTIFHUNG,
+                2000,
+                &mut result,
+            );
+        }
         true
     }
 }
@@ -261,21 +309,25 @@ fn set_fonts(dpi: u32) {
         let font = CreateFontIndirectW(&metrics.lfMessageFont);
         let mut bold = metrics.lfMessageFont;
         bold.lfWeight = FW_SEMIBOLD as i32;
-        let bold = CreateFontIndirectW(&bold);
-        let (old, old_bold) = FONTS.replace((font, bold));
-        if !old.is_null() {
-            DeleteObject(old as HGDIOBJ);
-            DeleteObject(old_bold as HGDIOBJ);
+        let mut big = bold;
+        big.lfHeight *= 2;
+        let (bold, big) = (CreateFontIndirectW(&bold), CreateFontIndirectW(&big));
+        let old = FONTS.replace((font, bold, big));
+        if !old.0.is_null() {
+            DeleteObject(old.0 as HGDIOBJ);
+            DeleteObject(old.1 as HGDIOBJ);
+            DeleteObject(old.2 as HGDIOBJ);
         }
     }
 }
 
-/// Sizes the window for the tallest page (up to most of the screen), the list and the pane
-/// in it. `center`: also centers it on its monitor.
+/// Sizes the window for the current page (up to most of the screen; another page resizes
+/// it, like the macOS window), the list and the pane in it. `center`: also centers it on
+/// its monitor.
 fn place(window: HWND, center: bool) {
-    let Some((dpi, list, pane, heights)) = with(|s| {
-        let heights: Vec<i32> = s.pages.iter().map(|p| layout(p, s.dpi).1).collect();
-        (s.dpi, s.list, s.pane, heights)
+    let Some((dpi, list, pane, page_height)) = with(|s| {
+        let height = s.pages.get(s.current).map_or(0, |p| layout(p, s.dpi).1);
+        (s.dpi, s.list, s.pane, height)
     }) else {
         return;
     };
@@ -299,8 +351,7 @@ fn place(window: HWND, center: bool) {
             dpi,
         );
         let width = dip(LIST_WIDTH, dpi) + pane_width;
-        let tallest = heights.into_iter().max().unwrap_or(0);
-        let height = tallest.min((work.bottom - work.top) * 85 / 100);
+        let height = page_height.min((work.bottom - work.top) * 85 / 100);
         let mut frame = RECT {
             left: 0,
             top: 0,
@@ -348,6 +399,13 @@ enum Placed {
     Label(String, bool),
     Row(Row),
     Note(String),
+    /// Read-only text of a full-width row: `align` an `SS_*` style, `gray` as a note.
+    Cell {
+        text: String,
+        align: u32,
+        font: Font,
+        gray: bool,
+    },
 }
 
 /// Each element's rectangle, and the page's height.
@@ -377,12 +435,17 @@ fn layout(page: &Page, dpi: u32) -> (Vec<(Placed, RECT)>, i32) {
             y += h + d(ROW_SPACING) / 2;
         }
         for row in &section.rows {
+            if let Some(h) = full_width(&row.control, label_x, y, dpi, &mut out) {
+                y += h + d(ROW_SPACING);
+                continue;
+            }
             let h = match &row.control {
                 Control::Toggle { .. } => d(20),
                 Control::Choice { .. } | Control::Text { .. } => d(24),
                 Control::LongText { .. } => d(LONG_TEXT_HEIGHT),
                 Control::Button(_) => d(26),
                 Control::Value(text) => measure(text, control_width, false).max(d(20)),
+                Control::Stats(_) | Control::Table { .. } => unreachable!("laid out above"),
             };
             if !row.label.is_empty() {
                 // Centered on a one-line control, level with the first line otherwise.
@@ -426,11 +489,83 @@ fn layout(page: &Page, dpi: u32) -> (Vec<(Placed, RECT)>, i32) {
     (out, y + d(MARGIN))
 }
 
+/// Lays out a control that spans both columns ([`Control::Stats`], [`Control::Table`]) at
+/// `(x, y)`: its height, or `None` for other controls.
+fn full_width(
+    control: &Control,
+    x: i32,
+    y: i32,
+    dpi: u32,
+    out: &mut Vec<(Placed, RECT)>,
+) -> Option<i32> {
+    let d = |v| dip(v, dpi);
+    let mut cell = |text: &str, align, font, gray, left, top, width, height| {
+        out.push((
+            Placed::Cell {
+                text: text.to_owned(),
+                align,
+                font,
+                gray,
+            },
+            RECT {
+                left,
+                top,
+                right: left + width,
+                bottom: top + height,
+            },
+        ));
+    };
+    match control {
+        Control::Stats(stats) => {
+            let n = stats.len().max(1) as i32;
+            let width = (d(FULL_WIDTH) - (n - 1) * d(GAP)) / n;
+            let (value_h, caption_h) = (d(34), d(18));
+            for (i, Stat { value, caption }) in stats.iter().enumerate() {
+                let left = x + i as i32 * (width + d(GAP));
+                cell(value, SS_CENTER, Font::Big, false, left, y, width, value_h);
+                cell(
+                    caption,
+                    SS_CENTER,
+                    Font::Normal,
+                    true,
+                    left,
+                    y + value_h,
+                    width,
+                    caption_h,
+                );
+            }
+            Some(value_h + caption_h)
+        }
+        Control::Table { columns, rows } => {
+            let rest = columns.len().saturating_sub(1) as i32;
+            let column = d(TABLE_COLUMN_WIDTH);
+            let first = d(FULL_WIDTH) - rest * (column + d(GAP));
+            let line = d(20);
+            let lines = std::iter::once((columns, true)).chain(rows.iter().map(|r| (r, false)));
+            for (i, (texts, header)) in lines.enumerate() {
+                let top = y + i as i32 * line;
+                for c in 0..columns.len() {
+                    let text = texts.get(c).map_or("", String::as_str);
+                    let font = if header { Font::Bold } else { Font::Normal };
+                    if c == 0 {
+                        cell(text, SS_LEFT, font, header, x, top, first, line);
+                    } else {
+                        let left = x + first + d(GAP) + (c as i32 - 1) * (column + d(GAP));
+                        cell(text, SS_RIGHT, font, header, left, top, column, line);
+                    }
+                }
+            }
+            Some((rows.len() as i32 + 1) * line)
+        }
+        _ => None,
+    }
+}
+
 /// `text`'s height wrapped at `width` (`single`: its width on one line), in the dialog font.
 fn measure(text: &str, width: i32, single: bool) -> i32 {
     unsafe {
         let dc: HDC = GetDC(null_mut());
-        let old = SelectObject(dc, FONTS.get().0 as HGDIOBJ);
+        let old = SelectObject(dc, Font::Normal.handle() as HGDIOBJ);
         let mut rect = RECT {
             left: 0,
             top: 0,
@@ -478,7 +613,7 @@ fn rebuild(force: bool) {
     };
     let Some(page) = page else { return };
     unsafe {
-        SendMessageW(list, WM_SETFONT, FONTS.get().0 as WPARAM, 0);
+        SendMessageW(list, WM_SETFONT, Font::Normal.handle() as WPARAM, 0);
         SendMessageW(list, LB_SETITEMHEIGHT, 0, dip(28, dpi) as LPARAM);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
         for t in &titles {
@@ -533,7 +668,7 @@ unsafe fn create(
     dpi: u32,
     shown_text: &mut HashMap<usize, String>,
 ) -> HWND {
-    let (font, bold) = FONTS.get();
+    let (font, bold) = (Font::Normal.handle(), Font::Bold.handle());
     let (class, text, style, ex_style, id, enabled, font) = match item {
         Placed::Header(t) => ("STATIC", t.clone(), SS_LEFT | SS_NOPREFIX, 0, 0, true, bold),
         Placed::Label(t, enabled) => (
@@ -546,6 +681,17 @@ unsafe fn create(
             font,
         ),
         Placed::Note(t) => ("STATIC", t.clone(), SS_LEFT | SS_NOPREFIX, 0, 0, true, font),
+        Placed::Cell {
+            text, align, font, ..
+        } => (
+            "STATIC",
+            text.clone(),
+            *align | SS_NOPREFIX,
+            0,
+            0,
+            true,
+            font.handle(),
+        ),
         Placed::Row(row) => {
             let id = FIRST_ID + row.id as i32;
             let (class, text, style, ex) = match &row.control {
@@ -583,6 +729,8 @@ unsafe fn create(
                     )
                 }
                 Control::Value(text) => ("STATIC", text.clone(), SS_LEFT | SS_NOPREFIX, 0),
+                // Laid out as `Placed::Cell`s.
+                Control::Stats(_) | Control::Table { .. } => return null_mut(),
                 Control::Button(title) => (
                     "BUTTON",
                     title.clone(),
@@ -640,7 +788,7 @@ unsafe fn create(
                 _ => {}
             }
         }
-        if let Placed::Note(_) = item {
+        if matches!(item, Placed::Note(_) | Placed::Cell { gray: true, .. }) {
             NOTES.with(|n| n.borrow_mut().push(hwnd));
         }
         if !enabled {
@@ -781,6 +929,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                             s.scroll = 0;
                         });
                         rebuild(true);
+                        place(hwnd, false);
                     }
                 } else if id == IDOK {
                     // Enter in a one-line field: report it now.
@@ -834,6 +983,28 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 rebuild(true);
                 place(hwnd, false);
                 0
+            }
+            WM_COPYDATA => {
+                let data = &*(lp as *const COPYDATASTRUCT);
+                if data.dwData != SHOW_PAGE || data.lpData.is_null() {
+                    return 0;
+                }
+                let title = String::from_utf16_lossy(std::slice::from_raw_parts(
+                    data.lpData as *const u16,
+                    data.cbData as usize / 2,
+                ));
+                // Moving the focus off an edit field reports its last change.
+                SetFocus(hwnd);
+                let index = with(|s| crate::page_index(&s.pages, Some(&title))).flatten();
+                if let Some(index) = index {
+                    with(|s| {
+                        s.current = index;
+                        s.scroll = 0;
+                    });
+                    rebuild(true);
+                    place(hwnd, false);
+                }
+                1
             }
             WM_CTLCOLORLISTBOX => BACKGROUND.get() as LRESULT,
             WM_CLOSE => {

@@ -1,9 +1,10 @@
 //! Settings, read from `config.toml` and written back to it ([`agt_core::config::set`]); the
 //! file stays the only place settings live. [`schema`] describes them once; they're shown
 //! in the tray's Quick settings submenu ([`Settings`]) and the settings window ([`window`],
-//! its own process: `agt settings`). In the tray, choices are clickable and free text (API
+//! its own process: `agt settings`, with a [`metrics`] page). In the tray, choices are clickable and free text (API
 //! key, prompts, URLs, the models folder) is a line that says what it is.
 
+pub mod metrics;
 pub mod schema;
 pub mod window;
 
