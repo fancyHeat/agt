@@ -12,7 +12,9 @@
 //!
 //! - After a paste that had no text field to land in, a notice takes the pill's place: "You
 //!   weren't in a text box", with a Copy button (macOS; the only window here that takes a
-//!   click, and it still never activates AGT or moves keyboard focus).
+//!   click, and it still never activates AGT or moves keyboard focus). A key press while
+//!   the speech model is still loading shows "Getting ready..." the same way, without the
+//!   button.
 //!
 //! All methods must be called on the UI (main) thread.
 
@@ -59,6 +61,11 @@ pub const ERROR_FOR: Duration = Duration::from_millis(900);
 pub const NOTICE_FOR: Duration = Duration::from_secs(12);
 /// How long it says "Copied" after the click.
 pub const COPIED_FOR: Duration = Duration::from_millis(1200);
+/// How long "Getting ready..." stays up.
+pub const GETTING_READY_FOR: Duration = Duration::from_millis(1800);
+
+pub const NOT_IN_TEXT_BOX: &str = "You weren't in a text box";
+pub const GETTING_READY: &str = "Getting ready...";
 
 /// The OS window the pill is shown in.
 trait Surface {
@@ -70,12 +77,12 @@ trait Surface {
     fn hide(&mut self);
 }
 
-/// The OS window the "not in a text box" notice is shown in.
+/// The OS window the notice ("not in a text box", "Getting ready...") is shown in.
 trait NoticeSurface {
-    /// Shows the message and the Copy button, centered where the pill goes (`margin` from the
-    /// bottom or top edge of the screen with the keyboard focus). `false` if it couldn't be
-    /// shown (no screen).
-    fn show(&mut self, margin: f32, top: bool) -> bool;
+    /// Shows `text`, and the Copy button if `copy`, centered where the pill goes (`margin`
+    /// from the bottom or top edge of the screen with the keyboard focus). `false` if it
+    /// couldn't be shown (no screen).
+    fn show(&mut self, text: &'static str, copy: bool, margin: f32, top: bool) -> bool;
     /// Swaps the message and button for "Copied", in place.
     fn copied(&mut self);
     fn hide(&mut self);
@@ -87,6 +94,8 @@ pub struct Overlay {
     notice: Option<Box<dyn NoticeSurface>>,
     /// While the notice is up: when it hides.
     notice_until: Option<Instant>,
+    /// Whether the notice up has the Copy button.
+    notice_copy: bool,
     position: Position,
     mode: Mode,
     since: Instant,
@@ -124,6 +133,7 @@ impl Overlay {
             window,
             notice,
             notice_until: None,
+            notice_copy: false,
             position,
             mode: Mode::Hidden,
             since: now,
@@ -160,7 +170,8 @@ impl Overlay {
     }
 
     /// Flashes the error state even if hidden: for a key press that couldn't start a
-    /// recording (no microphone, model not ready), which would otherwise show nothing.
+    /// recording (no microphone, the model failed to load), which would otherwise show
+    /// nothing.
     pub fn flash_error(&mut self, level: f32, now: Instant) {
         if self.mode != Mode::Error {
             self.enter(Mode::Error, level, now);
@@ -171,20 +182,39 @@ impl Overlay {
     /// dictation pasted where nothing takes text. Not over the pill (a new recording has
     /// already started); it hides after [`NOTICE_FOR`] or when the pill comes back.
     pub fn show_notice(&mut self, now: Instant) {
-        if self.mode != Mode::Hidden {
-            return;
+        if self.mode == Mode::Hidden {
+            self.show_text(NOT_IN_TEXT_BOX, true, NOTICE_FOR, now);
         }
+    }
+
+    /// Says "Getting ready..." for [`GETTING_READY_FOR`]: for a key press while the speech
+    /// model is still loading. Where there is no notice (Windows for now), flashes the error
+    /// instead, so the press still shows something.
+    pub fn show_getting_ready(&mut self, level: f32, now: Instant) {
+        self.set_mode(Mode::Hidden, level, now);
+        if !self.show_text(GETTING_READY, false, GETTING_READY_FOR, now) {
+            self.flash_error(level, now);
+        }
+    }
+
+    /// Shows the notice for `time`; `false` if it couldn't be.
+    fn show_text(&mut self, text: &'static str, copy: bool, time: Duration, now: Instant) -> bool {
         let Some(notice) = &mut self.notice else {
-            return;
+            return false;
         };
-        if notice.show(scene::MARGIN, self.position == Position::Top) {
-            self.notice_until = Some(now + NOTICE_FOR);
+        if !notice.show(text, copy, scene::MARGIN, self.position == Position::Top) {
+            return false;
         }
+        self.notice_until = Some(now + time);
+        self.notice_copy = copy;
+        true
     }
 
     /// The notice's text was copied: it says so, then hides after [`COPIED_FOR`].
     pub fn notice_copied(&mut self, now: Instant) {
-        if let (Some(notice), Some(_)) = (&mut self.notice, self.notice_until) {
+        if let (Some(notice), Some(_), true) =
+            (&mut self.notice, self.notice_until, self.notice_copy)
+        {
             notice.copied();
             self.notice_until = Some(now + COPIED_FOR);
         }
@@ -304,6 +334,7 @@ mod tests {
         presents: usize,
         visible: bool,
         notice: Option<&'static str>,
+        button: bool,
         /// The notice's `show` fails.
         no_screen: bool,
     }
@@ -327,16 +358,19 @@ mod tests {
     }
 
     impl NoticeSurface for Fake {
-        fn show(&mut self, _: f32, _: bool) -> bool {
+        fn show(&mut self, text: &'static str, copy: bool, _: f32, _: bool) -> bool {
             let mut log = self.0.borrow_mut();
             if log.no_screen {
                 return false;
             }
-            log.notice = Some("not in a text box");
+            log.notice = Some(text);
+            log.button = copy;
             true
         }
         fn copied(&mut self) {
-            self.0.borrow_mut().notice = Some("copied");
+            let mut log = self.0.borrow_mut();
+            log.notice = Some("copied");
+            log.button = false;
         }
         fn hide(&mut self) {
             self.0.borrow_mut().notice = None;
@@ -427,7 +461,8 @@ mod tests {
         let (mut o, log) = overlay();
         let t = Instant::now();
         o.show_notice(t);
-        assert_eq!(log.borrow().notice, Some("not in a text box"));
+        assert_eq!(log.borrow().notice, Some(NOT_IN_TEXT_BOX));
+        assert!(log.borrow().button);
         assert_eq!(
             o.next_frame(),
             Some(t + NOTICE_FOR),
@@ -480,7 +515,7 @@ mod tests {
         o.show_notice(later);
         assert_eq!(
             log.borrow().notice,
-            Some("not in a text box"),
+            Some(NOT_IN_TEXT_BOX),
             "the button is back"
         );
         assert_eq!(o.next_frame(), Some(later + NOTICE_FOR));
@@ -514,5 +549,46 @@ mod tests {
         let mut o = Overlay::with_surfaces(Box::new(Fake(log)), None, Position::Bottom);
         o.show_notice(Instant::now());
         assert!(!o.notice_visible(), "no notice on this platform");
+    }
+
+    #[test]
+    fn getting_ready_shows_without_a_button_then_times_out() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.show_getting_ready(0.0, t);
+        assert_eq!(log.borrow().notice, Some(GETTING_READY));
+        assert!(!log.borrow().button);
+        assert_eq!(o.mode(), Mode::Hidden, "not the red flash");
+        assert!(!log.borrow().visible);
+        o.notice_copied(t + FRAME);
+        assert_eq!(
+            log.borrow().notice,
+            Some(GETTING_READY),
+            "nothing was copied from it"
+        );
+        assert_eq!(o.next_frame(), Some(t + GETTING_READY_FOR));
+        o.tick(0.0, t + GETTING_READY_FOR);
+        assert_eq!(log.borrow().notice, None);
+        assert_eq!(o.next_frame(), None);
+    }
+
+    #[test]
+    fn getting_ready_replaces_an_error_flash() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.flash_error(0.0, t);
+        o.show_getting_ready(0.0, t + FRAME);
+        assert_eq!(o.mode(), Mode::Hidden);
+        assert!(!log.borrow().visible);
+        assert_eq!(log.borrow().notice, Some(GETTING_READY));
+    }
+
+    #[test]
+    fn getting_ready_without_a_notice_flashes_the_error() {
+        let log = Rc::new(RefCell::new(Log::default()));
+        let mut o = Overlay::with_surfaces(Box::new(Fake(log.clone())), None, Position::Bottom);
+        o.show_getting_ready(0.0, Instant::now());
+        assert_eq!(o.mode(), Mode::Error);
+        assert!(log.borrow().visible);
     }
 }

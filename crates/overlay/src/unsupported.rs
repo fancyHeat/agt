@@ -27,7 +27,7 @@ impl Notice {
 }
 
 impl NoticeSurface for Notice {
-    fn show(&mut self, _: f32, _: bool) -> bool {
+    fn show(&mut self, _: &'static str, _: bool, _: f32, _: bool) -> bool {
         false
     }
     fn copied(&mut self) {}

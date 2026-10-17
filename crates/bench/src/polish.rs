@@ -136,6 +136,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 eprintln!("           {why}");
             }
         }),
+        hold_download: None,
     };
     let polisher = agt_polish::load(&cfg, &env)?;
     println!("polisher: {}", polisher.name());
