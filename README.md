@@ -140,7 +140,8 @@ that no longer joins.
 - Transcription runs entirely on your computer. Audio is never uploaded, and only saved if you
   turn on the [dictation history](#dictation-history).
 - AGT goes online only to download its models and to check for updates. For the local AI
-  clean-up (on by default), it also downloads llama.cpp (12–32 MB) once to run it.
+  clean-up (on by default), it also downloads llama.cpp (12–32 MB) once to run it. That goes
+  in AGT's own data folder, not the models folder, which may be shared.
 - The one exception is opt-in: if you configure the clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
 - Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:

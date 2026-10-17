@@ -1034,7 +1034,7 @@ target/release/agt-bench polish --runs 1 --pause-ms 3000 --fast-drafting on long
 target/release/agt-bench polish --runs 1 --fast-drafting off --refs eval-data/long/clips --save off.tsv long.txt
 target/release/agt-bench polish --runs 1 --fast-drafting on --refs eval-data/long/clips --save on.tsv --compare off.tsv long.txt
 target/release/agt-bench polish --segments --pause-ms 3000 --fast-drafting on --refs eval-data/long/clips segs.tsv
-# llama-server flags (the managed server's files are in AGT's models folder, s1-mini/ and agt-llama-server/b11669/)
+# llama-server flags (the managed server's files: s1-mini/ in AGT's models folder, llama.cpp/b11669/ in its data folder)
 python3 scripts/polish_sweep.py --exe <llama-server> --model <s1-mini-q4_k_m.gguf> --texts long.txt \
   --warm warm.txt --pause-ms 3000 --label base --args "--n-gpu-layers all"
 python3 scripts/polish_sweep.py ... --label spec --compare base \

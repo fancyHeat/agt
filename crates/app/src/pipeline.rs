@@ -386,6 +386,7 @@ pub fn start(
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
 
+    remove_old_llama_builds(&config.stt.models_path());
     let (polisher, polish_info) = load_polisher(config, &hub);
     let saver = history::start(&config.history, paths::dictations_dir());
     let (h, cfg, tp, hs) = (hub.clone(), config.clone(), to_paste.clone(), saver.clone());
@@ -407,6 +408,30 @@ pub fn start(
     })
 }
 
+/// AGT 0.0.16 and earlier installed llama.cpp in the models folder. Removed (in the
+/// background, whatever the polish settings) from the default one, which is the user's own;
+/// a folder set in the config may be shared with an older AGT still running those builds.
+/// Never touches the disk on the calling thread: the models folder may be a slow share.
+fn remove_old_llama_builds(models_dir: &std::path::Path) {
+    let own = models_dir == paths::models_dir();
+    let dir = models_dir.to_owned();
+    spawn("cleanup", move || {
+        let old = agt_polish::managed::legacy_dir(&dir);
+        if !old.exists() {
+            return;
+        }
+        if own {
+            agt_polish::managed::remove_legacy(&dir);
+        } else {
+            tracing::warn!(
+                "{} is no longer used (llama.cpp now lives in {}); delete it once no older AGT uses this models folder",
+                old.display(),
+                paths::llama_dir().display()
+            );
+        }
+    });
+}
+
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
 /// so a local server loads its model before the first dictation. Returns the tray line.
 fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, String) {
@@ -414,7 +439,7 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
         tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
         return (None, "Polish: off (config error, see log)".into());
     }
-    if let Some(notice) = &config.polish_notice {
+    for notice in &config.polish_notices {
         tracing::warn!("{notice}");
     }
     if !config.polish.enabled {
@@ -423,6 +448,7 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
     let notify = hub.notify.clone();
     let env = agt_polish::Env {
         models_dir: config.stt.models_path(),
+        llama_dir: paths::llama_dir(),
         // Start-up output only (see agt-polish), next to agt.db ("Open data folder").
         log_file: Some(paths::history_dir().join("llama-server.log")),
         on_status: Arc::new(move |s: &agt_polish::Status| {

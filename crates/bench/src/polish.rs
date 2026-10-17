@@ -12,6 +12,8 @@
 //!   --s1-device <d>      s1-mini: auto | cpu
 //!   --fast-drafting <b>  s1-mini: on | off (polish.s1-mini.fast_drafting)
 //!   --models-dir <dir>   s1-mini: where it's downloaded (default: AGT's models folder)
+//!   --llama-dir <dir>    s1-mini: where llama.cpp is installed (default: in the temp
+//!                        folder, so a branch's build never replaces the app's)
 //!   --server-log <file>  s1-mini: llama-server's output (default: in the temp folder)
 //!   --timeout-ms <n>     override polish.timeout_ms
 //!   --runs <n>           polish each line n times (default 3); latency = median
@@ -51,11 +53,12 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--fast-drafting on|off] [--models-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] [--refs dir] [--save f] [--compare f] [--segments] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench polish [--config f] [--provider s1-mini|openai|anthropic] [--base-url u] [--model m] [--style light|formal] [--styling s] [--context c] [--s1-device auto|cpu] [--fast-drafting on|off] [--models-dir d] [--llama-dir d] [--server-log f] [--timeout-ms n] [--runs n] [--hold secs] [--pause-ms n] [--refs dir] [--save f] [--compare f] [--segments] <transcripts.txt>";
 
 pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut cfg = PolishConfig::default();
     let mut models_dir = paths::models_dir();
+    let mut llama_dir = std::env::temp_dir().join("agt-bench-llama.cpp");
     let mut server_log = std::env::temp_dir().join("agt-bench-llama-server.log");
     let (mut runs, mut hold, mut pause, mut file) = (3usize, 0u64, 0u64, None);
     let (mut segments, mut refs, mut save, mut compare) = (false, None, None, None);
@@ -77,6 +80,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--context" => cfg.s1_mini.context = crate::enum_value(&a, val()?)?,
             "--s1-device" => cfg.s1_mini.device = crate::enum_value(&a, val()?)?,
             "--models-dir" => models_dir = PathBuf::from(val()?),
+            "--llama-dir" => llama_dir = PathBuf::from(val()?),
             "--server-log" => server_log = PathBuf::from(val()?),
             "--timeout-ms" => cfg.timeout_ms = val()?.parse().map_err(|_| "bad --timeout-ms")?,
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
@@ -123,6 +127,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let t0 = Instant::now();
     let env = agt_polish::Env {
         models_dir,
+        llama_dir,
         log_file: Some(server_log),
         on_status: Arc::new(move |s: &agt_polish::Status| {
             eprintln!("[{:6.1} s] {s}", t0.elapsed().as_secs_f64());

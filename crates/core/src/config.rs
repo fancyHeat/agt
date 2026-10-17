@@ -113,8 +113,9 @@ restore_clipboard_ms = 500
 # pasted instead.
 enabled = true
 # "s1-mini": S1-mini by Superwhisper, a small model made for exactly this (English only), run
-# by AGT on this machine. On first use AGT downloads it (485 MB) and llama.cpp's llama-server
-# (12-32 MB) to the models folder and starts the server in the background.
+# by AGT on this machine. On first use AGT downloads it (485 MB) to the models folder and
+# llama.cpp's llama-server (12-32 MB) to its own data folder, and starts the server in the
+# background.
 # "openai": an OpenAI-compatible chat completions server you run yourself: Ollama, LM Studio,
 # llama.cpp's llama-server, or a cloud provider. "anthropic": the Claude API (cloud).
 provider = "s1-mini"
@@ -254,9 +255,9 @@ pub struct Config {
     /// Why `[polish]` couldn't be used (see [`Config::parse`]); polish is then off.
     #[serde(skip)]
     pub polish_error: Option<String>,
-    /// Something about `[polish]` worth a warning in the log (see [`Config::parse`]).
+    /// Things about `[polish]` worth a warning in the log (see [`Config::parse`]).
     #[serde(skip)]
-    pub polish_notice: Option<String>,
+    pub polish_notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -641,7 +642,7 @@ impl Default for Config {
             history: HistoryConfig::default(),
             update: UpdateConfig::default(),
             polish_error: None,
-            polish_notice: None,
+            polish_notices: Vec::new(),
         }
     }
 }
@@ -755,32 +756,39 @@ impl ConfigError {
     }
 
     fn at(message: &str, span: Option<std::ops::Range<usize>>, text: &str) -> Self {
-        let at = span.map(|span| {
-            let before = &text[..span.start.min(text.len())];
-            let line = before.matches('\n').count() + 1;
-            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-            (line, column)
-        });
         Self::Parse {
             message: redact_values(message.trim()),
-            at,
+            at: line_column(span, text),
         }
     }
+}
+
+/// 1-based line and column where `span` starts in `text`.
+fn line_column(span: Option<std::ops::Range<usize>>, text: &str) -> Option<(usize, usize)> {
+    span.map(|span| {
+        let before = &text[..span.start.min(text.len())];
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        (line, column)
+    })
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "config I/O error: {e}"),
-            Self::Parse {
-                message,
-                at: Some((line, column)),
-            } => write!(
-                f,
-                "invalid config.toml at line {line}, column {column}: {message}"
-            ),
-            Self::Parse { message, at: None } => write!(f, "invalid config.toml: {message}"),
+            Self::Parse { message, at } => {
+                f.write_str(&located("invalid config.toml", message, *at))
+            }
         }
+    }
+}
+
+/// `<what> at line L, column C: <message>`, or without the position if there is none.
+fn located(what: &str, message: &str, at: Option<(usize, usize)>) -> String {
+    match at {
+        Some((line, column)) => format!("{what} at line {line}, column {column}: {message}"),
+        None => format!("{what}: {message}"),
     }
 }
 
@@ -792,27 +800,30 @@ impl Config {
     /// turns polish off ([`Config::polish_error`] says why) and keeps the rest of the
     /// user's settings. Anything wrong elsewhere fails the whole file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut table: toml::Table =
-            toml::from_str(text).map_err(|e| ConfigError::parse(e, text))?;
-        let polish = table.remove("polish");
-        let mut config: Self = toml::Value::Table(table)
-            .try_into()
+        // Deserialized from the parsed document rather than a `toml::Value`, which has no
+        // positions: errors keep their line and column.
+        let mut table = toml::de::DeTable::parse(text).map_err(|e| ConfigError::parse(e, text))?;
+        let polish = table.get_mut().remove("polish");
+        let mut config = Self::deserialize(toml::de::Deserializer::from(table))
             .map_err(|e| ConfigError::parse(e, text))?;
         if let Some(mut polish) = polish {
             // Written before `s1-mini` became the default: `base_url` without a provider
             // meant the OpenAI-compatible one (a server the user runs).
-            if let Some(t) = polish.as_table_mut()
+            if let toml::de::DeValue::Table(t) = polish.get_mut()
                 && !t.contains_key("provider")
                 && t.get("base_url")
-                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.get_ref().as_str())
                     .is_some_and(|u| !u.trim().is_empty())
             {
-                t.insert("provider".into(), "openai".into());
-                config.polish_notice = Some(
+                t.insert(
+                    toml::Spanned::new(0..0, "provider".into()),
+                    toml::Spanned::new(0..0, toml::de::DeValue::String("openai".into())),
+                );
+                config.polish_notices.push(
                     "[polish] has base_url but no provider: using provider = \"openai\" (write it into config.toml to silence this)".into(),
                 );
             }
-            match polish.try_into::<PolishConfig>() {
+            match PolishConfig::deserialize(toml::de::ValueDeserializer::from(polish)) {
                 Ok(p) => {
                     let ignored = p.provider == PolishProvider::S1Mini
                         && (!p.base_url.is_empty()
@@ -820,7 +831,7 @@ impl Config {
                             || !p.api_key.is_empty()
                             || !p.api_key_env.is_empty());
                     if ignored {
-                        config.polish_notice = Some(
+                        config.polish_notices.push(
                             "[polish] provider = \"s1-mini\" ignores base_url, model and api_key*; for your own server use provider = \"openai\"".into(),
                         );
                     }
@@ -829,8 +840,11 @@ impl Config {
                 Err(e) => {
                     config.polish = PolishConfig::default();
                     config.polish.enabled = false;
-                    config.polish_error =
-                        Some(format!("[polish]: {}", redact_values(e.message().trim())));
+                    config.polish_error = Some(located(
+                        "[polish]",
+                        &redact_values(e.message().trim()),
+                        line_column(e.span(), text),
+                    ));
                 }
             }
         }
@@ -1033,6 +1047,25 @@ mod tests {
     }
 
     #[test]
+    fn errors_say_where() {
+        // Valid TOML, but not a valid config: in a section, and in [polish] (which is
+        // deserialized on its own).
+        let e = Config::parse("[paste]\ntrailing_space = true\n\n[stt]\ntypo = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("invalid config.toml at line 5, column 1:"),
+            "{e}"
+        );
+        let c = Config::parse("[stt]\n\n[polish]\nenabled = true\ntimeout_ms = \"x\"\n").unwrap();
+        let e = c.polish_error.unwrap();
+        assert!(e.starts_with("[polish] at line 5, column 14:"), "{e}");
+        let c = Config::parse("[polish]\nbase_url = \"http://h/v1\"\ntypo = 1\n").unwrap();
+        let e = c.polish_error.unwrap();
+        assert!(e.starts_with("[polish] at line 3, column 1:"), "{e}");
+    }
+
+    #[test]
     fn errors_never_echo_values() {
         // A key in a numeric field, an enum field, and outside [polish] (fails the file).
         for (text, field) in [
@@ -1099,20 +1132,21 @@ mod tests {
             .unwrap();
         assert_eq!(c.polish.provider, PolishProvider::OpenAi);
         assert_eq!(c.polish.base_url(), "http://localhost:8080/v1");
-        assert!(c.polish_notice.is_some());
+        assert_eq!(c.polish_notices.len(), 1);
         let c = Config::parse("[polish]\nprovider = \"s1-mini\"\nmodel = \"x\"").unwrap();
-        assert!(c.polish_notice.unwrap().contains("ignores"));
+        assert_eq!(c.polish_notices.len(), 1);
+        assert!(c.polish_notices[0].contains("ignores"));
         assert!(
             Config::parse("[polish]\nenabled = true")
                 .unwrap()
-                .polish_notice
-                .is_none()
+                .polish_notices
+                .is_empty()
         );
         assert!(
             Config::parse(DEFAULT_CONFIG)
                 .unwrap()
-                .polish_notice
-                .is_none()
+                .polish_notices
+                .is_empty()
         );
     }
 
