@@ -107,11 +107,10 @@ trailing_space = true
 restore_clipboard_ms = 500
 
 [polish]
-# Optional clean-up of each transcript by an LLM before pasting: punctuation, capitalization,
-# filler words ("um", "you know") and false starts. Off by default. Adds latency (typically
-# 0.05-0.5 s on a GPU). On any error, timeout or suspicious output, the raw transcript is
-# pasted instead.
-enabled = false
+# Clean-up of each transcript by an LLM before pasting: punctuation, capitalization, filler
+# words ("um", "you know") and false starts. On by default. Adds latency (typically 0.05-0.5 s
+# on a GPU). On any error, timeout or suspicious output, the raw transcript is pasted instead.
+enabled = true
 # "s1-mini": S1-mini by Superwhisper, a small model made for exactly this (English only), run
 # by AGT on this machine. On first use AGT downloads it (485 MB) and llama.cpp's llama-server
 # (12-32 MB) to the models folder and starts the server in the background.
@@ -468,7 +467,7 @@ pub enum PolishStyle {
 impl Default for PolishConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: PolishProvider::S1Mini,
             base_url: String::new(),
             model: String::new(),
@@ -1170,7 +1169,7 @@ mod tests {
     #[test]
     fn polish_defaults_depend_on_provider() {
         let c = Config::default().polish;
-        assert!(!c.enabled);
+        assert!(c.enabled);
         assert_eq!(c.provider, PolishProvider::S1Mini);
         assert_eq!(c.model(), "s1-mini");
         assert_eq!(c.timeout(0), std::time::Duration::from_millis(2000));
