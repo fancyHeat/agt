@@ -36,11 +36,27 @@ text **on your own computer**; your voice never leaves it.
 Good to know:
 
 - Press **Esc** while holding the hotkey to cancel.
+- Long dictations are fine (up to 30 minutes): AGT transcribes what you said before each pause
+  while you keep talking, so when you let go only the last few seconds are left to transcribe.
+  Polish (S1-mini, or a server on your own machine) also cleans up finished sentences while
+  you keep talking, so only the end is left when you let go. S1-mini's email context and
+  list structure need the whole text instead: with those, a dictation of more than about
+  1,400 words (some 10 minutes) is pasted unpolished, as it doesn't fit the model's context.
+  Settings... → Polish → **Fast drafting**
+  (`fast_drafting` under `[polish.s1-mini]`) polishes long text about twice as fast on a GPU,
+  at the cost of an occasional different word or comma; it's off by default.
+- **Hands-free:** tap the hotkey twice quickly and AGT keeps recording after you let go; press
+  it once more to stop and paste. Esc cancels, and one left running for 30 minutes is
+  discarded. `double_tap_ms` under `[hotkey]` in `config.toml` sets how quick (0 turns it
+  off).
 - While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
-  and comes back when you let go. Settings → **Lower other audio while dictating** turns this
-  off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
+  and comes back when you let go. Settings... → **Lower other audio while dictating** turns
+  this off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
   in `config.toml`).
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
+- macOS: if focus clearly wasn't in a text box when the text was pasted (you'd clicked a web
+  page, a link or the desktop), the text is still pasted, and a note where the bar was says so,
+  with a **Copy** button that puts the text on your clipboard. It needs the overlay on.
 
 ## macOS
 
@@ -53,8 +69,10 @@ AGT asks for two permissions on first launch, one after the other:
 Until everything is granted, the menu-bar item says which permission is missing, and its
 "Privacy & Security settings..." item opens the right page.
 
-The default hotkey is **Fn** (the 🌐 Globe key). Set System Settings > Keyboard > "Press 🌐 key
-to" to **Do Nothing**, or releasing it also opens the emoji picker or starts Apple's dictation.
+The default hotkey is **Fn** (the 🌐 Globe key). While AGT runs, tapping it no longer does
+what System Settings > Keyboard > "Press 🌐 key to" says (by default, opening the emoji
+picker), so a dictation doesn't also open the picker. Fn+key shortcuts still work. If a
+tap still sets off something else, set "Press 🌐 key to" to **Do Nothing**.
 Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
 `"Fn+RightOption"`.
 
@@ -75,20 +93,24 @@ downloads and installs it and restarts AGT (as soon as dictation is idle) — no
 
 ## Settings
 
-Settings live in a plain text file, `config.toml`, with a comment on every option:
+Tray menu → **Settings...** opens the settings window: every option, in pages (General,
+Speech, Polish, History, Advanced). The tray's **Quick settings** submenu has the same
+choices without opening a window.
+
+Either way, settings live in a plain text file, `config.toml`, with a comment on every option:
 
 - Windows: `%APPDATA%\AGT\config.toml`
 - macOS: `~/Library/Application Support/AGT/config.toml`
 
 Tray menu → **Open config folder** takes you there. AGT restarts on its own to apply a change
-(once dictation is idle): right away for one made in the tray's **Settings** menu, a few
-seconds after the last save for an edit to the file. You can change the hotkey, turn the
-overlay off, or enable optional AI clean-up of your text (removes "um"s, fixes punctuation;
-off by default, and it runs locally unless you point it at a cloud service).
+(once dictation is idle): right away for one made in **Quick settings**, a few seconds after
+the last change for one made in the settings window or the file. You can change the hotkey, turn the
+overlay off, or turn off AI clean-up of your text (removes "um"s, fixes punctuation; on by
+default, and it runs locally unless you point it at a cloud service).
 
 ## Dictation history
 
-Off by default. Tray menu → **Settings → History** lets AGT keep a copy of each dictation:
+Off by default. **Settings... → History** lets AGT keep a copy of each dictation:
 
 - **Save transcripts**: the transcript as recognized, the cleaned-up text (if AI clean-up is
   on) and the text that was pasted.
@@ -156,9 +178,10 @@ type into during the call. Dictation keeps working; what you dictate isn't part 
 
 - Transcription runs entirely on your computer. Audio is never uploaded, and only saved if you
   turn on the [dictation history](#dictation-history).
-- AGT goes online only to download its models and to check for updates. If you turn on the
-  local AI clean-up, it also downloads llama.cpp (12–32 MB) once to run it.
-- The one exception is opt-in: if you configure the optional clean-up to use a cloud service
+- AGT goes online only to download its models and to check for updates. For the local AI
+  clean-up (on by default), it also downloads llama.cpp (12–32 MB) once to run it. That goes
+  in AGT's own data folder, not the models folder, which may be shared.
+- The one exception is opt-in: if you configure the clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
 - AI notes for a [meeting](#meeting-notes) send its transcript and your notes to your own
   Claude Code CLI when you click Generate notes, or automatically after each meeting if you

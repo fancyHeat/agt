@@ -13,6 +13,7 @@
 //! [`guard`]). Every request has a hard deadline ([`PolishConfig::timeout`]) covering
 //! connect, send and the whole response.
 
+pub mod ahead;
 pub mod guard;
 pub mod managed;
 pub mod prompt;
@@ -108,12 +109,18 @@ fn is_env_var_name(s: &str) -> bool {
 /// `https://...`, or plain http to this machine (or a URL that doesn't parse: requests to
 /// it fail anyway, so there's nothing to warn about).
 fn is_https_or_loopback(base: &str) -> bool {
-    let Ok(u) = url::Url::parse(base) else {
-        return true;
-    };
-    if u.scheme() != "http" {
-        return true;
+    match url::Url::parse(base) {
+        Ok(u) if u.scheme() == "http" => is_local(&u),
+        _ => true,
     }
+}
+
+/// A URL whose host is this machine (`localhost`, `127.x.x.x`, `[::1]`).
+pub(crate) fn is_loopback(base: &str) -> bool {
+    url::Url::parse(base).is_ok_and(|u| is_local(&u))
+}
+
+fn is_local(u: &url::Url) -> bool {
     match u.host() {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

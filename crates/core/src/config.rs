@@ -1,8 +1,8 @@
 //! `config.toml`. Every field has a default, so a partial or empty file is valid.
 //! Unknown keys are rejected so typos surface instead of being silently ignored.
 //!
-//! The file is the only place settings live: the tray's Settings menu edits it through
-//! [`set`], which keeps the user's comments and layout.
+//! The file is the only place settings live: the tray's menu and the settings window edit
+//! it through [`set`], which keeps the user's comments and layout.
 
 use serde::Deserialize;
 use std::{fs, io, path::Path, path::PathBuf};
@@ -26,10 +26,10 @@ pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
-    r#"# AGT configuration. The tray menu's Settings change this file too. AGT applies a saved
-# change by restarting itself once you're not dictating.
+    r#"# AGT configuration. The tray menu's Settings window changes this file too. AGT applies a
+# saved change by restarting itself once you're not dictating.
 # If this file has an error, a running AGT keeps its settings until it's fixed; starting with
-# an error, AGT uses defaults (updates off). Either way it records the error.
+# an error, AGT uses defaults (updates and polish off). Either way it records the error.
 
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
@@ -42,8 +42,8 @@ log_level = "info"
 # Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (the default on
 # Windows); LeftWin/RightWin only work in a chord with Ctrl or Shift. A chord starts once
 # all its keys are down and ends when any of them is released.
-# macOS keys: Fn (the Globe key, the default; set System Settings > Keyboard > "Press 🌐 key
-# to" to "Do Nothing"), RightOption, RightCommand, or F13-F20.
+# macOS keys: Fn (the Globe key, the default; on its own, tapping it no longer also opens
+# the emoji picker), RightOption, RightCommand, or F13-F20.
 # With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
 # keys are up: if you already hold the hotkey for the next dictation, the previous text
 # lands when you release it (after 10 s it's pasted anyway).
@@ -52,6 +52,10 @@ key = ""#,
     r#""
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
+# Hands-free: tap the hotkey twice (the second press within this many milliseconds of letting
+# go of the first) and AGT keeps recording after you let go, until you press the hotkey
+# again; that press pastes. Esc cancels, and so does running for 30 minutes. 0: off.
+double_tap_ms = 400
 
 [audio]
 # Microphone to record from, by name as the Settings menu lists it. "": the system's default
@@ -103,14 +107,15 @@ trailing_space = true
 restore_clipboard_ms = 500
 
 [polish]
-# Optional clean-up of each transcript by an LLM before pasting: punctuation, capitalization,
-# filler words ("um", "you know") and false starts. Off by default. Adds latency (typically
-# 0.05-0.5 s on a GPU). On any error, timeout or suspicious output, the raw transcript is
+# Clean-up of each transcript by an LLM before pasting: punctuation, capitalization, filler
+# words ("um", "you know") and false starts. On by default. Adds latency (typically 0.05-0.5 s
+# on a GPU, more on a CPU). On any error, timeout or suspicious output, the raw transcript is
 # pasted instead.
-enabled = false
+enabled = true
 # "s1-mini": S1-mini by Superwhisper, a small model made for exactly this (English only), run
-# by AGT on this machine. On first use AGT downloads it (485 MB) and llama.cpp's llama-server
-# (12-32 MB) to the models folder and starts the server in the background.
+# by AGT on this machine. On first use AGT downloads it (485 MB) to the models folder and
+# llama.cpp's llama-server (12-32 MB) to its own data folder, and starts the server in the
+# background.
 # "openai": an OpenAI-compatible chat completions server you run yourself: Ollama, LM Studio,
 # llama.cpp's llama-server, or a cloud provider. "anthropic": the Claude API (cloud).
 provider = "s1-mini"
@@ -156,6 +161,11 @@ context = "general"
 # "auto": on the GPU (Metal on a Mac, Vulkan on Windows; ~0.85 GB of VRAM) if there is one,
 # else the CPU. "cpu": always on the CPU (slower: ~0.5 s instead of 0.08 s for a sentence).
 device = "auto"
+# Draft from the transcript (llama.cpp's speculative decoding): up to 2-3x faster on long
+# dictations, since the cleaned text mostly repeats the transcript (little gain when it
+# rewrites a lot). The trade-off: now and then a word or punctuation mark comes out
+# differently where two choices were nearly tied. Only the S1-mini that AGT runs uses it.
+fast_drafting = false
 
 [overlay]
 # Show a small bar with a live waveform while recording and an animation while transcribing.
@@ -167,7 +177,7 @@ position = "bottom"
 [history]
 # Keep a copy of each dictation, e.g. to look back at what you said or to build a custom
 # dictionary. Stored only on this machine, as plain files in the "dictations" folder next to
-# agt.db (tray: Settings > History > Open history folder); never uploaded. Turning saving off
+# agt.db (tray: Settings... > History > Open history folder); never uploaded. Turning saving off
 # keeps what's already there (it's still deleted after keep_days).
 # Save the transcript (before polish), the polished text and the pasted text (dictations.jsonl).
 save_text = false
@@ -277,9 +287,9 @@ pub struct Config {
     /// Why `[polish]` couldn't be used (see [`Config::parse`]); polish is then off.
     #[serde(skip)]
     pub polish_error: Option<String>,
-    /// Something about `[polish]` worth a warning in the log (see [`Config::parse`]).
+    /// Things about `[polish]` worth a warning in the log (see [`Config::parse`]).
     #[serde(skip)]
-    pub polish_notice: Option<String>,
+    pub polish_notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -288,6 +298,8 @@ pub struct HotkeyConfig {
     /// Key name or `+`-separated chord; parsed (and rejected if invalid) by `agt-platform`.
     pub key: String,
     pub min_hold_ms: u64,
+    /// Max gap between a tap's release and the next press for a double tap; 0 = off.
+    pub double_tap_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -374,7 +386,7 @@ pub struct PasteConfig {
     pub restore_clipboard_ms: u64,
 }
 
-/// `[polish]`: optional LLM clean-up of transcripts (see `agt-polish`).
+/// `[polish]`: LLM clean-up of transcripts, on by default (see `agt-polish`).
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolishConfig {
@@ -419,6 +431,8 @@ pub struct S1MiniConfig {
     pub structure: S1Structure,
     pub context: S1Context,
     pub device: S1Device,
+    /// Speculative decoding from the prompt (llama-server `--spec-type ngram-simple`).
+    pub fast_drafting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -459,6 +473,7 @@ impl Default for S1MiniConfig {
             structure: S1Structure::Prose,
             context: S1Context::General,
             device: S1Device::Auto,
+            fast_drafting: false,
         }
     }
 }
@@ -486,7 +501,7 @@ pub enum PolishStyle {
 impl Default for PolishConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: PolishProvider::S1Mini,
             base_url: String::new(),
             model: String::new(),
@@ -710,7 +725,7 @@ impl Default for Config {
             meeting: MeetingConfig::default(),
             update: UpdateConfig::default(),
             polish_error: None,
-            polish_notice: None,
+            polish_notices: Vec::new(),
         }
     }
 }
@@ -720,6 +735,7 @@ impl Default for HotkeyConfig {
         Self {
             key: DEFAULT_HOTKEY.into(),
             min_hold_ms: 150,
+            double_tap_ms: 400,
         }
     }
 }
@@ -823,32 +839,39 @@ impl ConfigError {
     }
 
     fn at(message: &str, span: Option<std::ops::Range<usize>>, text: &str) -> Self {
-        let at = span.map(|span| {
-            let before = &text[..span.start.min(text.len())];
-            let line = before.matches('\n').count() + 1;
-            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-            (line, column)
-        });
         Self::Parse {
             message: redact_values(message.trim()),
-            at,
+            at: line_column(span, text),
         }
     }
+}
+
+/// 1-based line and column where `span` starts in `text`.
+fn line_column(span: Option<std::ops::Range<usize>>, text: &str) -> Option<(usize, usize)> {
+    span.map(|span| {
+        let before = &text[..span.start.min(text.len())];
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        (line, column)
+    })
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "config I/O error: {e}"),
-            Self::Parse {
-                message,
-                at: Some((line, column)),
-            } => write!(
-                f,
-                "invalid config.toml at line {line}, column {column}: {message}"
-            ),
-            Self::Parse { message, at: None } => write!(f, "invalid config.toml: {message}"),
+            Self::Parse { message, at } => {
+                f.write_str(&located("invalid config.toml", message, *at))
+            }
         }
+    }
+}
+
+/// `<what> at line L, column C: <message>`, or without the position if there is none.
+fn located(what: &str, message: &str, at: Option<(usize, usize)>) -> String {
+    match at {
+        Some((line, column)) => format!("{what} at line {line}, column {column}: {message}"),
+        None => format!("{what}: {message}"),
     }
 }
 
@@ -860,27 +883,30 @@ impl Config {
     /// turns polish off ([`Config::polish_error`] says why) and keeps the rest of the
     /// user's settings. Anything wrong elsewhere fails the whole file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut table: toml::Table =
-            toml::from_str(text).map_err(|e| ConfigError::parse(e, text))?;
-        let polish = table.remove("polish");
-        let mut config: Self = toml::Value::Table(table)
-            .try_into()
+        // Deserialized from the parsed document rather than a `toml::Value`, which has no
+        // positions: errors keep their line and column.
+        let mut table = toml::de::DeTable::parse(text).map_err(|e| ConfigError::parse(e, text))?;
+        let polish = table.get_mut().remove("polish");
+        let mut config = Self::deserialize(toml::de::Deserializer::from(table))
             .map_err(|e| ConfigError::parse(e, text))?;
         if let Some(mut polish) = polish {
             // Written before `s1-mini` became the default: `base_url` without a provider
             // meant the OpenAI-compatible one (a server the user runs).
-            if let Some(t) = polish.as_table_mut()
+            if let toml::de::DeValue::Table(t) = polish.get_mut()
                 && !t.contains_key("provider")
                 && t.get("base_url")
-                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.get_ref().as_str())
                     .is_some_and(|u| !u.trim().is_empty())
             {
-                t.insert("provider".into(), "openai".into());
-                config.polish_notice = Some(
+                t.insert(
+                    toml::Spanned::new(0..0, "provider".into()),
+                    toml::Spanned::new(0..0, toml::de::DeValue::String("openai".into())),
+                );
+                config.polish_notices.push(
                     "[polish] has base_url but no provider: using provider = \"openai\" (write it into config.toml to silence this)".into(),
                 );
             }
-            match polish.try_into::<PolishConfig>() {
+            match PolishConfig::deserialize(toml::de::ValueDeserializer::from(polish)) {
                 Ok(p) => {
                     let ignored = p.provider == PolishProvider::S1Mini
                         && (!p.base_url.is_empty()
@@ -888,7 +914,7 @@ impl Config {
                             || !p.api_key.is_empty()
                             || !p.api_key_env.is_empty());
                     if ignored {
-                        config.polish_notice = Some(
+                        config.polish_notices.push(
                             "[polish] provider = \"s1-mini\" ignores base_url, model and api_key*; for your own server use provider = \"openai\"".into(),
                         );
                     }
@@ -897,8 +923,11 @@ impl Config {
                 Err(e) => {
                     config.polish = PolishConfig::default();
                     config.polish.enabled = false;
-                    config.polish_error =
-                        Some(format!("[polish]: {}", redact_values(e.message().trim())));
+                    config.polish_error = Some(located(
+                        "[polish]",
+                        &redact_values(e.message().trim()),
+                        line_column(e.span(), text),
+                    ));
                 }
             }
         }
@@ -922,11 +951,13 @@ impl Config {
         Self::parse(&fs::read_to_string(path).map_err(ConfigError::Io)?)
     }
 
-    /// What to run with when the config file can't be loaded: defaults, but with
-    /// updates off, since the user may have disabled them in the file we couldn't read.
+    /// What to run with when the config file can't be loaded: defaults, but with updates
+    /// and polish off, since the user may have disabled them in the file we couldn't read
+    /// (polish would otherwise download S1-mini and change the pasted text).
     pub fn fallback() -> Self {
         let mut c = Self::default();
         c.update.enabled = false;
+        c.polish.enabled = false;
         c
     }
 }
@@ -992,7 +1023,8 @@ pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Confi
     };
     let out = with_settings(&text, changes)?;
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    let tmp = target.with_extension("toml.tmp");
+    // Per process: the tray and the settings window may both be writing.
+    let tmp = target.with_extension(format!("toml.{}.tmp", std::process::id()));
     let written = fs::write(&tmp, &out).and_then(|()| {
         // Keep the file's permissions (e.g. 0600 for a file holding an API key).
         if let Ok(m) = fs::metadata(&target) {
@@ -1098,6 +1130,25 @@ mod tests {
     }
 
     #[test]
+    fn errors_say_where() {
+        // Valid TOML, but not a valid config: in a section, and in [polish] (which is
+        // deserialized on its own).
+        let e = Config::parse("[paste]\ntrailing_space = true\n\n[stt]\ntypo = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("invalid config.toml at line 5, column 1:"),
+            "{e}"
+        );
+        let c = Config::parse("[stt]\n\n[polish]\nenabled = true\ntimeout_ms = \"x\"\n").unwrap();
+        let e = c.polish_error.unwrap();
+        assert!(e.starts_with("[polish] at line 5, column 14:"), "{e}");
+        let c = Config::parse("[polish]\nbase_url = \"http://h/v1\"\ntypo = 1\n").unwrap();
+        let e = c.polish_error.unwrap();
+        assert!(e.starts_with("[polish] at line 3, column 1:"), "{e}");
+    }
+
+    #[test]
     fn errors_never_echo_values() {
         // A key in a numeric field, an enum field, and outside [polish] (fails the file).
         for (text, field) in [
@@ -1164,20 +1215,21 @@ mod tests {
             .unwrap();
         assert_eq!(c.polish.provider, PolishProvider::OpenAi);
         assert_eq!(c.polish.base_url(), "http://localhost:8080/v1");
-        assert!(c.polish_notice.is_some());
+        assert_eq!(c.polish_notices.len(), 1);
         let c = Config::parse("[polish]\nprovider = \"s1-mini\"\nmodel = \"x\"").unwrap();
-        assert!(c.polish_notice.unwrap().contains("ignores"));
+        assert_eq!(c.polish_notices.len(), 1);
+        assert!(c.polish_notices[0].contains("ignores"));
         assert!(
             Config::parse("[polish]\nenabled = true")
                 .unwrap()
-                .polish_notice
-                .is_none()
+                .polish_notices
+                .is_empty()
         );
         assert!(
             Config::parse(DEFAULT_CONFIG)
                 .unwrap()
-                .polish_notice
-                .is_none()
+                .polish_notices
+                .is_empty()
         );
     }
 
@@ -1288,7 +1340,7 @@ mod tests {
     #[test]
     fn polish_defaults_depend_on_provider() {
         let c = Config::default().polish;
-        assert!(!c.enabled);
+        assert!(c.enabled);
         assert_eq!(c.provider, PolishProvider::S1Mini);
         assert_eq!(c.model(), "s1-mini");
         assert_eq!(c.timeout(0), std::time::Duration::from_millis(2000));
@@ -1326,7 +1378,7 @@ mod tests {
             "[Styling: semi-formal] [Structure: prose] [Context: general]"
         );
         let c = Config::parse(
-            "[polish]\nenabled = true\n[polish.s1-mini]\nstyling = \"semi-casual\"\nstructure = \"lists\"\ncontext = \"email\"\ndevice = \"cpu\"\n",
+            "[polish]\nenabled = true\n[polish.s1-mini]\nstyling = \"semi-casual\"\nstructure = \"lists\"\ncontext = \"email\"\ndevice = \"cpu\"\nfast_drafting = true\n",
         )
         .unwrap()
         .polish;
@@ -1335,6 +1387,8 @@ mod tests {
             "[Styling: semi-casual] [Structure: lists] [Context: email]"
         );
         assert_eq!(c.s1_mini.device, S1Device::Cpu);
+        assert!(c.s1_mini.fast_drafting);
+        assert!(!S1MiniConfig::default().fast_drafting);
         // Values S1-mini wasn't trained on are config errors, not garbage output.
         assert!(polish_error("[polish.s1-mini]\nstyling = \"pirate\""));
         assert!(polish_error("[polish.s1-mini]\ncontext = \"chat\""));
@@ -1390,7 +1444,7 @@ mod tests {
             DEFAULT_CONFIG,
             &[
                 (&["stt", "device"], "cpu".into()),
-                (&["polish", "enabled"], true.into()),
+                (&["polish", "enabled"], false.into()),
                 (&["polish", "s1-mini", "styling"], "casual".into()),
                 (&["paste", "restore_clipboard_ms"], 1000i64.into()),
             ],
@@ -1402,13 +1456,13 @@ mod tests {
         assert!(out.contains("\ndevice = \"cpu\"\n# CPU threads"), "{out}");
         let c = Config::parse(&out).unwrap();
         assert_eq!(c.stt.device, Device::Cpu);
-        assert!(c.polish.enabled);
+        assert!(!c.polish.enabled);
         assert_eq!(c.polish.s1_mini.styling, S1Styling::Casual);
         assert_eq!(c.paste.restore_clipboard_ms, 1000);
         // Everything else is as before.
         let mut expected = Config::default();
         expected.stt.device = Device::Cpu;
-        expected.polish.enabled = true;
+        expected.polish.enabled = false;
         expected.polish.s1_mini.styling = S1Styling::Casual;
         expected.paste.restore_clipboard_ms = 1000;
         assert_eq!(c, expected);
@@ -1503,8 +1557,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_disables_updates() {
+    fn fallback_disables_updates_and_polish() {
         assert!(!Config::fallback().update.enabled);
+        assert!(!Config::fallback().polish.enabled);
     }
 
     #[test]

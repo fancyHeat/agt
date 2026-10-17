@@ -2,9 +2,15 @@
 //! SHA-256, and where it puts it:
 //!
 //! ```text
-//! <models dir>/s1-mini/s1-mini-q4_k_m.gguf                485 MB, superwhisper/s1-mini-GGUF
-//! <models dir>/agt-llama-server/<build>/llama-server      from an official llama.cpp release
+//! <models dir>/s1-mini/s1-mini-q4_k_m.gguf    485 MB, superwhisper/s1-mini-GGUF
+//! <llama dir>/<build>/llama-server            from an official llama.cpp release
 //! ```
+//!
+//! The models dir may be a shared or network folder (`stt.models_dir`), so no program goes
+//! there: llama.cpp is downloaded, unpacked and run from the llama dir
+//! ([`crate::Env::llama_dir`]), AGT's own per-user folder. The GGUF does stay in the models
+//! dir, checked only by size at start, so in a shared folder others can change the model
+//! llama-server loads.
 //!
 //! llama.cpp builds: Windows x64 uses the Vulkan build (32 MB; any GPU with a Vulkan driver,
 //! which NVIDIA, AMD and Intel drivers include, and the CPU otherwise; it needs no CUDA
@@ -16,11 +22,13 @@
 //! into a new folder with a manifest ([`MARKER`]: SHA-256, size and mtime of every file),
 //! which is then renamed into place. Before every start the folder is checked against the
 //! manifest ([`Assets::verified_server_exe`]): exactly those files, unchanged (a file whose
-//! size or mtime differs is hashed again), so nothing put there later is ever run.
+//! size or mtime differs is hashed again). That catches damage and stray files; it isn't
+//! what keeps others out (whoever can write the files can rewrite a manifest next to
+//! them): the folder being the user's own is.
 //!
-//! The folder name is AGT's own (`stt.models_dir` may be a shared folder that already has
-//! a `llama.cpp`), and AGT only ever deletes what it made there: builds with a manifest,
-//! its staging folders and its archives.
+//! AGT only ever deletes what it made: builds with a manifest, its staging folders and its
+//! archives. Versions before 0.0.17 installed the builds in `<models dir>/agt-llama-server`
+//! ([`legacy_dir`]); [`remove_legacy`] removes those the same way.
 
 use super::Status;
 use agt_fetch::ModelFile;
@@ -36,9 +44,12 @@ use std::{
 
 /// Subfolder of the models dir holding the GGUF.
 pub const MODEL_DIR: &str = "s1-mini";
-/// Subfolder of the models dir holding the llama.cpp builds AGT installed.
-pub const LLAMA_DIR: &str = "agt-llama-server";
-/// The pinned llama.cpp release.
+/// Subfolder of the models dir where versions before 0.0.17 installed llama.cpp builds.
+const LEGACY_DIR: &str = "agt-llama-server";
+/// The pinned llama.cpp release. When bumping it, check every flag in
+/// `LlamaLauncher::args` (process.rs) against the new `llama-server --help`: options get
+/// renamed (the `--spec-*` ones were recently), and an unknown flag makes the server exit
+/// at start, i.e. no polish at all.
 pub const LLAMA_BUILD: &str = "b11669";
 
 /// S1-mini Q4_K_M, the build its published accuracy was measured on. Revision `v1` of
@@ -96,13 +107,15 @@ fn wanted(name: &str) -> bool {
 pub(crate) struct Assets {
     /// The models dir.
     root: PathBuf,
+    /// AGT's own folder for llama.cpp builds (never the models dir, see the module docs).
+    llama: PathBuf,
     model: ModelFile,
     server: ModelFile,
     build: &'static str,
 }
 
 impl Assets {
-    pub fn for_this_platform(models_dir: &Path) -> Result<Self, String> {
+    pub fn for_this_platform(models_dir: &Path, llama_dir: &Path) -> Result<Self, String> {
         let server = SERVER.ok_or_else(|| {
             format!(
                 "polish.provider = \"s1-mini\" is not available on {}-{} (no llama.cpp build is pinned for it); use provider = \"openai\" with your own server",
@@ -112,6 +125,7 @@ impl Assets {
         })?;
         Ok(Self {
             root: models_dir.to_owned(),
+            llama: llama_dir.to_owned(),
             model: GGUF,
             server,
             build: LLAMA_BUILD,
@@ -122,6 +136,7 @@ impl Assets {
     pub fn test(root: &Path) -> Self {
         Self {
             root: root.to_owned(),
+            llama: root.join("llama.cpp"),
             model: GGUF,
             server: GGUF,
             build: "btest",
@@ -132,12 +147,8 @@ impl Assets {
         self.root.join(MODEL_DIR).join(self.model.name)
     }
 
-    fn llama_dir(&self) -> PathBuf {
-        self.root.join(LLAMA_DIR)
-    }
-
     fn build_dir(&self) -> PathBuf {
-        self.llama_dir().join(self.build)
+        self.llama.join(self.build)
     }
 
     #[cfg(test)]
@@ -158,8 +169,8 @@ impl Assets {
                 build_dir.display()
             ));
         }
-        let dir = self.llama_dir();
-        download(&dir, &self.server, "llama.cpp", report)?;
+        let dir = &self.llama;
+        download(dir, &self.server, "llama.cpp", report)?;
         let archive = dir.join(self.server.name);
         let staging = dir.join(format!("{}.unpacking", self.build));
         let ready = dir.join(format!("{}.installing", self.build));
@@ -182,40 +193,13 @@ impl Assets {
         write_manifest(&ready)?;
         fs::rename(&ready, &build_dir)
             .map_err(|e| format!("cannot move llama.cpp into place: {e}"))?;
-        self.clean_up();
+        clean_up(dir, Some(self.build));
         tracing::info!(
             "llama.cpp {} installed in {}",
             self.build,
             build_dir.display()
         );
         Ok(())
-    }
-
-    /// Removes what AGT left in its folder: staging folders, archives, and builds it
-    /// installed (they have a manifest) other than the current one. Nothing else.
-    fn clean_up(&self) {
-        let Ok(entries) = fs::read_dir(self.llama_dir()) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let p = e.path();
-            let ours_dir = p.is_dir()
-                && name != self.build
-                && (name.ends_with(".unpacking")
-                    || name.ends_with(".installing")
-                    || p.join(MARKER).is_file());
-            let ours_file = p.is_file()
-                && name.starts_with("llama-b")
-                && [".zip", ".tar.gz", ".zip.part", ".tar.gz.part"]
-                    .iter()
-                    .any(|ext| name.ends_with(ext));
-            if ours_dir {
-                let _ = fs::remove_dir_all(&p);
-            } else if ours_file {
-                let _ = fs::remove_file(&p);
-            }
-        }
     }
 
     /// The server executable, after checking its folder against the manifest written at
@@ -254,6 +238,47 @@ impl Assets {
         }
         Ok(dir.join(SERVER_EXE))
     }
+}
+
+/// `<models dir>/agt-llama-server`, where versions before 0.0.17 installed llama.cpp.
+pub fn legacy_dir(models_dir: &Path) -> PathBuf {
+    models_dir.join(LEGACY_DIR)
+}
+
+/// Removes what AGT made in [`legacy_dir`]. Only for a models dir no one else uses: in a
+/// shared one, an older AGT elsewhere may still run those builds.
+pub fn remove_legacy(models_dir: &Path) {
+    clean_up(&legacy_dir(models_dir), None);
+}
+
+/// Removes what AGT left in `dir`: staging folders, archives, and builds it installed
+/// (they have a manifest) other than `keep`; then `dir` itself if that emptied it.
+/// Nothing else.
+fn clean_up(dir: &Path, keep: Option<&str>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let p = e.path();
+        let ours_dir = p.is_dir()
+            && Some(name.as_str()) != keep
+            && (name.ends_with(".unpacking")
+                || name.ends_with(".installing")
+                || p.join(MARKER).is_file());
+        let ours_file = p.is_file()
+            && name.starts_with("llama-b")
+            && [".zip", ".tar.gz", ".zip.part", ".tar.gz.part"]
+                .iter()
+                .any(|ext| name.ends_with(ext));
+        if ours_dir {
+            let _ = fs::remove_dir_all(&p);
+        } else if ours_file {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    // Only succeeds if nothing else is left.
+    let _ = fs::remove_dir(dir);
 }
 
 #[derive(Debug, PartialEq)]
@@ -476,10 +501,12 @@ mod tests {
         let work = std::env::temp_dir().join(format!("agt-s1-assets-{}", std::process::id()));
         let _ = fs::remove_dir_all(&work);
         let root = work.join("models");
+        let dir = work.join("data").join("llama.cpp");
         let gguf = b"gguf!".to_vec();
         let tar = archive(&work);
         let mut a = Assets {
             root: root.clone(),
+            llama: dir.clone(),
             model: ModelFile {
                 name: "m.gguf",
                 url: serve(gguf.clone()),
@@ -494,13 +521,17 @@ mod tests {
             },
             build: "b2",
         };
-        let dir = root.join(LLAMA_DIR);
         // An earlier build AGT installed (has a manifest), and things that aren't AGT's.
         fs::create_dir_all(dir.join("b1")).unwrap();
         fs::write(dir.join("b1").join(MARKER), "").unwrap();
         fs::create_dir_all(dir.join("b0-user")).unwrap();
         fs::write(dir.join("notes.txt"), b"mine").unwrap();
         fs::create_dir_all(root.join("llama.cpp")).unwrap();
+        // What an earlier version installed in the models dir.
+        let legacy = root.join(LEGACY_DIR);
+        fs::create_dir_all(legacy.join("b1")).unwrap();
+        fs::write(legacy.join("b1").join(MARKER), "").unwrap();
+        fs::write(legacy.join("llama-b1-bin-test.zip.part"), b"x").unwrap();
 
         // A bad hash: nothing is installed and nothing partial stays.
         let mut statuses = Vec::new();
@@ -533,7 +564,21 @@ mod tests {
             ["b0-user", "b2", "notes.txt"],
             "archive, staging and AGT's old build removed; nothing else"
         );
-        assert!(root.join("llama.cpp").is_dir());
+        assert_eq!(
+            names(&root),
+            ["agt-llama-server", "llama.cpp", MODEL_DIR],
+            "nothing new to run in the models dir; the old install left to remove_legacy"
+        );
+        remove_legacy(&root);
+        assert_eq!(names(&root), ["llama.cpp", MODEL_DIR]);
+
+        // An old install in the models dir next to something that isn't AGT's: only the
+        // former goes.
+        fs::create_dir_all(legacy.join("b1")).unwrap();
+        fs::write(legacy.join("b1").join(MARKER), "").unwrap();
+        fs::write(legacy.join("notes.txt"), b"mine").unwrap();
+        remove_legacy(&root);
+        assert_eq!(names(&legacy), ["notes.txt"]);
 
         // Everything present: no network access.
         a.model.url = "http://127.0.0.1:1/unreachable";

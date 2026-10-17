@@ -109,6 +109,45 @@ fn version_1_database_gets_the_new_columns() {
         )
         .unwrap();
     assert_eq!(row, (7, true));
+    let d = Dictation {
+        started_at: 4000,
+        audio_secs: Some(100.0),
+        stt_ms: Some(300.0),
+        release_to_text_ms: Some(320.0),
+        live_pause_cuts: Some(5),
+        live_limit_cuts: Some(1),
+        live_end_cuts: Some(1),
+        live_skipped: Some(0),
+        live_tail_joined: Some(false),
+        live_trimmed_secs: Some(30.5),
+        live_tail_secs: Some(9.5),
+        live_stt_ms: Some(2100.0),
+        live_busy_at_release: Some(false),
+        live_idle_ms: Some(4000.0),
+        live_max_queue: Some(1),
+        history_saved: true,
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let row: (f64, i64, bool, f64, Option<f64>, Option<f64>) = conn
+        .query_row(
+            "SELECT release_to_text_ms, live_pause_cuts, live_tail_joined, live_stt_ms, rtf,
+                live_discarded_ms FROM dictations WHERE started_at = 4000",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    // No RTF: `stt_ms` is only the tail's.
+    assert_eq!(row, (320.0, 5, false, 2100.0, None, None));
     // Rows from before the migration read as "not saved".
     assert_eq!(
         count(
@@ -172,6 +211,75 @@ fn version_2_database_gains_the_duck_columns() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(rows, [(None, None), (Some(true), Some(0.25))]);
+}
+
+#[test]
+fn version_4_database_gains_the_fast_drafting_column() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..4] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    conn.execute(
+        "INSERT INTO app_sessions (started_at, app_version, os, arch) VALUES (1, 'old', 'x', 'y')",
+        [],
+    )
+    .unwrap();
+    migrate(&mut conn).unwrap();
+    let s = SessionStart {
+        s1_fast_drafting: Some(true),
+        ..Default::default()
+    };
+    insert_session(&conn, &s, 2).unwrap();
+    let rows: Vec<Option<bool>> = conn
+        .prepare("SELECT s1_fast_drafting FROM app_sessions ORDER BY started_at")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [None, Some(true)]);
+}
+
+#[test]
+fn version_5_database_gains_the_polish_ahead_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..5] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 5).unwrap();
+    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
+    migrate(&mut conn).unwrap();
+    let d = Dictation {
+        started_at: 2000,
+        polish_outcome: Some("partial"),
+        polish_ahead_pieces: Some(4),
+        polish_ahead_ms: Some(512.5),
+        polish_release_words: Some(61),
+        polish_fallbacks: Some(1),
+        polish_wait_ms: Some(80.0),
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let row: (String, i64, f64, i64, i64, f64) = conn
+        .query_row(
+            "SELECT polish_outcome, polish_ahead_pieces, polish_ahead_ms, polish_release_words,
+                polish_fallbacks, polish_wait_ms FROM dictations",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("partial".into(), 4, 512.5, 61, 1, 80.0));
 }
 
 #[test]

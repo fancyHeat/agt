@@ -40,6 +40,12 @@ pub fn foreground_window() -> Option<usize> {
     None
 }
 
+pub fn focus_takes_text() -> Option<bool> {
+    None
+}
+
+pub fn prepare_focus_check() {}
+
 pub fn snapshot_clipboard() -> Result<ClipboardSnapshot, Error> {
     Err(format!("clipboard access {MSG}").into())
 }

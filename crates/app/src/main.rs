@@ -61,6 +61,8 @@ enum AppEvent {
     Update(UpdateEvent),
     /// `config.toml` was modified (or appeared, or went away).
     ConfigFile,
+    /// The Copy button on the "not in a text box" notice was clicked.
+    NoticeCopy,
     /// Meeting notes: the session, its windows, summaries, detection, the command line.
     Meeting(meeting::Msg),
 }
@@ -93,6 +95,10 @@ fn main() {
     // `agt stats`: a report from the telemetry database; doesn't start the app.
     if std::env::args().nth(1).as_deref() == Some("stats") {
         return print_stats();
+    }
+    // `agt settings`: the settings window (see `settings::window`); doesn't start the app.
+    if std::env::args().nth(1).as_deref() == Some("settings") {
+        return settings::window::run();
     }
     // `agt meeting start|stop|status`: asks the running app (see `control`).
     if std::env::args().nth(1).as_deref() == Some("meeting") {
@@ -144,7 +150,9 @@ fn main() {
         Ok(c) => (c.clone(), false),
         Err(e) => {
             tracing::error!("{e}");
-            tracing::error!("running with defaults and updates OFF; the file was not modified");
+            tracing::error!(
+                "running with defaults, updates and polish OFF; the file was not modified"
+            );
             (Config::fallback(), true)
         }
     };
@@ -289,6 +297,7 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         s1_structure: s1.then(|| lower(&polish.s1_mini.structure)),
         s1_context: s1.then(|| lower(&polish.s1_mini.context)),
         s1_device: s1.then(|| lower(&polish.s1_mini.device)),
+        s1_fast_drafting: s1.then_some(polish.s1_mini.fast_drafting),
         restore_clipboard_ms: config.paste.restore_clipboard_ms as i64,
         trailing_space: config.paste.trailing_space,
         overlay_enabled: config.overlay.enabled,
@@ -483,7 +492,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
             // Created hidden now, so showing it on key down is a single present.
             if let (Some(position), Some(_)) = (self.overlay_position, &self.pipeline) {
-                match agt_overlay::Overlay::new(position) {
+                let proxy = self.proxy.clone();
+                let on_copy = move || {
+                    let _ = proxy.send_event(AppEvent::NoticeCopy);
+                };
+                match agt_overlay::Overlay::new(position, on_copy) {
                     Ok(o) => self.overlay = Some(o),
                     Err(e) => tracing::warn!("no overlay: {e}"),
                 }
@@ -530,6 +543,22 @@ impl ApplicationHandler<AppEvent> for App {
                         o.flash_error(p.level.get(), Instant::now());
                     }
                 }
+                pipeline::Event::NotInTextBox => {
+                    if let Some(o) = &mut self.overlay {
+                        o.show_notice(Instant::now());
+                        // Not idle while it's up: a restart would take the Copy button away.
+                        // (If it didn't show, the restart timer armed on `Ready` still stands.)
+                        if o.notice_visible() {
+                            self.changes += 1;
+                            self.changed_at = Instant::now();
+                        }
+                    }
+                }
+                pipeline::Event::Copied => {
+                    if let Some(o) = &mut self.overlay {
+                        o.notice_copied(Instant::now());
+                    }
+                }
                 pipeline::Event::CopyAvailable(available) => {
                     if let Some(tray) = &self.tray {
                         tray.set_copy_enabled(*available);
@@ -558,6 +587,12 @@ impl ApplicationHandler<AppEvent> for App {
         {
             return self.settings_action(action.clone(), event_loop);
         }
+        if let AppEvent::NoticeCopy = event {
+            if let Some(p) = &self.pipeline {
+                p.copy_last_transcript();
+            }
+            return;
+        }
         let Some(tray) = &self.tray else { return };
         match event {
             AppEvent::Menu(e) if e.id == tray.copy_last => {
@@ -577,6 +612,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
+            AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
                 // The page for the first missing permission (or Accessibility, to review).
@@ -619,25 +655,32 @@ impl ApplicationHandler<AppEvent> for App {
                 tray.set_update("Update failed - see log", true);
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
-            AppEvent::Menu(_) | AppEvent::Pipeline(_) | AppEvent::ConfigFile => {}
+            AppEvent::Menu(_)
+            | AppEvent::Pipeline(_)
+            | AppEvent::ConfigFile
+            | AppEvent::NoticeCopy => {}
             AppEvent::Meeting(_) => {} // handled above
         }
     }
 
-    /// Draws overlay frames while it's visible, and runs the meeting pill's timer while it
-    /// shows (see `meeting_ui`). While both are hidden, the loop just waits for events: no
-    /// timer, no wake-ups.
+    /// Draws overlay frames while it's visible (the "not in a text box" notice included), and
+    /// runs the meeting pill's timer while it shows (see `meeting_ui`). While both are hidden,
+    /// the loop just waits for events: no timer, no wake-ups.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if self.exit_at.is_some_and(|at| now >= at) {
             return event_loop.exit();
         }
         let mut next = self.exit_at;
+        // The notice went away this frame: idle again (see `idle`).
+        let mut notice_gone = false;
         if let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) {
+            let notice = overlay.notice_visible();
             if overlay.next_frame().is_some_and(|due| now >= due) {
                 overlay.tick(pipeline.level.get(), now);
             }
             next = earliest(next, overlay.next_frame());
+            notice_gone = notice && !overlay.notice_visible();
         }
         if let Some(m) = &mut self.meetings {
             if m.next_tick().is_some_and(|due| now >= due) {
@@ -649,6 +692,10 @@ impl ApplicationHandler<AppEvent> for App {
             Some(due) => ControlFlow::WaitUntil(due),
             None => ControlFlow::Wait,
         });
+        if notice_gone {
+            self.changed_at = Instant::now();
+            self.start_restart_timer();
+        }
     }
 
     fn resumed(&mut self, _: &ActiveEventLoop) {}
@@ -779,12 +826,15 @@ impl App {
     /// transcript can still be copied: it may be a failed paste's, and a restart would lose it
     /// (for settings the user just changed, on an error anyway: a bad setting may be the
     /// error). Never while loading: a restart would start a model download over. Never while
-    /// a meeting starts, records or finishes, or its AI notes are being written. Clicking
-    /// "Install update X now" / "Restart now to apply" restarts regardless (stopping the
-    /// meeting first, see [`Self::exit`]).
+    /// a meeting starts, records or finishes, or its AI notes are being written. Not while the
+    /// "not in a text box" notice is up (at most 12 s): a restart would take its Copy button
+    /// away. Clicking "Install update X now" / "Restart now to apply" restarts regardless
+    /// (stopping the meeting first, see [`Self::exit`]).
     fn idle(&self) -> bool {
         use pipeline::Status;
-        if self.meetings.as_ref().is_some_and(|m| m.busy()) {
+        if self.meetings.as_ref().is_some_and(|m| m.busy())
+            || self.overlay.as_ref().is_some_and(|o| o.notice_visible())
+        {
             return false;
         }
         self.pipeline.is_none()
@@ -915,13 +965,7 @@ impl App {
                 }
             }
             Action::EditFile => open_in_editor(&self.config_path),
-            Action::OpenHistory => {
-                let dir = paths::dictations_dir();
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    tracing::error!("cannot create {}: {e}", dir.display());
-                }
-                open_folder(&dir);
-            }
+            Action::OpenHistory => open_history(),
             Action::ApplyNow => {
                 let restart = self.restart_with.take().unwrap_or(Restart::Settings);
                 self.restart_now(restart, event_loop);
@@ -1000,7 +1044,7 @@ impl App {
 
 /// Opens `file` in a text editor: the default one on macOS, Notepad on Windows (`.toml`
 /// usually has no app associated there).
-fn open_in_editor(file: &std::path::Path) {
+pub(crate) fn open_in_editor(file: &std::path::Path) {
     let mut command = if cfg!(windows) {
         std::process::Command::new("notepad")
     } else if cfg!(target_os = "macos") {
@@ -1013,6 +1057,15 @@ fn open_in_editor(file: &std::path::Path) {
     if let Err(e) = command.arg(file).spawn() {
         tracing::error!("failed to open {}: {e}", file.display());
     }
+}
+
+/// Opens the saved dictations' folder (created if needed).
+pub(crate) fn open_history() {
+    let dir = paths::dictations_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("cannot create {}: {e}", dir.display());
+    }
+    open_folder(&dir);
 }
 
 /// Opens `dir` in Finder / Explorer.

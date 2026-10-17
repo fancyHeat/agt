@@ -4,20 +4,33 @@
 //! - `hotkey` (agt-platform): low-level keyboard hook; forwards hold events to `audio`.
 //! - `audio`: owns the microphone. Starts recording on key down, and on release hands the
 //!   samples to `stt`. Short taps and cancelled holds are dropped here. While recording it
-//!   also polls the key, in case the hook missed the release (see [`RELEASE_POLL`]).
+//!   also polls the key, in case the hook missed the release (see [`RELEASE_POLL`]), and
+//!   takes the new audio: a long recording is cut into segments as it comes in
+//!   (`agt_stt::chunk::Live`, cheap), and each finished one goes to `stt` right away, so at
+//!   release only the last few seconds are left to transcribe (see [`Feed`]). A double tap
+//!   (`hotkey.double_tap_ms`) records hands-free instead: the release doesn't end that
+//!   recording, the next press and release does (Esc cancels it, and so does
+//!   [`HANDS_FREE_MAX`]). After a tap the status stays "recording" for `double_tap_ms`, so
+//!   the bar doesn't flicker between the two taps.
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
 //!   system output volume down until the recording ends, however it ends. Not while a meeting
 //!   records ([`Pipeline::set_meeting_active`]): that would turn the call down.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
 //!   recording may start while the previous one is still being transcribed: jobs queue up
-//!   and are pasted in order (nothing is dropped). Long recordings are chunked by `agt-stt`.
-//!   With `polish.enabled`, each transcript is then cleaned up by an LLM (`agt-polish`),
-//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted.
+//!   and are pasted in order (nothing is dropped). A recording's segments are transcribed
+//!   while it's still being recorded, and their texts joined at release; a dropped
+//!   (cancelled) recording's are skipped, or discarded if already being transcribed.
 //!   It also transcribes a recording meeting's segments ([`Pipeline::transcriber`]) on the same
-//!   engine, at low priority: each time it takes everything queued and runs a waiting dictation
-//!   first, so a meeting delays a dictation by at most the one segment already being
-//!   transcribed when the hotkey was released. Segments never reach polish, the paste, history
-//!   or the status line.
+//!   engine, at low priority: each time it takes everything queued, and whatever dictation sent
+//!   (segments cut while recording, the job at release, a dropped recording's record, a
+//!   reload) goes first, in the order sent ([`SttQueue`]). So a meeting delays a dictation by
+//!   at most the one meeting segment already being transcribed when the dictation's work came
+//!   in. Meeting segments never reach polish, the paste, history or the status line.
+//! - `polish`: with `polish.enabled`, cleans each transcript up with an LLM (`agt-polish`),
+//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted. Then hands
+//!   it to `paste`. A long dictation transcribed while recording is also polished while
+//!   recording, in pieces that end at a sentence end (`agt_polish::ahead`, local servers
+//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]).
 //! - `permissions` (macOS, only while something is missing): asks for the Microphone and
 //!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
 //!   both are granted, so no restart is needed.
@@ -43,24 +56,25 @@
 use agt_audio::{Level, Recorder};
 use agt_core::{
     Config,
-    config::PolishProvider,
+    config::{PolishConfig, PolishProvider},
     paths,
     polish::Polisher,
-    stt::{self, SAMPLE_RATE, SttEngine, TranscribeOpts, Transcript},
+    stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
 use agt_history::{self as history, History};
 use agt_platform::{
     ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key,
     MAX_CHORD, PasteToken, Permission,
 };
-use agt_polish::Outcome;
+use agt_polish::{Outcome, ahead::Ahead};
+use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
     collections::VecDeque,
     fmt,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -76,7 +90,17 @@ pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 /// or Windows dropped a hook that was too slow once. A missed release is treated as a normal
 /// release at the moment it's noticed: the user did let go, and what they said up to then is
 /// what they meant to dictate (at most ~250 ms of extra audio). The hook is then re-installed.
+/// It's also how often the new audio is taken and cut ([`Feed`]).
 const RELEASE_POLL: Duration = Duration::from_millis(250);
+
+/// A hands-free recording (double tap) that nobody ends is discarded after this, the longest
+/// recording: it was most likely forgotten, and pasting it would put whatever was said since
+/// into whatever window has focus by then.
+const HANDS_FREE_MAX: Duration = Duration::from_secs(agt_audio::MAX_SECONDS as u64);
+
+/// A press shorter than this (or than `min_hold_ms`, if that's longer) is a tap: a double tap
+/// is two of them. Not tied to `min_hold_ms` alone, which may be 0.
+const TAP: Duration = Duration::from_millis(150);
 
 /// While a permission is missing (macOS), how often it's checked again.
 const PERMISSION_POLL: Duration = Duration::from_secs(1);
@@ -142,6 +166,11 @@ pub enum Event {
     Rejected,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
     CopyAvailable(bool),
+    /// A dictation was pasted, but keyboard focus wasn't in anything that takes text (macOS):
+    /// offer to copy it.
+    NotInTextBox,
+    /// The last transcript was put on the clipboard (see [`Pipeline::copy_last_transcript`]).
+    Copied,
     /// New tray line about LLM polish (the managed S1-mini downloading, starting, failed).
     PolishInfo(String),
 }
@@ -155,6 +184,9 @@ enum Engine {
 struct HubState {
     engine: Engine,
     recording: bool,
+    /// A tap just ended and a second one may still make it a double tap: still shown as
+    /// recording, so the bar doesn't hide and come back between the two.
+    lingering: bool,
     /// Jobs sent to `stt` and not yet pasted.
     pending: usize,
     /// Latest microphone/paste error, cleared by the next successful dictation.
@@ -178,7 +210,8 @@ impl HubState {
 struct Hub {
     state: Arc<Mutex<HubState>>,
     notify: Arc<dyn Fn(Event) + Send + Sync>,
-    /// `HubState::recording`, readable without the lock ([`Pipeline::dictating`]).
+    /// `HubState::recording`, readable without the lock ([`Pipeline::dictating`]). Not
+    /// `lingering`: between the two taps of a double tap nothing records.
     dictating: Arc<AtomicBool>,
 }
 
@@ -188,6 +221,7 @@ impl Hub {
             state: Arc::new(Mutex::new(HubState {
                 engine: Engine::Loading("Loading model...".into()),
                 recording: false,
+                lingering: false,
                 pending: 0,
                 error: None,
                 missing: Vec::new(),
@@ -202,8 +236,8 @@ impl Hub {
     fn update(&self, f: impl FnOnce(&mut HubState)) {
         let mut s = self.state.lock().unwrap();
         f(&mut s);
-        self.dictating.store(s.recording, Ordering::Relaxed);
-        let status = if s.recording {
+        self.dictating.store(s.recording, Relaxed);
+        let status = if s.recording || s.lingering {
             Status::Recording
         } else if s.pending > 0 {
             Status::Transcribing
@@ -230,6 +264,14 @@ impl Hub {
 
     fn copy_available(&self, available: bool) {
         (self.notify)(Event::CopyAvailable(available));
+    }
+
+    fn not_in_text_box(&self) {
+        (self.notify)(Event::NotInTextBox);
+    }
+
+    fn copied(&self) {
+        (self.notify)(Event::Copied);
     }
 
     fn engine_ready(&self) -> bool {
@@ -296,24 +338,25 @@ impl Pipeline {
 /// For meeting notes (`agt-meeting`).
 impl Pipeline {
     /// Speech to text for a meeting's segments: the dictation engine on the `stt` thread,
-    /// behind every dictation (see the module docs). `done` runs on that thread, so it must be
-    /// quick (a channel send): a dictation may be waiting. Once the pipeline is gone, segments
-    /// are answered "transcription stopped".
+    /// behind everything dictation sends it (see the module docs). Only queues: `done` runs on
+    /// that thread, so it must be quick (a channel send): a dictation may be waiting. Once the
+    /// pipeline is gone, segments are answered "transcription stopped".
     pub fn transcriber(&self) -> Arc<dyn agt_meeting::Transcriber> {
         Arc::new(MeetingTranscriber(self.to_stt.clone()))
     }
 
-    /// True while a dictation records: from the microphone starting to the hold ending
-    /// (released, cancelled, too short or discarded). A meeting blanks its mic track
-    /// meanwhile: the dictation isn't part of the meeting.
+    /// True while a dictation records: from the microphone starting to the recording ending
+    /// (a hold released, a hands-free one ended by the next press, cancelled, too short,
+    /// timed out or discarded). A meeting blanks its mic track meanwhile: the dictation isn't
+    /// part of the meeting.
     pub fn dictating(&self) -> Arc<AtomicBool> {
         self.dictating.clone()
     }
 
     /// While on (a meeting records), dictations don't turn the output volume down: that would
-    /// turn the call down. A dictation already ducked stays so until its hold ends.
+    /// turn the call down. A dictation already ducked stays so until its recording ends.
     pub fn set_meeting_active(&self, on: bool) {
-        self.meeting.store(on, Ordering::Relaxed);
+        self.meeting.store(on, Relaxed);
     }
 
     /// The speech model now: a meeting can't be transcribed if it failed, and its segments
@@ -328,27 +371,46 @@ impl Pipeline {
 }
 
 struct Job {
+    /// The whole recording (for the history); transcribed unless `live` is set.
     audio: Vec<f32>,
     released: Instant,
     /// The foreground window at release ([`agt_platform::foreground_window`]).
     target: Option<usize>,
     dictation: Box<Dictation>,
+    /// Segments were sent while recording: only the rest is left to transcribe.
+    live: Option<(Vec<Piece>, Arc<Shared>)>,
+}
+
+/// Shared by the audio and stt threads for one recording whose segments are sent while it's
+/// being recorded.
+#[derive(Default)]
+struct Shared {
+    /// The recording was dropped (cancelled, too short, stale): its segments still queued
+    /// are skipped, and the text of the one being transcribed is discarded.
+    dropped: AtomicBool,
+    /// Segments sent and not started yet.
+    queued: AtomicUsize,
+}
+
+enum ToStt {
+    Transcribe(Job),
+    /// A finished segment of the recording in progress.
+    Segment(Piece, Arc<Shared>),
+    /// The recording those segments were from was dropped: recorded as `Ended` once they
+    /// are out of the way.
+    Dropped(Box<Dictation>, Ended),
+    /// The model failed to load and the user pressed the hotkey: try again.
+    RetryLoad,
+    /// A meeting's segment (16 kHz mono), run when nothing from dictation waits. `done` gets
+    /// its text ("" for no speech) or why not, on the `stt` thread.
+    Meeting {
+        audio: Vec<f32>,
+        done: Done,
+    },
 }
 
 /// Where a meeting segment's text goes ([`agt_meeting::Transcriber`]).
 type Done = Box<dyn FnOnce(Result<String, String>) + Send>;
-
-enum ToStt {
-    Transcribe(Job),
-    /// A meeting's segment (16 kHz mono), run when no dictation waits. `done` gets its text
-    /// ("" for no speech) or why not, on the `stt` thread.
-    Segment {
-        audio: Vec<f32>,
-        done: Done,
-    },
-    /// The model failed to load and the user pressed the hotkey: try again.
-    RetryLoad,
-}
 
 /// [`Pipeline::transcriber`]: meeting segments into the `stt` thread's queue.
 struct MeetingTranscriber(Sender<ToStt>);
@@ -356,67 +418,68 @@ struct MeetingTranscriber(Sender<ToStt>);
 impl agt_meeting::Transcriber for MeetingTranscriber {
     fn transcribe(&self, audio: Vec<f32>, done: Done) {
         // The `stt` thread is gone (shutting down): answer now rather than never.
-        if let Err(mpsc::SendError(ToStt::Segment { done, .. })) =
-            self.0.send(ToStt::Segment { audio, done })
+        if let Err(mpsc::SendError(ToStt::Meeting { done, .. })) =
+            self.0.send(ToStt::Meeting { audio, done })
         {
             done(Err("transcription stopped".into()));
         }
     }
 }
 
-/// The `stt` thread's work, by kind: [`next_job`] picks from it.
+/// The `stt` thread's work, by kind: [`SttQueue::next`] picks from it.
 #[derive(Default)]
 struct SttQueue {
-    dictations: VecDeque<Job>,
-    /// Meeting segments, and where each one's text goes.
-    segments: VecDeque<(Vec<f32>, Done)>,
-    /// The user asked for the model to be loaded again ([`ToStt::RetryLoad`]).
-    reload: bool,
+    /// Everything but meeting segments: what dictation sends (segments cut while recording,
+    /// the job at release, a dropped recording's record) and reloads, in the order sent,
+    /// which they depend on (a recording's segments before its job or its `Dropped`).
+    dictation: VecDeque<ToStt>,
+    /// [`ToStt::Meeting`]s, in order.
+    meeting: VecDeque<ToStt>,
 }
 
 impl SttQueue {
-    fn is_empty(&self) -> bool {
-        self.dictations.is_empty() && self.segments.is_empty() && !self.reload
-    }
-
     fn push(&mut self, msg: ToStt) {
         match msg {
-            ToStt::Transcribe(job) => self.dictations.push_back(job),
-            ToStt::Segment { audio, done } => self.segments.push_back((audio, done)),
-            ToStt::RetryLoad => self.reload = true,
+            ToStt::Meeting { .. } => self.meeting.push_back(msg),
+            msg => self.dictation.push_back(msg),
         }
     }
 
-    /// Waits for a message if there's nothing to do, then takes every other one already sent,
-    /// without waiting: a dictation sent behind meeting segments is seen, and run, before them.
-    /// False once every sender is gone and nothing is left.
-    fn fill(&mut self, rx: &Receiver<ToStt>) -> bool {
-        if self.is_empty() {
-            match rx.recv() {
-                Ok(msg) => self.push(msg),
-                Err(_) => return false,
-            }
+    /// The next message to handle: waits for one if nothing is queued, then takes every other
+    /// one already sent, without waiting, so dictation's work sent behind meeting segments is
+    /// seen, and run, before them. `None` once every sender is gone and nothing is left.
+    fn next(&mut self, rx: &Receiver<ToStt>) -> Option<ToStt> {
+        if self.dictation.is_empty() && self.meeting.is_empty() {
+            self.push(rx.recv().ok()?);
         }
         while let Ok(msg) = rx.try_recv() {
             self.push(msg);
         }
-        true
+        self.dictation
+            .pop_front()
+            .or_else(|| self.meeting.pop_front())
     }
 }
 
-/// What the `stt` thread runs next.
-enum Next<D, S> {
-    Dictation(D),
-    Segment(S),
+enum ToPolish {
+    /// A piece of the recording in progress (`agt_polish::ahead`), to polish right away.
+    Piece(String, Arc<Shared>),
+    /// A transcribed dictation: polish it (or what's left of it), then paste.
+    Text(Box<Transcribed>),
 }
 
-/// The oldest dictation, else the oldest meeting segment: someone who just let go of the
-/// hotkey is waiting for their text; a meeting's transcript can wait.
-fn next_job<D, S>(dictations: &mut VecDeque<D>, segments: &mut VecDeque<S>) -> Option<Next<D, S>> {
-    match dictations.pop_front() {
-        Some(job) => Some(Next::Dictation(job)),
-        None => segments.pop_front().map(Next::Segment),
-    }
+struct Transcribed {
+    /// The transcript, whitespace-normalized; never empty.
+    text: String,
+    /// Polished in pieces: those left at release, after the `Piece`s with this `Shared`.
+    rest: Option<(Vec<String>, Arc<Shared>)>,
+    /// When the transcript was ready.
+    ready: Instant,
+    released: Instant,
+    target: Option<usize>,
+    dictation: Box<Dictation>,
+    /// Only with `[history]` on.
+    saved: Option<Box<history::Entry>>,
 }
 
 enum ToPaste {
@@ -454,12 +517,14 @@ pub fn start(
     .map_err(|e| e.to_string())?;
 
     let (to_stt, stt_rx) = mpsc::channel::<ToStt>();
+    let (to_polish, polish_rx) = mpsc::channel::<ToPolish>();
     let (to_paste, paste_rx) = mpsc::channel::<ToPaste>();
     let level = Level::default();
     let key_down = Arc::new(Mutex::new(None));
     let meeting = Arc::new(AtomicBool::new(false));
 
     let test_wav = load_test_wav();
+    let chunk_secs = Arc::new(AtomicU32::new(agt_stt::CHUNK_SECS.to_bits()));
     let audio = AudioThread {
         config: config.clone(),
         key: key.clone(),
@@ -470,15 +535,24 @@ pub fn start(
         test_wav,
         key_down: key_down.clone(),
         ducker: config.audio.duck.then(|| ducker.clone()),
+        chunk_secs: chunk_secs.clone(),
         meeting: meeting.clone(),
     };
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
 
+    remove_old_llama_builds(&config.stt.models_path());
     let (polisher, polish_info) = load_polisher(config, &hub);
     let saver = history::start(&config.history, paths::dictations_dir());
-    let (h, cfg, tp, hs) = (hub.clone(), config.clone(), to_paste.clone(), saver.clone());
-    spawn("stt", move || stt_thread(cfg, h, stt_rx, tp, polisher, hs));
+    let polishing = polisher.is_some();
+    let (h, cfg, hs) = (hub.clone(), config.clone(), saver.clone());
+    spawn("stt", move || {
+        stt_thread(cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs)
+    });
+    let (cfg, tp) = (config.clone(), to_paste.clone());
+    spawn("polish", move || {
+        polish_thread(cfg, polish_rx, tp, polisher)
+    });
 
     let (h, cfg) = (hub.clone(), config.clone());
     spawn("paste", move || paste_thread(cfg, h, paste_rx, key, saver));
@@ -498,6 +572,30 @@ pub fn start(
     })
 }
 
+/// AGT 0.0.16 and earlier installed llama.cpp in the models folder. Removed (in the
+/// background, whatever the polish settings) from the default one, which is the user's own;
+/// a folder set in the config may be shared with an older AGT still running those builds.
+/// Never touches the disk on the calling thread: the models folder may be a slow share.
+fn remove_old_llama_builds(models_dir: &std::path::Path) {
+    let own = models_dir == paths::models_dir();
+    let dir = models_dir.to_owned();
+    spawn("cleanup", move || {
+        let old = agt_polish::managed::legacy_dir(&dir);
+        if !old.exists() {
+            return;
+        }
+        if own {
+            agt_polish::managed::remove_legacy(&dir);
+        } else {
+            tracing::warn!(
+                "{} is no longer used (llama.cpp now lives in {}); delete it once no older AGT uses this models folder",
+                old.display(),
+                paths::llama_dir().display()
+            );
+        }
+    });
+}
+
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
 /// so a local server loads its model before the first dictation. Returns the tray line.
 fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, String) {
@@ -505,7 +603,7 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
         tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
         return (None, "Polish: off (config error, see log)".into());
     }
-    if let Some(notice) = &config.polish_notice {
+    for notice in &config.polish_notices {
         tracing::warn!("{notice}");
     }
     if !config.polish.enabled {
@@ -514,6 +612,7 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
     let notify = hub.notify.clone();
     let env = agt_polish::Env {
         models_dir: config.stt.models_path(),
+        llama_dir: paths::llama_dir(),
         // Start-up output only (see agt-polish), next to agt.db ("Open data folder").
         log_file: Some(paths::history_dir().join("llama-server.log")),
         on_status: Arc::new(move |s: &agt_polish::Status| {
@@ -666,6 +765,28 @@ impl ReleaseWatch {
     }
 }
 
+/// Hands-free recording (double tap): how the recording in progress ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Latch {
+    /// Holding to talk: the release ends it.
+    Off,
+    /// The double tap's second press is still down: if it's a tap, its release doesn't end
+    /// it (if it's held, it was a hold after all).
+    Pressed,
+    /// Recording with the hotkey up: the next press's release ends it.
+    On,
+    /// That press is down: its release ends it. Another press meanwhile (an auto-repeat after
+    /// a missed press re-installed the hook) changes nothing; another key (a shortcut with the
+    /// hotkey, or Esc) goes back to `On`.
+    Ending,
+}
+
+/// Whether a press at `now` may be the second tap of a double tap: a tap (see [`TAP`]) was
+/// let go at most `gap` before (`last_tap`). A zero `gap` turns it off.
+fn is_double_tap(last_tap: Option<Instant>, now: Instant, gap: Duration) -> bool {
+    !gap.is_zero() && last_tap.is_some_and(|up| now.saturating_duration_since(up) <= gap)
+}
+
 struct AudioThread {
     config: Config,
     key: Hotkey,
@@ -677,8 +798,85 @@ struct AudioThread {
     key_down: Arc<Mutex<Option<Instant>>>,
     /// `None` with `audio.duck` off.
     ducker: Option<Ducker>,
+    /// The longest segment to cut a recording into (seconds, `f32` bits; set by `stt`).
+    chunk_secs: Arc<AtomicU32>,
     /// A meeting is recording ([`Pipeline::set_meeting_active`]).
     meeting: Arc<AtomicBool>,
+}
+
+/// A recording in progress: taken from the recorder every [`RELEASE_POLL`] and cut as it
+/// comes in, finished segments sent to `stt` (with what `Live` says to transcribe). The cutter
+/// only looks at 10 ms levels (microseconds per poll), so capture is never held up; nothing
+/// is transcribed on this thread. If nothing was cut by release, the recording is transcribed
+/// whole after release as it always was: a short dictation's release costs nothing extra.
+struct Feed {
+    live: Live,
+    /// The recording so far: the history may keep it, and a short one is transcribed whole.
+    audio: Vec<f32>,
+    /// Swapped with the recorder's buffer (see [`Recorder::take_new`]).
+    buf: Vec<f32>,
+    /// Samples pushed into `live` (with [`TEST_WAV_ENV`], of the test file, at the pace of
+    /// the recording).
+    fed: usize,
+    shared: Arc<Shared>,
+    /// A segment was sent to `stt`.
+    sent: bool,
+    max_queue: usize,
+}
+
+impl Feed {
+    fn new(chunk_secs: f32) -> Self {
+        Self {
+            live: Live::new(CutConfig::live(chunk_secs)),
+            audio: Vec::new(),
+            // Swapped into the callback: room for 250 ms polls, so it never allocates there.
+            buf: Vec::with_capacity(SAMPLE_RATE as usize / 2),
+            fed: 0,
+            shared: Arc::default(),
+            sent: false,
+            max_queue: 0,
+        }
+    }
+
+    /// Takes the new audio from `recorder` and sends the segments that are finished.
+    fn pump(&mut self, recorder: &Recorder, test_wav: Option<&[f32]>, to_stt: &Sender<ToStt>) {
+        recorder.take_new(&mut self.buf);
+        self.audio.append(&mut self.buf);
+        self.push(test_wav, to_stt);
+    }
+
+    /// Pushes what's new in `audio` (or the test file) into the cutter.
+    fn push(&mut self, test_wav: Option<&[f32]>, to_stt: &Sender<ToStt>) {
+        let source = test_wav.unwrap_or(&self.audio);
+        let to = self.audio.len().min(source.len());
+        if to <= self.fed {
+            return;
+        }
+        let pieces = self.live.push(&source[self.fed..to]);
+        self.fed = to;
+        for piece in pieces {
+            tracing::debug!(
+                "segment cut while recording ({:?}, {:.1} s); transcribing it",
+                piece.cut,
+                secs(&piece.audio)
+            );
+            let queued = self.shared.queued.fetch_add(1, Relaxed) + 1;
+            self.max_queue = self.max_queue.max(queued);
+            self.sent = true;
+            let _ = to_stt.send(ToStt::Segment(piece, self.shared.clone()));
+        }
+    }
+}
+
+/// A recording's cuts so far into its telemetry (released or dropped).
+fn live_stats(d: &mut Dictation, stats: &LiveStats, max_queue: usize) {
+    let n = |cut: Cut| Some(stats.cuts[cut as usize] as i64);
+    d.live_pause_cuts = n(Cut::Pause);
+    d.live_limit_cuts = n(Cut::Limit);
+    d.live_end_cuts = n(Cut::End);
+    d.live_skipped = Some(stats.skipped as i64);
+    d.live_trimmed_secs = Some((stats.received - stats.kept) as f64 / SAMPLE_RATE as f64);
+    d.live_max_queue = Some(max_queue as i64);
 }
 
 impl AudioThread {
@@ -695,21 +893,75 @@ impl AudioThread {
         } else if let Err(e) = recorder.prepare() {
             tracing::warn!("microphone not available yet: {e}");
         }
-        // The hold in progress: when the key went down, its measurements so far, and the
-        // ducked output volume. Dropping that guard puts the volume back, however the hold
-        // ends (including this thread exiting or panicking).
-        let mut holding: Option<(Instant, Box<Dictation>, Option<Ducked>)> = None;
+        // The hold in progress: when the key went down, its measurements so far, the ducked
+        // output volume, and its audio. Dropping that guard puts the volume back, however the
+        // hold ends (including this thread exiting or panicking).
+        let mut holding: Option<(Instant, Box<Dictation>, Option<Ducked>, Feed)> = None;
         let mut watch = ReleaseWatch::new(&self.key, 0);
+        let mut latch = Latch::Off;
+        // When the last tap was let go: maybe the first half of a double tap.
+        let mut last_tap: Option<Instant> = None;
+        // Until when the bar stays up after that tap ([`HubState::lingering`]).
+        let mut linger: Option<Instant> = None;
+        let double_tap = Duration::from_millis(self.config.hotkey.double_tap_ms);
+        let min_hold = Duration::from_millis(self.config.hotkey.min_hold_ms);
+        let tap = min_hold.max(TAP);
 
         loop {
+            let hands_free = latch == Latch::On && holding.is_some();
+            // Esc is ours only while it can end something.
+            agt_platform::arm_escape(hands_free);
             // `missed`: a release synthesized after the hook missed the real one.
-            let (ev, missed) = if holding.is_some() {
-                match events.recv_timeout(RELEASE_POLL) {
+            let (ev, missed) = if let Some((down, .., feed)) = &mut holding {
+                // Hands-free, the hotkey is up: no release to watch for, but a press the hook
+                // missed, and the time limit.
+                let until = *down + HANDS_FREE_MAX;
+                let wait = match hands_free {
+                    true => until.saturating_duration_since(Instant::now()),
+                    false => RELEASE_POLL,
+                };
+                match events.recv_timeout(wait.min(RELEASE_POLL)) {
                     Ok(ev) => (ev, false),
-                    Err(RecvTimeoutError::Timeout) => match self.missed_release(&events, &watch) {
-                        Some(ev) => ev,
-                        None => continue,
-                    },
+                    Err(RecvTimeoutError::Timeout) if hands_free && Instant::now() >= until => {
+                        tracing::warn!(
+                            "hands-free recording reached {} minutes; discarded it",
+                            HANDS_FREE_MAX.as_secs() / 60
+                        );
+                        latch = Latch::Off;
+                        if let Some((down, d, _ducked, feed)) = holding.take() {
+                            let now = Instant::now();
+                            self.abort_recording(
+                                &mut recorder,
+                                down,
+                                now,
+                                d,
+                                feed,
+                                Ended::TimedOut,
+                            );
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
+                        let missed = match hands_free {
+                            true => self.missed_press(&events).map(|ev| (ev, false)),
+                            false => self.missed_release(&events, &watch),
+                        };
+                        match missed {
+                            Some(ev) => ev,
+                            None => continue,
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            } else if let Some(until) = linger {
+                match events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                    Ok(ev) => (ev, false),
+                    Err(RecvTimeoutError::Timeout) => {
+                        linger = None;
+                        self.hub.update(|s| s.lingering = false);
+                        continue;
+                    }
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             } else {
@@ -721,39 +973,97 @@ impl AudioThread {
             match ev {
                 HotkeyEvent::Down(t) => {
                     *self.key_down.lock().unwrap() = Some(t);
-                    if let Some((down, mut d, _ducked)) = holding.take() {
+                    if matches!(latch, Latch::On | Latch::Ending) && holding.is_some() {
+                        // Ends the hands-free recording on its release, like a hold: every
+                        // paste comes after the hotkey is let go.
+                        if latch == Latch::On {
+                            tracing::debug!("hands-free recording ending: {} pressed", self.key);
+                        }
+                        latch = Latch::Ending;
+                        continue;
+                    }
+                    latch = Latch::Off;
+                    if let Some((down, d, _ducked, feed)) = holding.take() {
                         // The previous hold's release was never seen (and the poll couldn't
                         // tell, e.g. a swallowed F13-F24 key). Its audio may span minutes of
                         // unrelated speech: discard it rather than paste it.
-                        recorder.stop();
                         tracing::warn!("previous hold was never released; discarded it");
-                        self.hub.update(|s| s.recording = false);
-                        d.hold_ms = Some(ms(t.saturating_duration_since(down)));
-                        telemetry::global().dictation(d, Ended::StaleDiscarded);
+                        let outcome = Ended::StaleDiscarded;
+                        self.abort_recording(&mut recorder, down, t, d, feed, outcome);
                     }
                     // Before starting: any paste from here on counts as "during this recording".
                     watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
+                    let double = is_double_tap(last_tap.take(), t, double_tap);
                     holding = self.start_recording(&mut recorder, t).map(|d| {
                         // Only once the microphone runs: never delays it (a channel send).
-                        (t, d, self.duck())
+                        let ducked = self.duck();
+                        let secs = f32::from_bits(self.chunk_secs.load(Relaxed));
+                        (t, d, ducked, Feed::new(secs))
                     });
+                    // After `start_recording`: the status goes straight from lingering to
+                    // recording.
+                    if linger.take().is_some() {
+                        self.hub.update(|s| s.lingering = false);
+                    }
+                    if double && holding.is_some() {
+                        latch = Latch::Pressed;
+                        tracing::info!(
+                            "double tap: recording hands-free until {} is pressed again",
+                            self.key
+                        );
+                    }
                 }
                 HotkeyEvent::Up(released) => {
-                    let Some((down, mut d, _ducked)) = holding.take() else {
+                    let held = holding
+                        .as_ref()
+                        .map(|(down, ..)| released.saturating_duration_since(*down));
+                    if latch == Latch::Pressed && held.is_some_and(|h| h < tap) {
+                        latch = Latch::On;
+                        continue;
+                    }
+                    // A second press held down was a hold: a tap just before doesn't matter.
+                    latch = Latch::Off;
+                    let Some((down, mut d, _ducked, feed)) = holding.take() else {
                         continue;
                     };
+                    if held.is_some_and(|h| h < tap) {
+                        last_tap = Some(released);
+                        // Only for a tap that was dropped: with `min_hold_ms` below TAP, a tap
+                        // that long is transcribed, and the bar should say so.
+                        let dropped = held.is_some_and(|h| h < min_hold);
+                        if dropped && !double_tap.is_zero() {
+                            linger = Some(released + double_tap);
+                            self.hub.update(|s| s.lingering = true);
+                        }
+                    }
                     d.missed_release = missed;
-                    self.finish_recording(&mut recorder, down, released, d);
+                    self.finish_recording(&mut recorder, down, released, d, feed);
+                }
+                HotkeyEvent::Cancel if latch == Latch::Ending && holding.is_some() => {
+                    // A shortcut with the hotkey while hands-free: not the end of it.
+                    tracing::debug!("{} was part of a shortcut; still hands-free", self.key);
+                    latch = Latch::On;
                 }
                 HotkeyEvent::Cancel => {
-                    if let Some((down, mut d, _ducked)) = holding.take() {
-                        recorder.stop();
+                    latch = Latch::Off;
+                    if let Some((down, d, _ducked, feed)) = holding.take() {
                         tracing::info!(
                             "dictation cancelled (another key was pressed, or the hold was stale)"
                         );
-                        self.hub.update(|s| s.recording = false);
-                        d.hold_ms = Some(ms(down.elapsed()));
-                        telemetry::global().dictation(d, Ended::Cancelled);
+                        let now = Instant::now();
+                        self.abort_recording(&mut recorder, down, now, d, feed, Ended::Cancelled);
+                    }
+                }
+                HotkeyEvent::Escape => {
+                    if latch != Latch::On {
+                        continue; // only sent while armed; a late one
+                    }
+                    latch = Latch::Off;
+                    if let Some((down, d, _ducked, feed)) = holding.take() {
+                        tracing::info!("hands-free dictation cancelled (Esc)");
+                        let now = Instant::now();
+                        let outcome = Ended::EscCancelled;
+                        self.abort_recording(&mut recorder, down, now, d, feed, outcome);
                     }
                 }
             }
@@ -764,7 +1074,7 @@ impl AudioThread {
     /// while a meeting records (it would turn the call down).
     fn duck(&self) -> Option<Ducked> {
         let ducker = self.ducker.as_ref()?;
-        if self.meeting.load(Ordering::Relaxed) {
+        if self.meeting.load(Relaxed) {
             tracing::debug!("a meeting is recording; not ducking");
             return None;
         }
@@ -797,6 +1107,47 @@ impl AudioThread {
         );
         self.reset.reset();
         Some((HotkeyEvent::Up(Instant::now()), true))
+    }
+
+    /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
+    /// synthesized press if the hotkey turns out to be down without the hook having said so
+    /// (macOS disabled the event tap after a timeout, Windows dropped the hook), so the
+    /// recording can still be ended.
+    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<HotkeyEvent> {
+        let keys = self.key.keys();
+        if !keys
+            .iter()
+            .all(|&k| agt_platform::key_down(k) == Some(true))
+        {
+            return None; // up, or can't tell
+        }
+        // As in `missed_release`: a real press would normally be queued already.
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
+            return Some(ev);
+        }
+        tracing::warn!(
+            "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
+            self.key
+        );
+        self.reset.reset();
+        Some(HotkeyEvent::Down(Instant::now()))
+    }
+
+    /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded
+    /// as `outcome`.
+    fn abort_recording(
+        &self,
+        recorder: &mut Recorder,
+        down: Instant,
+        end: Instant,
+        mut d: Box<Dictation>,
+        feed: Feed,
+        outcome: Ended,
+    ) {
+        recorder.stop();
+        self.hub.update(|s| s.recording = false);
+        d.hold_ms = Some(ms(end.saturating_duration_since(down)));
+        self.drop_dictation(feed, d, outcome);
     }
 
     /// Returns the new dictation's record if recording started.
@@ -843,24 +1194,40 @@ impl AudioThread {
         }
     }
 
+    /// A recording ends without being transcribed: recorded as `outcome`. If segments of it
+    /// went to `stt`, by `stt` once it has skipped them (or discarded the one in flight).
+    fn drop_dictation(&self, feed: Feed, mut d: Box<Dictation>, outcome: Ended) {
+        if feed.sent {
+            feed.shared.dropped.store(true, Relaxed);
+            // As far as it got (up to the last poll).
+            d.audio_secs = Some(secs(&feed.audio));
+            let queued = feed.shared.queued.load(Relaxed);
+            live_stats(&mut d, feed.live.stats(), feed.max_queue.max(queued));
+            let _ = self.to_stt.send(ToStt::Dropped(d, outcome));
+        } else {
+            telemetry::global().dictation(d, outcome);
+        }
+    }
+
     fn finish_recording(
         &self,
         recorder: &mut Recorder,
         down: Instant,
         released: Instant,
         mut d: Box<Dictation>,
+        mut feed: Feed,
     ) {
         // Where the text should go: pasting is skipped if focus has moved by then.
         let target = agt_platform::foreground_window();
-        let rec = recorder.stop();
+        let mut rec = recorder.stop();
+        feed.audio.append(&mut rec.samples);
+        let samples = &feed.audio;
         let held = released.saturating_duration_since(down);
         // A few µs per second of audio.
-        let rms = (rec.samples.iter().map(|x| x * x).sum::<f32>()
-            / rec.samples.len().max(1) as f32)
-            .sqrt();
+        let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len().max(1) as f32).sqrt();
         tracing::debug!(
             "recorded {:.2} s from the microphone (rms {rms:.4})",
-            rec.samples.len() as f64 / SAMPLE_RATE as f64,
+            secs(samples),
         );
         if let Some(first) = rec.first_audio {
             tracing::debug!("first audio {:.1} ms after recording started", ms(first));
@@ -874,11 +1241,21 @@ impl AudioThread {
                 held.as_millis()
             );
             self.hub.update(|s| s.recording = false);
-            telemetry::global().dictation(d, Ended::TooShort);
+            self.drop_dictation(feed, d, Ended::TooShort);
             return;
         }
-        let audio = self.test_wav.clone().unwrap_or(rec.samples);
-        d.audio_secs = Some(audio.len() as f64 / SAMPLE_RATE as f64);
+        // The last bit of audio may still end a segment.
+        feed.push(self.test_wav.as_deref(), &self.to_stt);
+        let live = feed.live.cut().then(|| {
+            let (tail, stats) = feed.live.finish();
+            let queued = feed.shared.queued.load(Relaxed) + tail.len();
+            live_stats(&mut d, &stats, feed.max_queue.max(queued));
+            d.live_tail_joined = Some(stats.tail_joined);
+            d.live_tail_secs = Some(stats.tail as f64 / SAMPLE_RATE as f64);
+            (tail, feed.shared)
+        });
+        let audio = self.test_wav.clone().unwrap_or(feed.audio);
+        d.audio_secs = Some(secs(&audio));
         self.hub.update(|s| {
             s.recording = false;
             s.pending += 1;
@@ -888,6 +1265,7 @@ impl AudioThread {
             released,
             target,
             dictation: d,
+            live,
         }));
     }
 }
@@ -949,16 +1327,75 @@ fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
     }
 }
 
-/// Runs the engine. A change in how it runs (e.g. the GPU failed and it switched to the CPU)
-/// goes to the session record and the status line.
-fn run_engine(
+/// The texts so far of the recording whose segments are transcribed while it's recorded.
+struct Partial {
+    shared: Arc<Shared>,
+    texts: Texts,
+    /// Time spent on its segments, and on calls whose text was discarded (it was dropped
+    /// meanwhile).
+    stt_ms: f64,
+    discarded_ms: f64,
+    error: Option<String>,
+    /// Polishing it in pieces while recording; `None` when polish is off or needs the whole
+    /// text (see [`Ahead::new`]).
+    ahead: Option<Ahead>,
+    /// How many of `texts` went to `ahead`.
+    fed: usize,
+}
+
+impl Partial {
+    /// `polish`: the settings, with polish on.
+    fn new(shared: Arc<Shared>, polish: Option<&PolishConfig>) -> Self {
+        Self {
+            shared,
+            texts: Texts::default(),
+            stt_ms: 0.0,
+            discarded_ms: 0.0,
+            error: None,
+            ahead: polish.and_then(Ahead::new),
+            fed: 0,
+        }
+    }
+
+    /// Hands every text but the last to `ahead`, and its pieces to `polish`. The last one
+    /// waits for the next, or for release: a short tail may be transcribed again together
+    /// with it, and that text replaces it ([`Texts::add`] with `redo`).
+    fn feed_ahead(&mut self, to_polish: &Sender<ToPolish>) {
+        // After a failed segment the dictation fails too: nothing more to polish.
+        let Some(ahead) = self.ahead.as_mut().filter(|_| self.error.is_none()) else {
+            return;
+        };
+        while self.fed + 1 < self.texts.0.len() {
+            for piece in ahead.push(&self.texts.0[self.fed]) {
+                tracing::debug!(
+                    "polishing {} words while recording",
+                    piece.split_whitespace().count()
+                );
+                let _ = to_polish.send(ToPolish::Piece(piece, self.shared.clone()));
+            }
+            self.fed += 1;
+        }
+    }
+
+    /// At release, once the tail is transcribed: the pieces left to polish, if it's
+    /// polished in pieces.
+    fn finish_ahead(&mut self) -> Option<Vec<String>> {
+        let rest = self.texts.0[self.fed.min(self.texts.0.len())..].join(" ");
+        let pieces = self.ahead.take()?.finish(&rest);
+        Some(pieces.into_iter().filter(|p| !p.is_empty()).collect())
+    }
+}
+
+/// One engine call. Notices a change of backend (e.g. the GPU failed and the engine
+/// switched to the CPU), which may also change how long segments should be.
+fn transcribe(
     engine: &mut dyn SttEngine,
     audio: &[f32],
-    opts: &TranscribeOpts,
     hub: &Hub,
-) -> stt::Result<Transcript> {
+    chunk_secs: &AtomicU32,
+) -> Result<String, String> {
     let notice = engine.notice();
-    let result = engine.transcribe(audio, opts);
+    let result = engine.transcribe(audio, &TranscribeOpts::default());
     if engine.notice() != notice {
         let note = engine.notice();
         telemetry::global().session(telemetry::SessionUpdate {
@@ -967,19 +1404,27 @@ fn run_engine(
             ..Default::default()
         });
         hub.update(|s| s.engine = Engine::Ready(note));
+        set_chunk_secs(engine, chunk_secs);
     }
-    result
+    result.map(|t| t.text).map_err(|e| e.to_string())
+}
+
+/// Tells the audio thread how long the engine's chunks are (shorter for a GPU window).
+fn set_chunk_secs(engine: &dyn SttEngine, chunk_secs: &AtomicU32) {
+    let secs = engine.chunk_secs().unwrap_or(agt_stt::CHUNK_SECS);
+    chunk_secs.store(secs.to_bits(), Relaxed);
 }
 
 /// A meeting segment's text, made like a dictation's raw text (whitespace collapsed, no
 /// trailing space, "" for no speech). Never polished (polish is for pasted text), and it
-/// leaves no trace in the status line, the dictation records or history. The log gets
-/// timings only, never the text.
+/// leaves no trace in the dictation records or history; the status line only learns of a
+/// change in how the engine runs, as from any call ([`transcribe`]). The log gets timings
+/// only, never the text.
 fn transcribe_segment(
     engine: Option<&mut Box<dyn SttEngine>>,
     audio: &[f32],
-    opts: &TranscribeOpts,
     hub: &Hub,
+    chunk_secs: &AtomicU32,
 ) -> Result<String, String> {
     let Some(engine) = engine else {
         // At debug: a meeting sends one every few seconds, and the load failure is logged.
@@ -987,47 +1432,122 @@ fn transcribe_segment(
         return Err("model not ready".into());
     };
     let start = Instant::now();
-    match run_engine(engine.as_mut(), audio, opts, hub) {
-        Ok(t) => {
+    match transcribe(engine.as_mut(), audio, hub, chunk_secs) {
+        Ok(text) => {
             tracing::debug!(
                 "meeting segment: {:.1} s of audio, stt {:.0} ms",
-                audio.len() as f64 / SAMPLE_RATE as f64,
+                secs(audio),
                 ms(start.elapsed())
             );
-            Ok(finish_text(&t.text, false))
+            Ok(finish_text(&text, false))
         }
         Err(e) => {
             tracing::error!("meeting segment transcription failed: {e}");
-            Err(e.to_string())
+            Err(e)
         }
     }
 }
 
-/// Transcribes dictations and meeting segments, one at a time, dictations first (see the
+/// Transcribes dictations and meeting segments, one at a time, dictation first (see the
 /// module docs).
 fn stt_thread(
     config: Config,
     hub: Hub,
     jobs: Receiver<ToStt>,
-    to_paste: Sender<ToPaste>,
-    polisher: Option<Arc<dyn Polisher>>,
+    to_polish: Sender<ToPolish>,
+    polishing: bool,
     history: Option<History>,
+    chunk_secs: Arc<AtomicU32>,
 ) {
+    let polish = polishing.then_some(&config.polish);
     let mut engine = load_engine(&config, &hub);
-    let opts = TranscribeOpts::default();
+    if let Some(e) = &engine {
+        set_chunk_secs(e.as_ref(), &chunk_secs);
+    }
+    let mut partial: Option<Partial> = None;
+    // When the engine's last call ended (it's been idle since: a GPU wakes up slowly). A
+    // meeting segment's call counts: the engine was busy with it.
+    let mut engine_done: Option<Instant> = None;
     let mut queue = SttQueue::default();
-    while queue.fill(&jobs) {
-        if std::mem::take(&mut queue.reload) && engine.is_none() {
-            hub.update(|s| s.engine = Engine::Loading("Loading model...".into()));
-            engine = load_engine(&config, &hub);
-        }
-        let mut job = match next_job(&mut queue.dictations, &mut queue.segments) {
-            Some(Next::Dictation(job)) => job,
-            Some(Next::Segment((audio, done))) => {
-                done(transcribe_segment(engine.as_mut(), &audio, &opts, &hub));
+    loop {
+        // Free from here on, until the next message (none if one is queued already).
+        let free_at = Instant::now();
+        let Some(msg) = queue.next(&jobs) else { return };
+        let mut job = match msg {
+            ToStt::RetryLoad => {
+                if engine.is_none() {
+                    hub.update(|s| s.engine = Engine::Loading("Loading model...".into()));
+                    engine = load_engine(&config, &hub);
+                    if let Some(e) = &engine {
+                        set_chunk_secs(e.as_ref(), &chunk_secs);
+                    }
+                }
                 continue;
             }
-            None => continue, // only a reload was asked for
+            ToStt::Segment(piece, shared) => {
+                shared.queued.fetch_sub(1, Relaxed);
+                if !partial
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.shared, &shared))
+                {
+                    partial = Some(Partial::new(shared.clone(), polish));
+                }
+                let p = partial.get_or_insert_with(|| Partial::new(shared.clone(), polish));
+                let Some(engine) = engine.as_mut().filter(|_| !shared.dropped.load(Relaxed)) else {
+                    continue;
+                };
+                let t = Instant::now();
+                let result = transcribe(engine.as_mut(), &piece.audio, &hub, &chunk_secs);
+                engine_done = Some(Instant::now());
+                let took = ms(t.elapsed());
+                if shared.dropped.load(Relaxed) {
+                    tracing::debug!("recording dropped while a segment was transcribed");
+                    p.discarded_ms += took;
+                    continue;
+                }
+                tracing::debug!(
+                    "segment of {:.1} s transcribed while recording ({took:.0} ms)",
+                    secs(&piece.audio)
+                );
+                p.stt_ms += took;
+                match result {
+                    Ok(text) => {
+                        p.texts.add(text, piece.redo);
+                        p.feed_ahead(&to_polish);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "segment {} ({:.1} s) failed to transcribe; the dictation will fail: {e}",
+                            p.texts.0.len() + 1,
+                            secs(&piece.audio)
+                        );
+                        p.error = Some(e);
+                    }
+                }
+                continue;
+            }
+            ToStt::Dropped(mut d, outcome) => {
+                // Its segments are behind us: skipped, or the last one discarded.
+                if let Some(p) = partial.take() {
+                    d.live_stt_ms = Some(p.stt_ms);
+                    d.live_discarded_ms = (p.discarded_ms > 0.0).then_some(p.discarded_ms);
+                }
+                telemetry::global().dictation(d, outcome);
+                continue;
+            }
+            ToStt::Meeting { audio, done } => {
+                done(transcribe_segment(
+                    engine.as_mut(),
+                    &audio,
+                    &hub,
+                    &chunk_secs,
+                ));
+                if engine.is_some() {
+                    engine_done = Some(Instant::now());
+                }
+                continue;
+            }
+            ToStt::Transcribe(job) => job,
         };
         let mut d = job.dictation;
         let Some(engine) = engine.as_mut() else {
@@ -1036,18 +1556,53 @@ fn stt_thread(
             continue;
         };
         let stt_start = Instant::now();
-        let result = run_engine(engine.as_mut(), &job.audio, &opts, &hub);
+        // Polished in pieces: those left to polish.
+        let mut rest = None;
+        let result = match job.live.take() {
+            None => transcribe(engine.as_mut(), &job.audio, &hub, &chunk_secs),
+            // Most of it was transcribed while recording: only the tail is left.
+            Some((tail, shared)) => {
+                let mut p = partial
+                    .take()
+                    .filter(|p| Arc::ptr_eq(&p.shared, &shared))
+                    .unwrap_or_else(|| Partial::new(shared, None));
+                // Still busy at release: a segment, or an earlier dictation.
+                d.live_busy_at_release = Some(free_at > job.released);
+                d.live_idle_ms = engine_done.map(|t| ms(stt_start.saturating_duration_since(t)));
+                d.live_stt_ms = Some(p.stt_ms);
+                for piece in tail {
+                    match transcribe(engine.as_mut(), &piece.audio, &hub, &chunk_secs) {
+                        Ok(text) => p.texts.add(text, piece.redo),
+                        Err(e) => p.error = Some(e),
+                    }
+                }
+                rest = p.finish_ahead().map(|r| (r, p.shared.clone()));
+                p.error.map_or_else(|| Ok(p.texts.join()), Err)
+            }
+        };
         let stt_end = Instant::now();
+        engine_done = Some(stt_end);
         d.queue_wait_ms = Some(ms(stt_start.saturating_duration_since(job.released)));
         d.stt_ms = Some(ms(stt_end - stt_start));
+        d.release_to_text_ms = Some(ms(stt_end.saturating_duration_since(job.released)));
         d.stt_backend = Some(engine.name());
+        if d.live_stt_ms.is_some() {
+            tracing::debug!(
+                "{:.1} s transcribed while recording ({} segments, {:.0} ms); release → text {:.0} ms ({:.1} s left)",
+                d.audio_secs.unwrap_or_default(),
+                d.live_pause_cuts.unwrap_or(0) + d.live_limit_cuts.unwrap_or(0),
+                d.live_stt_ms.unwrap_or_default(),
+                d.release_to_text_ms.unwrap_or_default(),
+                d.live_tail_secs.unwrap_or_default(),
+            );
+        }
         match result {
             Ok(t) => {
-                let mut text = finish_text(&t.text, false);
+                let text = finish_text(&t, false);
                 d.words_raw = Some(text.split_whitespace().count() as i64);
                 // The audio is moved, not copied: transcription is done with it. The raw
                 // text's copy is a few hundred bytes: nanoseconds before the paste.
-                let mut saved = history.as_ref().map(|h| {
+                let saved = history.as_ref().map(|h| {
                     Box::new(history::Entry {
                         started_at: d.started_at,
                         audio: if h.save_audio {
@@ -1062,27 +1617,6 @@ fn stt_thread(
                         }),
                     })
                 });
-                if let Some(p) = polisher.as_deref().filter(|_| !text.is_empty()) {
-                    let t = Instant::now();
-                    let (polished, outcome) = agt_polish::polish_or_raw(p, &text, &config.polish);
-                    if let Outcome::Fallback(why) = &outcome {
-                        tracing::warn!("polish failed, pasting the raw transcript: {why}");
-                    }
-                    text = polished;
-                    d.polish_ms = Some(ms(t.elapsed()));
-                    d.polish_outcome = Some(match outcome {
-                        Outcome::Polished => "polished",
-                        Outcome::Skipped(_) => "skipped",
-                        Outcome::Fallback(_) => "fallback",
-                    });
-                }
-                if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
-                    t.polish_outcome = d.polish_outcome;
-                    t.polished = (d.polish_outcome == Some("polished")).then(|| text.clone());
-                }
-                if config.paste.trailing_space && !text.is_empty() {
-                    text.push(' ');
-                }
                 if text.is_empty() {
                     tracing::info!(
                         "no speech recognized in {:.1} s of audio (stt {:.0} ms)",
@@ -1097,13 +1631,15 @@ fn stt_thread(
                     }
                     telemetry::global().dictation(d, Ended::NoSpeech);
                 } else {
-                    let _ = to_paste.send(ToPaste::Paste {
+                    let _ = to_polish.send(ToPolish::Text(Box::new(Transcribed {
                         text,
+                        rest,
+                        ready: stt_end,
                         released: job.released,
                         target: job.target,
                         dictation: d,
                         saved,
-                    });
+                    })));
                 }
             }
             Err(e) => {
@@ -1115,6 +1651,203 @@ fn stt_thread(
                 telemetry::global().dictation(d, Ended::TranscribeFailed);
             }
         }
+    }
+}
+
+/// A dictation polished in pieces (`agt_polish::ahead`): its pieces polished so far.
+struct Pieces {
+    shared: Arc<Shared>,
+    texts: Vec<String>,
+    outcomes: Vec<Outcome>,
+    /// Words of the pieces as transcribed.
+    raw_words: usize,
+    /// Time spent on the pieces polished in the background, before the transcript was ready.
+    ahead_ms: f64,
+    /// A request ran out of time: the rest of the pieces stay raw.
+    timed_out: bool,
+}
+
+impl Pieces {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            texts: Vec::new(),
+            outcomes: Vec::new(),
+            raw_words: 0,
+            ahead_ms: 0.0,
+            timed_out: false,
+        }
+    }
+
+    /// Polishes the next piece, or keeps it raw once a request for this dictation failed by
+    /// running out of time: a hung server would make every piece wait out its own deadline,
+    /// one after the other. A quick failure (a server restarting) doesn't stop the rest.
+    fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
+        let words = piece.split_whitespace().count();
+        self.raw_words += words;
+        let (text, outcome) = if self.timed_out {
+            let why = "an earlier piece timed out".to_owned();
+            (piece.to_owned(), Outcome::Failed(why))
+        } else {
+            let t = Instant::now();
+            let (text, outcome) = agt_polish::polish_or_raw(p, piece, cfg);
+            log_outcome(&outcome, piece, "piece");
+            self.timed_out =
+                matches!(outcome, Outcome::Failed(_)) && t.elapsed() >= cfg.timeout(words);
+            (text, outcome)
+        };
+        self.texts.push(text);
+        self.outcomes.push(outcome);
+    }
+
+    /// The pieces joined, how they went as one outcome ("partial" if only some were
+    /// polished), and how many weren't.
+    fn finish(self) -> (String, &'static str, usize) {
+        let raw = self
+            .outcomes
+            .iter()
+            .filter(|o| **o != Outcome::Polished)
+            .count();
+        let outcome = match (raw, self.outcomes.first()) {
+            (0, _) => "polished",
+            (n, Some(first)) if n == self.outcomes.len() => outcome_name(first),
+            _ => "partial",
+        };
+        (self.texts.join(" "), outcome, raw)
+    }
+}
+
+fn outcome_name(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Polished => "polished",
+        Outcome::Skipped(agt_polish::guard::TOO_LONG) => "too_long",
+        Outcome::Skipped(_) => "skipped",
+        Outcome::Failed(_) | Outcome::Fallback(_) => "fallback",
+    }
+}
+
+/// `what`: "transcript", or "piece" of one.
+fn log_outcome(outcome: &Outcome, text: &str, what: &str) {
+    match outcome {
+        Outcome::Failed(why) | Outcome::Fallback(why) => {
+            tracing::warn!("polish failed, pasting the raw {what}: {why}")
+        }
+        Outcome::Skipped(agt_polish::guard::TOO_LONG) => tracing::info!(
+            "{what} too long to polish ({} words); pasting it raw",
+            text.split_whitespace().count()
+        ),
+        _ => {}
+    }
+}
+
+fn polish_thread(
+    config: Config,
+    jobs: Receiver<ToPolish>,
+    to_paste: Sender<ToPaste>,
+    polisher: Option<Arc<dyn Polisher>>,
+) {
+    // A piece may be shorter than `polish.min_words`; the dictation it's from isn't.
+    let piece_cfg = PolishConfig {
+        min_words: 1,
+        ..config.polish.clone()
+    };
+    // The recording in progress, or the last one, if it's polished in pieces.
+    let mut pieces: Option<Pieces> = None;
+    for msg in jobs {
+        let job = match msg {
+            ToPolish::Piece(text, shared) => {
+                if !pieces
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.shared, &shared))
+                {
+                    pieces = Some(Pieces::new(shared.clone()));
+                }
+                let (Some(polisher), Some(p)) = (polisher.as_deref(), pieces.as_mut()) else {
+                    continue;
+                };
+                // Dropped (cancelled): its pieces still queued are skipped.
+                if !shared.dropped.load(Relaxed) {
+                    let t = Instant::now();
+                    p.polish(polisher, &text, &piece_cfg);
+                    p.ahead_ms += ms(t.elapsed());
+                }
+                continue;
+            }
+            ToPolish::Text(job) => job,
+        };
+        let Transcribed {
+            mut text,
+            rest,
+            ready,
+            released,
+            target,
+            dictation: mut d,
+            mut saved,
+        } = *job;
+        // Pieces sent before it are its own (or a failed dictation's).
+        let earlier = pieces.take();
+        if let Some(polisher) = polisher.as_deref() {
+            let start = Instant::now();
+            d.polish_wait_ms = Some(ms(start.saturating_duration_since(ready)));
+            let split = rest.and_then(|(rest, shared)| {
+                let p = earlier
+                    .filter(|p| Arc::ptr_eq(&p.shared, &shared))
+                    .unwrap_or_else(|| Pieces::new(shared));
+                let rest_words: usize = rest.iter().map(|r| r.split_whitespace().count()).sum();
+                if p.raw_words + rest_words != text.split_whitespace().count() {
+                    tracing::warn!(
+                        "polished pieces don't add up to the transcript; polishing it whole"
+                    );
+                    return None;
+                }
+                // Nothing went ahead and it's one piece: the whole text, as always.
+                (!p.texts.is_empty() || rest.len() > 1).then_some((p, rest, rest_words))
+            });
+            let outcome = match split {
+                Some((mut p, rest, words)) => {
+                    let ahead = p.texts.len();
+                    for piece in &rest {
+                        p.polish(polisher, piece, &piece_cfg);
+                    }
+                    tracing::debug!(
+                        "polished in {} pieces, {ahead} in the background ({:.0} ms); {words} words left at release",
+                        ahead + rest.len(),
+                        p.ahead_ms
+                    );
+                    d.polish_ahead_pieces = Some(ahead as i64);
+                    d.polish_ahead_ms = Some(p.ahead_ms);
+                    d.polish_release_words = Some(words as i64);
+                    let (joined, outcome, raw) = p.finish();
+                    d.polish_fallbacks = Some(raw as i64);
+                    text = joined;
+                    outcome
+                }
+                None => {
+                    let (polished, outcome) =
+                        agt_polish::polish_or_raw(polisher, &text, &config.polish);
+                    log_outcome(&outcome, &text, "transcript");
+                    text = polished;
+                    outcome_name(&outcome)
+                }
+            };
+            d.polish_ms = Some(ms(start.elapsed()));
+            d.polish_outcome = Some(outcome);
+        }
+        if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
+            t.polish_outcome = d.polish_outcome;
+            t.polished =
+                matches!(d.polish_outcome, Some("polished" | "partial")).then(|| text.clone());
+        }
+        if config.paste.trailing_space && !text.is_empty() {
+            text.push(' ');
+        }
+        let _ = to_paste.send(ToPaste::Paste {
+            text,
+            released,
+            target,
+            dictation: d,
+            saved,
+        });
     }
 }
 
@@ -1315,6 +2048,8 @@ fn paste_thread(
 ) {
     let restore_after = Duration::from_millis(config.paste.restore_clipboard_ms);
     let restore = !restore_after.is_zero();
+    // Only the overlay shows the "not in a text box" notice: without it, don't ask apps.
+    let check_focus = config.overlay.enabled;
     let mut saver = Saver::default();
     // Our paste that still has to be undone, and when.
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
@@ -1339,6 +2074,11 @@ fn paste_thread(
                 if restore && pending_restore.is_none() {
                     saver.saved = None;
                     save_for_paste = saver.start();
+                }
+                // After starting the save (it runs on its own thread), and here, not on the
+                // audio thread: it asks the frontmost app, which may be slow.
+                if check_focus {
+                    agt_platform::prepare_focus_check();
                 }
             }
             Ok(ToPaste::Paste {
@@ -1460,6 +2200,14 @@ fn paste_thread(
                             pending_restore = Some((token, pasted + restore_after));
                         }
                         telemetry::global().dictation(d, Ended::Pasted);
+                        // Last, once the restore is scheduled: it asks the focused app, which
+                        // may take up to a second while it handles the paste. Pasted anyway
+                        // (the check can be wrong, and an app may take a paste outside a text
+                        // field, like a design canvas), so this only offers a way out.
+                        if check_focus && agt_platform::focus_takes_text() == Some(false) {
+                            tracing::info!("pasted, but focus isn't in a text box; offering Copy");
+                            hub.not_in_text_box();
+                        }
                     }
                     Err(e) => {
                         tracing::error!("paste failed ({chars} chars not pasted): {e}");
@@ -1485,6 +2233,7 @@ fn paste_thread(
                                 s.error = None;
                             }
                         });
+                        hub.copied();
                         tracing::info!(
                             "last transcript ({} chars) copied to the clipboard",
                             text.chars().count()
@@ -1591,6 +2340,11 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+/// Length of 16 kHz audio in seconds.
+fn secs(audio: &[f32]) -> f64 {
+    audio.len() as f64 / SAMPLE_RATE as f64
+}
+
 /// One line of a pasted dictation's timings, e.g. `audio 2.97 s | release→stt 0 ms |
 /// stt 157 ms | paste 4 ms | release→paste 161 ms | 42 chars`.
 fn timings(d: &Dictation) -> String {
@@ -1618,6 +2372,290 @@ fn wall_clock(t: Instant) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_tap_is_a_press_soon_after_a_tap() {
+        let t = Instant::now();
+        let gap = Duration::from_millis(400);
+        assert!(is_double_tap(Some(t), t + gap, gap));
+        assert!(!is_double_tap(
+            Some(t),
+            t + gap + Duration::from_millis(1),
+            gap
+        ));
+        assert!(!is_double_tap(None, t, gap), "no tap before");
+        assert!(!is_double_tap(Some(t), t, Duration::ZERO), "turned off");
+    }
+
+    /// `n` words of sentences: "w w w w w. W w w w w. ..." (a sentence end every 5 words).
+    fn sentences(n: usize, w: &str) -> String {
+        let cap = w[..1].to_uppercase() + &w[1..];
+        (0..n)
+            .map(|i| match (i % 5, i % 5 == 4) {
+                (0, _) => cap.clone(),
+                (_, true) => format!("{w}."),
+                _ => w.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn pieces_sent(rx: &Receiver<ToPolish>) -> Vec<String> {
+        rx.try_iter()
+            .map(|m| match m {
+                ToPolish::Piece(text, _) => text,
+                ToPolish::Text(_) => panic!("not a piece"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_last_segment_waits_so_a_redone_tail_can_replace_it() {
+        let (tx, rx) = mpsc::channel();
+        let polish = PolishConfig::default();
+        let mut p = Partial::new(Arc::default(), Some(&polish));
+        p.texts.add(sentences(30, "one"), false);
+        p.feed_ahead(&tx);
+        assert!(pieces_sent(&rx).is_empty(), "the only segment so far waits");
+        p.texts.add(sentences(30, "two"), false);
+        p.feed_ahead(&tx);
+        // The first segment, up to its last sentence end that isn't at its end.
+        assert_eq!(pieces_sent(&rx), [sentences(25, "one")]);
+        // At release a short tail is transcribed again with the second segment.
+        p.texts
+            .add(format!("{} and done.", sentences(30, "Two")), true);
+        let rest = p.finish_ahead().unwrap();
+        assert_eq!(
+            rest.join(" "),
+            format!(
+                "{} {} and done.",
+                &sentences(30, "one")[sentences(25, "one").len() + 1..],
+                sentences(30, "Two")
+            )
+        );
+        assert!(!rest.join(" ").contains("two"), "the replaced text is gone");
+        assert_eq!(
+            format!("{} {}", sentences(25, "one"), rest.join(" ")),
+            p.texts.join()
+        );
+    }
+
+    #[test]
+    fn nothing_goes_ahead_without_polish_or_for_whole_text_settings() {
+        let (tx, rx) = mpsc::channel();
+        let mut lists = PolishConfig::default();
+        lists.s1_mini.structure = agt_core::config::S1Structure::Lists;
+        for polish in [None, Some(&lists)] {
+            let mut p = Partial::new(Arc::default(), polish);
+            for _ in 0..5 {
+                p.texts.add(sentences(30, "word"), false);
+                p.feed_ahead(&tx);
+            }
+            assert!(pieces_sent(&rx).is_empty());
+            assert!(p.finish_ahead().is_none());
+        }
+    }
+
+    /// Ends each text with " ok." (one more word, so the guard accepts it). Fails texts with
+    /// "FAIL" in them at once and those with "HANG" after the deadline ([`TEST_TIMEOUT`]),
+    /// and answers those with "REPLY" like an assistant (the guard rejects that).
+    struct Marks;
+    impl Polisher for Marks {
+        fn name(&self) -> String {
+            "marks".into()
+        }
+        fn polish(
+            &self,
+            text: &str,
+            _: &agt_core::polish::PolishCtx,
+        ) -> agt_core::polish::Result<String> {
+            if text.contains("HANG") {
+                thread::sleep(TEST_TIMEOUT + Duration::from_millis(5));
+                Err("timed out".into())
+            } else if text.contains("FAIL") {
+                Err("failed".into())
+            } else if text.contains("REPLY") {
+                Ok("Sure! Here you go.".into())
+            } else {
+                Ok(format!("{text} ok."))
+            }
+        }
+    }
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(20);
+
+    /// Runs the polish thread over `msgs`; returns what it hands to `paste`.
+    fn polish_all(msgs: Vec<ToPolish>) -> Vec<(String, Box<Dictation>)> {
+        let (tx, rx) = mpsc::channel();
+        let (to_paste, pasted) = mpsc::channel();
+        for m in msgs {
+            tx.send(m).unwrap();
+        }
+        drop(tx);
+        let mut config = Config::default();
+        config.paste.trailing_space = false;
+        config.polish.timeout_ms = TEST_TIMEOUT.as_millis() as u64;
+        config.polish.timeout_per_word_ms = 0;
+        polish_thread(config, rx, to_paste, Some(Arc::new(Marks)));
+        pasted
+            .try_iter()
+            .map(|m| match m {
+                ToPaste::Paste {
+                    text, dictation, ..
+                } => (text, dictation),
+                _ => panic!("not a paste"),
+            })
+            .collect()
+    }
+
+    /// The transcript of `ahead` (sent as pieces before) and `rest`, with `rest` left to
+    /// polish at release.
+    fn transcribed(ahead: &[&str], rest: &[&str], shared: &Arc<Shared>) -> ToPolish {
+        let text = ahead
+            .iter()
+            .chain(rest)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rest = rest.iter().map(|r| r.to_string()).collect();
+        whole(&text, Some((rest, shared.clone())))
+    }
+
+    fn whole(text: &str, rest: Option<(Vec<String>, Arc<Shared>)>) -> ToPolish {
+        let now = Instant::now();
+        ToPolish::Text(Box::new(Transcribed {
+            text: text.into(),
+            rest,
+            ready: now,
+            released: now,
+            target: None,
+            dictation: Box::default(),
+            saved: None,
+        }))
+    }
+
+    fn piece(text: &str, shared: &Arc<Shared>) -> ToPolish {
+        ToPolish::Piece(text.into(), shared.clone())
+    }
+
+    #[test]
+    fn pieces_polished_while_recording_are_joined_with_the_rest() {
+        let a = Arc::<Shared>::default();
+        let (one, two) = (sentences(25, "one"), sentences(25, "two"));
+        let out = polish_all(vec![
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["and the end"], &a),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        // "and the end" is under min_words, but a piece of a long dictation all the same.
+        assert_eq!(text, &format!("{one} ok. {two} ok. and the end ok."));
+        assert_eq!(d.polish_outcome, Some("polished"));
+        assert_eq!(d.polish_ahead_pieces, Some(2));
+        assert_eq!(d.polish_release_words, Some(3));
+        assert_eq!(d.polish_fallbacks, Some(0));
+        assert!(d.polish_ms.is_some() && d.polish_wait_ms.is_some());
+        assert!(d.polish_ahead_ms.is_some());
+    }
+
+    #[test]
+    fn a_rejected_piece_is_pasted_raw_and_the_rest_polished() {
+        let a = Arc::<Shared>::default();
+        let one = sentences(25, "one");
+        let two = format!("{} REPLY.", sentences(25, "two"));
+        let out = polish_all(vec![
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["the end"], &a),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        assert_eq!(text, &format!("{one} ok. {two} the end ok."));
+        assert_eq!(d.polish_outcome, Some("partial"));
+        assert_eq!(d.polish_fallbacks, Some(1));
+    }
+
+    #[test]
+    fn after_a_timed_out_request_the_rest_of_the_pieces_stay_raw() {
+        let a = Arc::<Shared>::default();
+        let one = format!("{} HANG.", sentences(25, "one"));
+        let two = sentences(25, "two");
+        let out = polish_all(vec![
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["the end"], &a),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        // Not sent: a hung server would make each wait out its own deadline.
+        assert_eq!(text, &format!("{one} {two} the end"));
+        // All raw: the failure's own outcome.
+        assert_eq!(d.polish_outcome, Some("fallback"));
+        assert_eq!(d.polish_fallbacks, Some(3));
+    }
+
+    #[test]
+    fn a_quick_failure_doesnt_stop_the_rest() {
+        let a = Arc::<Shared>::default();
+        let one = format!("{} FAIL.", sentences(25, "one"));
+        let two = sentences(25, "two");
+        let out = polish_all(vec![
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["the end"], &a),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        assert_eq!(text, &format!("{one} {two} ok. the end ok."));
+        assert_eq!(d.polish_outcome, Some("partial"));
+        assert_eq!(d.polish_fallbacks, Some(1));
+    }
+
+    #[test]
+    fn pieces_that_dont_add_up_fall_back_to_the_whole_text() {
+        let a = Arc::<Shared>::default();
+        let text = format!("{} the end", sentences(50, "word"));
+        // The pieces polished ahead went missing: only the rest arrives.
+        let out = polish_all(vec![whole(&text, Some((vec!["the end".into()], a)))]);
+        let [(got, d)] = &out[..] else { panic!() };
+        assert_eq!(got, &format!("{text} ok."));
+        assert_eq!(d.polish_ahead_pieces, None);
+    }
+
+    #[test]
+    fn a_cancelled_recordings_pieces_are_skipped_and_not_pasted() {
+        let (cancelled, next) = (Arc::<Shared>::default(), Arc::<Shared>::default());
+        cancelled.dropped.store(true, Relaxed);
+        let one = sentences(25, "next");
+        let out = polish_all(vec![
+            piece(&sentences(25, "gone"), &cancelled),
+            piece(&one, &next),
+            transcribed(&[&one], &["the end"], &next),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        assert_eq!(text, &format!("{one} ok. the end ok."));
+        assert_eq!(d.polish_ahead_pieces, Some(1));
+    }
+
+    #[test]
+    fn a_short_dictation_is_polished_whole_as_always() {
+        let a = Arc::<Shared>::default();
+        let out = polish_all(vec![
+            whole("um so this is short", None),
+            whole("hi", None),
+            // Cut while recording but nothing went ahead: one piece, the whole text.
+            transcribed(&[], &["hi there"], &a),
+        ]);
+        let got: Vec<_> = out
+            .iter()
+            .map(|(t, d)| (t.as_str(), d.polish_outcome, d.polish_ahead_pieces))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("um so this is short ok.", Some("polished"), None),
+                ("hi", Some("skipped"), None),
+                ("hi there", Some("skipped"), None),
+            ]
+        );
+    }
 
     #[test]
     fn text_is_normalized() {
@@ -1870,62 +2908,63 @@ mod tests {
             released: Instant::now(),
             target: None,
             dictation: Box::default(),
+            live: None,
         }
     }
 
-    fn segment(audio: Vec<f32>) -> ToStt {
-        ToStt::Segment {
+    fn meeting_segment(audio: Vec<f32>) -> ToStt {
+        ToStt::Meeting {
             audio,
             done: Box::new(|_| {}),
         }
     }
 
-    #[test]
-    fn dictation_jobs_go_first() {
-        // Two meeting segments are waiting when a dictation comes in behind them.
-        let (tx, rx) = mpsc::channel();
-        for msg in [segment(vec![1.0]), segment(vec![2.0])] {
-            tx.send(msg).unwrap();
+    /// What a message is, to check the order they're handled in (audio by its first sample).
+    fn label(msg: &ToStt) -> String {
+        match msg {
+            ToStt::Transcribe(j) => format!("job {}", j.audio[0]),
+            ToStt::Segment(p, _) => format!("segment {}", p.audio[0]),
+            ToStt::Dropped(..) => "dropped".into(),
+            ToStt::RetryLoad => "reload".into(),
+            ToStt::Meeting { audio, .. } => format!("meeting {}", audio[0]),
         }
-        tx.send(ToStt::Transcribe(job(vec![9.0]))).unwrap();
-        let mut queue = SttQueue::default();
-        assert!(
-            queue.fill(&rx),
-            "all three taken in one go, without blocking"
-        );
-        let order: Vec<f32> =
-            std::iter::from_fn(|| next_job(&mut queue.dictations, &mut queue.segments))
-                .map(|next| match next {
-                    Next::Dictation(j) => j.audio[0],
-                    Next::Segment((audio, _)) => audio[0],
-                })
-                .collect();
-        assert_eq!(
-            order,
-            [9.0, 1.0, 2.0],
-            "the dictation, then the segments in order"
-        );
-        // A reload request is work too: kept until the thread handles it.
-        tx.send(ToStt::RetryLoad).unwrap();
-        assert!(queue.fill(&rx) && queue.reload && !queue.is_empty());
-        queue.reload = false;
-        // Every sender gone and nothing left: the thread ends.
-        drop(tx);
-        assert!(!queue.fill(&rx));
     }
 
     #[test]
-    fn next_job_prefers_dictations() {
-        let mut d = VecDeque::from(["a", "b"]);
-        let mut s = VecDeque::from([1, 2]);
-        let mut next = || match next_job(&mut d, &mut s) {
-            Some(Next::Dictation(x)) => x.to_string(),
-            Some(Next::Segment(n)) => n.to_string(),
-            None => String::new(),
+    fn dictation_goes_first_in_the_order_sent() {
+        // Two meeting segments are waiting when a held dictation's segment, then its job at
+        // release, come in behind them.
+        let (tx, rx) = mpsc::channel();
+        let piece = Piece {
+            audio: vec![7.0],
+            cut: Cut::Pause,
+            redo: false,
         };
+        for msg in [
+            meeting_segment(vec![1.0]),
+            meeting_segment(vec![2.0]),
+            ToStt::Segment(piece, Arc::default()),
+            ToStt::Transcribe(job(vec![9.0])),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        let mut queue = SttQueue::default();
+        // All four taken in one go, without blocking.
+        let first = queue.next(&rx).map(|m| label(&m));
+        assert_eq!(first.as_deref(), Some("segment 7"));
+        // A dropped recording's record and a reload come in while the meeting waits.
+        tx.send(ToStt::Dropped(Box::default(), Ended::Cancelled))
+            .unwrap();
+        tx.send(ToStt::RetryLoad).unwrap();
+        // Every sender gone: what's queued is still handed out, then the thread ends.
+        drop(tx);
+        let rest: Vec<String> = std::iter::from_fn(|| queue.next(&rx))
+            .map(|m| label(&m))
+            .collect();
         assert_eq!(
-            [next(), next(), next(), next(), next()],
-            ["a", "b", "1", "2", ""]
+            rest,
+            ["job 9", "dropped", "reload", "meeting 1", "meeting 2"],
+            "dictation's work in the order sent, then the meeting's"
         );
     }
 
@@ -1936,12 +2975,16 @@ mod tests {
         fn name(&self) -> String {
             "scripted".into()
         }
-        fn warmup(&mut self) -> stt::Result<()> {
+        fn warmup(&mut self) -> agt_core::stt::Result<()> {
             Ok(())
         }
-        fn transcribe(&mut self, _: &[f32], _: &TranscribeOpts) -> stt::Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            _: &TranscribeOpts,
+        ) -> agt_core::stt::Result<agt_core::stt::Transcript> {
             match self.0.pop_front().expect("scripted") {
-                Ok(text) => Ok(Transcript { text: text.into() }),
+                Ok(text) => Ok(agt_core::stt::Transcript { text: text.into() }),
                 Err(e) => Err(e.into()),
             }
         }
@@ -1950,14 +2993,15 @@ mod tests {
     #[test]
     fn meeting_segments_get_plain_text_or_an_error() {
         let hub = Hub::new(|_| {});
-        let opts = TranscribeOpts::default();
+        let chunk_secs = AtomicU32::new(agt_stt::CHUNK_SECS.to_bits());
         let mut engine: Box<dyn SttEngine> = Box::new(Scripted(VecDeque::from([
             Ok("  Hello,\n world. "),
             Ok("   "),
             Err("engine fell over"),
         ])));
-        let run =
-            |e: Option<&mut Box<dyn SttEngine>>| transcribe_segment(e, &[0.0; 16], &opts, &hub);
+        let run = |e: Option<&mut Box<dyn SttEngine>>| {
+            transcribe_segment(e, &[0.0; 16], &hub, &chunk_secs)
+        };
         assert_eq!(
             run(Some(&mut engine)),
             Ok("Hello, world.".into()),
@@ -1979,11 +3023,11 @@ mod tests {
         let a = answers.clone();
         t.transcribe(vec![0.5], Box::new(move |r| a.send(r).unwrap()));
         match rx.try_recv() {
-            Ok(ToStt::Segment { audio, done }) => {
+            Ok(ToStt::Meeting { audio, done }) => {
                 assert_eq!(audio, [0.5]);
                 done(Ok("hi".into()));
             }
-            _ => panic!("expected a segment"),
+            _ => panic!("expected a meeting segment"),
         }
         assert_eq!(answer.try_recv(), Ok(Ok("hi".into())));
         // The stt thread is gone: the segment is answered at once, not lost.
@@ -1996,17 +3040,20 @@ mod tests {
     fn dictating_follows_the_recording_state() {
         let hub = Hub::new(|_| {});
         let dictating = hub.dictating.clone();
-        assert!(!dictating.load(Ordering::Relaxed));
+        assert!(!dictating.load(Relaxed));
         hub.update(|s| s.recording = true);
-        assert!(dictating.load(Ordering::Relaxed));
+        assert!(dictating.load(Relaxed));
+        // Between the two taps of a double tap: shown as recording, but nothing records.
         hub.update(|s| {
             s.recording = false;
+            s.lingering = true;
+        });
+        assert!(!dictating.load(Relaxed), "lingering is not dictating");
+        hub.update(|s| {
+            s.lingering = false;
             s.pending += 1;
         });
-        assert!(
-            !dictating.load(Ordering::Relaxed),
-            "transcribing is not dictating"
-        );
+        assert!(!dictating.load(Relaxed), "transcribing is not dictating");
     }
 
     #[test]

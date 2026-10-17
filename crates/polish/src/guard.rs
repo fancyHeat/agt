@@ -1,7 +1,8 @@
 //! Guards around a polisher: it may only make dictation better, never worse or stuck.
 //!
 //! [`polish_or_raw`] returns the raw transcript when:
-//! - it has fewer than `polish.min_words` words (not worth the latency);
+//! - it has fewer than `polish.min_words` words (not worth the latency), or (S1-mini) more
+//!   than its context holds ([`S1_MINI_MAX_WORDS`]);
 //! - the request fails or exceeds its deadline;
 //! - the output fails [`check`]: after stripping wrappers the model may add (code fences,
 //!   surrounding quotes, `<transcript>` tags, a `<think>` block), it is empty; has fewer than
@@ -32,7 +33,11 @@ pub enum Outcome {
     Polished,
     /// Not sent to the model.
     Skipped(&'static str),
-    /// Sent, but the raw transcript is used; the reason is safe to log (no dictated text).
+    /// The request brought no answer (an error, a timeout, a malformed, refused or cut-off
+    /// response): the raw transcript is used. The reason is safe to log (no dictated text).
+    Failed(String),
+    /// The model answered, but [`check`] rejected it: the raw transcript is used. The reason
+    /// is safe to log.
     Fallback(String),
 }
 
@@ -41,10 +46,20 @@ impl fmt::Display for Outcome {
         match self {
             Outcome::Polished => write!(f, "polished"),
             Outcome::Skipped(why) => write!(f, "skipped: {why}"),
-            Outcome::Fallback(why) => write!(f, "raw: {why}"),
+            Outcome::Failed(why) | Outcome::Fallback(why) => write!(f, "raw: {why}"),
         }
     }
 }
+
+/// S1-mini's longest transcript, in words. Its llama-server context (`CTX` in
+/// `managed/process.rs`, 4096 tokens) holds the prompt plus the transcript plus the answer
+/// (about as long), at ~1.4 tokens per word: 4096 / 2 / 1.4 ≈ 1,460. Longer ones would only
+/// fail after generating until the context or the timeout runs out (25-70 s for a 10-30
+/// minute dictation), so they aren't sent.
+pub const S1_MINI_MAX_WORDS: usize = 1400;
+
+/// The [`Outcome::Skipped`] reason for a transcript over [`S1_MINI_MAX_WORDS`].
+pub const TOO_LONG: &str = "too long";
 
 /// Polishes `raw` (whitespace-normalized transcript) or returns it unchanged. Never fails;
 /// takes at most about [`PolishConfig::timeout`].
@@ -53,9 +68,12 @@ pub fn polish_or_raw(p: &dyn Polisher, raw: &str, cfg: &PolishConfig) -> (String
     if words < cfg.min_words.max(1) {
         return (raw.to_owned(), Outcome::Skipped("too short"));
     }
+    if cfg.provider == PolishProvider::S1Mini && words > S1_MINI_MAX_WORDS {
+        return (raw.to_owned(), Outcome::Skipped(TOO_LONG));
+    }
     let out = match p.polish(raw, &PolishCtx::default()) {
         Ok(out) => out,
-        Err(e) => return (raw.to_owned(), Outcome::Fallback(e.to_string())),
+        Err(e) => return (raw.to_owned(), Outcome::Failed(e.to_string())),
     };
     let max_novel = match (cfg.prompt.trim().is_empty(), cfg.style) {
         // S1-mini isn't a chat model (it doesn't answer questions), and it legitimately
@@ -318,10 +336,28 @@ mod tests {
             polish_or_raw(&ok, "um hi", &cfg),
             ("um hi".into(), Outcome::Skipped("too short"))
         );
+        // Over S1-mini's context: not even sent (cloud providers have room).
+        let long = "word ".repeat(S1_MINI_MAX_WORDS + 1);
+        let s1 = PolishConfig {
+            provider: PolishProvider::S1Mini,
+            ..PolishConfig::default()
+        };
+        assert_eq!(
+            polish_or_raw(&Fixed(Err("not sent")), &long, &s1),
+            (long.clone(), Outcome::Skipped(TOO_LONG))
+        );
+        let cloud = PolishConfig {
+            provider: PolishProvider::OpenAi,
+            ..PolishConfig::default()
+        };
+        assert!(matches!(
+            polish_or_raw(&Fixed(Err("sent")), &long, &cloud).1,
+            Outcome::Failed(_)
+        ));
         let (text, outcome) = polish_or_raw(&Fixed(Err("timeout")), raw, &cfg);
         assert_eq!(
             (text.as_str(), outcome),
-            (raw, Outcome::Fallback("timeout".into()))
+            (raw, Outcome::Failed("timeout".into()))
         );
         let (text, outcome) = polish_or_raw(&Fixed(Ok("Sure! Here you go.")), raw, &cfg);
         assert_eq!(text, raw);

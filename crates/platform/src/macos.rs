@@ -3,7 +3,7 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkey (event tap), swallowing F13-F20, sending Cmd+V | Accessibility |
+//! | Seeing the hotkey (event tap), swallowing F13-F20 and the Globe key, sending Cmd+V | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
 //! | Meeting notes' system audio track (same: silence without it) | System Audio Recording Only |
 //!
@@ -24,7 +24,8 @@ use objc2_app_kit::{
     NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
 };
 use objc2_core_foundation::{
-    CFMachPort, CFRetained, CFRunLoop, CFString, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    CFGetTypeID, CFMachPort, CFRetained, CFRunLoop, CFString, CFType, CFTypeID, kCFBooleanTrue,
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
@@ -34,6 +35,7 @@ use objc2_core_graphics::{
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString};
 use std::{
+    collections::HashSet,
     ffi::c_void,
     ptr::{NonNull, null_mut},
     sync::{
@@ -52,6 +54,11 @@ const TAP_RETRY: Duration = Duration::from_secs(1);
 
 // Virtual key codes (Carbon `kVK_*`).
 const KVK_COMMAND: u16 = 0x37;
+const KVK_ESCAPE: u16 = 0x35;
+const KVK_FUNCTION: u16 = 0x3F;
+/// The key event macOS sends right after Fn is released on its own, which apps act on with
+/// "Press 🌐 key to" (System Settings > Keyboard). Not in Carbon's list.
+const KVK_GLOBE: u16 = 0xB3;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
@@ -98,8 +105,12 @@ struct TapState {
 
 struct Shared {
     hotkey: Hotkey,
-    /// Whether any chord key is swallowed (F13-F20), which takes an active tap.
+    /// Whether any chord key is swallowed (F13-F20), or `hide_globe`: both take an active tap.
     swallow: bool,
+    /// Whether the hotkey is Fn alone, whose every tap is followed by [`KVK_GLOBE`]: apps never
+    /// see that, or each dictation would also do what "Press 🌐 key to" says (the emoji
+    /// picker, by default), which then takes the paste. Fn itself still reaches apps.
+    hide_globe: bool,
     stop: AtomicBool,
     state: Mutex<TapState>,
 }
@@ -149,8 +160,10 @@ pub fn start_hotkey(
     hotkey: Hotkey,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
+    let hide_globe = matches!(hotkey.keys(), [k] if k.code == KVK_FUNCTION);
     let shared = Arc::new(Shared {
-        swallow: hotkey.keys().iter().any(Key::swallowed),
+        swallow: hotkey.keys().iter().any(Key::swallowed) || hide_globe,
+        hide_globe,
         stop: AtomicBool::new(false),
         state: Mutex::new(TapState {
             detector: HoldDetector::new(hotkey.keys().len()),
@@ -223,8 +236,9 @@ fn create_tap(shared: &Arc<Shared>) -> Option<CFRetained<CFMachPort>> {
     let mask = (1u64 << CGEventType::KeyDown.0)
         | (1u64 << CGEventType::KeyUp.0)
         | (1u64 << CGEventType::FlagsChanged.0);
-    // Listen-only unless the key must be swallowed, which takes an active tap.
-    let options = if shared.swallow {
+    // Active whenever Accessibility allows it: the hotkey may have to be swallowed,
+    // and so may Esc while it ends a hands-free recording ([`crate::arm_escape`]).
+    let options = if post_access() {
         CGEventTapOptions::Default
     } else {
         CGEventTapOptions::ListenOnly
@@ -272,6 +286,12 @@ unsafe extern "C-unwind" fn tap_callback(
         return pass;
     }
     let code = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
+    if shared.hide_globe
+        && code == KVK_GLOBE
+        && matches!(ty, CGEventType::KeyDown | CGEventType::KeyUp)
+    {
+        return null_mut();
+    }
     let chord_key = shared.hotkey.index_of(code as u32);
     let down = match (ty, chord_key) {
         // Modifiers that aren't in the chord don't cancel: they're part of a shortcut only
@@ -287,14 +307,24 @@ unsafe extern "C-unwind" fn tap_callback(
     let Ok(mut st) = shared.state.lock() else {
         return pass;
     };
-    if let Some(e) = st
-        .detector
-        .on_key(chord_key, down, now_ms(), Instant::now())
-    {
+    let modifiers = CGEventFlags::MaskShift
+        | CGEventFlags::MaskControl
+        | CGEventFlags::MaskAlternate
+        | CGEventFlags::MaskCommand;
+    let armed = crate::escape_armed() && !CGEvent::flags(Some(ev)).intersects(modifiers);
+    let (e, swallow_esc) = st.detector.on_hook_key(
+        chord_key,
+        code == KVK_ESCAPE,
+        armed,
+        down,
+        now_ms(),
+        Instant::now(),
+    );
+    if let Some(e) = e {
         (st.on_event)(e);
     }
-    if chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
-        // F13-F20: apps never see them.
+    if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
+        // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
         return null_mut();
     }
     pass
@@ -360,6 +390,211 @@ fn front_window_of(pid: i32) -> Option<i64> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------------------
+// Focus
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXUIElementCreateSystemWide() -> Option<NonNull<CFType>>;
+    fn AXUIElementGetTypeID() -> CFTypeID;
+    fn AXUIElementCopyAttributeValue(
+        element: &CFType,
+        attribute: &CFString,
+        value: *mut *mut CFType,
+    ) -> i32;
+    fn AXUIElementSetAttributeValue(element: &CFType, attribute: &CFString, value: &CFType) -> i32;
+    fn AXUIElementSetMessagingTimeout(element: &CFType, seconds: f32) -> i32;
+    fn AXUIElementGetPid(element: &CFType, pid: *mut i32) -> i32;
+}
+
+/// `kAXErrorNoValue`: the attribute is supported but empty (e.g. nothing has focus).
+const AX_NO_VALUE: i32 = -25212;
+/// `kAXErrorAttributeUnsupported`: the element (or app) doesn't have the attribute.
+const AX_UNSUPPORTED: i32 = -25205;
+/// `kAXErrorIllegalArgument`: what we report when an app hands back something that isn't an
+/// accessibility element.
+const AX_ILLEGAL_ARGUMENT: i32 = -25201;
+
+/// How long one accessibility request may take before giving up (the default is 6 s, and a
+/// busy app answers late or not at all). Set on the system-wide element, so it is the default
+/// for every accessibility request AGT makes.
+const AX_TIMEOUT: f32 = 0.25;
+
+/// Focused-element roles that take typed text. Secure (password) fields are `AXTextField`s.
+const TEXT_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"];
+
+/// Focused-element roles that clearly aren't a place to type: a web page or link with no field
+/// focused, a button or other control, a list, a table, a menu. Any other role is "can't tell":
+/// apps that draw their own text (terminals like kitty or WezTerm, editors like Zed or Emacs)
+/// report a plain group or window, and a paste there works.
+const NOT_TEXT_ROLES: &[&str] = &[
+    "AXWebArea",
+    "AXLink",
+    "AXButton",
+    "AXCheckBox",
+    "AXRadioButton",
+    "AXPopUpButton",
+    "AXMenuButton",
+    "AXDisclosureTriangle",
+    "AXSlider",
+    "AXTabGroup",
+    "AXList",
+    "AXOutline",
+    "AXTable",
+    "AXRow",
+    "AXCell",
+    "AXBrowser",
+    "AXImage",
+    "AXMenu",
+    "AXMenuBar",
+    "AXMenuBarItem",
+    "AXMenuItem",
+];
+
+/// The Finder, where a plain group (the desktop, an icon view) or nothing focused at all means
+/// files, not text.
+const FINDER: &str = "com.apple.finder";
+
+fn ax_element(raw: Option<NonNull<CFType>>) -> Option<CFRetained<CFType>> {
+    // SAFETY: `AXUIElementCreate*` return a +1 reference.
+    raw.map(|p| unsafe { CFRetained::from_raw(p) })
+}
+
+fn ax_attribute(element: &CFType, name: &'static str) -> Result<CFRetained<CFType>, i32> {
+    let mut value = null_mut();
+    let rc = unsafe {
+        AXUIElementCopyAttributeValue(element, &CFString::from_static_str(name), &mut value)
+    };
+    match NonNull::new(value) {
+        // SAFETY: a `Copy` function: the value is +1.
+        Some(v) if rc == 0 => Ok(unsafe { CFRetained::from_raw(v) }),
+        _ if rc == 0 => Err(AX_NO_VALUE),
+        _ => Err(rc),
+    }
+}
+
+/// An attribute whose value is another accessibility element (it comes from another process,
+/// so it's checked before being asked anything).
+fn ax_element_attribute(element: &CFType, name: &'static str) -> Result<CFRetained<CFType>, i32> {
+    let value = ax_attribute(element, name)?;
+    if CFGetTypeID(Some(&value)) == unsafe { AXUIElementGetTypeID() } {
+        Ok(value)
+    } else {
+        Err(AX_ILLEGAL_ARGUMENT)
+    }
+}
+
+/// The accessibility element of the app with the keyboard focus, and its pid (if known);
+/// requests to it are bounded by [`AX_TIMEOUT`]. Asked of the accessibility API, not
+/// `NSWorkspace`, whose frontmost app only follows along on a thread running the main run loop.
+fn focused_app() -> Option<(CFRetained<CFType>, Option<i32>)> {
+    if !unsafe { AXIsProcessTrusted() } {
+        return None;
+    }
+    let all = ax_element(unsafe { AXUIElementCreateSystemWide() })?;
+    unsafe { AXUIElementSetMessagingTimeout(&all, AX_TIMEOUT) };
+    let app = ax_element_attribute(&all, "AXFocusedApplication").ok()?;
+    let mut pid = 0;
+    let pid = (unsafe { AXUIElementGetPid(&app, &mut pid) } == 0).then_some(pid);
+    Some((app, pid))
+}
+
+/// Apps (by pid) already asked to build their accessibility tree: it stays built until they
+/// quit, so each is asked once.
+static PREPARED: LazyLock<Mutex<HashSet<i32>>> = LazyLock::new(Default::default);
+
+pub fn prepare_focus_check() {
+    let Some((app, Some(pid))) = focused_app() else {
+        return;
+    };
+    let prepared = || PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+    if prepared().contains(&pid) {
+        return;
+    }
+    // Electron's switch for building its accessibility tree (Chromium does it only for
+    // assistive apps, which it can't detect on macOS). Other apps answer "unsupported".
+    if let Some(yes) = unsafe { kCFBooleanTrue } {
+        let rc = unsafe {
+            AXUIElementSetAttributeValue(
+                &app,
+                &CFString::from_static_str("AXManualAccessibility"),
+                yes,
+            )
+        };
+        tracing::debug!("focus: pid {pid} AXManualAccessibility → {rc}");
+        // Asked again next time if it didn't get the message (busy, just launched).
+        if rc == 0 || rc == AX_UNSUPPORTED {
+            prepared().insert(pid);
+        }
+    }
+}
+
+pub fn focus_takes_text() -> Option<bool> {
+    let (app, pid) = focused_app()?;
+    let pid = pid.unwrap_or(0);
+    let is_finder = || {
+        autoreleasepool(|_| {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                .and_then(|a| a.bundleIdentifier())
+                .is_some_and(|b| b.to_string() == FINDER)
+        })
+    };
+    let focused = match ax_element_attribute(&app, "AXFocusedUIElement") {
+        Ok(f) => f,
+        // The app has nothing focused (no window, or a window with no focusable control).
+        Err(AX_NO_VALUE) => {
+            let takes = takes_text(None, false, is_finder());
+            tracing::debug!("focus: pid {pid}: nothing focused → takes text: {takes:?}");
+            return takes;
+        }
+        Err(e) => {
+            tracing::debug!("focus: pid {pid}: can't tell (accessibility error {e})");
+            return None;
+        }
+    };
+    let role = ax_attribute(&focused, "AXRole")
+        .ok()
+        .and_then(|r| r.downcast_ref::<CFString>().map(ToString::to_string));
+    let Some(role) = role else {
+        tracing::debug!("focus: pid {pid}: can't tell (no role)");
+        return None;
+    };
+    // In an editable region of a web page (Chromium and WebKit): a rich text editor, say.
+    // Not "has a text selection": Chromium gives every element of a page one, links too.
+    // Only asked when the role doesn't already answer it: it's another round trip to the app.
+    let editable = if TEXT_ROLES.contains(&role.as_str()) {
+        false
+    } else {
+        match ax_attribute(&focused, "AXEditableAncestor") {
+            Ok(_) => true,
+            Err(AX_NO_VALUE | AX_UNSUPPORTED) => false,
+            // Didn't answer in time, say: a link in an editor would look like a plain link.
+            Err(e) => {
+                tracing::debug!("focus: pid {pid}: {role}, can't tell (accessibility error {e})");
+                return None;
+            }
+        }
+    };
+    let finder = !editable && matches!(role.as_str(), "AXGroup" | "AXScrollArea") && is_finder();
+    let takes = takes_text(Some(&role), editable, finder);
+    tracing::debug!("focus: pid {pid}: {role} (editable {editable}) → takes text: {takes:?}");
+    takes
+}
+
+/// Whether a focused element with `role` (`None`: nothing is focused) takes typed text, or
+/// `None` if that can't be told. `editable`: it is in an editable region of a web page.
+/// `finder`: the focused app is the Finder.
+fn takes_text(role: Option<&str>, editable: bool, finder: bool) -> Option<bool> {
+    match role {
+        _ if editable => Some(true),
+        Some(r) if TEXT_ROLES.contains(&r) => Some(true),
+        Some(r) if NOT_TEXT_ROLES.contains(&r) => Some(false),
+        // The desktop, an icon view, or nothing selected.
+        None | Some("AXGroup" | "AXScrollArea") if finder => Some(false),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1079,5 +1314,43 @@ mod tests {
         }
         // A test binary has no bundle (the HAL says "", not an error).
         assert_eq!(process_bundle_id(mine).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn text_roles_and_editable_regions_take_text() {
+        for role in ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"] {
+            assert_eq!(takes_text(Some(role), false, false), Some(true), "{role}");
+        }
+        // A paragraph or a link in a contenteditable editor (Notion, Google Docs, Slack).
+        for role in ["AXStaticText", "AXGroup", "AXLink"] {
+            assert_eq!(takes_text(Some(role), true, false), Some(true), "{role}");
+        }
+    }
+
+    #[test]
+    fn only_clear_non_text_roles_say_no() {
+        // A link or a page with no field focused, a list, a button.
+        for role in ["AXLink", "AXWebArea", "AXList", "AXOutline", "AXButton"] {
+            assert_eq!(takes_text(Some(role), false, false), Some(false), "{role}");
+        }
+        // Apps that draw their own text (terminals, some editors) or have nothing focused.
+        for role in [
+            Some("AXGroup"),
+            Some("AXWindow"),
+            Some("AXScrollArea"),
+            None,
+        ] {
+            assert_eq!(takes_text(role, false, false), None, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn the_finder_desktop_is_not_a_text_box() {
+        for role in [Some("AXGroup"), Some("AXScrollArea"), None] {
+            assert_eq!(takes_text(role, false, true), Some(false), "{role:?}");
+        }
+        // Renaming a file.
+        assert_eq!(takes_text(Some("AXTextField"), false, true), Some(true));
+        assert_eq!(takes_text(Some("AXWindow"), false, true), None);
     }
 }

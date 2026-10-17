@@ -19,6 +19,7 @@ agt-polish.workspace = true
 agt-overlay.workspace = true
 agt-telemetry.workspace = true
 agt-history.workspace = true
+agt-settings-ui.workspace = true
 agt-meeting.workspace = true
 serde.workspace = true
 serde_json = "1"
@@ -31,8 +32,9 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 # The meeting notes window and the side pill (WKWebView / WebView2): real text editing.
 wry = { version = "0.57", default-features = false }
 
-# `agt stats` attaches to the console it was started from (release builds have none). The
-# meeting pill: cursor and mouse button polling, shown without activating.
+# `agt stats` attaches to the console it was started from (release builds have none); the
+# settings window may take the foreground. The meeting pill: cursor and mouse button polling,
+# shown without activating.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -41,9 +43,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# The meeting pill: a non-activating panel, cursor and mouse button polling; the Edit menu
-# the notes window's shortcuts need.
+# Whether the app bundle is writable (see `update::silent`). The meeting pill: a
+# non-activating panel, cursor and mouse button polling; the Edit menu the notes window's
+# shortcuts need.
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",

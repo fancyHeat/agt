@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 # Single source of truth for the app version. Bump this, then tag `vX.Y.Z`.
-version = "0.0.11"
+version = "0.0.17"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/fancyHeat/agt"
@@ -19,6 +19,7 @@ agt-fetch = { path = "crates/fetch" }
 agt-overlay = { path = "crates/overlay" }
 agt-telemetry = { path = "crates/telemetry" }
 agt-history = { path = "crates/history" }
+agt-settings-ui = { path = "crates/settings-ui" }
 agt-meeting = { path = "crates/meeting" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
