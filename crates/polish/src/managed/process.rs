@@ -141,7 +141,7 @@ impl Launcher for LlamaLauncher {
 
     fn launch(&mut self) -> Result<Box<dyn Server>, String> {
         // The files are checked against what was verified at download (size + mtime; a
-        // changed file is hashed again), so nothing swapped in later is run.
+        // changed file is hashed again). They're in the user's own folder (see `assets`).
         let exe = self.assets.verified_server_exe()?;
         let port = free_port()?;
         let key = random_key();
@@ -650,7 +650,7 @@ mod tests {
     fn args_pin_s1_minis_required_settings() {
         let dir = std::env::temp_dir().join("agt-args-test");
         let l = LlamaLauncher::new(
-            Assets::for_this_platform(&dir).unwrap_or_else(|_| Assets::test(&dir)),
+            Assets::for_this_platform(&dir, &dir).unwrap_or_else(|_| Assets::test(&dir)),
             &S1MiniConfig::default(),
             None,
         );

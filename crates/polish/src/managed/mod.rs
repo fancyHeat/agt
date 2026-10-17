@@ -1,9 +1,10 @@
 //! `provider = "s1-mini"`: S1-mini by Superwhisper, run by AGT itself.
 //!
 //! On start ([`start`]) a background thread:
-//! 1. downloads what's missing into the models folder ([`assets`]): the S1-mini GGUF
-//!    (pinned Hugging Face revision) and an official llama.cpp release build (pinned tag),
-//!    both SHA-256 verified; the llama.cpp archive is unpacked with the OS's `tar`;
+//! 1. downloads what's missing ([`assets`]): the S1-mini GGUF (pinned Hugging Face
+//!    revision) into the models folder and an official llama.cpp release build (pinned tag)
+//!    into AGT's own folder, both SHA-256 verified; the llama.cpp archive is unpacked with
+//!    the OS's `tar`;
 //! 2. starts `llama-server` on a free 127.0.0.1 port with a random API key ([`process`]),
 //!    tied to AGT's lifetime: on Windows it's in a job object that kills it when AGT exits
 //!    or crashes; on Unix a small `sh` watchdog kills it when AGT's end of a pipe closes;
@@ -33,14 +34,17 @@ use std::{
 };
 use supervisor::{Endpoint, Shared, Timing};
 
-pub use assets::{LLAMA_BUILD, LLAMA_DIR, MODEL_DIR};
+pub use assets::{LLAMA_BUILD, MODEL_DIR};
 
 /// What the managed server needs from the app.
 #[derive(Clone)]
 pub struct Env {
-    /// The models folder (`stt.models_dir` or the default); S1-mini and llama.cpp go in
-    /// subfolders of it.
+    /// The models folder (`stt.models_dir` or the default); S1-mini goes in a subfolder of
+    /// it. It may be shared with others, so nothing AGT runs is put there.
     pub models_dir: PathBuf,
+    /// Where the llama.cpp builds are installed and run from. Must be AGT's own per-user
+    /// folder: anyone who can write to it can make AGT run their code.
+    pub llama_dir: PathBuf,
     /// llama-server's own output (start-up, device, timings; never the text), truncated on
     /// every start. `None`: discarded.
     pub log_file: Option<PathBuf>,
@@ -82,7 +86,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Starts the background thread (never blocks). Fails only if there is no llama.cpp build
 /// for this platform.
 pub(crate) fn start(cfg: &PolishConfig, env: &Env) -> std::result::Result<Managed, String> {
-    let assets = assets::Assets::for_this_platform(&env.models_dir)?;
+    let assets = assets::Assets::for_this_platform(&env.models_dir, &env.llama_dir)?;
     let launcher = process::LlamaLauncher::new(assets, &cfg.s1_mini, env.log_file.clone());
     let shared = Arc::new(Shared::default());
     let (s, report) = (shared.clone(), env.on_status.clone());

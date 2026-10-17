@@ -123,6 +123,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let t0 = Instant::now();
     let env = agt_polish::Env {
         models_dir,
+        llama_dir: paths::llama_dir(),
         log_file: Some(server_log),
         on_status: Arc::new(move |s: &agt_polish::Status| {
             eprintln!("[{:6.1} s] {s}", t0.elapsed().as_secs_f64());

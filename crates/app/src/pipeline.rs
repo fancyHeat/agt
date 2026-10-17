@@ -414,7 +414,7 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
         tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
         return (None, "Polish: off (config error, see log)".into());
     }
-    if let Some(notice) = &config.polish_notice {
+    for notice in &config.polish_notices {
         tracing::warn!("{notice}");
     }
     if !config.polish.enabled {
@@ -423,6 +423,7 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
     let notify = hub.notify.clone();
     let env = agt_polish::Env {
         models_dir: config.stt.models_path(),
+        llama_dir: paths::llama_dir(),
         // Start-up output only (see agt-polish), next to agt.db ("Open data folder").
         log_file: Some(paths::history_dir().join("llama-server.log")),
         on_status: Arc::new(move |s: &agt_polish::Status| {

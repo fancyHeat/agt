@@ -1,6 +1,6 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: instance lock, ducked-volume marker (`data_dir`) | usage history: `agt.db`, `llama-server.log`, saved dictations in `dictations/` (`history_dir`) | models (`models_dir`) |
+//! | | config (`config_dir`) | data: instance lock, ducked-volume marker (`data_dir`) | usage history: `agt.db`, `llama-server.log`, saved dictations in `dictations/`, and the llama.cpp builds in `llama.cpp/` (`history_dir`) | models (`models_dir`) |
 //! |---|---|---|---|---|
 //! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-data` | `%LOCALAPPDATA%\AGT-models` |
 //! | macOS | `~/Library/Application Support/AGT` | same | same | `<data>/models` |
@@ -12,7 +12,8 @@
 //! the models.
 //!
 //! `AGT_HOME`, if set, replaces them all (models go to `$AGT_HOME/models`); handy for tests
-//! and dev runs. `stt.models_dir` in the config overrides the models location.
+//! and dev runs. `stt.models_dir` in the config overrides the models location; that folder
+//! may be shared, so the programs AGT downloads (llama.cpp) don't go there.
 
 use std::path::PathBuf;
 
@@ -35,6 +36,12 @@ pub fn history_dir() -> PathBuf {
 /// Default location of downloaded models (see the module docs).
 pub fn models_dir() -> PathBuf {
     home_override().map_or_else(platform::models_dir, |h| h.join("models"))
+}
+
+/// The llama.cpp builds the managed S1-mini runs (see `agt-polish`). Per-user and
+/// machine-local, kept across reinstalls, removed on uninstall (Windows).
+pub fn llama_dir() -> PathBuf {
+    history_dir().join("llama.cpp")
 }
 
 pub fn config_file() -> PathBuf {
