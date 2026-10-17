@@ -172,7 +172,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         );
         println!("  in:  {line}");
         firsts.push(results[0].0.clone());
-        if let agt_polish::Outcome::Fallback(why) = &results[0].1 {
+        if let agt_polish::Outcome::Failed(why) | agt_polish::Outcome::Fallback(why) = &results[0].1
+        {
             fallbacks.push(why.clone());
         }
         // Distinct results only (a model at temperature 0 usually repeats itself).

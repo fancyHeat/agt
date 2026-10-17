@@ -69,11 +69,15 @@ pub struct Ahead {
 
 impl Ahead {
     /// `None` when the output needs the whole text: S1-mini's email context (a greeting and
-    /// a sign-off around everything) and its list structure (bullets need all the items).
-    /// Also `None` for a server that isn't on this machine (a cloud provider bills every
-    /// piece as a request); S1-mini always is.
+    /// a sign-off around everything), its list structure (bullets need all the items), and a
+    /// custom `prompt` or `user_message` (written for a whole dictation: "turn this into an
+    /// email" would give one per piece). Also `None` for a server that isn't on this machine
+    /// (a cloud provider bills every piece as a request); S1-mini always is.
     pub fn new(cfg: &PolishConfig) -> Option<Self> {
         let s1 = &cfg.s1_mini;
+        if !cfg.prompt.trim().is_empty() || !cfg.user_message.is_empty() {
+            return None;
+        }
         let ok = match cfg.provider {
             PolishProvider::S1Mini => {
                 s1.context != S1Context::Email && s1.structure != S1Structure::Lists
@@ -314,6 +318,17 @@ mod tests {
         cfg.s1_mini.context = S1Context::General;
         cfg.s1_mini.structure = S1Structure::Lists;
         assert!(Ahead::new(&cfg).is_none());
+        for provider in [PolishProvider::S1Mini, PolishProvider::OpenAi] {
+            let custom = |prompt: &str, user_message: &str| PolishConfig {
+                provider,
+                prompt: prompt.into(),
+                user_message: user_message.into(),
+                ..PolishConfig::default()
+            };
+            assert!(Ahead::new(&custom("", "")).is_some());
+            assert!(Ahead::new(&custom("Write it as an email.", "")).is_none());
+            assert!(Ahead::new(&custom("", "Summarize: {text}")).is_none());
+        }
     }
 
     #[test]

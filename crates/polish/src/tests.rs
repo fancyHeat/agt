@@ -248,7 +248,7 @@ fn timeout_falls_back_to_raw() {
     let (text, outcome) = polish_or_raw(p.as_ref(), RAW, &cfg);
     let took = t.elapsed();
     assert_eq!(text, RAW);
-    assert!(matches!(outcome, Outcome::Fallback(_)), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
     assert!(took < Duration::from_millis(1500), "took {took:?}");
 }
 
@@ -265,7 +265,7 @@ fn unreachable_server_falls_back_quickly() {
     // The first request finds out (on Windows that takes ~2 s per address)...
     let (text, outcome) = polish_or_raw(&p, RAW, &cfg);
     assert_eq!(text, RAW);
-    assert!(matches!(outcome, Outcome::Fallback(_)));
+    assert!(matches!(outcome, Outcome::Failed(_)));
     p.reach.wait_for_check();
     assert!(p.reach.is_down());
     // ...later ones don't wait at all.
@@ -277,7 +277,7 @@ fn unreachable_server_falls_back_quickly() {
         t.elapsed()
     );
     assert_eq!(text, RAW);
-    let Outcome::Fallback(why) = outcome else {
+    let Outcome::Failed(why) = outcome else {
         panic!("{outcome:?}")
     };
     assert!(why.contains("unreachable"), "{why}");
@@ -304,7 +304,7 @@ fn malformed_responses_are_errors() {
         let cfg = openai(&url);
         let (text, outcome) = polish_or_raw(load_remote(&cfg).unwrap().as_ref(), RAW, &cfg);
         assert_eq!(text, RAW, "{body}");
-        assert!(matches!(outcome, Outcome::Fallback(_)), "{body}");
+        assert!(matches!(outcome, Outcome::Failed(_)), "{body}");
     }
     for body in [
         json!({"content": [{"type": "text", "text": "So"}], "stop_reason": "max_tokens"}),
@@ -353,7 +353,7 @@ fn anthropic_refusal_falls_back_to_raw() {
     let cfg = anthropic(&url);
     let (text, outcome) = polish_or_raw(load_remote(&cfg).unwrap().as_ref(), RAW, &cfg);
     assert_eq!(text, RAW);
-    assert_eq!(outcome, Outcome::Fallback("model refused".into()));
+    assert_eq!(outcome, Outcome::Failed("model refused".into()));
 }
 
 #[test]

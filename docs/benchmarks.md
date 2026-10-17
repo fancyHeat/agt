@@ -1000,8 +1000,10 @@ same.
   segment and replace its text (`Piece::redo`). So the release piece is the rest of the
   segment before the last, plus the last segment and the tail: about one segment more than
   measured here. Telemetry: `polish_ahead_pieces`, `polish_ahead_ms`, `polish_release_words`,
-  `polish_fallbacks` and `polish_outcome = partial`; `polish_ms` now runs from the raw text to
-  the polished one, waits included.
+  `polish_fallbacks`, `polish_wait_ms` (waiting for a request still running) and
+  `polish_outcome = partial`. After a failed request (`Outcome::Failed`: an error or a
+  timeout) the dictation's remaining pieces stay raw, so a hung server costs one deadline,
+  not one per piece.
 - **Telemetry** (metrics only): polish time at release, the release piece's word count, pieces
   polished ahead and their total time, guard fallbacks per piece, and draft acceptance
   (llama-server's `timings.draft_n` / `draft_n_accepted`) to see whether 24-token drafts suit

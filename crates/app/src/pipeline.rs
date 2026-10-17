@@ -1191,7 +1191,10 @@ impl Partial {
     /// waits for the next, or for release: a short tail may be transcribed again together
     /// with it, and that text replaces it ([`Texts::add`] with `redo`).
     fn feed_ahead(&mut self, to_polish: &Sender<ToPolish>) {
-        let Some(ahead) = &mut self.ahead else { return };
+        // After a failed segment the dictation fails too: nothing more to polish.
+        let Some(ahead) = self.ahead.as_mut().filter(|_| self.error.is_none()) else {
+            return;
+        };
         while self.fed + 1 < self.texts.0.len() {
             for piece in ahead.push(&self.texts.0[self.fed]) {
                 tracing::debug!(
@@ -1437,8 +1440,12 @@ struct Pieces {
     shared: Arc<Shared>,
     texts: Vec<String>,
     outcomes: Vec<Outcome>,
-    /// Time spent on the pieces polished before release.
+    /// Words of the pieces as transcribed.
+    raw_words: usize,
+    /// Time spent on the pieces polished in the background, before the transcript was ready.
     ahead_ms: f64,
+    /// A request failed: the rest of the pieces stay raw.
+    failed: bool,
 }
 
 impl Pieces {
@@ -1447,13 +1454,26 @@ impl Pieces {
             shared,
             texts: Vec::new(),
             outcomes: Vec::new(),
+            raw_words: 0,
             ahead_ms: 0.0,
+            failed: false,
         }
     }
 
+    /// Polishes the next piece, or keeps it raw once a request for this dictation failed: a
+    /// server that is down or hung would make every piece wait out its own deadline, one
+    /// after the other.
     fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
-        let (text, outcome) = agt_polish::polish_or_raw(p, piece, cfg);
-        log_outcome(&outcome, piece, "piece");
+        self.raw_words += piece.split_whitespace().count();
+        let (text, outcome) = if self.failed {
+            let why = "an earlier piece failed".to_owned();
+            (piece.to_owned(), Outcome::Failed(why))
+        } else {
+            let (text, outcome) = agt_polish::polish_or_raw(p, piece, cfg);
+            log_outcome(&outcome, piece, "piece");
+            (text, outcome)
+        };
+        self.failed |= matches!(outcome, Outcome::Failed(_));
         self.texts.push(text);
         self.outcomes.push(outcome);
     }
@@ -1461,13 +1481,17 @@ impl Pieces {
     /// The pieces joined, how they went as one outcome ("partial" if only some were
     /// polished), and how many weren't.
     fn finish(self) -> (String, &'static str, usize) {
-        let failed = self.outcomes.iter().filter(|o| **o != Outcome::Polished);
-        let outcome = match (failed.clone().count(), self.outcomes.first()) {
+        let raw = self
+            .outcomes
+            .iter()
+            .filter(|o| **o != Outcome::Polished)
+            .count();
+        let outcome = match (raw, self.outcomes.first()) {
             (0, _) => "polished",
             (n, Some(first)) if n == self.outcomes.len() => outcome_name(first),
             _ => "partial",
         };
-        (self.texts.join(" "), outcome, failed.count())
+        (self.texts.join(" "), outcome, raw)
     }
 }
 
@@ -1476,14 +1500,14 @@ fn outcome_name(outcome: &Outcome) -> &'static str {
         Outcome::Polished => "polished",
         Outcome::Skipped(agt_polish::guard::TOO_LONG) => "too_long",
         Outcome::Skipped(_) => "skipped",
-        Outcome::Fallback(_) => "fallback",
+        Outcome::Failed(_) | Outcome::Fallback(_) => "fallback",
     }
 }
 
 /// `what`: "transcript", or "piece" of one.
 fn log_outcome(outcome: &Outcome, text: &str, what: &str) {
     match outcome {
-        Outcome::Fallback(why) => {
+        Outcome::Failed(why) | Outcome::Fallback(why) => {
             tracing::warn!("polish failed, pasting the raw {what}: {why}")
         }
         Outcome::Skipped(agt_polish::guard::TOO_LONG) => tracing::info!(
@@ -1541,31 +1565,38 @@ fn polish_thread(
         // Pieces sent before it are its own (or a failed dictation's).
         let earlier = pieces.take();
         if let Some(polisher) = polisher.as_deref() {
-            let outcome = match rest {
-                Some((rest, shared)) => {
-                    let mut p = earlier
-                        .filter(|p| Arc::ptr_eq(&p.shared, &shared))
-                        .unwrap_or_else(|| Pieces::new(shared));
+            let start = Instant::now();
+            d.polish_wait_ms = Some(ms(start.saturating_duration_since(ready)));
+            let split = rest.and_then(|(rest, shared)| {
+                let p = earlier
+                    .filter(|p| Arc::ptr_eq(&p.shared, &shared))
+                    .unwrap_or_else(|| Pieces::new(shared));
+                let rest_words: usize = rest.iter().map(|r| r.split_whitespace().count()).sum();
+                if p.raw_words + rest_words != text.split_whitespace().count() {
+                    tracing::warn!(
+                        "polished pieces don't add up to the transcript; polishing it whole"
+                    );
+                    return None;
+                }
+                // Nothing went ahead and it's one piece: the whole text, as always.
+                (!p.texts.is_empty() || rest.len() > 1).then_some((p, rest, rest_words))
+            });
+            let outcome = match split {
+                Some((mut p, rest, words)) => {
                     let ahead = p.texts.len();
-                    // Nothing went ahead and it's one piece: the whole text, as always.
-                    let cfg = match (ahead, rest.len()) {
-                        (0, 1) => &config.polish,
-                        _ => &piece_cfg,
-                    };
                     for piece in &rest {
-                        p.polish(polisher, piece, cfg);
+                        p.polish(polisher, piece, &piece_cfg);
                     }
-                    let words: usize = rest.iter().map(|r| r.split_whitespace().count()).sum();
                     tracing::debug!(
-                        "polished in {} pieces, {ahead} while recording ({:.0} ms); {words} words left at release",
+                        "polished in {} pieces, {ahead} in the background ({:.0} ms); {words} words left at release",
                         ahead + rest.len(),
                         p.ahead_ms
                     );
                     d.polish_ahead_pieces = Some(ahead as i64);
                     d.polish_ahead_ms = Some(p.ahead_ms);
                     d.polish_release_words = Some(words as i64);
-                    let (joined, outcome, failed) = p.finish();
-                    d.polish_fallbacks = Some(failed as i64);
+                    let (joined, outcome, raw) = p.finish();
+                    d.polish_fallbacks = Some(raw as i64);
                     text = joined;
                     outcome
                 }
@@ -1577,7 +1608,7 @@ fn polish_thread(
                     outcome_name(&outcome)
                 }
             };
-            d.polish_ms = Some(ms(ready.elapsed()));
+            d.polish_ms = Some(ms(start.elapsed()));
             d.polish_outcome = Some(outcome);
         }
         if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
@@ -1585,7 +1616,7 @@ fn polish_thread(
             t.polished =
                 matches!(d.polish_outcome, Some("polished" | "partial")).then(|| text.clone());
         }
-        if config.paste.trailing_space {
+        if config.paste.trailing_space && !text.is_empty() {
             text.push(' ');
         }
         let _ = to_paste.send(ToPaste::Paste {
@@ -2203,8 +2234,9 @@ mod tests {
         }
     }
 
-    /// Ends each text with " ok." (one more word, so the guard accepts it); fails texts with
-    /// "FAIL" in them.
+    /// Ends each text with " ok." (one more word, so the guard accepts it). Fails texts with
+    /// "FAIL" in them, and answers those with "REPLY" like an assistant (the guard rejects
+    /// that).
     struct Marks;
     impl Polisher for Marks {
         fn name(&self) -> String {
@@ -2215,9 +2247,12 @@ mod tests {
             text: &str,
             _: &agt_core::polish::PolishCtx,
         ) -> agt_core::polish::Result<String> {
-            match text.contains("FAIL") {
-                true => Err("failed".into()),
-                false => Ok(format!("{text} ok.")),
+            if text.contains("FAIL") {
+                Err("failed".into())
+            } else if text.contains("REPLY") {
+                Ok("Sure! Here you go.".into())
+            } else {
+                Ok(format!("{text} ok."))
             }
         }
     }
@@ -2244,11 +2279,24 @@ mod tests {
             .collect()
     }
 
-    fn transcribed(text: &str, rest: Option<(Vec<&str>, &Arc<Shared>)>) -> ToPolish {
+    /// The transcript of `ahead` (sent as pieces before) and `rest`, with `rest` left to
+    /// polish at release.
+    fn transcribed(ahead: &[&str], rest: &[&str], shared: &Arc<Shared>) -> ToPolish {
+        let text = ahead
+            .iter()
+            .chain(rest)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rest = rest.iter().map(|r| r.to_string()).collect();
+        whole(&text, Some((rest, shared.clone())))
+    }
+
+    fn whole(text: &str, rest: Option<(Vec<String>, Arc<Shared>)>) -> ToPolish {
         let now = Instant::now();
         ToPolish::Text(Box::new(Transcribed {
             text: text.into(),
-            rest: rest.map(|(r, s)| (r.into_iter().map(str::to_owned).collect(), s.clone())),
+            rest,
             ready: now,
             released: now,
             target: None,
@@ -2257,15 +2305,18 @@ mod tests {
         }))
     }
 
+    fn piece(text: &str, shared: &Arc<Shared>) -> ToPolish {
+        ToPolish::Piece(text.into(), shared.clone())
+    }
+
     #[test]
     fn pieces_polished_while_recording_are_joined_with_the_rest() {
         let a = Arc::<Shared>::default();
-        let one = sentences(25, "one");
-        let two = sentences(25, "two");
+        let (one, two) = (sentences(25, "one"), sentences(25, "two"));
         let out = polish_all(vec![
-            ToPolish::Piece(one.clone(), a.clone()),
-            ToPolish::Piece(two.clone(), a.clone()),
-            transcribed("(whole)", Some((vec!["and the end"], &a))),
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["and the end"], &a),
         ]);
         let [(text, d)] = &out[..] else { panic!() };
         // "and the end" is under min_words, but a piece of a long dictation all the same.
@@ -2274,47 +2325,67 @@ mod tests {
         assert_eq!(d.polish_ahead_pieces, Some(2));
         assert_eq!(d.polish_release_words, Some(3));
         assert_eq!(d.polish_fallbacks, Some(0));
-        assert!(d.polish_ms.is_some() && d.polish_ahead_ms.is_some());
+        assert!(d.polish_ms.is_some() && d.polish_wait_ms.is_some());
+        assert!(d.polish_ahead_ms.is_some());
     }
 
     #[test]
-    fn a_failed_piece_is_pasted_raw_and_the_rest_polished() {
+    fn a_rejected_piece_is_pasted_raw_and_the_rest_polished() {
         let a = Arc::<Shared>::default();
+        let one = sentences(25, "one");
+        let two = format!("{} REPLY.", sentences(25, "two"));
         let out = polish_all(vec![
-            ToPolish::Piece(sentences(25, "one"), a.clone()),
-            ToPolish::Piece(format!("{} FAIL.", sentences(25, "two")), a.clone()),
-            transcribed("(whole)", Some((vec!["the end"], &a))),
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["the end"], &a),
         ]);
         let [(text, d)] = &out[..] else { panic!() };
-        assert_eq!(
-            text,
-            &format!(
-                "{} ok. {} FAIL. the end ok.",
-                sentences(25, "one"),
-                sentences(25, "two")
-            )
-        );
+        assert_eq!(text, &format!("{one} ok. {two} the end ok."));
         assert_eq!(d.polish_outcome, Some("partial"));
         assert_eq!(d.polish_fallbacks, Some(1));
-        // All failed: the failure's own outcome.
-        let out = polish_all(vec![transcribed(
-            "x",
-            Some((vec!["FAIL one", "FAIL two"], &a)),
-        )]);
-        assert_eq!(out[0].1.polish_outcome, Some("fallback"));
+    }
+
+    #[test]
+    fn after_a_failed_request_the_rest_of_the_pieces_stay_raw() {
+        let a = Arc::<Shared>::default();
+        let one = format!("{} FAIL.", sentences(25, "one"));
+        let two = sentences(25, "two");
+        let out = polish_all(vec![
+            piece(&one, &a),
+            piece(&two, &a),
+            transcribed(&[&one, &two], &["the end"], &a),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        // Not sent: a hung server would make each wait out its own deadline.
+        assert_eq!(text, &format!("{one} {two} the end"));
+        // All raw: the failure's own outcome.
+        assert_eq!(d.polish_outcome, Some("fallback"));
+        assert_eq!(d.polish_fallbacks, Some(3));
+    }
+
+    #[test]
+    fn pieces_that_dont_add_up_fall_back_to_the_whole_text() {
+        let a = Arc::<Shared>::default();
+        let text = format!("{} the end", sentences(50, "word"));
+        // The pieces polished ahead went missing: only the rest arrives.
+        let out = polish_all(vec![whole(&text, Some((vec!["the end".into()], a)))]);
+        let [(got, d)] = &out[..] else { panic!() };
+        assert_eq!(got, &format!("{text} ok."));
+        assert_eq!(d.polish_ahead_pieces, None);
     }
 
     #[test]
     fn a_cancelled_recordings_pieces_are_skipped_and_not_pasted() {
         let (cancelled, next) = (Arc::<Shared>::default(), Arc::<Shared>::default());
         cancelled.dropped.store(true, Relaxed);
+        let one = sentences(25, "next");
         let out = polish_all(vec![
-            ToPolish::Piece(sentences(25, "gone"), cancelled.clone()),
-            ToPolish::Piece(sentences(25, "next"), next.clone()),
-            transcribed("(whole)", Some((vec!["the end"], &next))),
+            piece(&sentences(25, "gone"), &cancelled),
+            piece(&one, &next),
+            transcribed(&[&one], &["the end"], &next),
         ]);
         let [(text, d)] = &out[..] else { panic!() };
-        assert_eq!(text, &format!("{} ok. the end ok.", sentences(25, "next")));
+        assert_eq!(text, &format!("{one} ok. the end ok."));
         assert_eq!(d.polish_ahead_pieces, Some(1));
     }
 
@@ -2322,10 +2393,10 @@ mod tests {
     fn a_short_dictation_is_polished_whole_as_always() {
         let a = Arc::<Shared>::default();
         let out = polish_all(vec![
-            transcribed("um so this is short", None),
-            transcribed("hi", None),
+            whole("um so this is short", None),
+            whole("hi", None),
             // Cut while recording but nothing went ahead: one piece, the whole text.
-            transcribed("hi there", Some((vec!["hi there"], &a))),
+            transcribed(&[], &["hi there"], &a),
         ]);
         let got: Vec<_> = out
             .iter()
@@ -2336,7 +2407,7 @@ mod tests {
             [
                 ("um so this is short ok.", Some("polished"), None),
                 ("hi", Some("skipped"), None),
-                ("hi there", Some("skipped"), Some(0)),
+                ("hi there", Some("skipped"), None),
             ]
         );
     }
