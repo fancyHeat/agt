@@ -674,17 +674,28 @@ fn add_markers(item: &NSPasteboardItem, markers: &[&str]) {
 }
 
 pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
+    let pb = put_text(text, &[TRANSIENT, CONCEALED])?;
+    Ok(PasteToken {
+        change_count: pb.changeCount(),
+    })
+}
+
+/// No markers: a copy to keep, which clipboard managers and Universal Clipboard may see.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    put_text(text, &[]).map(drop)
+}
+
+/// Replaces the general pasteboard's contents with `text`, marked with `markers`.
+fn put_text(text: &str, markers: &[&str]) -> Result<Retained<NSPasteboard>, Error> {
     let pb = NSPasteboard::generalPasteboard();
     let item = NSPasteboardItem::new();
     if !item.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }) {
         return Err("cannot put text in a pasteboard item".into());
     }
-    add_markers(&item, &[TRANSIENT, CONCEALED]);
+    add_markers(&item, markers);
     pb.clearContents();
     write_items(&pb, vec![item])?;
-    Ok(PasteToken {
-        change_count: pb.changeCount(),
-    })
+    Ok(pb)
 }
 
 pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Result<bool, Error> {
@@ -833,36 +844,37 @@ fn post_access() -> bool {
 /// What System Settings calls the Accessibility permission: "Device Control" from macOS 27 on.
 pub fn accessibility_name() -> &'static str {
     static NAME: LazyLock<&str> = LazyLock::new(|| {
-        let mut buf = [0u8; 32];
-        let mut len = buf.len();
-        // SAFETY: `buf`/`len` describe a writable buffer.
-        let rc = unsafe {
-            libc::sysctlbyname(
-                c"kern.osproductversion".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                null_mut(),
-                0,
-            )
-        };
-        let major = (rc == 0)
-            .then(|| std::str::from_utf8(&buf[..len]).ok())
-            .flatten()
-            .and_then(|v| {
-                v.trim_end_matches('\0')
-                    .split('.')
-                    .next()?
-                    .parse::<u32>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        if major >= 27 {
+        if os_version().is_some_and(|(major, _)| major >= 27) {
             "Device Control"
         } else {
             "Accessibility"
         }
     });
     *NAME
+}
+
+/// macOS's version as (major, minor), e.g. (14, 2); `None` if it can't be read.
+fn os_version() -> Option<(u32, u32)> {
+    let mut buf = [0u8; 32];
+    let mut len = buf.len();
+    // SAFETY: `buf`/`len` describe a writable buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let version = std::str::from_utf8(&buf[..len.min(buf.len())]).ok()?;
+    let mut parts = version.trim_end_matches('\0').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some((major, minor))
 }
 
 /// Asks for the Microphone first and for Accessibility only once it's answered: two prompts
@@ -1296,17 +1308,32 @@ mod tests {
     use super::*;
 
     /// Proves the list, PID and bundle ID reads, which `mic_users` can't show while nothing
-    /// records: this test process is a HAL client too (it just queried the HAL).
+    /// records: this test process is a HAL client too (it just queried the HAL). Skipped
+    /// (passes, saying why) where it can't tell: before macOS 14.2 (no process objects), and
+    /// where the HAL doesn't list this process (a CI virtual machine without audio devices).
+    /// A selector the HAL doesn't know still fails it: the list query on 14.2 or later, or a
+    /// PID read that fails for every process listed.
     #[test]
     fn process_objects_include_this_process() {
-        let Ok(objects) = process_objects() else {
-            return; // macOS before 14.2
-        };
+        match os_version() {
+            Some(v) if v >= (14, 2) => {}
+            v => return eprintln!("skipped: process objects need macOS 14.2 (this is {v:?})"),
+        }
+        let objects = process_objects().expect("the process list on macOS 14.2 or later");
         let pid = |o: u32| get_property(o, &global_address(PROCESS_PID), 0i32).ok();
+        let pids: Vec<i32> = objects.iter().filter_map(|&o| pid(o)).collect();
+        assert!(
+            objects.is_empty() || !pids.is_empty(),
+            "no PID read for any of {} audio processes",
+            objects.len()
+        );
         let me = std::process::id() as i32;
         let mine = objects.iter().copied().find(|&o| pid(o) == Some(me));
         let Some(mine) = mine else {
-            panic!("pid {me} not among {} audio processes", objects.len());
+            return eprintln!(
+                "skipped: pid {me} not among the HAL's {} audio processes (no audio devices?)",
+                objects.len()
+            );
         };
         // Each is a CFString copy we release: reading them all must not crash.
         for &o in &objects {
@@ -1314,6 +1341,12 @@ mod tests {
         }
         // A test binary has no bundle (the HAL says "", not an error).
         assert_eq!(process_bundle_id(mine).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn os_version_reads() {
+        let (major, minor) = os_version().expect("kern.osproductversion");
+        assert!((11..100).contains(&major), "{major}.{minor}");
     }
 
     #[test]

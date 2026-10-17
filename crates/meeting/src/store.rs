@@ -8,6 +8,8 @@
 //! - `transcript.jsonl` is only appended to, one [`Line`] per line in one write. A line a
 //!   crash cut short is skipped when read, and the next one still starts on its own line.
 //! - `meeting.md` is derived (see [`markdown`]); rewrite it whenever the meeting changes.
+//! - A meeting AGT never got to stop (killed, crashed, the power went) is put right at the next
+//!   launch ([`Store::recover`]).
 
 use crate::{
     Line, Meeting, MeetingInfo,
@@ -18,6 +20,7 @@ use std::{
     io::{self, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Component, Path, PathBuf},
     sync::{Mutex, PoisonError},
+    time::UNIX_EPOCH,
 };
 
 const MEETING_FILE: &str = "meeting.json";
@@ -155,6 +158,72 @@ impl Store {
         Ok(path)
     }
 
+    /// Puts right the meetings AGT never got to stop (it was killed or crashed, or the Mac
+    /// lost power): `ended_at` still null, and started before `started_before` (unix ms: the
+    /// app's launch, so the meeting recording now is never one of them). Each gets `ended_at`
+    /// from the last time its transcript or audio was written (its start if they never
+    /// were), its WAV files' sizes patched so they read (they're zero until the writer
+    /// finishes, see `agt_audio::wav::repair_sizes`), and its `meeting.md`. Returns their ids.
+    /// Problems are logged; one meeting's never stops the others.
+    pub fn recover(&self, started_before: i64) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new(); // no meeting yet
+        };
+        let mut recovered: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|id| {
+                // Unreadable ones are skipped (and logged by `list`).
+                self.load(id)
+                    .is_ok_and(|m| m.ended_at.is_none() && m.started_at < started_before)
+            })
+            .filter(|id| match self.recover_one(id) {
+                Ok(ended_at) => {
+                    tracing::info!("meeting {id} never stopped; saved it as ended at {ended_at}");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("cannot put right meeting {id}, which never stopped: {e}");
+                    false
+                }
+            })
+            .collect();
+        recovered.sort();
+        recovered
+    }
+
+    /// [`Store::recover`] for one meeting. Returns the `ended_at` it got.
+    fn recover_one(&self, id: &str) -> io::Result<i64> {
+        let dir = self.dir(id);
+        let wavs: Vec<PathBuf> = fs::read_dir(&dir)
+            .map_err(at(&dir))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")))
+            .collect();
+        // Before the WAV files are patched, which changes their times.
+        let written = wavs
+            .iter()
+            .chain([&self.file(id, TRANSCRIPT_FILE)?])
+            .filter_map(|p| modified_ms(p))
+            .max();
+        for wav in &wavs {
+            match agt_audio::wav::repair_sizes(wav) {
+                Ok(true) => tracing::info!("patched the sizes of {}", wav.display()),
+                Ok(false) => {}
+                // The audio is still there; only players can't read it. Not worth more.
+                Err(e) => tracing::warn!("cannot patch {}: {e}", wav.display()),
+            }
+        }
+        let m = self.update(id, |m| {
+            let end = written.unwrap_or(m.started_at).max(m.started_at);
+            m.ended_at.get_or_insert(end);
+        })?;
+        self.write_markdown(id)?;
+        Ok(m.ended_at.unwrap_or(m.started_at))
+    }
+
     /// `name` in meeting `id`'s folder. Ids also come from the notes window: only a plain
     /// folder name directly under the root is one.
     fn file(&self, id: &str, name: &str) -> io::Result<PathBuf> {
@@ -169,15 +238,16 @@ impl Store {
     }
 }
 
-/// The meeting as Markdown: `# <title>`, the date, `## Notes` (the AI notes), `## My notes`
-/// (what the user typed) and `## Transcript` (`[mm:ss] Me: ...` / `[mm:ss] Them: ...`, one
-/// paragraph each, in the order they were said, not the order they were written). Empty
-/// sections are left out.
+/// The meeting as Markdown: `# <title>`, the date, `## Notes` (the AI notes, their headings
+/// moved down under it, `nested_headings`), `## My notes` (what the user typed) and
+/// `## Transcript` (`[mm:ss] Me: ...` / `[mm:ss] Them: ...`, one paragraph each, in the order
+/// they were said, not the order they were written). Empty sections are left out. The notes
+/// window's Copy builds the same (`meetingMarkdown` in `notes.html`).
 pub fn markdown(m: &Meeting, lines: &[Line]) -> String {
     let lines = in_order(lines);
     let mut md = format!("# {}\n\n{}\n", m.title.trim(), when(m));
-    let summary = m.summary.as_deref().map(str::trim).unwrap_or_default();
-    for (heading, body) in [("Notes", summary), ("My notes", m.notes.trim())] {
+    let summary = nested_headings(m.summary.as_deref().map(str::trim).unwrap_or_default());
+    for (heading, body) in [("Notes", summary.as_str()), ("My notes", m.notes.trim())] {
         if !body.is_empty() {
             md += &format!("\n## {heading}\n\n{body}\n");
         }
@@ -189,6 +259,80 @@ pub fn markdown(m: &Meeting, lines: &[Line]) -> String {
         }
     }
     md
+}
+
+/// The AI notes' Markdown with its headings moved down so the highest is `###`: they sit
+/// under the export's `## Notes`, and their own `## Summary` would otherwise read as a section
+/// of the export, level with `## Transcript`. Claude writes `##` sections
+/// ([`SYSTEM_PROMPT`](crate::summary::SYSTEM_PROMPT)), so that is one level: `## Summary`
+/// becomes `### Summary`. Every heading moves the same, so they keep their order, and none
+/// goes past `######`. Only `#` headings, and not in fenced code blocks.
+pub(crate) fn nested_headings(md: &str) -> String {
+    let lines: Vec<&str> = md.split('\n').collect();
+    let mut fence = None;
+    let levels: Vec<Option<usize>> = lines
+        .iter()
+        .map(|line| {
+            let (indent, text) = indented(line);
+            let marker = if indent <= 3 {
+                fence_marker(text)
+            } else {
+                None
+            };
+            match (fence, marker) {
+                (Some(open), Some(marker)) if marker == open => {
+                    fence = None;
+                    None
+                }
+                (Some(_), _) => None,
+                (None, Some(marker)) => {
+                    fence = Some(marker);
+                    None
+                }
+                (None, None) if indent <= 3 => heading_level(text),
+                (None, None) => None,
+            }
+        })
+        .collect();
+    let Some(&top) = levels.iter().flatten().min() else {
+        return md.to_owned();
+    };
+    let down = 3usize.saturating_sub(top);
+    if down == 0 {
+        return md.to_owned();
+    }
+    let moved: Vec<String> = lines
+        .iter()
+        .zip(&levels)
+        .map(|(line, level)| match *level {
+            Some(level) => {
+                let (indent, text) = indented(line);
+                let more = "#".repeat((level + down).min(6) - level);
+                format!("{}{more}{text}", &line[..indent])
+            }
+            None => (*line).to_owned(),
+        })
+        .collect();
+    moved.join("\n")
+}
+
+/// The leading spaces' length, and the rest of `line`.
+fn indented(line: &str) -> (usize, &str) {
+    let text = line.trim_start_matches(' ');
+    (line.len() - text.len(), text)
+}
+
+/// The marker of a line opening or closing a fenced code block.
+fn fence_marker(text: &str) -> Option<&'static str> {
+    ["```", "~~~"].into_iter().find(|f| text.starts_with(f))
+}
+
+/// An ATX heading's level: 1 to 6 `#`, then a space, a tab or the end of the line.
+fn heading_level(text: &str) -> Option<usize> {
+    let rest = text.trim_start_matches('#');
+    let level = text.len() - rest.len();
+    let ends = rest.is_empty() || rest.starts_with([' ', '\t', '\r']);
+    ((1..=6).contains(&level) && ends).then_some(level)
 }
 
 /// When the meeting was: `Oct 16, 2026, 2:30 PM (45 min)`.
@@ -241,6 +385,14 @@ fn read_lines(path: &Path) -> io::Result<Vec<Line>> {
         tracing::warn!("skipped {skipped} unreadable line(s) in {}", path.display());
     }
     Ok(lines)
+}
+
+/// When `path` was last written, in unix ms; `None` if it isn't there (or the system doesn't
+/// say).
+fn modified_ms(path: &Path) -> Option<i64> {
+    let at = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let ms = at.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(ms).ok()
 }
 
 /// Adds the path to an I/O error, for the log.
@@ -480,8 +632,9 @@ mod tests {
         let md = markdown(&m, &lines);
         assert!(md.starts_with("# Weekly sync\n"), "{md}");
         assert!(md.contains("45 min"), "{md}");
+        // Claude's own `## Summary` goes under `## Notes`, a level down.
         let notes = md
-            .find("## Notes\n\n## Summary\n\nWe ship Friday.\n")
+            .find("## Notes\n\n### Summary\n\nWe ship Friday.\n")
             .expect(&md);
         let mine = md.find("## My notes\n\n- ship friday\n").expect(&md);
         let transcript = md.find("## Transcript\n").expect(&md);
@@ -511,6 +664,96 @@ mod tests {
         let md = fs::read_to_string(path).unwrap();
         assert!(md.contains("## My notes\n\n- ship friday\n"), "{md}");
         assert!(md.contains("[00:05] Them: hello\n"), "{md}");
+    }
+
+    #[test]
+    fn ai_notes_headings_go_under_notes() {
+        let notes = "## Summary\nShipped.\n\n## Action items\n- [ ] Me: #42 by Friday\n\n\
+                     ```\n## not a heading\n```\n#hashtag\n   ### indented\n    ## code";
+        assert_eq!(
+            nested_headings(notes),
+            "### Summary\nShipped.\n\n### Action items\n- [ ] Me: #42 by Friday\n\n\
+             ```\n## not a heading\n```\n#hashtag\n   #### indented\n    ## code"
+        );
+        // Every level moves the same; none past six.
+        assert_eq!(
+            nested_headings("# Top\n## Sub\n###### Deep\n#\n####### seven"),
+            "### Top\n#### Sub\n###### Deep\n###\n####### seven"
+        );
+        // Already below `##`, or no headings at all: as it is.
+        for md in [
+            "### Summary\n#### More",
+            "Just text.\n- a\n",
+            "",
+            "~~~\n# in code\n~~~",
+        ] {
+            assert_eq!(nested_headings(md), md);
+        }
+        // An unclosed fence runs to the end.
+        assert_eq!(nested_headings("## A\n```\n## B"), "### A\n```\n## B");
+    }
+
+    #[test]
+    fn recover_puts_right_meetings_that_never_stopped() {
+        use agt_audio::wav::{read_16k_mono, write_16k_mono};
+        let store = Store::new(temp_dir("recover"));
+        let launch = START + 86_400_000;
+        // Killed while recording: no ended_at, no meeting.md, a WAV with zero sizes.
+        let killed = store.create(START).unwrap();
+        store
+            .append_line(&killed.id, &line(1, Speaker::Them, 5_000, "hello"))
+            .unwrap();
+        let wav = store.dir(&killed.id).join("system.wav");
+        write_16k_mono(&wav, &[0.25; 1600]).unwrap();
+        let mut bytes = fs::read(&wav).unwrap();
+        bytes[4..8].fill(0);
+        bytes[40..44].fill(0);
+        fs::write(&wav, bytes).unwrap();
+        store
+            .update(&killed.id, |m| m.audio.push("system.wav".into()))
+            .unwrap();
+        assert_eq!(read_16k_mono(&wav).map(|s| s.len()).unwrap_or(0), 0);
+        let written = [store.dir(&killed.id).join("transcript.jsonl"), wav.clone()]
+            .iter()
+            .filter_map(|p| modified_ms(p))
+            .max()
+            .unwrap();
+        // Killed before it said anything.
+        let empty = store.create(START + 60_000).unwrap();
+        // Stopped properly, and the one recording now (started after the launch): left alone.
+        let done = store.create(START + 120_000).unwrap();
+        store
+            .update(&done.id, |m| m.ended_at = Some(START + 180_000))
+            .unwrap();
+        let live = store.create(launch).unwrap();
+
+        assert_eq!(store.recover(launch), [killed.id.clone(), empty.id.clone()]);
+        let m = store.load(&killed.id).unwrap();
+        assert_eq!(m.ended_at, Some(written.max(START)));
+        assert_eq!(read_16k_mono(&wav).unwrap().len(), 1600);
+        let md = fs::read_to_string(store.dir(&killed.id).join("meeting.md")).unwrap();
+        assert!(md.contains("[00:05] Them: hello\n"), "{md}");
+        // Nothing written: it ended when it started.
+        assert_eq!(
+            store.load(&empty.id).unwrap().ended_at,
+            Some(START + 60_000)
+        );
+        assert!(store.dir(&empty.id).join("meeting.md").is_file());
+        assert_eq!(
+            store.load(&done.id).unwrap().ended_at,
+            Some(START + 180_000)
+        );
+        assert!(!store.dir(&done.id).join("meeting.md").exists());
+        assert_eq!(store.load(&live.id).unwrap().ended_at, None);
+        assert!(!store.dir(&live.id).join("meeting.md").exists());
+        // Once is enough.
+        assert_eq!(store.recover(launch), Vec::<String>::new());
+        // No meetings folder yet: nothing to do.
+        assert!(
+            Store::new(temp_dir("recover-none").join("x"))
+                .recover(launch)
+                .is_empty()
+        );
     }
 
     #[test]

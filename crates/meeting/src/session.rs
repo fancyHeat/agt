@@ -7,6 +7,10 @@
 //! arrived; the [`Transcriber`] each segment's text; [`Session`]'s methods pause, resume and
 //! stop. So nothing is locked, and the audio callbacks never wait.
 //!
+//! If the `meeting` thread panics anyway (a bug), the meeting still ends properly: what was
+//! written stays, `ended_at` and `meeting.md` are saved, and [`Event::Error`] then
+//! [`Event::Stopped`] go out, so the app never waits for a meeting that can't finish.
+//!
 //! The system capture is started on a `meeting-system-start` thread, which sends the result
 //! back the same way, at most one at a time, restarts included. On macOS that start can block
 //! for as long as the "System Audio Recording" prompt is unanswered (forever, on a locked
@@ -31,8 +35,12 @@
 //! a muted mic, the zeros filling a gap) before a cutter's first sound isn't fed to it at all.
 //! [`Cutter`] keeps everything until it hears speech, so the first line would otherwise start
 //! at 0:00 however much later it was said, and minutes of zeros would be transcribed. A
-//! segment of nothing but zeros isn't transcribed either. A real mic's room noise isn't zeros,
-//! so a line's times are those of the speech inside its segment ([`speech_span`]), not of the
+//! segment of nothing but zeros isn't transcribed either, nor one the cutter heard no speech in
+//! ([`Segment::speech`]: room noise, a quiet stretch), which the model would only turn into
+//! made-up words ("Okay.", "Thank you."); either still counts as transcribed, for the echo
+//! check. (Speech too quiet to stand out from the room it's in goes with it: the cutter tells
+//! speech by a clear rise over the noise floor.) A real mic's room noise isn't zeros, so a
+//! line's times are those of the speech inside its segment ([`speech_span`]), not of the
 //! segment.
 //!
 //! # Echo
@@ -172,7 +180,10 @@ pub struct SessionConfig {
     /// Also keep the audio: `mic.wav` and `system.wav` in the meeting's folder, on the meeting
     /// clock (a pause or a gap is silence in them).
     pub save_audio: bool,
-    /// How each track is cut into segments to transcribe ([`CutConfig::live`]).
+    /// How each track is cut into segments to transcribe. The app passes its meeting cut
+    /// config (short pauses cut short segments, so lines come within a second or two of each
+    /// pause), not dictation's [`CutConfig::live`]. With a [`PauseCut`](agt_stt::chunk::PauseCut),
+    /// segments the cutter heard no speech in aren't transcribed (see the module docs).
     pub cut: CutConfig,
     /// While set (a dictation records), the mic track is silence: the dictation is not part of
     /// the meeting.
@@ -293,9 +304,22 @@ impl Session {
         }
         let id = meeting.id.clone();
         tracing::info!("meeting {id} started; starting the system audio");
+        let rescue = Rescue {
+            id: id.clone(),
+            started_at: meeting.started_at,
+            t0,
+            store: w.store.clone(),
+            notify: w.notify.clone(),
+            stopped: w.stopped.clone(),
+        };
         thread::Builder::new()
             .name("meeting".into())
-            .spawn(move || w.run(rx, meeting, errors))
+            .spawn(move || {
+                let run = AssertUnwindSafe(|| w.run(rx, meeting, errors));
+                if panic::catch_unwind(run).is_err() {
+                    rescue.finish();
+                }
+            })
             .map_err(|e| format!("Couldn't start the meeting thread: {e}"))?;
         Ok(Session {
             id,
@@ -400,6 +424,54 @@ fn sink(track: Track, generation: u64, tx: &Sender<Msg>, muted: Option<Arc<Atomi
             samples,
         });
     })
+}
+
+/// What a panicked `meeting` thread still needs to end its meeting: [`Rescue::finish`].
+struct Rescue {
+    id: String,
+    started_at: i64,
+    t0: Instant,
+    store: Store,
+    notify: Arc<dyn Fn(Event) + Send + Sync>,
+    /// [`Event::Stopped`] went out already (the panic came after it).
+    stopped: Arc<AtomicBool>,
+}
+
+impl Rescue {
+    /// The meeting thread panicked (the panic hook has logged where): everything it held is
+    /// gone (the captures stopped as it unwound, its WAV files were finished on the way, the
+    /// segments still being transcribed are lost), but what it wrote stays. Ends the meeting
+    /// now with that: `ended_at` (unless it was set), `meeting.md`, then [`Event::Error`] and
+    /// [`Event::Stopped`], so the app goes back to idle instead of waiting for a stop that
+    /// never comes.
+    fn finish(self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // Not the panic's message: a formatted one can hold anything, even what was said.
+        tracing::error!(
+            "meeting {}: the recording stopped on an error; saving what there is",
+            self.id
+        );
+        let ended_at = self.started_at + elapsed_ms(self.t0, Instant::now()) as i64;
+        if let Err(e) = self.store.update(&self.id, |m| {
+            m.ended_at.get_or_insert(ended_at);
+        }) {
+            tracing::error!("cannot save meeting {}: {e}", self.id);
+        }
+        if let Err(e) = self.store.write_markdown(&self.id) {
+            tracing::error!("cannot write meeting {}'s meeting.md: {e}", self.id);
+        }
+        let id = self.id.clone();
+        let message = "Meeting notes stopped because of an error in AGT. What was transcribed \
+                       until then is saved."
+            .to_owned();
+        (self.notify)(Event::Error {
+            id: id.clone(),
+            message,
+        });
+        (self.notify)(Event::Stopped { id });
+    }
 }
 
 /// What the `meeting` thread gets from [`Session::start`].
@@ -618,6 +690,8 @@ struct Worker {
     echoes: u64,
     /// The last error sent: one that repeats on every segment is sent once.
     last_error: Option<String>,
+    /// Set as [`Event::Stopped`] goes out (see [`Rescue`]).
+    stopped: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -646,6 +720,7 @@ impl Worker {
             lines: 0,
             echoes: 0,
             last_error: None,
+            stopped: Arc::default(),
         }
     }
 
@@ -834,7 +909,9 @@ impl Worker {
         }
     }
 
-    /// Sends a finished segment to the transcriber, unless it is all zeros.
+    /// Sends a finished segment to the transcriber, unless it is all zeros or holds no speech
+    /// ([`Segment::speech`], always true without a pause cut). A segment that isn't sent is
+    /// done at once: the track is transcribed past it all the same.
     fn segment(&mut self, track: Track, seg: Segment) {
         let t = &mut self.tracks[track.index()];
         let base = t.base.unwrap_or(t.pos);
@@ -849,7 +926,15 @@ impl Worker {
         t.seq += 1;
         let seq = t.seq;
         t.order.push_back((Some(seq), done));
-        if seg.audio.iter().all(|&x| x == 0.0) {
+        if !seg.speech || seg.audio.iter().all(|&x| x == 0.0) {
+            if !seg.speech {
+                tracing::debug!(
+                    "{}: no speech in {} ms at {} ms, not transcribed",
+                    track.label(),
+                    ms(seg.audio.len() as u64),
+                    ms(start)
+                );
+            }
             self.advance(track);
             return;
         }
@@ -1057,6 +1142,7 @@ impl Worker {
             self.lines,
             self.echoes
         );
+        self.stopped.store(true, Ordering::SeqCst);
         self.emit(Event::Stopped {
             id: self.id.clone(),
         });
@@ -1400,6 +1486,29 @@ mod tests {
         }
     }
 
+    /// Transcribes at once like [`AtOnce`], but makes words up for audio it can't hear that
+    /// isn't silence, as a speech model does with room noise.
+    struct MakesUp;
+
+    impl Transcriber for MakesUp {
+        fn transcribe(&self, audio: Vec<f32>, done: Done) {
+            let text = match hear(&audio) {
+                heard if heard.is_empty() && audio.iter().any(|&x| x != 0.0) => "thank you".into(),
+                heard => heard,
+            };
+            done(Ok(text));
+        }
+    }
+
+    /// Panics on the meeting thread, which calls it.
+    struct Panics;
+
+    impl Transcriber for Panics {
+        fn transcribe(&self, _: Vec<f32>, _: Done) {
+            panic!("fake transcriber crashed");
+        }
+    }
+
     /// Fake devices: the test plays audio into whichever captures are running.
     #[derive(Default)]
     struct Devices {
@@ -1583,6 +1692,16 @@ mod tests {
 
     impl Run {
         fn start(name: &str, devices: Devices, cfg: SessionConfig) -> Run {
+            Run::start_with(name, devices, cfg, Stt::new())
+        }
+
+        /// [`Run::start`] with another transcriber.
+        fn start_with(
+            name: &str,
+            devices: Devices,
+            cfg: SessionConfig,
+            transcriber: Arc<dyn Transcriber>,
+        ) -> Run {
             let dir = TempDir::new(name);
             let store = Store::new(dir.0.clone());
             let held = *devices.hold_system.lock().unwrap();
@@ -1600,7 +1719,7 @@ mod tests {
                 store.clone(),
                 cfg,
                 Arc::new(Fake(devices.clone())),
-                Stt::new(),
+                transcriber,
                 Arc::new(move |e| {
                     let _ = tx.send(e);
                 }),
@@ -1794,6 +1913,51 @@ mod tests {
             texts(&lines(&events)),
             [(Speaker::Them, THEM), (Speaker::Me, ME)]
         );
+    }
+
+    #[test]
+    fn noise_without_speech_is_not_transcribed() {
+        let mut run = Run::start_with("noise", Devices::default(), config(), Arc::new(MakesUp));
+        // Them: 14 s of steady noise and nothing said: a limit cut at 10 s, the rest at the
+        // stop, neither with speech. Me: a phrase in the middle of it.
+        run.play(
+            &[quiet(2.0), say(ME, 3.0), quiet(9.0)].concat(),
+            &noise(-40.0, 14.0),
+        );
+        // Them plays all along, so the Me line waits until Them is transcribed past it: done
+        // at the limit cut, which never went to the transcriber.
+        run.wait("the Me line", |e| is_line(e, Speaker::Me));
+        let events = run.stop();
+        assert_eq!(
+            texts(&lines(&events)),
+            [(Speaker::Me, ME)],
+            "no made-up Them lines: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn a_panic_still_ends_the_meeting() {
+        let mut run = Run::start_with("panic", Devices::default(), config(), Arc::new(Panics));
+        run.play(&[say(ME, 3.0), quiet(2.0)].concat(), &quiet(5.0));
+        // The first segment makes the meeting thread panic.
+        run.wait("the error", |e| {
+            matches!(e, Event::Error { message, .. } if message.contains("because of an error"))
+        });
+        let stopped = run.wait("Stopped", |e| matches!(e, Event::Stopped { .. }));
+        assert_eq!(stopped, Event::Stopped { id: run.id.clone() });
+        // The thread is gone, and nothing comes after Stopped.
+        match run.events.recv_timeout(Duration::from_secs(10)) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            other => panic!("after Stopped: {other:?}"),
+        }
+        // Its captures were stopped, and the meeting is saved as ended.
+        wait_until("the mic stopped", || run.devices.dropped(Track::Mic) == 1);
+        assert!(!run.devices.running(Track::Mic));
+        let m = run.store.load(&run.id).unwrap();
+        assert!(m.ended_at.is_some_and(|end| end >= m.started_at), "{m:?}");
+        assert!(run.store.dir(&run.id).join("meeting.md").is_file());
+        // Stopping the session afterwards is harmless.
+        run.session.take().unwrap().stop();
     }
 
     #[test]

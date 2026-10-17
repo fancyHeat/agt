@@ -452,6 +452,19 @@ fn mark_transient() {
 }
 
 pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
+    put_text(text, true)?;
+    Ok(PasteToken {
+        sequence: unsafe { GetClipboardSequenceNumber() },
+    })
+}
+
+/// Not marked: a copy to keep, which Win+V history and clipboard managers may see.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    put_text(text, false)
+}
+
+/// Replaces the clipboard's contents with `text` (`transient`: kept out of clipboard history).
+fn put_text(text: &str, transient: bool) -> Result<(), Error> {
     let utf16: Vec<u8> = text
         .encode_utf16()
         .chain([0])
@@ -465,11 +478,10 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
         .into());
     }
     set_data(CF_UNICODETEXT as u32, &utf16)?;
-    mark_transient();
-    drop(_open);
-    Ok(PasteToken {
-        sequence: unsafe { GetClipboardSequenceNumber() },
-    })
+    if transient {
+        mark_transient();
+    }
+    Ok(())
 }
 
 pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {

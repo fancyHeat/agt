@@ -247,14 +247,33 @@ mod tests {
         );
     }
 
+    /// macOS's version as (major, minor); `None` if it can't be read.
+    fn os_version() -> Option<(u32, u32)> {
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.osproductversion"])
+            .output()
+            .ok()?;
+        let version = String::from_utf8(out.stdout).ok()?;
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+        Some((major, minor))
+    }
+
     #[test]
     fn taps_missing_is_an_error_not_a_panic() {
         // What `Capture::start(&Source::SystemOutput, ..)` returns before macOS 14.2: the
         // error from `GlobalTap::new`, passed through unchanged.
         let e = require_taps(false).unwrap_err();
         assert_eq!(e.to_string(), "system audio needs macOS 14.2 or later");
-        // This Mac has them (the lookup `new` makes).
-        assert!(require_taps(AnyClass::get(c"CATapDescription").is_some()).is_ok());
+        // From 14.2 on the class is there (the lookup `new` makes; a wrong name fails here).
+        // Before (a CI runner on an older image), there's nothing more to check.
+        match os_version() {
+            Some(v) if v >= (14, 2) => {
+                assert!(require_taps(AnyClass::get(c"CATapDescription").is_some()).is_ok());
+            }
+            v => eprintln!("skipped: process taps need macOS 14.2 (this is {v:?})"),
+        }
     }
 
     #[test]

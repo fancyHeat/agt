@@ -24,12 +24,27 @@ macro_rules! default_hotkey {
 /// Default `hotkey.key`: Fn (the Globe key) on macOS, Left Ctrl + Left Win elsewhere.
 pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 
+// Default `meeting.enabled` in the file, as [`MeetingConfig::default`] has it.
+#[cfg(target_os = "macos")]
+macro_rules! default_meeting_enabled {
+    () => {
+        "true"
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! default_meeting_enabled {
+    () => {
+        "false"
+    };
+}
+
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
     r#"# AGT configuration. The tray menu's Settings window changes this file too. AGT applies a
 # saved change by restarting itself once you're not dictating.
 # If this file has an error, a running AGT keeps its settings until it's fixed; starting with
-# an error, AGT uses defaults (updates and polish off). Either way it records the error.
+# an error, AGT uses defaults (updates, polish and meeting detection off). Either way it
+# records the error.
 
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
@@ -193,8 +208,10 @@ keep_days = 30
 # computer plays ("Them": everyone else on the call), transcribes both on this machine with the
 # dictation model, and keeps the text next to the notes you type. No bot joins the call. Kept
 # only on this machine, in the "meetings" folder next to agt.db. Let people know you're taking
-# notes.
-enabled = true
+# notes. On by default on macOS; off on Windows until it has been tested there.
+enabled = "#,
+    default_meeting_enabled!(),
+    r#"
 # Also keep the recording: one WAV file per side (16 kHz mono; about 1.9 MB per minute each).
 # Off: only the text is kept.
 save_audio = false
@@ -658,7 +675,8 @@ impl HistoryConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeetingConfig {
-    /// Off: meeting notes are hidden and can't be started.
+    /// Off: meeting notes are hidden and can't be started. On by default only on macOS
+    /// ([`MeetingConfig::defaults`]).
     pub enabled: bool,
     /// Keep each side's audio as a WAV file next to the transcript. Text is always kept.
     pub save_audio: bool,
@@ -688,10 +706,13 @@ pub enum MeetingSummary {
     Off,
 }
 
-impl Default for MeetingConfig {
-    fn default() -> Self {
+impl MeetingConfig {
+    /// The defaults on macOS (`macos`) or elsewhere. Meeting notes are on only where they have
+    /// been tested: macOS. On Windows nobody has run them yet (the system audio, the windows'
+    /// pages), so they stay off until someone has; `enabled = true` turns them on.
+    pub fn defaults(macos: bool) -> Self {
         Self {
-            enabled: true,
+            enabled: macos,
             save_audio: false,
             detect: true,
             summary: MeetingSummary::Claude,
@@ -700,6 +721,12 @@ impl Default for MeetingConfig {
             claude_model: "sonnet".into(),
             command_line: false,
         }
+    }
+}
+
+impl Default for MeetingConfig {
+    fn default() -> Self {
+        Self::defaults(cfg!(target_os = "macos"))
     }
 }
 
@@ -951,13 +978,15 @@ impl Config {
         Self::parse(&fs::read_to_string(path).map_err(ConfigError::Io)?)
     }
 
-    /// What to run with when the config file can't be loaded: defaults, but with updates
-    /// and polish off, since the user may have disabled them in the file we couldn't read
-    /// (polish would otherwise download S1-mini and change the pasted text).
+    /// What to run with when the config file can't be loaded: defaults, but with updates,
+    /// polish and meeting detection off, since the user may have disabled them in the file we
+    /// couldn't read (polish would otherwise download S1-mini and change the pasted text, and
+    /// detection would offer to take notes in every call).
     pub fn fallback() -> Self {
         let mut c = Self::default();
         c.update.enabled = false;
         c.polish.enabled = false;
+        c.meeting.detect = false;
         c
     }
 }
@@ -1283,7 +1312,8 @@ mod tests {
     #[test]
     fn meeting_defaults() {
         let c = Config::default().meeting;
-        assert!(c.enabled && c.detect && !c.save_audio);
+        assert_eq!(c.enabled, cfg!(target_os = "macos"));
+        assert!(c.detect && !c.save_audio);
         assert_eq!(c.summary, MeetingSummary::Claude);
         // Nothing goes to Claude without a click, and no other program starts a recording.
         assert!(!c.auto_summary && !c.command_line);
@@ -1295,12 +1325,52 @@ mod tests {
     }
 
     #[test]
+    fn meeting_notes_on_by_default_only_on_macos() {
+        let (mac, other) = (
+            MeetingConfig::defaults(true),
+            MeetingConfig::defaults(false),
+        );
+        assert!(mac.enabled);
+        assert!(!other.enabled);
+        // Nothing else differs.
+        assert_eq!(
+            MeetingConfig {
+                enabled: true,
+                ..other
+            },
+            mac
+        );
+        assert_eq!(
+            MeetingConfig::default(),
+            MeetingConfig::defaults(cfg!(target_os = "macos"))
+        );
+        // The file written on first run says the same (see default_file_matches_default_struct).
+        let enabled = format!("\nenabled = {}\n", cfg!(target_os = "macos"));
+        let meeting = &DEFAULT_CONFIG[DEFAULT_CONFIG.find("[meeting]").unwrap()..];
+        assert!(meeting.contains(&enabled), "{meeting}");
+        assert!(meeting.contains("On by default on macOS; off on Windows"));
+    }
+
+    #[test]
     fn meeting_section_parses() {
         let c = Config::parse("[meeting]\nsave_audio = true\nclaude_model = \"opus\"")
             .unwrap()
             .meeting;
-        assert!(c.save_audio && c.enabled);
+        assert!(c.save_audio);
+        assert_eq!(c.enabled, cfg!(target_os = "macos"));
         assert_eq!(c.claude_model, "opus");
+        assert!(
+            Config::parse("[meeting]\nenabled = true")
+                .unwrap()
+                .meeting
+                .enabled
+        );
+        assert!(
+            !Config::parse("[meeting]\nenabled = false")
+                .unwrap()
+                .meeting
+                .enabled
+        );
         let c = Config::parse(
             "[meeting]\nsummary = \"off\"\ndetect = false\nclaude_path = '/x/claude'",
         )
@@ -1557,9 +1627,13 @@ mod tests {
     }
 
     #[test]
-    fn fallback_disables_updates_and_polish() {
-        assert!(!Config::fallback().update.enabled);
-        assert!(!Config::fallback().polish.enabled);
+    fn fallback_disables_updates_polish_and_meeting_detection() {
+        let c = Config::fallback();
+        assert!(!c.update.enabled);
+        assert!(!c.polish.enabled);
+        assert!(!c.meeting.detect);
+        // Meeting notes still start by hand where they're on.
+        assert_eq!(c.meeting.enabled, Config::default().meeting.enabled);
     }
 
     #[test]

@@ -3,6 +3,13 @@
 //! in, Markdown out: no tools, no MCP servers, no slash commands or skills, none of the user's
 //! customizations (safe mode), no saved session.
 //!
+//! An `ANTHROPIC_API_KEY` in AGT's environment is passed on (see `scrubbed`): a user may have
+//! set it up that way on purpose. The CLI then uses that key, not the account it's signed in
+//! with, so the notes are billed to that key.
+//!
+//! The CLI's output is never logged, not even when it fails: it can quote the meeting. The log
+//! gets the exit status, how much it wrote and what kind of failure it was ([`failure_kind`]).
+//!
 //! The transcript and the user's notes go to the CLI on stdin; the instructions are the whole
 //! system prompt ([`SYSTEM_PROMPT`]), so the CLI's own coding-agent prompt is not in the way.
 
@@ -150,8 +157,9 @@ pub fn prompt(m: &Meeting, lines: &[Line]) -> (String, String) {
 
 /// Asks `claude` (see [`find_claude`]) for meeting `m`'s notes with `model` (`sonnet`), run
 /// in `cwd` (the meeting's folder) and stopped after `timeout`. Returns the Markdown, or an
-/// error for the log and [`friendly_error`]: the CLI's own message when it fails (stderr, or
-/// stdout when stderr is empty, as for "Not logged in"), a timeout, or no output.
+/// error for [`friendly_error`]: the CLI's own message when it fails (stderr, or stdout when
+/// stderr is empty, as for "Not logged in"), a timeout, or no output. Only what AGT says
+/// itself is logged, never the CLI's message (log [`failure_kind`] of it).
 ///
 /// With `--safe-mode`, so none of the user's customizations (CLAUDE.md, hooks, plugins, ...)
 /// run or shape the notes, while their login still does. A CLI too old to know the option is
@@ -240,10 +248,15 @@ fn run_with_env(
         cmd
     };
 
-    let mut exit = call(claude, command(true), &input, deadline, cancel)?;
+    // Its errors are AGT's own (cancelled, can't run it): fine to log.
+    let ask = |safe_mode: bool| {
+        call(claude, command(safe_mode), &input, deadline, cancel)
+            .inspect_err(|e| tracing::warn!("meeting {}: {e}", m.id))
+    };
+    let mut exit = ask(true)?;
     if exit.as_ref().is_some_and(knows_no_safe_mode) {
         tracing::info!("this claude has no --safe-mode, asking again without it");
-        exit = call(claude, command(false), &input, deadline, cancel)?;
+        exit = ask(false)?;
     }
     let Some(Exit {
         status,
@@ -263,9 +276,14 @@ fn run_with_env(
             ("", out) => cap(out),
             (err, _) => cap(err),
         };
+        // Not the message itself: it can quote the meeting.
         tracing::warn!(
-            "meeting {}: claude failed ({status}) after {took:.1} s: {err}",
-            m.id
+            "meeting {}: claude failed ({status}) after {took:.1} s, {} bytes on stderr and {} \
+             on stdout: {}",
+            m.id,
+            stderr.len(),
+            stdout.len(),
+            failure_kind(&err)
         );
         return Err(err);
     }
@@ -369,16 +387,45 @@ fn knows_no_safe_mode(exit: &Exit) -> bool {
     !exit.status.success() && out.contains("unknown option") && out.contains("safe-mode")
 }
 
-/// The message the notes window shows for an error from [`run`].
-pub fn friendly_error(raw: &str) -> String {
+/// What went wrong in an error from [`run`], as far as AGT can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Failure {
+    NotSignedIn,
+    TimedOut,
+    Other,
+}
+
+fn classify(raw: &str) -> Failure {
     let lower = raw.to_lowercase();
     let mentions = |words: &[&str]| words.iter().any(|w| lower.contains(w));
     if mentions(&["/login", "not logged in", "authenticate", "oauth"]) {
-        "Claude isn't signed in. Open Terminal, run claude, then type /login.".into()
+        Failure::NotSignedIn
     } else if mentions(&["timed out", "timeout"]) {
-        "Claude took too long. Try again.".into()
+        Failure::TimedOut
     } else {
-        format!("Claude couldn't write notes: {raw}")
+        Failure::Other
+    }
+}
+
+/// The message the notes window shows for an error from [`run`]. It may quote the CLI's own
+/// message: the user's screen, not the log (see [`failure_kind`]).
+pub fn friendly_error(raw: &str) -> String {
+    match classify(raw) {
+        Failure::NotSignedIn => {
+            "Claude isn't signed in. Open Terminal, run claude, then type /login.".into()
+        }
+        Failure::TimedOut => "Claude took too long. Try again.".into(),
+        Failure::Other => format!("Claude couldn't write notes: {raw}"),
+    }
+}
+
+/// An error from [`run`] for the log: what kind of failure it was, in a few words, never the
+/// error itself (the CLI's output can quote the meeting).
+pub fn failure_kind(raw: &str) -> &'static str {
+    match classify(raw) {
+        Failure::NotSignedIn => "not signed in",
+        Failure::TimedOut => "timed out",
+        Failure::Other => "other error (message not logged)",
     }
 }
 
@@ -388,6 +435,10 @@ pub fn friendly_error(raw: &str) -> String {
 /// (or its tests) runs inside a Claude session, they are that session's, and they would turn
 /// the user's CLI into a part of it. `CLAUDE_CONFIG_DIR` says where the user's own login and
 /// settings are.
+///
+/// `ANTHROPIC_API_KEY` is passed on: nothing sets it for AGT but the user (a launchd
+/// environment, a shell AGT was started from), who may rely on it. With it the CLI bills that
+/// key instead of using the account it's signed in with (the README says so).
 fn scrubbed(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         (name.starts_with("CLAUDE") && name != "CLAUDE_CONFIG_DIR") || name == "ANTHROPIC_BASE_URL"
@@ -1131,5 +1182,21 @@ cat"#;
             friendly_error("Usage limit reached"),
             "Claude couldn't write notes: Usage limit reached"
         );
+    }
+
+    #[test]
+    fn failure_kind_never_repeats_the_message() {
+        assert_eq!(
+            failure_kind("Not logged in · Please run /login"),
+            "not signed in"
+        );
+        assert_eq!(failure_kind("claude timed out after 180 s"), "timed out");
+        // The CLI's output can quote the meeting: the log gets none of it.
+        let quoted = "Error: could not parse \"we agreed to sell the Ohio plant\"";
+        let kind = failure_kind(quoted);
+        assert_eq!(kind, "other error (message not logged)");
+        assert!(!kind.contains("Ohio"));
+        // The window still says what the CLI said.
+        assert!(friendly_error(quoted).contains("Ohio plant"));
     }
 }

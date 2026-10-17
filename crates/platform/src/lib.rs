@@ -474,6 +474,14 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     imp::set_clipboard_text(text).map(PasteToken)
 }
 
+/// Puts `text` on the clipboard the way any app's Copy does: unlike [`set_clipboard_text`],
+/// which is for a paste and keeps its text out of clipboard history, managers and other
+/// devices, this is a copy the user asked for to keep and paste elsewhere (the meeting notes
+/// window's Copy). Nothing is restored afterwards.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    imp::copy_text(text)
+}
+
 /// Sends Ctrl+V to the focused window (Windows: releasing held Shift/Alt/Win first, so e.g. a
 /// Win key still held from a `LeftCtrl+LeftWin` chord doesn't turn it into Win+Ctrl+V; macOS:
 /// Cmd+V with no other modifier, whatever is held). Returns once the keystrokes are queued;

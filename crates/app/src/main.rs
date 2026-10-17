@@ -39,7 +39,13 @@ const RESTORE_MARGIN: Duration = Duration::from_millis(500);
 /// Set for the instance a settings restart starts, so it waits for this one to exit and
 /// release the instance lock (for up to [`RELAUNCH_WAIT`]) instead of quitting at once.
 const RELAUNCH_ENV: &str = "AGT_RELAUNCH";
-const RELAUNCH_WAIT: Duration = Duration::from_secs(15);
+/// Long enough for the old instance's slowest shutdown: an explicit restart (Restart, Install
+/// now) may stop a meeting, and quitting then waits for its last lines ([`MEETING_STOP_WAIT`],
+/// 10 s), for AI notes being written (about 4 s), the notes page's last edits
+/// ([`EXIT_FLUSH`]) and the telemetry and history writers ([`TELEMETRY_FLUSH`],
+/// [`HISTORY_FLUSH`], 2 s each): about 18 s, with room to spare on a busy machine. Waiting
+/// only costs when the old instance really is that slow; it's done as soon as the lock is free.
+const RELAUNCH_WAIT: Duration = Duration::from_secs(30);
 
 /// How often `config.toml` is checked for changes made outside AGT (one `stat`; a file
 /// watcher crate isn't worth it for this).
@@ -151,7 +157,8 @@ fn main() {
         Err(e) => {
             tracing::error!("{e}");
             tracing::error!(
-                "running with defaults, updates and polish OFF; the file was not modified"
+                "running with defaults, updates, polish and meeting detection OFF; the file \
+                 was not modified"
             );
             (Config::fallback(), true)
         }
@@ -533,6 +540,10 @@ impl ApplicationHandler<AppEvent> for App {
                         tray.set_status(&s.to_string());
                     }
                     self.status = Some(s.clone());
+                    // The model may have loaded (or failed): a meeting waiting for it hears so.
+                    if let (Some(m), Some(p)) = (&mut self.meetings, &self.pipeline) {
+                        m.speech_model(&p.speech_model());
+                    }
                     self.status_at = Instant::now();
                     self.changes += 1;
                     self.changed_at = Instant::now();

@@ -213,8 +213,15 @@ pub enum ToNotes {
     },
     /// Something went wrong (or is worth knowing) that the user should hear of: one line
     /// under the header, until dismissed. `id`: about that meeting; `None`: about none (a start
-    /// that failed).
+    /// that failed). The page keeps the last one per meeting (and for none).
     Notice {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        text: String,
+    },
+    /// The notice `text` about `id` no longer holds (the speech model has loaded): the page
+    /// drops it, unless a newer one took its place.
+    ClearNotice {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         text: String,
@@ -1747,6 +1754,13 @@ mod tests {
                 text: "Speech model failed to load: model unavailable".into()
             }),
             json!({"type":"notice","text":"Speech model failed to load: model unavailable"})
+        );
+        assert_eq!(
+            out(&ToNotes::ClearNotice {
+                id: Some("m1".into()),
+                text: "Speech model still loading".into()
+            }),
+            json!({"type":"clear_notice","id":"m1","text":"Speech model still loading"})
         );
 
         assert_eq!(

@@ -19,7 +19,12 @@
 //!   That is the only time text leaves the machine.
 //! - **What goes wrong reaches the user**: a session's errors and a start that failed (or was
 //!   refused: the speech model didn't load) go to the notes page as a one-line notice, and
-//!   flash the pill ([`Meetings::notice`]).
+//!   flash the pill ([`Meetings::notice`]). The last notice per meeting is kept and given to a
+//!   notes window that opens later ([`Notices`]). A start that fails from the tray or the
+//!   pill's Take notes opens the notes window, on the list, to say why. "Speech model still
+//!   loading" goes away once it has loaded.
+//! - **Meetings AGT never got to stop** (it was killed or crashed) are put right once at
+//!   launch, on a `meeting-recover` thread ([`Store::recover`]).
 //! - **Detection** (`meeting.detect`, macOS): a `meeting-detect` thread lists the apps using
 //!   the microphone every [`DETECT_POLL`] while no meeting records; [`Detector`] decides when
 //!   the pill offers to take notes.
@@ -110,6 +115,28 @@ fn meeting_cut() -> CutConfig {
     }
 }
 
+/// Whether a start opens the notes window, by where it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenNotes {
+    /// The tray: on the meeting, or on the list saying why it didn't start.
+    Always,
+    /// The pill's Take notes: only to say why it didn't start (the pill goes away then, and
+    /// its flash with it).
+    OnFailure,
+    /// The notes window (it's open) and the command line (its answer says why).
+    Never,
+}
+
+impl OpenNotes {
+    fn on_start(self) -> bool {
+        self == OpenNotes::Always
+    }
+
+    fn on_failure(self) -> bool {
+        self != OpenNotes::Never
+    }
+}
+
 /// What other threads (and the pages) post about meetings, as [`AppEvent::Meeting`].
 pub enum Msg {
     /// From the recording session's thread.
@@ -123,6 +150,8 @@ pub enum Msg {
     },
     /// The meeting apps using the microphone now (detection).
     MicUsers(Vec<String>),
+    /// These meetings, which AGT never got to stop, were put right at launch.
+    Recovered(Vec<String>),
     /// `agt meeting <command>`.
     #[cfg_attr(
         not(unix),
@@ -142,6 +171,7 @@ impl fmt::Debug for Msg {
             Msg::Started(Err(e)) => write!(f, "Started(Err({e}))"),
             Msg::Summary { id, result } => write!(f, "Summary({id}, ok: {})", result.is_ok()),
             Msg::MicUsers(apps) => write!(f, "MicUsers({apps:?})"),
+            Msg::Recovered(ids) => write!(f, "Recovered({ids:?})"),
             Msg::Control(c, _) => write!(f, "Control({c:?})"),
             Msg::Ui(UiEvent::Notes(m)) => write!(f, "Notes({:?})", std::mem::discriminant(m)),
             Msg::Ui(e) => write!(f, "Ui({e:?})"),
@@ -151,9 +181,9 @@ impl fmt::Debug for Msg {
 
 enum Phase {
     Idle,
-    /// [`Session::start`] is running. `open_notes`: show the notes window once it has.
+    /// [`Session::start`] is running; `open` says whether the notes window opens after.
     Starting {
-        open_notes: bool,
+        open: OpenNotes,
     },
     Recording(Session),
     /// Stopped; the last segments are being transcribed until [`Event::Stopped`].
@@ -189,6 +219,10 @@ pub struct Meetings {
     stopped_tx: Sender<String>,
     /// The last start failed (shown on the tray item until the next one).
     start_failed: bool,
+    /// The last notice per meeting, for a notes window that opens later.
+    notices: Notices,
+    /// The meeting whose notice says the speech model is still loading, until it has.
+    loading_notice: Option<String>,
     /// Quitting: nothing new starts.
     exiting: bool,
     permission: PermissionCache,
@@ -203,11 +237,14 @@ impl Meetings {
         if config.meeting.detect && cfg!(target_os = "macos") {
             spawn_detection(proxy.clone(), busy.clone());
         }
+        let store = Store::new(paths::history_dir().join("meetings"));
+        // Nothing can have started yet: every meeting without an end is one AGT never stopped.
+        spawn_recovery(store.clone(), unix_ms(), proxy.clone());
         let (stopped_tx, stopped) = mpsc::channel();
         Meetings {
             cfg: config.meeting.clone(),
             mic_device: config.audio.device.clone(),
-            store: Store::new(paths::history_dir().join("meetings")),
+            store,
             captures: DeviceCaptures::default(),
             ui: Ui::new(proxy.clone()),
             proxy,
@@ -223,6 +260,8 @@ impl Meetings {
             stopped,
             stopped_tx,
             start_failed: false,
+            notices: Notices::default(),
+            loading_notice: None,
             exiting: false,
             permission: PermissionCache::default(),
         }
@@ -253,21 +292,50 @@ impl Meetings {
     /// The tray's start/stop item.
     pub fn toggle(&mut self, event_loop: &ActiveEventLoop, pipeline: Option<&Pipeline>) {
         match self.phase {
-            Phase::Idle => self.start(event_loop, pipeline, true, None),
+            Phase::Idle => self.start(event_loop, pipeline, OpenNotes::Always, None),
             Phase::Recording(_) => self.stop(None),
             Phase::Starting { .. } | Phase::Finishing(_) => {}
         }
     }
 
     /// "Meeting notes...", the pill's Notes: the notes window, on the live meeting if one
-    /// records, else on the list.
+    /// records, else on the list. A window opened for the first time also gets the notices
+    /// sent while there was none.
     pub fn open_window(&mut self, event_loop: &ActiveEventLoop) {
+        let new = !self.ui.notes_exists();
         if !self.ui.show_notes(event_loop) {
             return;
         }
         self.send_list();
         if let Some(id) = self.current_id().map(str::to_owned) {
             self.send_meeting(&id);
+        }
+        if new {
+            self.send_notices();
+        }
+    }
+
+    /// The speech model's state changed (or may have): a meeting waiting for it hears so.
+    pub fn speech_model(&mut self, model: &SpeechModel) {
+        let Some(id) = self.loading_notice.clone() else {
+            return;
+        };
+        match model {
+            SpeechModel::Loading => {}
+            SpeechModel::Ready => self.model_ready(&id),
+            SpeechModel::Failed(why) => {
+                // Replaces the loading notice: transcription won't start after all.
+                self.loading_notice = None;
+                self.notice(Some(&id), format!("Speech model failed to load: {why}"));
+            }
+        }
+    }
+
+    /// Takes back meeting `id`'s "still loading" notice, if it's still the one showing.
+    fn model_ready(&mut self, id: &str) {
+        if self.loading_notice.as_deref() == Some(id) {
+            self.loading_notice = None;
+            self.clear_notice(Some(id), MODEL_LOADING);
         }
     }
 
@@ -280,8 +348,14 @@ impl Meetings {
                 self.ui.send_notes(&ToNotes::summary(&id, result));
             }
             Msg::MicUsers(using) => self.mic_users(event_loop, &using),
+            Msg::Recovered(ids) => {
+                // Their end times and files changed: an open list shows them as they are now.
+                if !ids.is_empty() && self.ui.notes_exists() {
+                    self.send_list();
+                }
+            }
             Msg::Control(Command::Start, reply) => {
-                self.start(event_loop, pipeline, false, Some(reply))
+                self.start(event_loop, pipeline, OpenNotes::Never, Some(reply))
             }
             Msg::Control(Command::Stop, reply) => self.stop(Some(reply)),
             Msg::Control(Command::Status, reply) => {
@@ -320,7 +394,7 @@ impl Meetings {
         &mut self,
         event_loop: &ActiveEventLoop,
         pipeline: Option<&Pipeline>,
-        open_notes: bool,
+        open: OpenNotes,
         reply: Option<Reply>,
     ) {
         let answer = |reply: Option<Reply>, text: String| {
@@ -331,7 +405,7 @@ impl Meetings {
         match &self.phase {
             Phase::Recording(s) => {
                 let id = s.id().to_owned();
-                if open_notes {
+                if open.on_start() {
                     self.open_window(event_loop);
                 }
                 return answer(reply, format!("already recording {id}"));
@@ -352,12 +426,12 @@ impl Meetings {
         let Some(pipeline) = pipeline else {
             tracing::error!("cannot start meeting notes: dictation (its transcription) is off");
             let why = "AGT can't transcribe right now (see the tray and the log)".to_owned();
-            self.fail_start(event_loop, open_notes, &why);
+            self.fail_start(event_loop, open, &why);
             return answer(reply, format!("error: {why}"));
         };
         if let Err(why) = start_check(&pipeline.speech_model()) {
             tracing::error!("not starting meeting notes: {why}");
-            self.fail_start(event_loop, open_notes, &why);
+            self.fail_start(event_loop, open, &why);
             return answer(reply, format!("error: {why}"));
         }
         let mut cfg = SessionConfig::new(meeting_cut(), pipeline.dictating());
@@ -387,11 +461,11 @@ impl Meetings {
         if let Err(e) = spawned {
             tracing::error!("cannot start meeting notes: {e}");
             let why = format!("Meeting notes didn't start: {e}");
-            self.fail_start(event_loop, open_notes, &why);
+            self.fail_start(event_loop, open, &why);
             return answer(reply, format!("error: {e}"));
         }
         pipeline.set_meeting_active(true);
-        self.phase = Phase::Starting { open_notes };
+        self.phase = Phase::Starting { open };
         self.start_waiters.extend(reply);
         self.busy.store(true, Ordering::Relaxed);
         self.detector.meeting_started();
@@ -403,7 +477,10 @@ impl Meetings {
         event_loop: &ActiveEventLoop,
         pipeline: Option<&Pipeline>,
     ) {
-        let open_notes = matches!(self.phase, Phase::Starting { open_notes: true });
+        let open = match self.phase {
+            Phase::Starting { open } => open,
+            _ => OpenNotes::Never,
+        };
         let session = match result {
             Ok(s) => s,
             Err(e) => {
@@ -416,16 +493,15 @@ impl Meetings {
                 for r in self.start_waiters.drain(..) {
                     let _ = r.send(format!("error: {e}"));
                 }
-                if self.prompt.take().is_some() {
-                    self.ui.hide_pill();
-                }
                 // `e` says what: "Couldn't start the microphone: ...".
-                return self.fail_start(event_loop, open_notes, &e);
+                return self.fail_start(event_loop, open, &e);
             }
         };
         let id = session.id().to_owned();
         self.start_failed = false;
         self.prompt = None;
+        // A failed start's notice is old news (the page drops it too).
+        self.notices.remove(None);
         // Until the session's first status, a second from now.
         let permission = self.permission();
         self.live = Some(Live::new(
@@ -452,35 +528,62 @@ impl Meetings {
                 app: None,
             }),
         );
-        if open_notes {
+        if open.on_start() {
             self.open_window(event_loop);
         } else if self.ui.notes_exists() {
             self.send_meeting(&id);
         }
-        // Its segments wait for the model meanwhile.
+        // Its segments wait for the model meanwhile; the notice goes once it's ready.
         if pipeline.is_some_and(|p| p.speech_model() == SpeechModel::Loading) {
             self.notice(Some(&id), MODEL_LOADING.into());
+            self.loading_notice = Some(id);
         }
     }
 
     /// A start that failed (or was refused), `why` said plainly: on the tray item, and as a
-    /// notice in the notes window, opened for it if the start came from the tray.
-    fn fail_start(&mut self, event_loop: &ActiveEventLoop, open_notes: bool, why: &str) {
+    /// notice in the notes window, opened for it (on the list) if the start came from the tray
+    /// or the pill. A "Meeting detected" prompt goes away, and isn't offered again for the
+    /// same call.
+    fn fail_start(&mut self, event_loop: &ActiveEventLoop, open: OpenNotes, why: &str) {
         self.start_failed = true;
-        if open_notes {
+        if self.prompt.take().is_some() {
+            self.detector.dismiss();
+            self.ui.hide_pill();
+        }
+        // First, so a window opened just now gets it with the rest (see `open_window`).
+        self.notice(None, why.into());
+        if open.on_failure() {
             self.open_window(event_loop);
         }
-        self.notice(None, why.into());
     }
 
     /// Tells the user `text` (something went wrong, or is worth knowing): a line in the notes
-    /// window (if it's open; `id`: the meeting it's about), and a flash of the pill if it shows.
+    /// window (`id`: the meeting it's about), and a flash of the pill if it shows. Kept as the
+    /// last notice about `id`, for a notes window that opens later.
     fn notice(&mut self, id: Option<&str>, text: String) {
         self.ui.flash_pill(&text);
+        self.notices.set(id, &text);
         self.ui.send_notes(&ToNotes::Notice {
             id: id.map(str::to_owned),
             text,
         });
+    }
+
+    /// Takes back the notice `text` about `id`, if it's still the last one.
+    fn clear_notice(&mut self, id: Option<&str>, text: &str) {
+        if self.notices.clear(id, text) {
+            self.ui.send_notes(&ToNotes::ClearNotice {
+                id: id.map(str::to_owned),
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    /// Every kept notice, to a notes page that has none of them (new, or reloaded).
+    fn send_notices(&mut self) {
+        for msg in self.notices.messages() {
+            self.ui.send_notes(&msg);
+        }
     }
 
     /// [`agt_platform::system_audio_permission`], asked again at most every
@@ -568,7 +671,11 @@ impl Meetings {
     fn session_event(&mut self, e: Event, pipeline: Option<&Pipeline>) {
         match e {
             Event::Started(m) => tracing::debug!("meeting {} recording", m.id),
-            Event::Line { id, line } => self.ui.send_notes(&ToNotes::Line { id, line }),
+            Event::Line { id, line } => {
+                // Something was transcribed: the model has loaded.
+                self.model_ready(&id);
+                self.ui.send_notes(&ToNotes::Line { id, line });
+            }
             Event::Status {
                 id,
                 recording,
@@ -578,6 +685,12 @@ impl Meetings {
             } => {
                 if self.current_id() != Some(id.as_str()) {
                     return;
+                }
+                // In case the app heard nothing of it (its status line didn't change).
+                if self.loading_notice.is_some()
+                    && let Some(p) = pipeline
+                {
+                    self.speech_model(&p.speech_model());
                 }
                 let permission = self.permission();
                 self.live = Some(Live::new(
@@ -679,9 +792,10 @@ impl Meetings {
                     if let Some(id) = self.current_id().map(str::to_owned) {
                         self.send_meeting(&id);
                     }
+                    self.send_notices();
                 }
             }
-            FromNotes::Start => self.start(event_loop, p, false, None),
+            FromNotes::Start => self.start(event_loop, p, OpenNotes::Never, None),
             FromNotes::Stop => self.stop(None),
             FromNotes::Pause => self.pause(true),
             FromNotes::Resume => self.pause(false),
@@ -753,7 +867,8 @@ impl Meetings {
             },
             (None, None) => return,
         };
-        if let Err(e) = agt_platform::set_clipboard_text(&text) {
+        // A copy to keep, like any app's Copy: not marked transient like a dictation's paste.
+        if let Err(e) = agt_platform::copy_text(&text) {
             tracing::error!("cannot copy the meeting notes: {e}");
         }
     }
@@ -804,7 +919,7 @@ impl Meetings {
             FromPill::Stop => self.stop(None),
             FromPill::Pause => self.pause(true),
             FromPill::Resume => self.pause(false),
-            FromPill::Start => self.start(event_loop, p, false, None),
+            FromPill::Start => self.start(event_loop, p, OpenNotes::OnFailure, None),
             FromPill::Dismiss => {
                 self.detector.dismiss();
                 if self.prompt.take().is_some() {
@@ -911,9 +1026,7 @@ impl Meetings {
             }
         }
         tracing::warn!("meeting {id} didn't finish in time; saving it as it is");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64);
+        let now = unix_ms();
         if let Err(e) = self.store.update(&id, |m| {
             m.ended_at.get_or_insert(now);
         }) {
@@ -952,7 +1065,9 @@ fn write_summary(
     let markdown =
         summary::run_cancellable(&claude, model, &m, &lines, &dir, SUMMARY_TIMEOUT, cancel)
             .map_err(|raw| {
-                tracing::warn!("AI notes for meeting {id} failed: {raw}");
+                // Not `raw`: the CLI's message can quote the meeting.
+                let kind = summary::failure_kind(&raw);
+                tracing::warn!("AI notes for meeting {id} failed: {kind}");
                 summary::friendly_error(&raw)
             })?;
     tracing::info!(
@@ -998,6 +1113,46 @@ fn start_check(model: &SpeechModel) -> Result<(), String> {
     }
 }
 
+/// The last notice about each meeting (and about none: a start that failed), in the order
+/// they came, for a notes page that wasn't there when they were sent: the window opens later
+/// (a failed start from the command line, a lost microphone while it was never opened), or the
+/// page reloaded. A page that was there keeps them itself, dismissals included. One per
+/// meeting, a short line each: a long-running AGT keeps a few.
+#[derive(Debug, Default)]
+struct Notices(Vec<(Option<String>, String)>);
+
+impl Notices {
+    /// `text` is the last notice about `id` now.
+    fn set(&mut self, id: Option<&str>, text: &str) {
+        self.remove(id);
+        self.0.push((id.map(str::to_owned), text.to_owned()));
+    }
+
+    /// Forgets the notice about `id`, whatever it says.
+    fn remove(&mut self, id: Option<&str>) {
+        self.0.retain(|(about, _)| about.as_deref() != id);
+    }
+
+    /// Forgets the notice about `id` if it still says `text`. Returns whether it did.
+    fn clear(&mut self, id: Option<&str>, text: &str) -> bool {
+        let before = self.0.len();
+        self.0
+            .retain(|(about, said)| !(about.as_deref() == id && said == text));
+        self.0.len() < before
+    }
+
+    /// Them as messages to the notes page, oldest first (the page shows the newest).
+    fn messages(&self) -> Vec<ToNotes> {
+        self.0
+            .iter()
+            .map(|(id, text)| ToNotes::Notice {
+                id: id.clone(),
+                text: text.clone(),
+            })
+            .collect()
+    }
+}
+
 /// A value asked for at most every [`PERMISSION_REFRESH`].
 #[derive(Debug, Default)]
 struct PermissionCache {
@@ -1025,6 +1180,30 @@ fn words(lines: &[Line]) -> usize {
         .iter()
         .map(|l| l.text.split_whitespace().count())
         .sum()
+}
+
+/// Puts right, once, the meetings AGT never got to stop ([`Store::recover`]; those started
+/// before `launched`, unix ms), on a `meeting-recover` thread: it reads every meeting folder
+/// and may patch WAV files. Tells the app which ones, so an open list shows them as they are.
+fn spawn_recovery(store: Store, launched: i64, proxy: EventLoopProxy<AppEvent>) {
+    let spawned = thread::Builder::new()
+        .name("meeting-recover".into())
+        .spawn(move || {
+            let ids = store.recover(launched);
+            if !ids.is_empty() {
+                let _ = proxy.send_event(AppEvent::Meeting(Msg::Recovered(ids)));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("not checking for meetings left unfinished: {e}");
+    }
+}
+
+/// Now, in unix ms.
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Lists the meeting apps using the microphone every [`DETECT_POLL`] while `busy` is clear,
@@ -1253,6 +1432,52 @@ mod tests {
         assert!(!auto_summary(&on, false, || None), "transcript unreadable");
         assert!(!auto_summary(&on, true, long), "quitting");
         assert!(!auto_summary(&cfg(true, MeetingSummary::Off), false, long));
+    }
+
+    #[test]
+    fn notices_keep_the_last_per_meeting() {
+        let said = |n: &Notices| -> Vec<(Option<String>, String)> {
+            n.messages()
+                .into_iter()
+                .map(|m| match m {
+                    ToNotes::Notice { id, text } => (id, text),
+                    other => panic!("not a notice: {other:?}"),
+                })
+                .collect()
+        };
+        let notice = |id: Option<&str>, text: &str| (id.map(str::to_owned), text.to_owned());
+        let mut n = Notices::default();
+        n.set(Some("m1"), "The microphone stopped");
+        n.set(None, "Speech model failed to load");
+        n.set(Some("m1"), MODEL_LOADING);
+        n.set(Some("m2"), "Couldn't save the transcript");
+        // One per meeting (and one about none), oldest first.
+        assert_eq!(
+            said(&n),
+            [
+                notice(None, "Speech model failed to load"),
+                notice(Some("m1"), MODEL_LOADING),
+                notice(Some("m2"), "Couldn't save the transcript"),
+            ]
+        );
+        // Taken back only while it still says the same.
+        assert!(!n.clear(Some("m1"), "The microphone stopped"));
+        assert!(n.clear(Some("m1"), MODEL_LOADING));
+        assert!(!n.clear(Some("m1"), MODEL_LOADING));
+        // A meeting that started: the failed start is old news.
+        n.remove(None);
+        assert_eq!(
+            said(&n),
+            [notice(Some("m2"), "Couldn't save the transcript")]
+        );
+    }
+
+    #[test]
+    fn tray_and_pill_starts_open_the_notes_window_to_say_why_not() {
+        assert!(OpenNotes::Always.on_start() && OpenNotes::Always.on_failure());
+        // The pill's Take notes: the window only if it didn't start.
+        assert!(!OpenNotes::OnFailure.on_start() && OpenNotes::OnFailure.on_failure());
+        assert!(!OpenNotes::Never.on_start() && !OpenNotes::Never.on_failure());
     }
 
     #[test]

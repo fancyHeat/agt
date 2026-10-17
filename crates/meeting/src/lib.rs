@@ -18,6 +18,9 @@
 //! - `meeting.json`: the [`Meeting`] (title, times, the user's notes, the AI notes).
 //! - `transcript.jsonl`: one [`Line`] per line of text, appended as each is final.
 //! - `meeting.md`: the Markdown export ([`markdown`]), rewritten on stop and after a summary.
+//!
+//! A meeting AGT never got to stop (killed, crashed) keeps `ended_at` null and its WAV sizes at
+//! zero; [`Store::recover`] puts both right, and writes its `meeting.md`, at the next launch.
 //! - `mic.wav`, `system.wav`: the two tracks' audio, only with `meeting.save_audio`.
 
 mod devices;

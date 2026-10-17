@@ -154,11 +154,12 @@ type into during the call. Dictation keeps working; what you dictate isn't part 
   those echoes from the transcript, but headphones avoid them.
 - **AI notes:** **Generate notes** turns the transcript and your notes into a summary,
   decisions and action items with your own Claude Code CLI (`claude`, signed in with your
-  Claude account; no API key). The transcript and your notes go to Claude when you click
-  Generate notes, or automatically after each meeting if you turn on `auto_summary = true`
-  under `[meeting]` in `config.toml`. This is the only time meeting text leaves your computer,
-  and it goes only to Claude. `summary = "off"` turns AI notes off; `claude_path` and
-  `claude_model` pick the program and the model.
+  Claude account; AGT holds no API key). If `ANTHROPIC_API_KEY` is set in AGT's environment,
+  the CLI uses that key instead, and the notes are billed to it. The transcript and your notes
+  go to Claude when you click Generate notes, or automatically after each meeting if you turn
+  on `auto_summary = true` under `[meeting]` in `config.toml`. This is the only time meeting
+  text leaves your computer, and it goes only to Claude. `summary = "off"` turns AI notes off;
+  `claude_path` and `claude_model` pick the program and the model.
 - **Files:** one folder per meeting in `meetings` next to `agt.db`, with `meeting.json` (the
   title, your notes, the AI notes), `transcript.jsonl` (one line per thing said) and
   `meeting.md` (all of it as Markdown). The window's **Copy** and **Folder** buttons get you
@@ -172,12 +173,14 @@ type into during the call. Dictation keeps working; what you dictate isn't part 
   scripts. `agt meeting start` works once you set `command_line = true` under `[meeting]`:
   it's off by default, so no other program can start a recording through AGT's permissions.
   `agt` is the program in `AGT.app/Contents/MacOS`.
-- **Windows:** meeting notes are untested on Windows so far.
+- **Windows:** meeting notes are off by default, since they haven't been tested on Windows
+  yet. `enabled = true` under `[meeting]` turns them on.
 
 ## Privacy
 
 - Transcription runs entirely on your computer. Audio is never uploaded, and only saved if you
-  turn on the [dictation history](#dictation-history).
+  turn on the [dictation history](#dictation-history), or `save_audio` for
+  [meeting notes](#meeting-notes).
 - AGT goes online only to download its models and to check for updates. For the local AI
   clean-up (on by default), it also downloads llama.cpp (12–32 MB) once to run it. That goes
   in AGT's own data folder, not the models folder, which may be shared.
@@ -188,7 +191,8 @@ type into during the call. Dictation keeps working; what you dictate isn't part 
   turn on `auto_summary` (`summary = "off"` under `[meeting]` turns AI notes off).
 - Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:
   `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), never audio or text (those only go
-  to the opt-in dictation history). `agt stats` sums it up;
+  to the opt-in dictation history, and the transcripts of meeting notes you take to their
+  `meetings` folder). `agt stats` sums it up;
   raw rows are kept 180 days (events 30, sessions 365), daily summaries for good.
 
 ## Building from source

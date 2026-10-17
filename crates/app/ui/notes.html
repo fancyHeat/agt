@@ -594,13 +594,14 @@
     sum: {},            // id -> { state, error }
     consentHidden: {},  // id -> true
     sysHidden: {},      // id -> the system value whose notice was dismissed
-    notice: null,       // { id, text }: the last notice from Rust, until dismissed
+    notices: {},        // id ('' for none) -> { text, seq }: the last notice about it, until dismissed
     stopping: {},       // id -> true after Stop until live is null
     starting: false,
     levels: { me: 0, them: 0, at: 0 }
   };
   var follow = true;
   var tFresh = false;
+  var noticeSeq = 0;
   var pending = { notes: null, title: null };
   var lastSentTitle = {};
 
@@ -718,7 +719,7 @@
     };
     lines.forEach(function (l) { S.m.ids[l.id] = true; });
     // A meeting runs again: a failed start's notice is old news.
-    if (live && S.notice && S.notice.id == null) S.notice = null;
+    if (live) delete S.notices[''];
     // What Rust has. While an edit is kept, leave it alone so the edit still counts as unsent.
     if (!keepTitle) lastSentTitle[m.id] = m.title || '';
     setLive(m.id, live || null);
@@ -883,23 +884,49 @@
   }
 
   // One line under the header: a session error, a start that failed, the model still loading.
+  // The last one about each meeting (and about none) is kept until dismissed or taken back.
+  function noticeKey(id) { return id == null ? '' : String(id); }
   function onNotice(id, text) {
     if (!text) return;
-    S.notice = { id: id == null ? null : String(id), text: String(text) };
+    S.notices[noticeKey(id)] = { text: String(text), seq: ++noticeSeq };
     // A start that failed answers the Start button.
-    if (S.notice.id == null && S.starting) { S.starting = false; renderListAction(); }
+    if (id == null && S.starting) { S.starting = false; renderListAction(); }
     renderNotice();
   }
-  function renderNotice() {
-    var n = S.notice;
-    var inList = !!n && S.view === 'list';
-    var inMeeting = !!n && S.view === 'meeting' && (n.id == null || (!!S.m && S.m.id === n.id));
-    el.lNotice.hidden = !inList;
-    el.mNotice.hidden = !inMeeting;
-    el.lNoticeText.textContent = inList ? n.text : '';
-    el.mNoticeText.textContent = inMeeting ? n.text : '';
+  // Rust takes a notice back once it no longer holds (the speech model has loaded), unless a
+  // newer one took its place.
+  function onClearNotice(id, text) {
+    var k = noticeKey(id), n = S.notices[k];
+    if (n && n.text === String(text)) { delete S.notices[k]; renderNotice(); }
   }
-  function dismissNotice() { S.notice = null; renderNotice(); }
+  // The key of the newest notice among `keys` (null ones skipped), or null.
+  function newestNotice(keys) {
+    var best = null;
+    keys.forEach(function (k) {
+      var n = k == null ? null : S.notices[k];
+      if (n && (best == null || n.seq > S.notices[best].seq)) best = k;
+    });
+    return best;
+  }
+  // The list shows a failed start's notice and the live meeting's; a meeting its own and a
+  // failed start's. The newest of the two.
+  function shownNotice(view) {
+    if (view === 'list') return newestNotice(['', S.liveId]);
+    return S.m ? newestNotice(['', S.m.id]) : null;
+  }
+  function renderNotice() {
+    var lk = S.view === 'list' ? shownNotice('list') : null;
+    var mk = S.view === 'meeting' ? shownNotice('meeting') : null;
+    el.lNotice.hidden = lk == null;
+    el.mNotice.hidden = mk == null;
+    el.lNoticeText.textContent = lk == null ? '' : S.notices[lk].text;
+    el.mNoticeText.textContent = mk == null ? '' : S.notices[mk].text;
+  }
+  function dismissNotice(view) {
+    var k = shownNotice(view);
+    if (k != null) delete S.notices[k];
+    renderNotice();
+  }
 
   function onMeetings(list) {
     S.meetings = (Array.isArray(list) ? list.filter(Boolean) : []).slice().sort(function (a, b) {
@@ -920,6 +947,7 @@
         case 'summary': onSummary(msg); break;
         case 'meetings': onMeetings(msg.list); break;
         case 'notice': onNotice(msg.id, msg.text); break;
+        case 'clear_notice': onClearNotice(msg.id, msg.text); break;
       }
     } catch (e) {
       console.error('[agt] could not handle', msg && msg.type, e);
@@ -1235,8 +1263,8 @@
     var out = ['# ' + ((m.title || '').trim() || 'Meeting')];
     var meta = metaText(m, liveOf(m.id));
     if (meta) out.push('', meta);
-    // The same headings as meeting.md.
-    if (m.summary && String(m.summary).trim()) out.push('', '## Notes', '', String(m.summary).trim());
+    // The same headings as meeting.md, Claude's own a level under "## Notes".
+    if (m.summary && String(m.summary).trim()) out.push('', '## Notes', '', nestHeadings(String(m.summary).trim()));
     if ((m.notes || '').trim()) out.push('', '## My notes', '', m.notes.trim());
     if (m.lines.length) {
       out.push('', '## Transcript', '');
@@ -1245,6 +1273,31 @@
       });
     }
     return out.join('\n') + '\n';
+  }
+
+  // The AI notes' headings moved down so the highest is ### (Claude writes ## sections), as
+  // meeting.md has them (store::nested_headings in Rust): every heading moves the same, none
+  // goes past ######, and fenced code blocks are left alone.
+  function nestHeadings(md) {
+    var lines = md.split('\n'), fence = null;
+    function indentOf(line) { return line.length - line.replace(/^ +/, '').length; }
+    var levels = lines.map(function (line) {
+      var indent = indentOf(line), text = line.slice(indent);
+      var marker = indent <= 3 && /^(```|~~~)/.test(text) ? text.slice(0, 3) : null;
+      if (fence) { if (marker === fence) fence = null; return 0; }
+      if (marker) { fence = marker; return 0; }
+      var h = indent <= 3 ? /^(#{1,6})(?:[ \t\r]|$)/.exec(text) : null;
+      return h ? h[1].length : 0;
+    });
+    var top = levels.reduce(function (a, l) { return l && l < a ? l : a; }, 7);
+    var down = top <= 6 ? Math.max(0, 3 - top) : 0;
+    if (!down) return md;
+    return lines.map(function (line, i) {
+      var l = levels[i];
+      if (!l) return line;
+      var indent = indentOf(line);
+      return line.slice(0, indent) + '#'.repeat(Math.min(6, l + down) - l) + line.slice(indent);
+    }).join('\n');
   }
 
   el.back.addEventListener('click', function () {
@@ -1293,8 +1346,8 @@
     var live = S.m && liveOf(S.m.id);
     if (live) { S.sysHidden[S.m.id] = live.system; renderHeader(); }
   });
-  el.lNoticeX.addEventListener('click', dismissNotice);
-  el.mNoticeX.addEventListener('click', dismissNotice);
+  el.lNoticeX.addEventListener('click', function () { dismissNotice('list'); });
+  el.mNoticeX.addEventListener('click', function () { dismissNotice('meeting'); });
   el.openSettings.addEventListener('click', function () { send({ type: 'open_settings' }); });
   [el.tabNotes, el.tabAi, el.tabTranscript].forEach(function (t, i, all) {
     t.addEventListener('click', function () { setTab(t.dataset.tab); });
@@ -1357,11 +1410,13 @@
     // &system=ok|no-permission|silent|unsupported sets the Them track's state (unsupported comes
     // with its reason); &auto writes the AI notes by themselves after a stop (auto_summary);
     // &fail=model|mic refuses or fails every start with a notice; &loading says the speech model
-    // is still loading when a meeting starts; &notice=S sends a meeting error S seconds in.
+    // is still loading when a meeting starts (taken back at its first line); &notice=S sends a
+    // meeting error S seconds in.
     var BIG = Math.max(0, parseInt(params.get('big') || '0', 10) || 0);
     var LATE = params.has('late') ? Math.max(0, parseInt(params.get('late'), 10) || 0) : 7;
     var sysParam = params.get('system');
     var REASON = 'system audio needs macOS 14.2 or later';
+    var LOADING = "Speech model still loading; transcription starts when it's ready";
     var FAIL = {
       model: 'Speech model failed to load: model unavailable, see log (press the hotkey to retry)',
       mic: "Couldn't start the microphone: no input device"
@@ -1488,7 +1543,7 @@
       }
       if (BIG) { live.next = BIG; live.elapsed = BIG * 4200 + 2000; }
       deliver(meetingMsg(m.id));
-      if (params.has('loading')) notice("Speech model still loading; transcription starts when it's ready", m.id);
+      if (params.has('loading')) notice(LOADING, m.id);
       if (params.has('notice')) {
         var nid = m.id;
         setTimeout(function () {
@@ -1515,6 +1570,8 @@
         var line = { id: n + 1, speaker: s[0], start_ms: startMs, end_ms: startMs + 2400, text: s[1] };
         store[live.id].lines.push(line);
         deliver({ type: 'line', id: live.id, line: line });
+        // The first line: the model has loaded, so its notice is taken back.
+        if (params.has('loading') && n === BIG) deliver({ type: 'clear_notice', id: live.id, text: LOADING });
       }, LINE_MS);
       live.levelTimer = setInterval(function () {
         if (!live) return;
