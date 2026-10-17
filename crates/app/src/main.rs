@@ -1,7 +1,10 @@
 // No console window for release builds on Windows.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod control;
 mod logging;
+mod meeting;
+mod meeting_ui;
 mod pipeline;
 mod settings;
 mod tray;
@@ -42,6 +45,13 @@ const RELAUNCH_WAIT: Duration = Duration::from_secs(15);
 /// watcher crate isn't worth it for this).
 const CONFIG_POLL: Duration = Duration::from_secs(2);
 
+/// Quitting with the meeting notes window open keeps the event loop running this long after
+/// asking the page for its unsaved edits, so they arrive and are saved.
+const EXIT_FLUSH: Duration = Duration::from_millis(300);
+/// On exit, how long a recording meeting may take to transcribe its last segments and write
+/// its files.
+const MEETING_STOP_WAIT: Duration = Duration::from_secs(10);
+
 /// Everything other threads post to the UI thread, via `EventLoopProxy<AppEvent>`.
 #[derive(Debug)]
 enum AppEvent {
@@ -51,6 +61,8 @@ enum AppEvent {
     Update(UpdateEvent),
     /// `config.toml` was modified (or appeared, or went away).
     ConfigFile,
+    /// Meeting notes: the session, its windows, summaries, detection, the command line.
+    Meeting(meeting::Msg),
 }
 
 /// Why AGT is waiting to restart.
@@ -81,6 +93,11 @@ fn main() {
     // `agt stats`: a report from the telemetry database; doesn't start the app.
     if std::env::args().nth(1).as_deref() == Some("stats") {
         return print_stats();
+    }
+    // `agt meeting start|stop|status`: asks the running app (see `control`).
+    if std::env::args().nth(1).as_deref() == Some("meeting") {
+        attach_console();
+        std::process::exit(control::cli(std::env::args().nth(2).as_deref()));
     }
 
     let config_path = paths::config_file();
@@ -148,6 +165,9 @@ fn main() {
         // window to type into, every keystroke goes nowhere until the user clicks elsewhere
         // (e.g. after every settings restart).
         builder.with_activate_ignoring_other_apps(false);
+        // Its Cmd+Q would quit AGT on the spot from the meeting notes window; that window
+        // installs the Edit menu it needs instead (see `meeting_ui`).
+        builder.with_default_menu(false);
     }
     let event_loop = builder.build().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -167,6 +187,23 @@ fn main() {
 
     watch_config(config_path.clone(), event_loop.create_proxy());
 
+    // The command line's socket (`agt meeting ...`); removed when this goes out of scope.
+    // `start` is refused here unless `meeting.command_line` is on (see `control::refusal`).
+    #[cfg(unix)]
+    let _control = {
+        let proxy = event_loop.create_proxy();
+        let command_line = config.meeting.command_line;
+        control::serve(control::socket_path(), move |command, reply| {
+            if let Some(no) = control::refusal(command, command_line) {
+                return reply.send(no.into()).is_ok();
+            }
+            let msg = meeting::Msg::Control(command, reply);
+            proxy.send_event(AppEvent::Meeting(msg)).is_ok()
+        })
+        .map_err(|e| tracing::warn!("no `agt meeting` command line: {e}"))
+        .ok()
+    };
+
     let proxy = event_loop.create_proxy();
     let pipeline = pipeline::start(&config, move |e| {
         let _ = proxy.send_event(AppEvent::Pipeline(e));
@@ -181,8 +218,15 @@ fn main() {
         .map_or("Polish: off", |p| &p.polish_info)
         .to_owned();
 
+    let meetings = config
+        .meeting
+        .enabled
+        .then(|| meeting::Meetings::new(&config, event_loop.create_proxy()));
     let mut app = App {
         tray: None,
+        meetings,
+        meeting_busy: false,
+        exit_at: None,
         proxy: event_loop.create_proxy(),
         updater,
         restart_with: None,
@@ -200,6 +244,7 @@ fn main() {
         failures_at_start: 0,
         copy_available: false,
         exit_reason: agt_telemetry::ExitReason::Quit,
+        shut_down: false,
         overlay_position: config
             .overlay
             .enabled
@@ -212,13 +257,8 @@ fn main() {
         tracing::error!("event loop error: {e}");
         app.exit_reason = agt_telemetry::ExitReason::Error;
     }
-    tracing::info!("AGT exiting");
-    if let Some(p) = &app.pipeline {
-        p.shutdown(); // quit or restart mid-dictation: put a ducked volume back
-    }
-    agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
-    // The last dictation's history record (and WAV) may still be being written.
-    agt_history::flush(HISTORY_FLUSH);
+    // Usually done already, from `exiting`.
+    app.shutdown();
 }
 
 /// The session's non-secret settings. Polish: provider, model, style, S1-mini's options and
@@ -271,10 +311,20 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
     }
 }
 
-/// `agt stats`. Release builds on Windows are GUI-subsystem programs with no console, so
-/// attach to the one we were started from (output then interleaves with the shell's prompt,
-/// which doesn't wait for GUI programs; `agt stats | more` or `> file` avoids that).
+/// `agt stats`.
 fn print_stats() {
+    attach_console();
+    let path = paths::db_file();
+    match agt_telemetry::stats::report(&path) {
+        Ok(report) => println!("AGT stats ({})\n{report}", path.display()),
+        Err(e) => eprintln!("agt stats: {e}"),
+    }
+}
+
+/// For `agt stats` and `agt meeting`: release builds on Windows are GUI-subsystem programs
+/// with no console, so attach to the one we were started from (output then interleaves with
+/// the shell's prompt, which doesn't wait for GUI programs; `| more` or `> file` avoids that).
+fn attach_console() {
     // Only without a stdout already (redirected to a file or pipe, or a debug build).
     #[cfg(windows)]
     unsafe {
@@ -284,11 +334,6 @@ fn print_stats() {
         if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
             AttachConsole(ATTACH_PARENT_PROCESS);
         }
-    }
-    let path = paths::db_file();
-    match agt_telemetry::stats::report(&path) {
-        Ok(report) => println!("AGT stats ({})\n{report}", path.display()),
-        Err(e) => eprintln!("agt stats: {e}"),
     }
 }
 
@@ -360,6 +405,13 @@ fn relaunch() -> std::io::Result<()> {
 
 struct App {
     tray: Option<tray::Tray>,
+    /// `None` with `meeting.enabled` off.
+    meetings: Option<meeting::Meetings>,
+    /// [`meeting::Meetings::busy`] as last seen: a change counts as a status change for a
+    /// waiting restart.
+    meeting_busy: bool,
+    /// Quitting once this passes (see [`EXIT_FLUSH`]).
+    exit_at: Option<Instant>,
     proxy: EventLoopProxy<AppEvent>,
     /// `None` if this isn't a Velopack install.
     updater: Option<update::Updater>,
@@ -397,6 +449,8 @@ struct App {
     copy_available: bool,
     /// Recorded in the session when the event loop returns.
     exit_reason: agt_telemetry::ExitReason,
+    /// [`Self::shutdown`] ran.
+    shut_down: bool,
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -406,11 +460,17 @@ impl ApplicationHandler<AppEvent> for App {
             let installed = self.updater.is_some();
             // On macOS (and with AGT_HOME) the history is in the config folder: one item will do.
             let data_folder = paths::history_dir() != paths::config_dir();
-            let tray = tray::Tray::new(VERSION, &self.polish_info, installed, data_folder);
+            let meetings = self.meetings.is_some();
+            let tray =
+                tray::Tray::new(VERSION, &self.polish_info, installed, data_folder, meetings);
             match tray {
                 Ok(t) => {
                     if let Some(s) = &self.status {
                         t.set_status(&s.to_string());
+                    }
+                    if let Some(m) = &self.meetings {
+                        let (label, enabled) = m.tray_label();
+                        t.set_meeting(label, enabled);
                     }
                     self.tray = Some(t);
                     self.show_settings();
@@ -433,8 +493,23 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         // Already restarting into an update (or quitting): don't hand Velopack a second job.
-        if event_loop.exiting() {
+        // While quitting waits for the notes page's last edits, only meeting events are taken.
+        if event_loop.exiting() || self.exit_at.is_some() && !matches!(event, AppEvent::Meeting(_))
+        {
             return;
+        }
+        if let AppEvent::Meeting(msg) = event {
+            match &mut self.meetings {
+                Some(m) => m.handle(msg, event_loop, self.pipeline.as_ref()),
+                None => {
+                    if let meeting::Msg::Control(_, reply) = msg {
+                        let _ = reply.send(
+                            "error: meeting notes are off (meeting.enabled in config.toml)".into(),
+                        );
+                    }
+                }
+            }
+            return self.meeting_changed();
         }
         if let AppEvent::Pipeline(e) = &event {
             match e {
@@ -490,6 +565,17 @@ impl ApplicationHandler<AppEvent> for App {
                     p.copy_last_transcript();
                 }
             }
+            AppEvent::Menu(e) if Some(&e.id) == tray.meeting_toggle.as_ref() => {
+                if let Some(m) = &mut self.meetings {
+                    m.toggle(event_loop, self.pipeline.as_ref());
+                }
+                self.meeting_changed();
+            }
+            AppEvent::Menu(e) if Some(&e.id) == tray.meeting_window.as_ref() => {
+                if let Some(m) = &mut self.meetings {
+                    m.open_window(event_loop);
+                }
+            }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
@@ -509,7 +595,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(u) = &self.updater {
                     update::apply_pending_on_exit(&u.um);
                 }
-                event_loop.exit();
+                self.exit(event_loop);
             }
             AppEvent::Update(UpdateEvent::Downloading(version)) => {
                 tray.set_update(&format!("Downloading update {version}..."), false);
@@ -534,22 +620,32 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Tray(e) => tracing::debug!("tray: {e:?}"),
             AppEvent::Menu(_) | AppEvent::Pipeline(_) | AppEvent::ConfigFile => {}
+            AppEvent::Meeting(_) => {} // handled above
         }
     }
 
-    /// Draws overlay frames while it's visible. While hidden, the loop just waits for events:
-    /// no timer, no wake-ups.
+    /// Draws overlay frames while it's visible, and runs the meeting pill's timer while it
+    /// shows (see `meeting_ui`). While both are hidden, the loop just waits for events: no
+    /// timer, no wake-ups.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) else {
-            return;
-        };
-        if overlay
-            .next_frame()
-            .is_some_and(|due| Instant::now() >= due)
-        {
-            overlay.tick(pipeline.level.get(), Instant::now());
+        let now = Instant::now();
+        if self.exit_at.is_some_and(|at| now >= at) {
+            return event_loop.exit();
         }
-        event_loop.set_control_flow(match overlay.next_frame() {
+        let mut next = self.exit_at;
+        if let (Some(overlay), Some(pipeline)) = (&mut self.overlay, &self.pipeline) {
+            if overlay.next_frame().is_some_and(|due| now >= due) {
+                overlay.tick(pipeline.level.get(), now);
+            }
+            next = earliest(next, overlay.next_frame());
+        }
+        if let Some(m) = &mut self.meetings {
+            if m.next_tick().is_some_and(|due| now >= due) {
+                m.tick(now);
+            }
+            next = earliest(next, m.next_tick());
+        }
+        event_loop.set_control_flow(match next {
             Some(due) => ControlFlow::WaitUntil(due),
             None => ControlFlow::Wait,
         });
@@ -557,10 +653,83 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn resumed(&mut self, _: &ActiveEventLoop) {}
 
-    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    /// The loop is ending: from our own `exit`, and on macOS also from AppKit's
+    /// `applicationWillTerminate:` (a quit from outside: an Apple Event, logging out, shutting
+    /// down), after which AppKit ends the process without returning from `run_app`. So the
+    /// shutdown happens here, not after `run_app`.
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        self.shutdown();
+    }
+
+    fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Some(m) = &mut self.meetings {
+            m.window_event(id, &event);
+        }
+    }
+}
+
+/// The sooner of two deadlines.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 impl App {
+    /// What quitting needs once the event loop is done, exactly once (from
+    /// [`ApplicationHandler::exiting`], and after `run_app` in case that never came): a
+    /// recording meeting finishes ([`MEETING_STOP_WAIT`]), a ducked volume goes back, the
+    /// telemetry session ends and the dictation history is written. A quit from outside skips
+    /// [`EXIT_FLUSH`]: an edit the notes page hadn't sent yet is lost.
+    fn shutdown(&mut self) {
+        if std::mem::replace(&mut self.shut_down, true) {
+            return;
+        }
+        tracing::info!("AGT exiting");
+        // A recording meeting's last segments go through the pipeline's engine: before it goes.
+        if let Some(m) = &mut self.meetings {
+            // Already done by `exit` unless the quit came from outside: hides the windows.
+            m.prepare_exit();
+            m.shutdown(MEETING_STOP_WAIT);
+        }
+        if let Some(p) = &self.pipeline {
+            p.shutdown(); // quit or restart mid-dictation: put a ducked volume back
+        }
+        agt_telemetry::global().end_session(self.exit_reason, TELEMETRY_FLUSH);
+        // The last dictation's history record (and WAV) may still be being written.
+        agt_history::flush(HISTORY_FLUSH);
+    }
+
+    /// Quits (or restarts, after a relaunch or an update was started). A recording meeting is
+    /// stopped and the windows hidden first; with the notes window open, the loop runs
+    /// [`EXIT_FLUSH`] longer so its last edits are saved.
+    fn exit(&mut self, event_loop: &ActiveEventLoop) {
+        let flushing = self.meetings.as_mut().is_some_and(|m| m.prepare_exit());
+        if flushing {
+            self.exit_at = Some(Instant::now() + EXIT_FLUSH);
+        } else {
+            event_loop.exit();
+        }
+    }
+
+    /// After a meeting event or action: the tray item's label, and a meeting starting or
+    /// ending counts as a status change for a waiting restart (one never happens during a
+    /// meeting, see [`Self::idle`]).
+    fn meeting_changed(&mut self) {
+        let Some(m) = &self.meetings else { return };
+        if let Some(tray) = &self.tray {
+            let (label, enabled) = m.tray_label();
+            tray.set_meeting(label, enabled);
+        }
+        if m.busy() != self.meeting_busy {
+            self.meeting_busy = m.busy();
+            self.changes += 1;
+            self.changed_at = Instant::now();
+            self.start_restart_timer();
+        }
+    }
+
     /// "Update now": with an update already downloaded, installs it once idle; else checks
     /// and downloads on a worker thread, which reports back as [`AppEvent::Update`] (an
     /// update it downloads is installed the same way, with no further click). Clicked while
@@ -609,10 +778,15 @@ impl App {
     /// permissions, or unavailable altogether. For an update, not on an error while a
     /// transcript can still be copied: it may be a failed paste's, and a restart would lose it
     /// (for settings the user just changed, on an error anyway: a bad setting may be the
-    /// error). Never while loading: a restart would start a model download over. Clicking
-    /// "Install update X now" / "Restart now to apply" restarts regardless.
+    /// error). Never while loading: a restart would start a model download over. Never while
+    /// a meeting starts, records or finishes, or its AI notes are being written. Clicking
+    /// "Install update X now" / "Restart now to apply" restarts regardless (stopping the
+    /// meeting first, see [`Self::exit`]).
     fn idle(&self) -> bool {
         use pipeline::Status;
+        if self.meetings.as_ref().is_some_and(|m| m.busy()) {
+            return false;
+        }
         self.pipeline.is_none()
             || match &self.status {
                 Some(Status::Ready(_)) => true,
@@ -654,7 +828,7 @@ impl App {
                     Ok(()) => {
                         tracing::info!("restarting to apply changed settings");
                         self.exit_reason = agt_telemetry::ExitReason::SettingsRestart;
-                        event_loop.exit();
+                        self.exit(event_loop);
                     }
                     Err(e) => {
                         tracing::error!("cannot restart to apply settings: {e}");
@@ -674,7 +848,7 @@ impl App {
         match update::apply_and_restart(&updater.um, &asset) {
             Ok(()) => {
                 self.exit_reason = agt_telemetry::ExitReason::UpdateRestart;
-                event_loop.exit();
+                self.exit(event_loop);
             }
             Err(e) => {
                 tracing::error!("failed to start updater: {e}");
@@ -841,6 +1015,7 @@ fn open_in_editor(file: &std::path::Path) {
     }
 }
 
+/// Opens `dir` in Finder / Explorer.
 fn open_folder(dir: &std::path::Path) {
     let opener = if cfg!(windows) {
         "explorer"

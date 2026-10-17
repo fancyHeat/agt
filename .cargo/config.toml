@@ -1,10 +1,16 @@
 # ONNX Runtime's prebuilt macOS objects (CoreML EP) use `@available`, which needs clang's
 # runtime library (___isPlatformVersionAtLeast); rustc links with -nodefaultlibs, so ask for it.
+#
+# CoreAudio is weak-linked: the process tap functions meeting notes use
+# (AudioHardwareCreateProcessTap, AudioHardwareDestroyProcessTap) only exist from macOS 14.2,
+# and a strong reference to a missing symbol stops dyld from launching AGT at all on 13.4-14.1.
+# Weak, they are just null there; `agt_audio::tap` checks for CATapDescription before calling
+# them. (RUSTFLAGS in the environment replaces these flags.)
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fapple-link-rtlib"]
+rustflags = ["-C", "link-arg=-fapple-link-rtlib", "-C", "link-arg=-Wl,-weak_framework,CoreAudio"]
 
 [target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-fapple-link-rtlib"]
+rustflags = ["-C", "link-arg=-fapple-link-rtlib", "-C", "link-arg=-Wl,-weak_framework,CoreAudio"]
 
 [env]
 # The ONNX Runtime prebuilt targets macOS 13.4; match it (also LSMinimumSystemVersion).

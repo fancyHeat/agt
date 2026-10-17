@@ -1,6 +1,6 @@
 [package]
 name = "agt-audio"
-description = "AGT audio: microphone capture to 16 kHz mono f32, resampling, WAV reading and writing."
+description = "AGT audio: microphone and system audio capture to 16 kHz mono f32, resampling, WAV reading and writing."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,28 @@ agt-core.workspace = true
 tracing.workspace = true
 cpal = "0.18"
 hound = "3.5"
+
+# System audio on macOS: a global Core Audio process tap (`src/tap.rs`). cpal already pulls in
+# all four; these are just the pieces the tap needs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-audio = { version = "0.3", default-features = false, features = [
+    "std",
+    "AudioHardware",
+    "objc2",
+    "objc2-foundation",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSString",
+    "NSUUID",
+    "NSValue",
+] }

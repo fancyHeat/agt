@@ -1,7 +1,8 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, a config
-//! error line (while there is one), "Copy last transcript", "Update now", "Settings" (see
-//! [`crate::settings`]), (macOS) "Privacy & Security settings", "Open config folder", "Open
-//! data folder" (where it differs) and "Quit".
+//! error line (while there is one), "Start meeting notes" / "Stop meeting notes" and "Meeting
+//! notes..." (with `meeting.enabled`; see [`crate::meeting`]), "Copy last transcript", "Update
+//! now", "Settings" (see [`crate::settings`]), (macOS) "Privacy & Security settings", "Open
+//! config folder", "Open data folder" (where it differs) and "Quit".
 
 use crate::settings::Settings;
 use tray_icon::{
@@ -26,6 +27,11 @@ pub struct Tray {
     pub settings: Settings,
     copy_last_item: MenuItem,
     update_item: MenuItem,
+    /// "Start meeting notes", which reads "Stop meeting notes" while one records.
+    meeting_item: Option<MenuItem>,
+    pub meeting_toggle: Option<MenuId>,
+    /// "Meeting notes...": the notes window.
+    pub meeting_window: Option<MenuId>,
     pub copy_last: MenuId,
     pub update: MenuId,
     /// macOS only: opens the System Settings page of the first missing permission.
@@ -40,18 +46,26 @@ impl Tray {
     /// `polish`: a disabled info line, e.g. "Polish: off".
     /// `installed`: whether this is a Velopack install (else "Update now" is disabled).
     /// `data_folder`: whether to offer "Open data folder".
+    /// `meetings`: whether meeting notes are on (`meeting.enabled`; it takes a restart).
     /// The Settings submenu starts empty: fill it with [`Settings::show`].
     pub fn new(
         version: &str,
         polish: &str,
         installed: bool,
         data_folder: bool,
+        meetings: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let title = format!("AGT {version}");
         let title_item = MenuItem::new(&title, false, None);
         let status = MenuItem::new("Starting...", false, None);
         let warning = MenuItem::new("", false, None);
         let polish = MenuItem::new(polish, false, None);
+        let meeting = meetings.then(|| {
+            (
+                MenuItem::new("Start meeting notes", true, None),
+                MenuItem::new("Meeting notes...", true, None),
+            )
+        });
         // Recovery path when a paste failed; enabled once there is a transcript.
         let copy_last = MenuItem::new("Copy last transcript", false, None);
         let update = if installed {
@@ -71,6 +85,9 @@ impl Tray {
             &polish,
             &PredefinedMenuItem::separator(),
         ])?;
+        if let Some((toggle, window)) = &meeting {
+            menu.append_items(&[toggle, window, &PredefinedMenuItem::separator()])?;
+        }
         menu.append_items(&[&copy_last, &update, &settings.menu])?;
         if let Some(p) = &privacy {
             menu.append(p)?;
@@ -99,6 +116,9 @@ impl Tray {
             warning,
             warning_shown: false,
             settings,
+            meeting_toggle: meeting.as_ref().map(|(t, _)| t.id().clone()),
+            meeting_window: meeting.as_ref().map(|(_, w)| w.id().clone()),
+            meeting_item: meeting.map(|(t, _)| t),
             copy_last: copy_last.id().clone(),
             copy_last_item: copy_last,
             update: update.id().clone(),
@@ -138,6 +158,18 @@ impl Tray {
     pub fn set_copy_enabled(&self, enabled: bool) {
         if self.copy_last_item.is_enabled() != enabled {
             self.copy_last_item.set_enabled(enabled);
+        }
+    }
+
+    /// The meeting notes item's label ("Start meeting notes", "Stop meeting notes", ...).
+    pub fn set_meeting(&self, label: &str, enabled: bool) {
+        if let Some(item) = &self.meeting_item {
+            if item.text() != label {
+                item.set_text(label);
+            }
+            if item.is_enabled() != enabled {
+                item.set_enabled(enabled);
+            }
         }
     }
 

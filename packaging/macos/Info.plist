@@ -26,5 +26,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>AGT records your voice while you hold the dictation hotkey and transcribes it on this Mac.</string>
+    <!-- Meeting notes: the other side of a call (Core Audio process tap). -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>AGT hears the other people in your meetings so it can transcribe them on this Mac.</string>
 </dict>
 </plist>

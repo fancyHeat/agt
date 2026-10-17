@@ -5,20 +5,24 @@
 //! |---|---|
 //! | Seeing the hotkey (event tap), swallowing F13-F20, sending Cmd+V | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
+//! | Meeting notes' system audio track (same: silence without it) | System Audio Recording Only |
 //!
 //! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
-//! Monitoring (which macOS only applies after quitting and reopening the app). Neither needs a
-//! restart once granted: the hotkey thread retries creating its tap every second until it
-//! works, and the others are checked when used.
+//! Monitoring (which macOS only applies after quitting and reopening the app). None of them
+//! needs a restart once granted: the hotkey thread retries creating its tap every second until
+//! it works, the microphone is checked each time a recording starts, and system audio applies
+//! to the next system audio capture (the next meeting).
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, MicUser, Permission};
 use block2::RcBlock;
 use objc2::{
     msg_send,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyClass, AnyObject, Bool, ProtocolObject},
 };
-use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSWorkspace};
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
+};
 use objc2_core_foundation::{
     CFMachPort, CFRetained, CFRunLoop, CFString, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
@@ -668,10 +672,64 @@ pub fn open_permission_settings(permission: Permission) {
         Permission::Microphone => "Privacy_Microphone",
         Permission::Accessibility => "Privacy_Accessibility",
     };
+    open_privacy_pane(pane);
+}
+
+fn open_privacy_pane(pane: &str) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
         tracing::error!("cannot open {url}: {e}");
     }
+}
+
+// System audio (meeting notes). There is no public API to check this permission: the capture
+// (a Core Audio process tap) just records silence without it. So AGT asks TCC itself, through
+// the private TCC.framework's preflight; macOS shows its prompt the first time a tap starts.
+
+/// `int TCCAccessPreflight(CFStringRef service, CFDictionaryRef options)` in the private
+/// `TCC.framework`: 0 granted, 1 denied, 2 not asked yet. A preflight only reads the
+/// permission's state: it never prompts and changes nothing.
+type TccAccessPreflight = unsafe extern "C" fn(service: &CFString, options: *const c_void) -> i32;
+
+/// TCC's preflight, looked up at run time: it's private, so it may be gone in some macOS, and
+/// then we know nothing rather than failing to launch.
+static TCC_PREFLIGHT: LazyLock<Option<TccAccessPreflight>> = LazyLock::new(|| {
+    // SAFETY: NUL-terminated strings. The handle is never closed: the function must stay
+    // loaded for the rest of the process.
+    let symbol = unsafe {
+        let tcc = libc::dlopen(
+            c"/System/Library/PrivateFrameworks/TCC.framework/TCC".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        if tcc.is_null() {
+            tracing::warn!("cannot load TCC.framework: system audio permission unknown");
+            return None;
+        }
+        libc::dlsym(tcc, c"TCCAccessPreflight".as_ptr())
+    };
+    if symbol.is_null() {
+        tracing::warn!("no TCCAccessPreflight: system audio permission unknown");
+        return None;
+    }
+    // SAFETY: a non-null `TCCAccessPreflight` is the function declared above. A macOS without
+    // the symbol gives `None` (the permission reads as unknown), and its answer only picks the
+    // message the notes page shows: it never decides what is recorded.
+    Some(unsafe { std::mem::transmute::<*mut c_void, TccAccessPreflight>(symbol) })
+});
+
+pub fn system_audio_permission() -> Option<bool> {
+    let preflight = (*TCC_PREFLIGHT)?;
+    let service = CFString::from_static_str("kTCCServiceAudioCapture");
+    // SAFETY: a valid CFString; no options (NULL is allowed).
+    match unsafe { preflight(&service, std::ptr::null()) } {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+pub fn open_system_audio_settings() {
+    open_privacy_pane("Privacy_AudioCapture");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -687,6 +745,13 @@ struct PropertyAddress {
 #[link(name = "CoreAudio", kind = "framework")]
 unsafe extern "C" {
     fn AudioObjectHasProperty(id: u32, address: *const PropertyAddress) -> u8;
+    fn AudioObjectGetPropertyDataSize(
+        id: u32,
+        address: *const PropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: *mut u32,
+    ) -> i32;
     fn AudioObjectIsPropertySettable(
         id: u32,
         address: *const PropertyAddress,
@@ -864,5 +929,155 @@ impl OutputVolume {
             return Ok(false);
         }
         Ok(get_property(self.device, &address, 0u32)? != 0)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Mic users (meeting detection): Core Audio's process objects (macOS 14.2+), one per HAL
+// client process, each saying whether it is recording right now. They are property
+// selectors, not new functions, so there's nothing extra to link: on older macOS the list
+// query fails (unknown property) and nobody is found.
+
+/// `kAudioHardwarePropertyProcessObjectList`: the `AudioObjectID`s of the client processes.
+const PROCESS_OBJECT_LIST: u32 = fourcc(b"prs#");
+/// `kAudioProcessPropertyPID` (`pid_t`).
+const PROCESS_PID: u32 = fourcc(b"ppid");
+/// `kAudioProcessPropertyBundleID`: a `CFString` the caller releases.
+const PROCESS_BUNDLE_ID: u32 = fourcc(b"pbid");
+/// `kAudioProcessPropertyIsRunningInput`: a `UInt32`, non-zero while the process runs IO on
+/// any input device.
+const PROCESS_IS_RUNNING_INPUT: u32 = fourcc(b"piri");
+
+/// Set once listing the processes failed, so an old macOS logs it once rather than every poll.
+static NO_PROCESS_LIST: AtomicBool = AtomicBool::new(false);
+
+pub fn mic_users() -> Vec<MicUser> {
+    let objects = match process_objects() {
+        Ok(objects) => objects,
+        Err(e) => {
+            if !NO_PROCESS_LIST.swap(true, Ordering::Relaxed) {
+                tracing::info!("cannot list audio processes (needs macOS 14.2): {e}");
+            }
+            return Vec::new();
+        }
+    };
+    let me = std::process::id() as i32;
+    // AppKit's names come back autoreleased, and the polling thread may have no pool.
+    autoreleasepool(|_| {
+        objects
+            .into_iter()
+            .filter_map(|object| {
+                // A process can exit between the list and these reads: it's skipped.
+                let running = get_property(object, &global_address(PROCESS_IS_RUNNING_INPUT), 0u32);
+                if running.ok()? == 0 {
+                    return None;
+                }
+                let pid = get_property(object, &global_address(PROCESS_PID), 0i32).ok()?;
+                if pid <= 0 || pid == me {
+                    // Not a real process, or AGT itself (recording a dictation or meeting).
+                    return None;
+                }
+                let bundle_id = process_bundle_id(object).unwrap_or_default();
+                let app = display_name(pid, &bundle_id);
+                Some(MicUser {
+                    pid,
+                    bundle_id,
+                    app,
+                })
+            })
+            .collect()
+    })
+}
+
+/// The process objects: `AudioObjectID`s, read with [`get_property`] like devices.
+fn process_objects() -> Result<Vec<u32>, Error> {
+    let address = global_address(PROCESS_OBJECT_LIST);
+    let mut size = 0u32;
+    // SAFETY: `size` is writable; no qualifier.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(SYSTEM_OBJECT, &address, 0, std::ptr::null(), &mut size)
+    };
+    if status != 0 {
+        return Err(format!("AudioObjectGetPropertyDataSize failed (OSStatus {status})").into());
+    }
+    let mut objects = vec![0u32; size as usize / size_of::<u32>()];
+    let mut size = size_of_val(objects.as_slice()) as u32;
+    // SAFETY: `objects` has room for `size` bytes, and the HAL writes at most that much.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            SYSTEM_OBJECT,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            objects.as_mut_ptr().cast(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("AudioObjectGetPropertyData failed (OSStatus {status})").into());
+    }
+    // Processes may have left since the size was read (new ones wait for the next poll).
+    objects.truncate(size as usize / size_of::<u32>());
+    Ok(objects)
+}
+
+/// `None` for processes without a bundle.
+fn process_bundle_id(object: u32) -> Option<String> {
+    let id: *const CFString =
+        get_property(object, &global_address(PROCESS_BUNDLE_ID), std::ptr::null()).ok()?;
+    let id = NonNull::new(id.cast_mut())?;
+    // SAFETY: a copy we own (the property's rule for CFString values).
+    Some(unsafe { CFRetained::from_raw(id) }.to_string())
+}
+
+/// [`MicUser::app`](crate::MicUser::app): the meeting app's name, else the app's own (helpers
+/// and command-line tools have none), else the process name, else the bundle ID or pid.
+fn display_name(pid: i32, bundle_id: &str) -> String {
+    if let Some(name) = crate::meeting_app_name(bundle_id) {
+        return name.to_owned();
+    }
+    if let Some(name) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.localizedName())
+    {
+        return name.to_string();
+    }
+    let mut buf = [0u8; 64]; // names are at most 2 * MAXCOMLEN (16) bytes
+    // SAFETY: `buf` is writable for its length.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if len > 0
+        && let Ok(name) = std::str::from_utf8(&buf[..len as usize])
+    {
+        return name.to_owned();
+    }
+    if bundle_id.is_empty() {
+        format!("pid {pid}")
+    } else {
+        bundle_id.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Proves the list, PID and bundle ID reads, which `mic_users` can't show while nothing
+    /// records: this test process is a HAL client too (it just queried the HAL).
+    #[test]
+    fn process_objects_include_this_process() {
+        let Ok(objects) = process_objects() else {
+            return; // macOS before 14.2
+        };
+        let pid = |o: u32| get_property(o, &global_address(PROCESS_PID), 0i32).ok();
+        let me = std::process::id() as i32;
+        let mine = objects.iter().copied().find(|&o| pid(o) == Some(me));
+        let Some(mine) = mine else {
+            panic!("pid {me} not among {} audio processes", objects.len());
+        };
+        // Each is a CFString copy we release: reading them all must not crash.
+        for &o in &objects {
+            let _ = process_bundle_id(o);
+        }
+        // A test binary has no bundle (the HAL says "", not an error).
+        assert_eq!(process_bundle_id(mine).unwrap_or_default(), "");
     }
 }

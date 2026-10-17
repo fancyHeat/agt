@@ -116,6 +116,42 @@ clean-up style, ...), so the two can be joined, e.g. to label data with a bigger
 build a custom dictionary. `agt.db` keeps those rows for 180 days: history kept longer than
 that no longer joins.
 
+## Meeting notes
+
+Tray menu → **Start meeting notes** writes down a call in any app (Google Meet, Teams, Zoom,
+...) with no bot joining it. AGT listens to your microphone ("Me") and to what your computer
+plays ("Them"), and transcribes both on your computer with the dictation model. While it
+records, a small pill sits at the right edge of the screen (hover it for Notes, Pause and
+Stop), and the **Meeting notes** window shows the transcript as it comes and a notes field to
+type into during the call. Dictation keeps working; what you dictate isn't part of the meeting.
+
+- **macOS:** hearing the other side needs macOS 14.2 or later and the **System Audio Recording
+  Only** permission (System Settings > Privacy & Security > Screen & System Audio Recording),
+  which macOS asks for the first time. Without it only your microphone is recorded.
+- **Headphones** work best: on speakers your microphone hears the other side too. AGT drops
+  those echoes from the transcript, but headphones avoid them.
+- **AI notes:** **Generate notes** turns the transcript and your notes into a summary,
+  decisions and action items with your own Claude Code CLI (`claude`, signed in with your
+  Claude account; no API key). The transcript and your notes go to Claude when you click
+  Generate notes, or automatically after each meeting if you turn on `auto_summary = true`
+  under `[meeting]` in `config.toml`. This is the only time meeting text leaves your computer,
+  and it goes only to Claude. `summary = "off"` turns AI notes off; `claude_path` and
+  `claude_model` pick the program and the model.
+- **Files:** one folder per meeting in `meetings` next to `agt.db`, with `meeting.json` (the
+  title, your notes, the AI notes), `transcript.jsonl` (one line per thing said) and
+  `meeting.md` (all of it as Markdown). The window's **Copy** and **Folder** buttons get you
+  there. Audio is kept only with `save_audio = true`.
+- **Let people know** you're taking notes. In many places recording a call needs everyone's
+  consent.
+- **Detection (macOS):** when a call app starts using the microphone, the pill offers to take
+  notes (`detect = false` turns that off).
+- **Command line (macOS):** `agt meeting stop` (answers once the transcript is complete) and
+  `agt meeting status` (`idle` or `recording <id> <seconds>`), for Shortcuts, Raycast or
+  scripts. `agt meeting start` works once you set `command_line = true` under `[meeting]`:
+  it's off by default, so no other program can start a recording through AGT's permissions.
+  `agt` is the program in `AGT.app/Contents/MacOS`.
+- **Windows:** meeting notes are untested on Windows so far.
+
 ## Privacy
 
 - Transcription runs entirely on your computer. Audio is never uploaded, and only saved if you
@@ -124,6 +160,9 @@ that no longer joins.
   local AI clean-up, it also downloads llama.cpp (12–32 MB) once to run it.
 - The one exception is opt-in: if you configure the optional clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
+- AI notes for a [meeting](#meeting-notes) send its transcript and your notes to your own
+  Claude Code CLI when you click Generate notes, or automatically after each meeting if you
+  turn on `auto_summary` (`summary = "off"` under `[meeting]` turns AI notes off).
 - Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:
   `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), never audio or text (those only go
   to the opt-in dictation history). `agt stats` sums it up;

@@ -1,4 +1,6 @@
-//! Microphone capture to 16 kHz mono f32, plus resampling and WAV reading.
+//! Microphone capture to 16 kHz mono f32, plus resampling and WAV reading and writing.
+//! [`Recorder`] is the dictation mic (started and stopped per key press); [`Capture`] is a
+//! continuous stream of the mic or of what the computer plays, for meeting notes.
 //!
 //! ## Mic stream lifecycle
 //!
@@ -20,8 +22,13 @@
 //! few ms) and switches to it. A chosen device that is connected but fails to open also
 //! falls back, and is tried again a minute later or once it has been reconnected.
 
+mod capture;
 pub mod resample;
+#[cfg(target_os = "macos")]
+mod tap;
 pub mod wav;
+
+pub use capture::{Capture, Source, current_device_id};
 
 use cpal::{
     FromSample, SizedSample,
@@ -62,7 +69,7 @@ impl Level {
 }
 
 /// State shared with the audio callback.
-struct Capture {
+struct Shared {
     recording: bool,
     resampler: Resampler,
     /// 16 kHz output of the current recording.
@@ -70,8 +77,6 @@ struct Capture {
     /// Last `PREROLL_MS` of 16 kHz audio while not recording (keep-open mode only).
     preroll: VecDeque<f32>,
     keep_preroll: bool,
-    /// Scratch buffer for the mono downmix.
-    mono: Vec<f32>,
     /// When recording started and when its first audio arrived (start-up latency).
     started: Option<Instant>,
     first_audio: Option<Duration>,
@@ -95,7 +100,7 @@ pub struct Recorder {
     /// as soon as it was unplugged and is back.
     chosen_failed: Option<Instant>,
     live: Option<Live>,
-    capture: Arc<Mutex<Capture>>,
+    capture: Arc<Mutex<Shared>>,
     failed: Arc<AtomicBool>,
     level: Level,
 }
@@ -110,13 +115,12 @@ impl Recorder {
             missing_logged: false,
             chosen_failed: None,
             live: None,
-            capture: Arc::new(Mutex::new(Capture {
+            capture: Arc::new(Mutex::new(Shared {
                 recording: false,
                 resampler: Resampler::new(SAMPLE_RATE, SAMPLE_RATE),
                 samples: Vec::new(),
                 preroll: VecDeque::new(),
                 keep_preroll: keep_open,
-                mono: Vec::new(),
                 started: None,
                 first_audio: None,
                 truncated: false,
@@ -190,13 +194,13 @@ impl Recorder {
             c.preroll.clear();
         }
         self.failed.store(false, Ordering::Relaxed);
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => self.build::<f32>(device, &stream_config),
-            cpal::SampleFormat::I16 => self.build::<i16>(device, &stream_config),
-            cpal::SampleFormat::I32 => self.build::<i32>(device, &stream_config),
-            cpal::SampleFormat::U16 => self.build::<u16>(device, &stream_config),
-            other => return Err(format!("unsupported microphone sample format {other}").into()),
-        }?;
+        let stream = build_mono_stream(
+            device,
+            &config,
+            "microphone",
+            self.failed.clone(),
+            self.on_audio(),
+        )?;
         if self.keep_open {
             stream.play()?;
         }
@@ -223,17 +227,13 @@ impl Recorder {
             let broken = self
                 .chosen_failed
                 .is_some_and(|t| t.elapsed() < CHOSEN_RETRY);
-            match host.input_devices() {
-                Ok(mut all) => {
-                    match all.find(|d| device_name(d).as_deref() == Some(&self.device)) {
-                        Some(d) if !broken => {
-                            self.missing_logged = false;
-                            return Ok((d, true));
-                        }
-                        Some(_) => {}
-                        None => self.chosen_failed = None,
-                    }
+            match named_input(host, &self.device) {
+                Ok(Some(d)) if !broken => {
+                    self.missing_logged = false;
+                    return Ok((d, true));
                 }
+                Ok(Some(_)) => {}
+                Ok(None) => self.chosen_failed = None,
                 Err(e) => tracing::warn!("cannot list microphones: {e}"),
             }
             if !self.missing_logged && !broken {
@@ -250,70 +250,39 @@ impl Recorder {
         Ok((device, false))
     }
 
-    fn build<T>(
-        &self,
-        device: &cpal::Device,
-        config: &cpal::StreamConfig,
-    ) -> Result<cpal::Stream, Error>
-    where
-        T: SizedSample + Send + 'static,
-        f32: FromSample<T>,
-    {
+    /// The stream callback: mono audio of the device's rate into the recording (or the
+    /// pre-roll).
+    fn on_audio(&self) -> impl FnMut(&[f32]) + Send + 'static {
         let capture = self.capture.clone();
         let level = self.level.clone();
-        let failed = self.failed.clone();
-        let channels = config.channels as usize;
         let preroll_len = PREROLL_MS * SAMPLE_RATE as usize / 1000;
         let max_len = MAX_SECONDS * SAMPLE_RATE as usize;
-        let stream = device.build_input_stream::<T, _, _>(
-            *config,
-            move |data: &[T], _| {
-                let Ok(mut guard) = capture.lock() else {
-                    return;
-                };
-                let c = &mut *guard;
-                if !c.recording && !c.keep_preroll {
-                    return;
+        move |mono: &[f32]| {
+            let Ok(mut guard) = capture.lock() else {
+                return;
+            };
+            let c = &mut *guard;
+            if !c.recording && !c.keep_preroll {
+                return;
+            }
+            level.set(rms(mono));
+            if c.recording {
+                if c.first_audio.is_none() {
+                    c.first_audio = c.started.map(|s| s.elapsed());
                 }
-                c.mono.clear();
-                c.mono.extend(data.chunks(channels).map(|f| {
-                    f.iter()
-                        .map(|&s| <f32 as FromSample<T>>::from_sample_(s))
-                        .sum::<f32>()
-                        / channels as f32
-                }));
-                let sq: f32 = c.mono.iter().map(|x| x * x).sum();
-                level.set((sq / c.mono.len().max(1) as f32).sqrt());
-                if c.recording {
-                    if c.first_audio.is_none() {
-                        c.first_audio = c.started.map(|s| s.elapsed());
-                    }
-                    if c.samples.len() < max_len {
-                        c.resampler.process(&c.mono, &mut c.samples);
-                    } else {
-                        c.truncated = true;
-                    }
+                if c.samples.len() < max_len {
+                    c.resampler.process(mono, &mut c.samples);
                 } else {
-                    let before = c.samples.len();
-                    c.resampler.process(&c.mono, &mut c.samples);
-                    c.preroll.extend(c.samples.drain(before..));
-                    let excess = c.preroll.len().saturating_sub(preroll_len);
-                    c.preroll.drain(..excess);
+                    c.truncated = true;
                 }
-            },
-            move |e: cpal::Error| {
-                // WASAPI flags a data discontinuity every time a paused stream is resumed;
-                // glitches are harmless, anything else means the stream must be rebuilt.
-                if e.kind() == cpal::ErrorKind::Xrun {
-                    tracing::debug!("microphone stream: {e}");
-                } else {
-                    tracing::warn!("microphone stream error: {e}");
-                    failed.store(true, Ordering::Relaxed);
-                }
-            },
-            None,
-        )?;
-        Ok(stream)
+            } else {
+                let before = c.samples.len();
+                c.resampler.process(mono, &mut c.samples);
+                c.preroll.extend(c.samples.drain(before..));
+                let excess = c.preroll.len().saturating_sub(preroll_len);
+                c.preroll.drain(..excess);
+            }
+        }
     }
 
     /// Starts a recording.
@@ -371,7 +340,8 @@ impl Recorder {
     }
 }
 
-/// The names of the connected input devices, as `audio.device` takes them (duplicates once).
+/// The names of the connected input devices, as `audio.device` takes them (duplicates once,
+/// and not the system audio tap of a running meeting, see [`is_own_tap_device`]).
 pub fn input_device_names() -> Vec<String> {
     let devices = match cpal::default_host().input_devices() {
         Ok(devices) => devices,
@@ -381,7 +351,10 @@ pub fn input_device_names() -> Vec<String> {
         }
     };
     let mut names: Vec<String> = Vec::new();
-    for name in devices.filter_map(|d| device_name(&d)) {
+    for name in devices
+        .filter_map(|d| device_name(&d))
+        .filter(|n| !is_own_tap_device(n))
+    {
         if !names.contains(&name) {
             names.push(name);
         }
@@ -389,8 +362,97 @@ pub fn input_device_names() -> Vec<String> {
     names
 }
 
+/// Names of the private aggregate devices behind macOS system audio capture (`tap.rs`): one
+/// exists while a meeting records, and this process sees it as an input device. Choosing it as
+/// the microphone would record the call as the user's own voice.
+const OWN_TAP_PREFIX: &str = "AGT system audio ";
+
+/// `name` is this process's system audio tap, not a microphone: hidden from
+/// [`input_device_names`] and never picked by name.
+fn is_own_tap_device(name: &str) -> bool {
+    name.starts_with(OWN_TAP_PREFIX)
+}
+
 fn device_name(device: &cpal::Device) -> Option<String> {
     device.description().ok().map(|d| d.name().to_owned())
+}
+
+/// The connected input device called `name`, if any (never the meeting's system audio tap).
+fn named_input(host: &cpal::Host, name: &str) -> Result<Option<cpal::Device>, cpal::Error> {
+    if is_own_tap_device(name) {
+        return Ok(None);
+    }
+    Ok(host
+        .input_devices()?
+        .find(|d| device_name(d).as_deref() == Some(name)))
+}
+
+/// Builds (does not start) an input stream on `device` in `config`, whatever its sample
+/// format, that hands each callback's audio to `on_mono` downmixed to mono f32 (at the
+/// device's rate). Stream errors other than glitches set `failed`: the stream is dead (device
+/// unplugged) and must be rebuilt. `what` names the source in logs and errors.
+fn build_mono_stream(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    what: &'static str,
+    failed: Arc<AtomicBool>,
+    on_mono: impl FnMut(&[f32]) + Send + 'static,
+) -> Result<cpal::Stream, Error> {
+    let stream_config = config.config();
+    match config.sample_format() {
+        cpal::SampleFormat::F32 => build::<f32>(device, &stream_config, what, failed, on_mono),
+        cpal::SampleFormat::I16 => build::<i16>(device, &stream_config, what, failed, on_mono),
+        cpal::SampleFormat::I32 => build::<i32>(device, &stream_config, what, failed, on_mono),
+        cpal::SampleFormat::U16 => build::<u16>(device, &stream_config, what, failed, on_mono),
+        other => Err(format!("unsupported {what} sample format {other}").into()),
+    }
+}
+
+fn build<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    what: &'static str,
+    failed: Arc<AtomicBool>,
+    mut on_mono: impl FnMut(&[f32]) + Send + 'static,
+) -> Result<cpal::Stream, Error>
+where
+    T: SizedSample + Send + 'static,
+    f32: FromSample<T>,
+{
+    let channels = config.channels as usize;
+    // Reused: no allocation on the audio thread once it has grown to the callback size.
+    let mut mono = Vec::new();
+    let stream = device.build_input_stream::<T, _, _>(
+        *config,
+        move |data: &[T], _| {
+            mono.clear();
+            mono.extend(data.chunks(channels).map(|f| {
+                f.iter()
+                    .map(|&s| <f32 as FromSample<T>>::from_sample_(s))
+                    .sum::<f32>()
+                    / channels as f32
+            }));
+            on_mono(&mono);
+        },
+        move |e: cpal::Error| {
+            // WASAPI flags a data discontinuity every time a paused stream is resumed;
+            // glitches are harmless, anything else means the stream must be rebuilt.
+            if e.kind() == cpal::ErrorKind::Xrun {
+                tracing::debug!("{what} stream: {e}");
+            } else {
+                tracing::warn!("{what} stream error: {e}");
+                failed.store(true, Ordering::Relaxed);
+            }
+        },
+        None,
+    )?;
+    Ok(stream)
+}
+
+/// RMS of `x` (0 if empty), for a [`Level`].
+fn rms(x: &[f32]) -> f32 {
+    let sq: f32 = x.iter().map(|v| v * v).sum();
+    (sq / x.len().max(1) as f32).sqrt()
 }
 
 pub struct Recording {
@@ -461,6 +523,17 @@ mod tests {
         let mut r = Recorder::new(false, "no such mic".into(), Level::default());
         r.prepare().expect("prepare");
         assert!(!r.live.as_ref().unwrap().chosen);
+    }
+
+    #[test]
+    fn the_system_audio_tap_is_not_a_microphone() {
+        assert!(is_own_tap_device("AGT system audio 812.0"));
+        for mic in ["MacBook Air Microphone", "AGT", "Microsoft Teams Audio", ""] {
+            assert!(!is_own_tap_device(mic), "{mic}");
+        }
+        // Picking it by name finds nothing (so `Recorder` and `Capture` use the default).
+        let found = named_input(&cpal::default_host(), "AGT system audio 812.0");
+        assert!(matches!(found, Ok(None)));
     }
 
     #[test]

@@ -141,6 +141,11 @@ pub struct Segment {
     pub cut: Cut,
     /// Samples received when it was cut: a pause cut comes `PauseCut::len` after the speech.
     pub at: usize,
+    /// Samples pushed before its first sample: where it starts in the recording. Without
+    /// trimming the segments are back to back (each starts where the last ended); with it,
+    /// silence trimmed between two segments is skipped, and silence trimmed *inside* one
+    /// shifts the rest of it earlier, so only the start is exact.
+    pub start: usize,
 }
 
 /// Cuts a recording into segments while it is still arriving: [`push`](Self::push) the
@@ -175,6 +180,12 @@ pub struct Cutter {
     heard: bool,
     /// Samples pushed so far.
     received: usize,
+    /// Samples pushed before `buf[0]` (handed out or trimmed from the front).
+    base: usize,
+    /// Silence trimmed out of the middle of `buf` (a pause too early to cut): `(i, n)`, `n`
+    /// samples were dropped just before `buf[i]`. A segment handed out across one covers
+    /// more of the recording than its length, so `take` adds them to `base`.
+    gaps: Vec<(usize, usize)>,
 }
 
 /// The silence `buf` currently ends in.
@@ -208,6 +219,8 @@ impl Cutter {
             speech_end: 0,
             heard: false,
             received: 0,
+            base: 0,
+            gaps: Vec::new(),
         }
     }
 
@@ -260,6 +273,17 @@ impl Cutter {
     /// Hands out `buf[..cut]`.
     fn take(&mut self, cut: usize, kind: Cut) -> Segment {
         let at = self.received - (self.buf.len() - self.scanned);
+        let start = self.base;
+        self.base += cut;
+        self.gaps.retain_mut(|(i, n)| {
+            if *i <= cut {
+                self.base += *n;
+                false
+            } else {
+                *i -= cut;
+                true
+            }
+        });
         let audio: Vec<f32> = self.buf.drain(..cut).collect();
         self.scanned = self.scanned.saturating_sub(cut);
         self.speech_end = self.speech_end.saturating_sub(cut);
@@ -271,6 +295,7 @@ impl Cutter {
             audio,
             cut: kind,
             at,
+            start,
         }
     }
 
@@ -352,6 +377,17 @@ impl Cutter {
             let to = self.scanned - p.pad;
             self.buf.drain(from..to);
             self.scanned -= to - from;
+            // From the front (right after a cut), `buf[0]` is now later in the recording;
+            // from the middle, everything from `from` on is (see `gaps`).
+            if from == 0 {
+                self.base += to;
+            } else if let Some((i, n)) = self.gaps.last_mut()
+                && *i == from
+            {
+                *n += to - from;
+            } else {
+                self.gaps.push((from, to - from));
+            }
         }
     }
 }
@@ -700,6 +736,66 @@ mod tests {
             kept >= 5 * S + 3 * S / 4,
             "{} s kept",
             kept as f32 / S as f32
+        );
+    }
+
+    /// Room noise and speech: pauses that cut (after 9 s of speech, and after 9 s more), a
+    /// 1.5 s pause too early to (3 s in, only trimmed), a 31 s monologue (cut at the limit),
+    /// and trailing noise.
+    fn meeting() -> Vec<f32> {
+        talk(
+            75.0,
+            &[
+                (0.5, 9.5),
+                (12.0, 21.0),
+                (23.0, 26.0),
+                (27.5, 36.0),
+                (39.0, 70.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn segment_starts_without_trim() {
+        let audio = meeting();
+        let segs = cut_all(pauses(1000, 8, false), &audio);
+        assert!(segs.len() >= 4, "{} segments", segs.len());
+        assert_eq!(segs[0].start, 0);
+        for w in segs.windows(2) {
+            assert_eq!(w[1].start, w[0].start + w[0].audio.len());
+        }
+        let joined: Vec<f32> = segs.iter().flat_map(|s| s.audio.iter().copied()).collect();
+        assert!(joined == audio, "the segments are not the input");
+    }
+
+    #[test]
+    fn segment_starts_with_trim() {
+        let audio = meeting();
+        let segs = cut_all(CutConfig::live(25.0), &audio);
+        let cuts: Vec<Cut> = segs.iter().map(|s| s.cut).collect();
+        assert!(
+            cuts.contains(&Cut::Pause) && cuts.contains(&Cut::Limit),
+            "{cuts:?}"
+        );
+        assert_eq!(segs[0].start, 0);
+        for s in &segs {
+            // Its first 10 ms is where it says (trimmed silence inside it shifts the rest).
+            assert!(s.audio.len() >= HOP);
+            assert!(
+                audio[s.start..s.start + HOP] == s.audio[..HOP],
+                "segment at {} s is not from there",
+                s.start as f32 / S as f32
+            );
+        }
+        for w in segs.windows(2) {
+            // Strictly increasing, and trimmed silence between them is skipped, not counted
+            // twice.
+            assert!(w[1].start >= w[0].start + w[0].audio.len(), "{cuts:?}");
+        }
+        assert!(
+            segs.windows(2)
+                .any(|w| w[1].start > w[0].start + w[0].audio.len()),
+            "nothing was trimmed between segments"
         );
     }
 

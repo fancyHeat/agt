@@ -1,6 +1,6 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, MicUser, Permission};
 use std::{
     cell::RefCell,
     ffi::c_void,
@@ -559,6 +559,27 @@ pub fn missing_permissions() -> Vec<Permission> {
 pub fn request_permissions(_missing: &[Permission]) {}
 
 pub fn open_permission_settings(_permission: Permission) {}
+
+/// WASAPI loopback capture needs no permission.
+pub fn system_audio_permission() -> Option<bool> {
+    Some(true)
+}
+
+/// The microphone privacy page: Windows has no system audio permission, and that page is where
+/// a blocked recording is unblocked.
+pub fn open_system_audio_settings() {
+    let url = "ms-settings:privacy-microphone";
+    // Explorer hands `ms-settings:` URIs to Settings, without the console window `cmd /c
+    // start` would flash.
+    if let Err(e) = std::process::Command::new("explorer").arg(url).spawn() {
+        tracing::error!("cannot open {url}: {e}");
+    }
+}
+
+/// Not implemented on Windows yet (meeting detection is macOS-only in v1).
+pub fn mic_users() -> Vec<MicUser> {
+    Vec::new()
+}
 
 // ---------------------------------------------------------------------------------------
 // Output volume (ducking): the default render endpoint's IAudioEndpointVolume, through

@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation (anything but Windows and macOS).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, Hotkey, HotkeyEvent, Key, Permission};
+use crate::{Error, Hotkey, HotkeyEvent, Key, MicUser, Permission};
 
 const MSG: &str = "not supported on this platform";
 
@@ -71,6 +71,16 @@ pub fn missing_permissions() -> Vec<Permission> {
 pub fn request_permissions(_missing: &[Permission]) {}
 
 pub fn open_permission_settings(_permission: Permission) {}
+
+pub fn system_audio_permission() -> Option<bool> {
+    Some(true)
+}
+
+pub fn open_system_audio_settings() {}
+
+pub fn mic_users() -> Vec<MicUser> {
+    Vec::new()
+}
 
 /// No volume control here: ducking does nothing.
 pub struct OutputVolume;
