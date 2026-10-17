@@ -40,11 +40,17 @@ pub(crate) struct LlamaLauncher {
     device: S1Device,
     fast_drafting: bool,
     log_file: Option<PathBuf>,
+    hold_download: Option<Arc<dyn Fn() + Send + Sync>>,
     health: ureq::Agent,
 }
 
 impl LlamaLauncher {
-    pub fn new(assets: Assets, s1: &S1MiniConfig, log_file: Option<PathBuf>) -> Self {
+    pub fn new(
+        assets: Assets,
+        s1: &S1MiniConfig,
+        log_file: Option<PathBuf>,
+        hold_download: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let health = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(2)))
@@ -55,6 +61,7 @@ impl LlamaLauncher {
             device: s1.device,
             fast_drafting: s1.fast_drafting,
             log_file,
+            hold_download,
             health,
         }
     }
@@ -136,7 +143,7 @@ impl LlamaLauncher {
 
 impl Launcher for LlamaLauncher {
     fn prepare(&mut self, report: &mut dyn FnMut(Status)) -> Result<(), String> {
-        self.assets.ensure(report)
+        self.assets.ensure(report, self.hold_download.as_deref())
     }
 
     fn launch(&mut self) -> Result<Box<dyn Server>, String> {
@@ -652,6 +659,7 @@ mod tests {
         let l = LlamaLauncher::new(
             Assets::for_this_platform(&dir, &dir).unwrap_or_else(|_| Assets::test(&dir)),
             &S1MiniConfig::default(),
+            None,
             None,
         );
         let a = l.args(4242).join(" ");

@@ -156,9 +156,23 @@ impl Assets {
         self.build_dir().join(SERVER_EXE)
     }
 
-    /// Downloads and installs whatever is missing. Cheap when everything is there.
-    pub fn ensure(&self, report: &mut dyn FnMut(Status)) -> Result<(), String> {
-        download(&self.root.join(MODEL_DIR), &self.model, "S1-mini", report)?;
+    /// Downloads and installs whatever is missing, calling `hold` (see [`super::Env`]) first
+    /// if anything is. Cheap when everything is there.
+    pub fn ensure(
+        &self,
+        report: &mut dyn FnMut(Status),
+        hold: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<(), String> {
+        let mut hold = hold;
+        let mut fetch = |dir: &Path, file: &ModelFile, what| {
+            if let Some(wait) = hold.filter(|_| !agt_fetch::is_present(dir, file)) {
+                hold = None;
+                report(Status::Queued);
+                wait();
+            }
+            download(dir, file, what, report)
+        };
+        fetch(&self.root.join(MODEL_DIR), &self.model, "S1-mini")?;
         let build_dir = self.build_dir();
         if build_dir.exists() {
             if build_dir.join(MARKER).is_file() {
@@ -170,7 +184,7 @@ impl Assets {
             ));
         }
         let dir = &self.llama;
-        download(dir, &self.server, "llama.cpp", report)?;
+        fetch(dir, &self.server, "llama.cpp")?;
         let archive = dir.join(self.server.name);
         let staging = dir.join(format!("{}.unpacking", self.build));
         let ready = dir.join(format!("{}.installing", self.build));
@@ -534,9 +548,18 @@ mod tests {
         fs::write(legacy.join("llama-b1-bin-test.zip.part"), b"x").unwrap();
 
         // A bad hash: nothing is installed and nothing partial stays.
+        // Held once, before the first download, however many files are missing.
+        let held = std::sync::atomic::AtomicUsize::new(0);
+        let hold = || {
+            held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
         let mut statuses = Vec::new();
-        let err = a.ensure(&mut |s| statuses.push(s)).unwrap_err();
+        let err = a
+            .ensure(&mut |s| statuses.push(s), Some(&hold))
+            .unwrap_err();
         assert!(err.contains("failed verification"), "{err}");
+        assert_eq!(held.into_inner(), 1);
+        assert_eq!(statuses[0], Status::Queued);
         assert!(!a.server_exe().exists());
         assert!(!dir.join("llama-b2-bin-test.tar.gz.part").exists());
         assert_eq!(fs::read(a.model_path()).unwrap(), gguf);
@@ -546,7 +569,7 @@ mod tests {
         }));
 
         a.server.sha256 = hex(&tar);
-        a.ensure(&mut |_| {}).unwrap();
+        a.ensure(&mut |_| {}, None).unwrap();
         assert_eq!(
             names(&a.build_dir()),
             [
@@ -583,7 +606,11 @@ mod tests {
         // Everything present: no network access.
         a.model.url = "http://127.0.0.1:1/unreachable";
         a.server.url = "http://127.0.0.1:1/unreachable";
-        a.ensure(&mut |s| panic!("unexpected {s:?}")).unwrap();
+        a.ensure(
+            &mut |s| panic!("unexpected {s:?}"),
+            Some(&|| panic!("held with nothing to download")),
+        )
+        .unwrap();
 
         // Touched but identical: still fine. Modified, or an extra file: refused.
         let lib = a.build_dir().join("libggml.dylib");
@@ -600,7 +627,7 @@ mod tests {
         // A build folder AGT didn't make is never replaced.
         fs::remove_dir_all(a.build_dir()).unwrap();
         fs::create_dir_all(a.build_dir()).unwrap();
-        let err = a.ensure(&mut |_| {}).unwrap_err();
+        let err = a.ensure(&mut |_| {}, None).unwrap_err();
         assert!(err.contains("wasn't installed by AGT"), "{err}");
         fs::remove_dir_all(&work).unwrap();
     }

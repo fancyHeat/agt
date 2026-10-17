@@ -226,9 +226,8 @@ impl Drop for Window {
 }
 
 // ---------------------------------------------------------------------------------------
-// The "not in a text box" notice
+// The notice: "not in a text box" with a Copy button, or "Getting ready..."
 
-const NOTICE_TEXT: &str = "You weren't in a text box";
 const COPY_TEXT: &str = "Copy";
 const COPIED_TEXT: &str = "Copied";
 /// Notice height and paddings, in points. A little taller than the pill (36), centered on
@@ -341,7 +340,7 @@ impl Notice {
             let _: () = msg_send![layer, setCornerRadius: (NOTICE_HEIGHT / 2.0) as CGFloat];
         }
 
-        let label = NSTextField::labelWithString(&NSString::from_str(NOTICE_TEXT), mtm);
+        let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
         label.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, unsafe {
             NSFontWeightMedium
         })));
@@ -393,7 +392,7 @@ impl Notice {
 }
 
 impl NoticeSurface for Notice {
-    fn show(&mut self, margin: f32, top: bool) -> bool {
+    fn show(&mut self, text: &'static str, copy: bool, margin: f32, top: bool) -> bool {
         let Some((s, _)) = main_screen(self.mtm) else {
             return false;
         };
@@ -408,8 +407,10 @@ impl NoticeSurface for Notice {
                 s.origin.y + margin + half_pill
             },
         );
-        self.label.setStringValue(&NSString::from_str(NOTICE_TEXT));
-        self.button.setHidden(false);
+        self.label.setStringValue(&NSString::from_str(text));
+        self.button.setHidden(!copy);
+        // Only the Copy button needs the mouse: without it, clicks go through to what's below.
+        self.panel.setIgnoresMouseEvents(!copy);
         self.layout();
         self.panel.orderFrontRegardless();
         true

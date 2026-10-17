@@ -468,6 +468,11 @@ impl ApplicationHandler<AppEvent> for App {
                         o.flash_error(p.level.get(), Instant::now());
                     }
                 }
+                pipeline::Event::NotReady => {
+                    if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
+                        o.show_getting_ready(p.level.get(), Instant::now());
+                    }
+                }
                 pipeline::Event::NotInTextBox => {
                     if let Some(o) = &mut self.overlay {
                         o.show_notice(Instant::now());

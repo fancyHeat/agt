@@ -64,7 +64,7 @@ use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
     fmt,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -152,9 +152,12 @@ pub enum Event {
     /// The status line changed. With the number of failures (microphone, transcription,
     /// paste) so far: a `Status::Error` is a new failure only if that went up since.
     Status(Status, u64),
-    /// The hotkey was pressed but no recording started (model not ready, or no microphone);
-    /// the status line says why.
+    /// The hotkey was pressed but no recording started (the model failed to load, or no
+    /// microphone); the status line says why.
     Rejected,
+    /// The hotkey was pressed while the model is still loading (or downloading): no
+    /// recording.
+    NotReady,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
     CopyAvailable(bool),
     /// A dictation was pasted, but keyboard focus wasn't in anything that takes text (macOS):
@@ -232,6 +235,10 @@ impl Hub {
         (self.notify)(Event::Rejected);
     }
 
+    fn not_ready(&self) {
+        (self.notify)(Event::NotReady);
+    }
+
     fn copy_available(&self, available: bool) {
         (self.notify)(Event::CopyAvailable(available));
     }
@@ -254,6 +261,35 @@ impl Hub {
 
     fn missing(&self, p: Permission) -> bool {
         self.state.lock().unwrap().missing.contains(&p)
+    }
+}
+
+/// Set once the speech model has loaded (or failed to): S1-mini waits for it before
+/// downloading, so on a first run the two don't share a slow link and dictation, which needs
+/// the speech model, can start sooner (issue #64).
+#[derive(Clone, Default)]
+struct SttLoaded(Arc<(Mutex<bool>, Condvar)>);
+
+impl SttLoaded {
+    fn set(&self) {
+        let (done, cv) = &*self.0;
+        *done.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let (done, cv) = &*self.0;
+        let _done = cv.wait_while(done.lock().unwrap(), |d| !*d).unwrap();
+    }
+}
+
+/// Sets [`SttLoaded`] when dropped: also if loading the model panics, so S1-mini isn't held
+/// forever.
+struct SetOnDrop(SttLoaded);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.set();
     }
 }
 
@@ -412,12 +448,15 @@ pub fn start(
     spawn("audio", move || audio.run(audio_rx, lvl));
 
     remove_old_llama_builds(&config.stt.models_path());
-    let (polisher, polish_info) = load_polisher(config, &hub);
+    let stt_loaded = SttLoaded::default();
+    let (polisher, polish_info) = load_polisher(config, &hub, &stt_loaded);
     let saver = history::start(&config.history, paths::dictations_dir());
     let polishing = polisher.is_some();
     let (h, cfg, hs) = (hub.clone(), config.clone(), saver.clone());
     spawn("stt", move || {
-        stt_thread(cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs)
+        stt_thread(
+            cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs, stt_loaded,
+        )
     });
     let (cfg, tp) = (config.clone(), to_paste.clone());
     spawn("polish", move || {
@@ -464,7 +503,11 @@ fn remove_old_llama_builds(models_dir: &std::path::Path) {
 
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
 /// so a local server loads its model before the first dictation. Returns the tray line.
-fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, String) {
+fn load_polisher(
+    config: &Config,
+    hub: &Hub,
+    stt_loaded: &SttLoaded,
+) -> (Option<Arc<dyn Polisher>>, String) {
     if let Some(e) = &config.polish_error {
         tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
         return (None, "Polish: off (config error, see log)".into());
@@ -485,13 +528,24 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
             tracing::info!("polish: {s}");
             notify(Event::PolishInfo(s.to_string()));
         }),
+        hold_download: Some(Arc::new({
+            let stt_loaded = stt_loaded.clone();
+            move || stt_loaded.wait()
+        })),
     };
     match agt_polish::load(&config.polish, &env) {
         Ok(p) => {
             let p: Arc<dyn Polisher> = Arc::from(p);
             tracing::info!("polish: {}", p.name());
             let warm = p.clone();
+            // S1-mini's own wait for the server is bounded; don't count the speech model's
+            // download (it holds S1-mini's) against it, or in polish_warmup_ms.
+            let held =
+                (config.polish.provider == PolishProvider::S1Mini).then(|| stt_loaded.clone());
             spawn("polish-warmup", move || {
+                if let Some(held) = held {
+                    held.wait();
+                }
                 let t = Instant::now();
                 let result = warm.warmup();
                 let took = ms(t.elapsed());
@@ -1013,11 +1067,13 @@ impl AudioThread {
             ..Default::default()
         });
         if !self.hub.engine_ready() {
+            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
             if self.hub.engine_failed() {
                 let _ = self.to_stt.send(ToStt::RetryLoad);
+                self.hub.reject();
+            } else {
+                self.hub.not_ready();
             }
-            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
-            self.hub.reject();
             telemetry::global().dictation(d, Ended::NotReady);
             return None;
         }
@@ -1271,6 +1327,7 @@ fn set_chunk_secs(engine: &dyn SttEngine, chunk_secs: &AtomicU32) {
     chunk_secs.store(secs.to_bits(), Relaxed);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stt_thread(
     config: Config,
     hub: Hub,
@@ -1279,9 +1336,13 @@ fn stt_thread(
     polishing: bool,
     history: Option<History>,
     chunk_secs: Arc<AtomicU32>,
+    stt_loaded: SttLoaded,
 ) {
     let polish = polishing.then_some(&config.polish);
+    let loading = SetOnDrop(stt_loaded);
     let mut engine = load_engine(&config, &hub);
+    // Loaded or failed: either way S1-mini no longer competes with it for the network.
+    drop(loading);
     if let Some(e) = &engine {
         set_chunk_secs(e.as_ref(), &chunk_secs);
     }
