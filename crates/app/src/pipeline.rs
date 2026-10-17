@@ -283,6 +283,16 @@ impl SttLoaded {
     }
 }
 
+/// Sets [`SttLoaded`] when dropped: also if loading the model panics, so S1-mini isn't held
+/// forever.
+struct SetOnDrop(SttLoaded);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
 /// Keeps the pipeline running; dropping it stops the hotkey.
 pub struct Pipeline {
     _hotkey: HotkeyHandle,
@@ -528,7 +538,14 @@ fn load_polisher(
             let p: Arc<dyn Polisher> = Arc::from(p);
             tracing::info!("polish: {}", p.name());
             let warm = p.clone();
+            // S1-mini's own wait for the server is bounded; don't count the speech model's
+            // download (it holds S1-mini's) against it, or in polish_warmup_ms.
+            let held =
+                (config.polish.provider == PolishProvider::S1Mini).then(|| stt_loaded.clone());
             spawn("polish-warmup", move || {
+                if let Some(held) = held {
+                    held.wait();
+                }
                 let t = Instant::now();
                 let result = warm.warmup();
                 let took = ms(t.elapsed());
@@ -1322,9 +1339,10 @@ fn stt_thread(
     stt_loaded: SttLoaded,
 ) {
     let polish = polishing.then_some(&config.polish);
+    let loading = SetOnDrop(stt_loaded);
     let mut engine = load_engine(&config, &hub);
     // Loaded or failed: either way S1-mini no longer competes with it for the network.
-    stt_loaded.set();
+    drop(loading);
     if let Some(e) = &engine {
         set_chunk_secs(e.as_ref(), &chunk_secs);
     }

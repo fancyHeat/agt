@@ -1,10 +1,10 @@
 //! `provider = "s1-mini"`: S1-mini by Superwhisper, run by AGT itself.
 //!
 //! On start ([`start`]) a background thread:
-//! 1. downloads what's missing ([`assets`]), once [`Env::hold_download`] lets it: the S1-mini GGUF (pinned Hugging Face
-//!    revision) into the models folder and an official llama.cpp release build (pinned tag)
-//!    into AGT's own folder, both SHA-256 verified; the llama.cpp archive is unpacked with
-//!    the OS's `tar`;
+//! 1. downloads what's missing ([`assets`]), once [`Env::hold_download`] lets it: the
+//!    S1-mini GGUF (pinned Hugging Face revision) into the models folder and an official
+//!    llama.cpp release build (pinned tag) into AGT's own folder, both SHA-256 verified; the
+//!    llama.cpp archive is unpacked with the OS's `tar`;
 //! 2. starts `llama-server` on a free 127.0.0.1 port with a random API key ([`process`]),
 //!    tied to AGT's lifetime: on Windows it's in a job object that kills it when AGT exits
 //!    or crashes; on Unix a small `sh` watchdog kills it when AGT's end of a pipe closes;

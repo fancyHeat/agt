@@ -409,6 +409,8 @@ impl NoticeSurface for Notice {
         );
         self.label.setStringValue(&NSString::from_str(text));
         self.button.setHidden(!copy);
+        // Only the Copy button needs the mouse: without it, clicks go through to what's below.
+        self.panel.setIgnoresMouseEvents(!copy);
         self.layout();
         self.panel.orderFrontRegardless();
         true
