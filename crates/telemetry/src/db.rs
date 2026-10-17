@@ -202,6 +202,14 @@ ALTER TABLE dictations ADD COLUMN live_discarded_ms REAL;
     r#"
 ALTER TABLE app_sessions ADD COLUMN s1_fast_drafting INTEGER;
 "#,
+    // 6: long dictations polished in pieces while recording.
+    r#"
+ALTER TABLE dictations ADD COLUMN polish_ahead_pieces INTEGER;
+ALTER TABLE dictations ADD COLUMN polish_ahead_ms REAL;
+ALTER TABLE dictations ADD COLUMN polish_release_words INTEGER;
+ALTER TABLE dictations ADD COLUMN polish_fallbacks INTEGER;
+ALTER TABLE dictations ADD COLUMN polish_wait_ms REAL;
+"#,
 ];
 
 /// Opens (creating if needed) and migrates the database. A file that isn't a database or is
@@ -402,10 +410,12 @@ pub(crate) fn insert_dictation(
             release_to_paste_ms, chars_out, words_out, stt_backend, latency_ms, words_raw,
             history_saved, release_to_text_ms, live_pause_cuts, live_limit_cuts, live_end_cuts,
             live_skipped, live_tail_joined, live_trimmed_secs, live_tail_secs, live_stt_ms,
-            live_busy_at_release, live_idle_ms, live_max_queue, live_discarded_ms)
+            live_busy_at_release, live_idle_ms, live_max_queue, live_discarded_ms,
+            polish_ahead_pieces, polish_ahead_ms, polish_release_words, polish_fallbacks,
+            polish_wait_ms)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-            ?36, ?37)",
+            ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
         params![
             session,
             d.started_at,
@@ -444,6 +454,11 @@ pub(crate) fn insert_dictation(
             d.live_idle_ms,
             d.live_max_queue,
             d.live_discarded_ms,
+            d.polish_ahead_pieces,
+            d.polish_ahead_ms,
+            d.polish_release_words,
+            d.polish_fallbacks,
+            d.polish_wait_ms,
         ],
     )?;
     Ok(())

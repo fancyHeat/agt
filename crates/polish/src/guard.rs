@@ -33,7 +33,11 @@ pub enum Outcome {
     Polished,
     /// Not sent to the model.
     Skipped(&'static str),
-    /// Sent, but the raw transcript is used; the reason is safe to log (no dictated text).
+    /// The request brought no answer (an error, a timeout, a malformed, refused or cut-off
+    /// response): the raw transcript is used. The reason is safe to log (no dictated text).
+    Failed(String),
+    /// The model answered, but [`check`] rejected it: the raw transcript is used. The reason
+    /// is safe to log.
     Fallback(String),
 }
 
@@ -42,7 +46,7 @@ impl fmt::Display for Outcome {
         match self {
             Outcome::Polished => write!(f, "polished"),
             Outcome::Skipped(why) => write!(f, "skipped: {why}"),
-            Outcome::Fallback(why) => write!(f, "raw: {why}"),
+            Outcome::Failed(why) | Outcome::Fallback(why) => write!(f, "raw: {why}"),
         }
     }
 }
@@ -69,7 +73,7 @@ pub fn polish_or_raw(p: &dyn Polisher, raw: &str, cfg: &PolishConfig) -> (String
     }
     let out = match p.polish(raw, &PolishCtx::default()) {
         Ok(out) => out,
-        Err(e) => return (raw.to_owned(), Outcome::Fallback(e.to_string())),
+        Err(e) => return (raw.to_owned(), Outcome::Failed(e.to_string())),
     };
     let max_novel = match (cfg.prompt.trim().is_empty(), cfg.style) {
         // S1-mini isn't a chat model (it doesn't answer questions), and it legitimately
@@ -348,12 +352,12 @@ mod tests {
         };
         assert!(matches!(
             polish_or_raw(&Fixed(Err("sent")), &long, &cloud).1,
-            Outcome::Fallback(_)
+            Outcome::Failed(_)
         ));
         let (text, outcome) = polish_or_raw(&Fixed(Err("timeout")), raw, &cfg);
         assert_eq!(
             (text.as_str(), outcome),
-            (raw, Outcome::Fallback("timeout".into()))
+            (raw, Outcome::Failed("timeout".into()))
         );
         let (text, outcome) = polish_or_raw(&Fixed(Ok("Sure! Here you go.")), raw, &cfg);
         assert_eq!(text, raw);

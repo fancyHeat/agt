@@ -242,6 +242,47 @@ fn version_4_database_gains_the_fast_drafting_column() {
 }
 
 #[test]
+fn version_5_database_gains_the_polish_ahead_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..5] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 5).unwrap();
+    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
+    migrate(&mut conn).unwrap();
+    let d = Dictation {
+        started_at: 2000,
+        polish_outcome: Some("partial"),
+        polish_ahead_pieces: Some(4),
+        polish_ahead_ms: Some(512.5),
+        polish_release_words: Some(61),
+        polish_fallbacks: Some(1),
+        polish_wait_ms: Some(80.0),
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let row: (String, i64, f64, i64, i64, f64) = conn
+        .query_row(
+            "SELECT polish_outcome, polish_ahead_pieces, polish_ahead_ms, polish_release_words,
+                polish_fallbacks, polish_wait_ms FROM dictations",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row, ("partial".into(), 4, 512.5, 61, 1, 80.0));
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);

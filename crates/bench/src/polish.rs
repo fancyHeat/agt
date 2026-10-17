@@ -37,10 +37,11 @@
 //! **Segments** (`--segments`): the pipeline could polish each finished segment of a long
 //! dictation in the background while the user is still talking, leaving only the tail for
 //! release. For each dictation this polishes the whole text (today), each segment on its own,
-//! and the pieces of `agt_polish::ahead`, then reports release latency (whole vs what is left
-//! at release), how far the joined output is from the whole-text output (word edits, case and
-//! punctuation count), the WER of raw, whole and joined against the reference, and the text
-//! around every piece boundary where a sentence break differs.
+//! and the pieces of `agt_polish::ahead` (fed each segment as it comes, and one segment
+//! behind as the app does: see `Partial::feed_ahead`), then reports release latency (whole vs
+//! what is left at release), how far the joined output is from the whole-text output (word
+//! edits, case and punctuation count), the WER of raw, whole and joined against the
+//! reference, and the text around every piece boundary where a sentence break differs.
 //!
 //! Release latency here is the best case: every background piece is done (and the GPU idle)
 //! before release. In the app the last background piece may still be running at release,
@@ -176,7 +177,8 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         );
         println!("  in:  {line}");
         firsts.push(results[0].0.clone());
-        if let agt_polish::Outcome::Fallback(why) = &results[0].1 {
+        if let agt_polish::Outcome::Failed(why) | agt_polish::Outcome::Fallback(why) = &results[0].1
+        {
             fallbacks.push(why.clone());
         }
         // Distinct results only (a model at temperature 0 usually repeats itself).
@@ -337,7 +339,11 @@ fn by_segment(
         (out, outcome == agt_polish::Outcome::Polished, ms(t))
     };
     let mut whole_ms = Vec::new();
-    let mut ways = [Way::new("each segment"), Way::new("ahead")];
+    let mut ways = [
+        Way::new("each segment"),
+        Way::new("ahead"),
+        Way::new("ahead, one segment behind"),
+    ];
     // Reference words, and word errors of raw and whole.
     let (mut ref_words, mut raw_errors, mut whole_errors) = (0, 0, 0);
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -378,9 +384,18 @@ fn by_segment(
         // `agt_polish::ahead`.
         let mut ahead = agt_polish::ahead::Ahead::new(cfg)
             .ok_or("--segments: these polish settings need the whole text")?;
-        let pieces: Vec<String> = before.iter().filter_map(|s| ahead.push(s)).collect();
+        let pieces: Vec<String> = before.iter().flat_map(|s| ahead.push(s)).collect();
         let last = ahead.finish(tail);
         ways[1].run(&polish, &pieces, &last, &w, reference.as_deref());
+        // The app's way: the last segment waits for release (a short tail may redo it). A
+        // tail that did redo it here is already joined to it, so this holds one segment
+        // more than the app would then.
+        let mut ahead = agt_polish::ahead::Ahead::new(cfg).unwrap_or_default();
+        let (behind, last_seg) = before.split_at(before.len().saturating_sub(1));
+        let pieces: Vec<String> = behind.iter().flat_map(|s| ahead.push(s)).collect();
+        let mut last = ahead.finish(&format!("{} {tail}", last_seg.join(" ")));
+        last.retain(|p| !p.is_empty());
+        ways[2].run(&polish, &pieces, &last, &w, reference.as_deref());
     }
     whole_ms.sort_by(f64::total_cmp);
     println!();
