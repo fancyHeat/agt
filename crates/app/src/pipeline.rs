@@ -386,6 +386,7 @@ pub fn start(
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
 
+    remove_old_llama_builds(&config.stt.models_path());
     let (polisher, polish_info) = load_polisher(config, &hub);
     let saver = history::start(&config.history, paths::dictations_dir());
     let (h, cfg, tp, hs) = (hub.clone(), config.clone(), to_paste.clone(), saver.clone());
@@ -405,6 +406,26 @@ pub fn start(
         key_down,
         ducker,
     })
+}
+
+/// AGT 0.0.16 and earlier installed llama.cpp in the models folder. Removed (in the
+/// background, whatever the polish settings) from the default one, which is the user's own;
+/// a folder set in the config may be shared with an older AGT still running those builds.
+fn remove_old_llama_builds(models_dir: &std::path::Path) {
+    let old = agt_polish::managed::legacy_dir(models_dir);
+    if !old.exists() {
+        return;
+    }
+    if models_dir == paths::models_dir() {
+        let dir = models_dir.to_owned();
+        spawn("cleanup", move || agt_polish::managed::remove_legacy(&dir));
+    } else {
+        tracing::warn!(
+            "{} is no longer used (llama.cpp now lives in {}); delete it once no older AGT uses this models folder",
+            old.display(),
+            paths::llama_dir().display()
+        );
+    }
 }
 
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,

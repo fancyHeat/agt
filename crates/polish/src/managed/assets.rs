@@ -6,9 +6,11 @@
 //! <llama dir>/<build>/llama-server            from an official llama.cpp release
 //! ```
 //!
-//! The models dir may be a shared or network folder (`stt.models_dir`), so it only holds
-//! data. What AGT runs goes in the llama dir ([`crate::Env::llama_dir`]), AGT's own per-user
-//! folder: from download to every start, nothing that others can write to is executed.
+//! The models dir may be a shared or network folder (`stt.models_dir`), so no program goes
+//! there: llama.cpp is downloaded, unpacked and run from the llama dir
+//! ([`crate::Env::llama_dir`]), AGT's own per-user folder. The GGUF does stay in the models
+//! dir, checked only by size at start, so in a shared folder others can change the model
+//! llama-server loads.
 //!
 //! llama.cpp builds: Windows x64 uses the Vulkan build (32 MB; any GPU with a Vulkan driver,
 //! which NVIDIA, AMD and Intel drivers include, and the CPU otherwise; it needs no CUDA
@@ -26,7 +28,7 @@
 //!
 //! AGT only ever deletes what it made: builds with a manifest, its staging folders and its
 //! archives. Versions before 0.0.17 installed the builds in `<models dir>/agt-llama-server`
-//! ([`LEGACY_DIR`]); those are removed the same way.
+//! ([`legacy_dir`]); [`remove_legacy`] removes those the same way.
 
 use super::Status;
 use agt_fetch::ModelFile;
@@ -157,7 +159,6 @@ impl Assets {
     /// Downloads and installs whatever is missing. Cheap when everything is there.
     pub fn ensure(&self, report: &mut dyn FnMut(Status)) -> Result<(), String> {
         download(&self.root.join(MODEL_DIR), &self.model, "S1-mini", report)?;
-        clean_up(&self.root.join(LEGACY_DIR), None);
         let build_dir = self.build_dir();
         if build_dir.exists() {
             if build_dir.join(MARKER).is_file() {
@@ -237,6 +238,17 @@ impl Assets {
         }
         Ok(dir.join(SERVER_EXE))
     }
+}
+
+/// `<models dir>/agt-llama-server`, where versions before 0.0.17 installed llama.cpp.
+pub fn legacy_dir(models_dir: &Path) -> PathBuf {
+    models_dir.join(LEGACY_DIR)
+}
+
+/// Removes what AGT made in [`legacy_dir`]. Only for a models dir no one else uses: in a
+/// shared one, an older AGT elsewhere may still run those builds.
+pub fn remove_legacy(models_dir: &Path) {
+    clean_up(&legacy_dir(models_dir), None);
 }
 
 /// Removes what AGT left in `dir`: staging folders, archives, and builds it installed
@@ -554,16 +566,18 @@ mod tests {
         );
         assert_eq!(
             names(&root),
-            ["llama.cpp", MODEL_DIR],
-            "nothing to run in the models dir; the old install there removed"
+            ["agt-llama-server", "llama.cpp", MODEL_DIR],
+            "nothing new to run in the models dir; the old install left to remove_legacy"
         );
+        remove_legacy(&root);
+        assert_eq!(names(&root), ["llama.cpp", MODEL_DIR]);
 
         // An old install in the models dir next to something that isn't AGT's: only the
         // former goes.
         fs::create_dir_all(legacy.join("b1")).unwrap();
         fs::write(legacy.join("b1").join(MARKER), "").unwrap();
         fs::write(legacy.join("notes.txt"), b"mine").unwrap();
-        a.ensure(&mut |_| {}).unwrap();
+        remove_legacy(&root);
         assert_eq!(names(&legacy), ["notes.txt"]);
 
         // Everything present: no network access.

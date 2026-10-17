@@ -34,7 +34,7 @@ use std::{
 };
 use supervisor::{Endpoint, Shared, Timing};
 
-pub use assets::{LLAMA_BUILD, MODEL_DIR};
+pub use assets::{LLAMA_BUILD, MODEL_DIR, legacy_dir, remove_legacy};
 
 /// What the managed server needs from the app.
 #[derive(Clone)]

@@ -777,15 +777,18 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "config I/O error: {e}"),
-            Self::Parse {
-                message,
-                at: Some((line, column)),
-            } => write!(
-                f,
-                "invalid config.toml at line {line}, column {column}: {message}"
-            ),
-            Self::Parse { message, at: None } => write!(f, "invalid config.toml: {message}"),
+            Self::Parse { message, at } => {
+                f.write_str(&located("invalid config.toml", message, *at))
+            }
         }
+    }
+}
+
+/// `<what> at line L, column C: <message>`, or without the position if there is none.
+fn located(what: &str, message: &str, at: Option<(usize, usize)>) -> String {
+    match at {
+        Some((line, column)) => format!("{what} at line {line}, column {column}: {message}"),
+        None => format!("{what}: {message}"),
     }
 }
 
@@ -837,13 +840,11 @@ impl Config {
                 Err(e) => {
                     config.polish = PolishConfig::default();
                     config.polish.enabled = false;
-                    let message = redact_values(e.message().trim());
-                    config.polish_error = Some(match line_column(e.span(), text) {
-                        Some((line, column)) => {
-                            format!("[polish] at line {line}, column {column}: {message}")
-                        }
-                        None => format!("[polish]: {message}"),
-                    });
+                    config.polish_error = Some(located(
+                        "[polish]",
+                        &redact_values(e.message().trim()),
+                        line_column(e.span(), text),
+                    ));
                 }
             }
         }
