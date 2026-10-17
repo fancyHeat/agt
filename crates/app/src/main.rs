@@ -8,7 +8,6 @@ mod tray;
 mod update;
 
 use agt_core::{Config, config::OverlayPosition, paths};
-use settings::Action;
 use std::{
     fs::{File, TryLockError},
     path::PathBuf,
@@ -27,11 +26,8 @@ use winit::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long dictation must be idle (no status change) before a restart: covers the clipboard
-/// restore after a paste and back-to-back dictations. A settings click in the tray only waits
-/// for the clipboard restore.
+/// restore after a paste and back-to-back dictations.
 const RESTART_SETTLE: Duration = Duration::from_secs(5);
-/// Allowance on top of `restore_clipboard_ms`: for the paste thread to wake and the restore to run.
-const RESTORE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Set for the instance a settings restart starts, so it waits for this one to exit and
 /// release the instance lock (for up to [`RELAUNCH_WAIT`]) instead of quitting at once.
@@ -57,13 +53,13 @@ enum AppEvent {
 
 /// Why AGT is waiting to restart.
 enum Restart {
-    /// Into a downloaded update ("Update now"); it applies changed settings as well.
+    /// Into a downloaded update ("Check for updates"); it applies changed settings as well.
     Update(VelopackAsset),
     /// To apply changed settings: the file differs from what the pipeline runs with.
     Settings,
 }
 
-/// Progress of an "Update now" check, from its worker thread.
+/// Progress of an "Check for updates" check, from its worker thread.
 #[derive(Debug)]
 enum UpdateEvent {
     /// Found this version; downloading it.
@@ -196,7 +192,6 @@ fn main() {
         restart_with: None,
         changes: 0,
         changed_at: Instant::now(),
-        status_at: Instant::now(),
         config_path,
         file,
         running: config.clone(),
@@ -372,19 +367,16 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     /// `None` if this isn't a Velopack install.
     updater: Option<update::Updater>,
-    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (a settings click
-    /// skips that, see [`Self::settings_action`]; "Install update X now" / "Restart now to
-    /// apply" restart regardless).
+    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] ("Install update X
+    /// now" / "Restart now to apply" restart regardless).
     restart_with: Option<Restart>,
     /// Counts pipeline status changes and settings changes: a restart timer is stale if this
     /// moved on.
     changes: u64,
     /// When [`Self::changes`] last moved on.
     changed_at: Instant,
-    /// When the pipeline status last changed (a paste's clipboard restore follows its Ready).
-    status_at: Instant,
     config_path: PathBuf,
-    /// `config.toml` as last read (or its error): what the Settings menu shows.
+    /// `config.toml` as last read (or its error).
     file: Result<Config, String>,
     /// What the pipeline was started with (defaults if the file had an error then).
     running: Config,
@@ -458,7 +450,6 @@ impl ApplicationHandler<AppEvent> for App {
                         tray.set_status(&s.to_string());
                     }
                     self.status = Some(s.clone());
-                    self.status_at = Instant::now();
                     self.changes += 1;
                     self.changed_at = Instant::now();
                     self.start_restart_timer();
@@ -512,11 +503,6 @@ impl ApplicationHandler<AppEvent> for App {
         if let AppEvent::ConfigFile = event {
             return self.config_file_changed();
         }
-        if let AppEvent::Menu(e) = &event
-            && let Some(action) = self.tray.as_ref().and_then(|t| t.settings.action(&e.id))
-        {
-            return self.settings_action(action.clone(), event_loop);
-        }
         if let AppEvent::NoticeCopy = event {
             if let Some(p) = &self.pipeline {
                 p.copy_last_transcript();
@@ -531,6 +517,10 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
+            AppEvent::Menu(e) if e.id == tray.apply_now => {
+                let restart = self.restart_with.take().unwrap_or(Restart::Settings);
+                self.restart_now(restart, event_loop);
+            }
             AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(false),
             AppEvent::Menu(e) if e.id == tray.open_metrics => settings::window::open(true),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
@@ -565,10 +555,8 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Update(UpdateEvent::Done(Ok(None))) => {
-                tray.set_update(
-                    &format!("{} - up to date ({VERSION})", tray::UPDATE_NOW),
-                    true,
-                );
+                // Clickable: checks again.
+                tray.set_update(&format!("AGT is up to date ({VERSION})"), true);
             }
             AppEvent::Update(UpdateEvent::Done(Err(e))) => {
                 tracing::error!("update failed: {e}");
@@ -612,7 +600,7 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
-    /// "Update now": with an update already downloaded, installs it once idle; else checks
+    /// "Check for updates": with an update already downloaded, installs it once idle; else checks
     /// and downloads on a worker thread, which reports back as [`AppEvent::Update`] (an
     /// update it downloads is installed the same way, with no further click). Clicked while
     /// an install waits for idle, installs right away (the way out if dictation is stuck).
@@ -628,6 +616,7 @@ impl App {
             return self.restart_when_idle(asset);
         }
         tray.set_update("Checking for updates...", false);
+        tray.reopen_menu();
         let (updater, proxy) = (updater.clone(), self.proxy.clone());
         let spawned = thread::Builder::new()
             .name("update-now".into())
@@ -755,55 +744,6 @@ impl App {
         self.settings_changed();
     }
 
-    fn settings_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
-        match action {
-            Action::Set(changes) => match agt_core::config::set(&self.config_path, &changes) {
-                Ok(c) => {
-                    self.file = Ok(c);
-                    self.settings_changed();
-                    // A click is an explicit request: apply it now, without the settle wait
-                    // (that's for edits to the file, which may come in a few saves). Only a
-                    // paste's clipboard restore, if one may still be pending, is waited for.
-                    if matches!(self.restart_with, Some(Restart::Settings)) && self.idle() {
-                        let restore =
-                            Duration::from_millis(self.running.paste.restore_clipboard_ms);
-                        let wait =
-                            (restore + RESTORE_MARGIN).saturating_sub(self.status_at.elapsed());
-                        if wait.is_zero() {
-                            let restart = self.restart_with.take().unwrap();
-                            self.restart_now(restart, event_loop);
-                        } else {
-                            self.restart_timer(wait);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("cannot change config.toml: {e}");
-                    // Puts back the checkmark the click moved.
-                    self.show_settings();
-                }
-            },
-            Action::Toggle(path, get) => {
-                let file = Config::load(&self.config_path).map_err(|e| e.to_string());
-                match file {
-                    Ok(c) => self
-                        .settings_action(Action::Set(vec![(path, (!get(&c)).into())]), event_loop),
-                    Err(e) => {
-                        tracing::error!("cannot change config.toml: {e}");
-                        self.file = Err(e);
-                        self.settings_changed();
-                    }
-                }
-            }
-            Action::EditFile => open_in_editor(&self.config_path),
-            Action::OpenHistory => open_history(),
-            Action::ApplyNow => {
-                let restart = self.restart_with.take().unwrap_or(Restart::Settings);
-                self.restart_now(restart, event_loop);
-            }
-        }
-    }
-
     /// The file's settings now differ from the running ones (restart once idle), or match
     /// them again, or can't be read (keep running as is).
     fn settings_changed(&mut self) {
@@ -820,17 +760,12 @@ impl App {
         self.show_settings();
     }
 
-    /// Rebuilds the Settings submenu and the config error line from [`Self::file`].
+    /// Shows "Restart now to apply" (while changed settings wait for a restart) and the
+    /// config error line, from [`Self::file`].
     fn show_settings(&mut self) {
         let applying = self.file.as_ref().is_ok_and(|c| *c != self.running);
         let Some(tray) = &mut self.tray else { return };
-        let (shown, editable) = match &self.file {
-            Ok(c) => (c, true),
-            Err(_) => (&self.running, false),
-        };
-        if let Err(e) = tray.settings.show(shown, editable, applying) {
-            tracing::error!("cannot build the Settings menu: {e}");
-        }
+        tray.set_applying(applying);
         tray.set_warning(match (&self.file, self.config_error) {
             (Ok(_), _) => None,
             (Err(_), true) => Some("Config error (auto-updates off) - see log"),

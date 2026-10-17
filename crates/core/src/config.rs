@@ -189,7 +189,7 @@ save_audio = false
 keep_days = 30
 
 [update]
-# Check GitHub Releases for updates on startup and periodically (tray "Update now" works
+# Check GitHub Releases for updates on startup and periodically (tray "Check for updates" works
 # either way).
 enabled = true
 # Minutes between update checks (minimum 30).

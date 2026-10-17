@@ -27,9 +27,12 @@ tray-icon = "0.26"
 velopack = "1.2"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
-# Whether the app bundle is writable (see `update::silent`).
+# Whether the app bundle is writable (see `update::silent`); reopening the tray menu after
+# "Check for updates" (see `tray::Tray::reopen_menu`).
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 libc = "0.2"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "CFRunLoop"] }
 
 # `agt stats` attaches to the console it was started from (release builds have none); the
 # settings window may take the foreground.
