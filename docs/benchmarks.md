@@ -709,7 +709,7 @@ starts, which are far more common; polish sees the whole text and can repair it.
 ## Polish speed
 
 With long dictations transcribed while recording, release -> text is 0.2-0.4 s and the
-optional S1-mini polish (1.2 s p50, 2.1 s p90, 4.5 s max above) is the long pole. S1-mini is
+S1-mini polish (on by default; 1.2 s p50, 2.1 s p90, 4.5 s max above) is the long pole. S1-mini is
 Qwen3-0.6B (Q4_K_M, 485 MB) run by AGT's own `llama-server` (llama.cpp b11669); its output is
 the transcript again with small edits, so a request is almost all decoding: 100-680 prompt
 tokens are read in 20-50 ms, then it writes about as many tokens one by one (~3.2 ms each on

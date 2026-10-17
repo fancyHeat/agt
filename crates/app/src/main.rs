@@ -133,7 +133,9 @@ fn main() {
         Ok(c) => (c.clone(), false),
         Err(e) => {
             tracing::error!("{e}");
-            tracing::error!("running with defaults and updates OFF; the file was not modified");
+            tracing::error!(
+                "running with defaults, updates and polish OFF; the file was not modified"
+            );
             (Config::fallback(), true)
         }
     };

@@ -29,7 +29,7 @@ pub const DEFAULT_CONFIG: &str = concat!(
     r#"# AGT configuration. The tray menu's Settings window changes this file too. AGT applies a
 # saved change by restarting itself once you're not dictating.
 # If this file has an error, a running AGT keeps its settings until it's fixed; starting with
-# an error, AGT uses defaults (updates off). Either way it records the error.
+# an error, AGT uses defaults (updates and polish off). Either way it records the error.
 
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
@@ -107,11 +107,11 @@ trailing_space = true
 restore_clipboard_ms = 500
 
 [polish]
-# Optional clean-up of each transcript by an LLM before pasting: punctuation, capitalization,
-# filler words ("um", "you know") and false starts. Off by default. Adds latency (typically
-# 0.05-0.5 s on a GPU). On any error, timeout or suspicious output, the raw transcript is
+# Clean-up of each transcript by an LLM before pasting: punctuation, capitalization, filler
+# words ("um", "you know") and false starts. On by default. Adds latency (typically 0.05-0.5 s
+# on a GPU, more on a CPU). On any error, timeout or suspicious output, the raw transcript is
 # pasted instead.
-enabled = false
+enabled = true
 # "s1-mini": S1-mini by Superwhisper, a small model made for exactly this (English only), run
 # by AGT on this machine. On first use AGT downloads it (485 MB) and llama.cpp's llama-server
 # (12-32 MB) to the models folder and starts the server in the background.
@@ -353,7 +353,7 @@ pub struct PasteConfig {
     pub restore_clipboard_ms: u64,
 }
 
-/// `[polish]`: optional LLM clean-up of transcripts (see `agt-polish`).
+/// `[polish]`: LLM clean-up of transcripts, on by default (see `agt-polish`).
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolishConfig {
@@ -468,7 +468,7 @@ pub enum PolishStyle {
 impl Default for PolishConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: PolishProvider::S1Mini,
             base_url: String::new(),
             model: String::new(),
@@ -854,11 +854,13 @@ impl Config {
         Self::parse(&fs::read_to_string(path).map_err(ConfigError::Io)?)
     }
 
-    /// What to run with when the config file can't be loaded: defaults, but with
-    /// updates off, since the user may have disabled them in the file we couldn't read.
+    /// What to run with when the config file can't be loaded: defaults, but with updates
+    /// and polish off, since the user may have disabled them in the file we couldn't read
+    /// (polish would otherwise download S1-mini and change the pasted text).
     pub fn fallback() -> Self {
         let mut c = Self::default();
         c.update.enabled = false;
+        c.polish.enabled = false;
         c
     }
 }
@@ -1170,7 +1172,7 @@ mod tests {
     #[test]
     fn polish_defaults_depend_on_provider() {
         let c = Config::default().polish;
-        assert!(!c.enabled);
+        assert!(c.enabled);
         assert_eq!(c.provider, PolishProvider::S1Mini);
         assert_eq!(c.model(), "s1-mini");
         assert_eq!(c.timeout(0), std::time::Duration::from_millis(2000));
@@ -1273,7 +1275,7 @@ mod tests {
             DEFAULT_CONFIG,
             &[
                 (&["stt", "device"], "cpu".into()),
-                (&["polish", "enabled"], true.into()),
+                (&["polish", "enabled"], false.into()),
                 (&["polish", "s1-mini", "styling"], "casual".into()),
                 (&["paste", "restore_clipboard_ms"], 1000i64.into()),
             ],
@@ -1285,13 +1287,13 @@ mod tests {
         assert!(out.contains("\ndevice = \"cpu\"\n# CPU threads"), "{out}");
         let c = Config::parse(&out).unwrap();
         assert_eq!(c.stt.device, Device::Cpu);
-        assert!(c.polish.enabled);
+        assert!(!c.polish.enabled);
         assert_eq!(c.polish.s1_mini.styling, S1Styling::Casual);
         assert_eq!(c.paste.restore_clipboard_ms, 1000);
         // Everything else is as before.
         let mut expected = Config::default();
         expected.stt.device = Device::Cpu;
-        expected.polish.enabled = true;
+        expected.polish.enabled = false;
         expected.polish.s1_mini.styling = S1Styling::Casual;
         expected.paste.restore_clipboard_ms = 1000;
         assert_eq!(c, expected);
@@ -1386,8 +1388,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_disables_updates() {
+    fn fallback_disables_updates_and_polish() {
         assert!(!Config::fallback().update.enabled);
+        assert!(!Config::fallback().polish.enabled);
     }
 
     #[test]
