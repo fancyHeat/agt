@@ -20,6 +20,7 @@ pub const DICTATION_METRICS: &[&str] = &[
     "polish_ms",
     "hotkey_wait_ms",
     "paste_ms",
+    "clipboard_settle_ms",
     // Recording
     "hold_ms",
     "audio_secs",
