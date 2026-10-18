@@ -57,7 +57,8 @@ pub const SESSION_METRICS: &[&str] = &[
     "polish_warmup_ms",
 ];
 
-/// How many days of latency rollups, updates and problems are listed.
+/// How many days of latency rollups are listed for everything kept (a period lists all its
+/// days); how many updates and problems.
 pub const HISTORY_DAYS: i64 = 14;
 pub const RECENT_UPDATES: i64 = 8;
 pub const RECENT_PROBLEMS: i64 = 12;
@@ -172,7 +173,8 @@ pub fn load(conn: &Connection, now: i64, days: Option<i64>) -> rusqlite::Result<
         }
     }
 
-    // The days the window touches (rollups are of whole local days).
+    // The days the window touches (rollups are of whole local days), all of a longer window's.
+    let limit = days.map_or(HISTORY_DAYS, |d| d.max(HISTORY_DAYS));
     let mut stmt = conn.prepare(
         "SELECT day, count, p50, p90, p99 FROM metric_rollups
         WHERE metric = 'latency_ms'
@@ -180,7 +182,7 @@ pub fn load(conn: &Connection, now: i64, days: Option<i64>) -> rusqlite::Result<
         ORDER BY day DESC LIMIT ?1",
     )?;
     d.daily_latency = stmt
-        .query_map(params![HISTORY_DAYS, days.map(|_| start)], |r| {
+        .query_map(params![limit, days.map(|_| start)], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<_>>()?;

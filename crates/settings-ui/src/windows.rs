@@ -104,6 +104,8 @@ struct State {
     last_focus: i32,
     /// While the user moves the window: whether its DPI (so its size) changed on the way.
     moving: Option<bool>,
+    /// The page changed size while the window was minimized: [`place`] it once restored.
+    place_owed: bool,
 }
 
 thread_local! {
@@ -249,6 +251,7 @@ pub fn run(title: &str, mut model: Box<dyn Model>, page: Option<&str>) -> Result
                 stale: false,
                 last_focus: 0,
                 moving: None,
+                place_owed: false,
             })
         });
         set_fonts(dpi);
@@ -373,6 +376,11 @@ enum Place {
 /// Sizes the window for the current page (up to most of the screen, at least the page
 /// list; another page resizes it, like the macOS window), the list and the pane in it.
 fn place(window: HWND, at: Place) {
+    // Minimized: its rectangle is parked off-screen. Done once it's restored.
+    if unsafe { IsIconic(window) } != 0 {
+        with(|s| s.place_owed = true);
+        return;
+    }
     let Some((dpi, list, pane, page_height, pages, scroll)) = with(|s| {
         let height = s.pages.get(s.current).map_or(0, |p| layout(p, s.dpi).1);
         (s.dpi, s.list, s.pane, height, s.pages.len(), s.scroll)
@@ -1047,9 +1055,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     if IsChild(hwnd, focused) != 0 {
                         with(|s| s.last_focus = GetDlgCtrlID(focused));
                     }
-                } else if IsIconic(hwnd) == 0
-                    && let Some((list, pane, id)) = with(|s| (s.list, s.pane, s.last_focus))
-                {
+                } else if IsIconic(hwnd) == 0 {
+                    let Some((list, pane, id)) = with(|s| (s.list, s.pane, s.last_focus)) else {
+                        return DefWindowProcW(hwnd, msg, wp, lp);
+                    };
                     let c = if id >= FIRST_ID {
                         GetDlgItem(pane, id)
                     } else {
@@ -1066,8 +1075,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let dropped = SendMessageW(GetFocus(), CB_GETDROPPEDSTATE, 0, 0) != 0;
                 if GetKeyState(VK_LBUTTON as i32) < 0 || dropped {
                     SetTimer(hwnd, REBUILD_TIMER, 50, None);
-                } else if rebuild(false) {
-                    // Rows shown or hidden (e.g. the advanced settings), or another page.
+                } else {
+                    // Re-placed if rows were shown or hidden (e.g. the advanced settings) or
+                    // another page shows, not when only figures changed: a window the user put
+                    // somewhere stays there.
+                    let size = || with(|s| (s.current, s.pages.len(), s.content_height));
+                    let before = size();
+                    if rebuild(false) && size() != before {
+                        place(hwnd, Place::Fit);
+                    }
+                }
+                0
+            }
+            WM_SIZE => {
+                if wp == SIZE_RESTORED as WPARAM
+                    && with(|s| std::mem::take(&mut s.place_owed)).unwrap_or(false)
+                {
                     place(hwnd, Place::Fit);
                 }
                 0
@@ -1131,8 +1154,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 ));
                 // Moving the focus off an edit field reports its last change.
                 SetFocus(hwnd);
-                let index = with(|s| crate::page_index(&s.pages, Some(&title))).flatten();
-                if let Some(index) = index {
+                // The page shown already (e.g. the error page for "Settings" while the file
+                // is broken): the one the user chose is kept for when it's back.
+                let index =
+                    with(|s| crate::page_index(&s.pages, Some(&title)).filter(|&i| i != s.current));
+                if let Some(index) = index.flatten() {
                     show(index);
                 }
                 if let Some(list) = with(|s| s.list) {
