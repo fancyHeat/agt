@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
-use velopack::{VelopackApp, VelopackAsset};
+use velopack::{VelopackApp, VelopackAsset, locator::LocationContext};
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
@@ -118,7 +118,16 @@ fn main() {
             }
         });
     }
-    velopack.run();
+    // Not a Velopack install (a dev build; `run` makes the same check): nothing to do, and
+    // `run` would log an ERROR saying so on every start. A hook (`--veloapp-install`, ...)
+    // always runs: `run` handles it before that check, and exits.
+    let hook = std::env::args()
+        .nth(1)
+        .is_some_and(|a| a.to_ascii_lowercase().starts_with("--veloapp-"));
+    if hook || velopack::locator::auto_locate_app_manifest(LocationContext::FromCurrentExe).is_ok()
+    {
+        velopack.run();
+    }
 
     tracing::info!(
         "AGT {VERSION} starting; config at {}",

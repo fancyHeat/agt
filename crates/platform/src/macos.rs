@@ -334,6 +334,11 @@ pub fn paste_may_release(_key: Key) -> bool {
     false
 }
 
+/// Swallowing doesn't hide a key's state here: the same as [`key_down`].
+pub fn key_down_past_hook(key: Key) -> Option<bool> {
+    key_down(key)
+}
+
 pub fn key_down(key: Key) -> Option<bool> {
     // The HID system state: swallowing at the session tap doesn't change it. (Events posted at
     // the HID tap do; `send_paste` posts none for hotkey keys.)

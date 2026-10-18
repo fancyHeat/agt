@@ -36,6 +36,10 @@ pub fn key_down(_key: Key) -> Option<bool> {
     None
 }
 
+pub fn key_down_past_hook(_key: Key) -> Option<bool> {
+    None
+}
+
 pub fn foreground_window() -> Option<usize> {
     None
 }
