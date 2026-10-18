@@ -517,8 +517,11 @@ fn process_name(hwnd: HWND) -> Option<String> {
     let mut len = buf.len() as u32;
     let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
     unsafe { CloseHandle(process) };
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    (ok != 0).then(|| path.rsplit('\\').next().unwrap_or(&path).to_owned())
+    if ok == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(buf.get(..len as usize)?);
+    path.rsplit('\\').next().map(str::to_owned)
 }
 
 pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {
