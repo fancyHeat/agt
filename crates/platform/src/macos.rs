@@ -713,6 +713,11 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Re
     Ok(true)
 }
 
+/// Reading the pasteboard never fails because someone else is reading it: nothing to wait for.
+pub fn wait_for_clipboard_listeners() -> Option<Duration> {
+    None
+}
+
 /// Never releases a held modifier (see [`paste_may_release`]), so `_before_releasing` is never
 /// called.
 pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {

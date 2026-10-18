@@ -11,7 +11,7 @@
 use std::{
     fmt,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -403,6 +403,14 @@ pub fn snapshot_clipboard() -> Result<ClipboardSnapshot, Error> {
 /// Puts `text` on the clipboard (excluded from clipboard history).
 pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     imp::set_clipboard_text(text).map(PasteToken)
+}
+
+/// Call between [`set_clipboard_text`] and [`send_paste`]. Windows: apps watching the
+/// clipboard (Logi Options+, WSLg, clipboard managers) open it right after every change, and
+/// an app whose paste finds it open pastes nothing, so this waits until they're likely done
+/// (a few ms). Returns how long it waited; `None` where nothing needs waiting for (macOS).
+pub fn wait_for_clipboard_listeners() -> Option<Duration> {
+    imp::wait_for_clipboard_listeners()
 }
 
 /// Sends Ctrl+V to the focused window (Windows: releasing held Shift/Alt/Win first, so e.g. a
@@ -838,7 +846,7 @@ mod tests {
     #[test]
     fn chord_starts_when_all_keys_are_down_in_any_order() {
         let t0 = Instant::now();
-        let t1 = t0 + std::time::Duration::from_millis(300);
+        let t1 = t0 + Duration::from_millis(300);
         for (first, second) in [(CTRL, WIN), (WIN, CTRL)] {
             let mut d = HoldDetector::new(2);
             assert_eq!(d.on_key(first, true, 0, t0), None);

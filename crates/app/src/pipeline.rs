@@ -2016,6 +2016,11 @@ fn paste_thread(
                 } else {
                     None
                 };
+                if matches!(set, Some(Ok(_))) {
+                    // Else apps that watch the clipboard may still hold it when the target
+                    // reads it, and some targets then paste nothing (#75).
+                    d.clipboard_wait_ms = agt_platform::wait_for_clipboard_listeners().map(ms);
+                }
                 let result = match set {
                     None => Err(PasteError::WindowChanged),
                     Some(Err(e)) => Err(PasteError::ClipboardBusy(e)),

@@ -283,6 +283,28 @@ fn version_5_database_gains_the_polish_ahead_columns() {
 }
 
 #[test]
+fn version_6_database_gains_clipboard_wait_ms() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..6] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 6).unwrap();
+    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
+    migrate(&mut conn).unwrap();
+    let d = Dictation {
+        started_at: 2000,
+        clipboard_wait_ms: Some(3.2),
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let wait: f64 = conn
+        .query_row("SELECT clipboard_wait_ms FROM dictations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(wait, 3.2);
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);

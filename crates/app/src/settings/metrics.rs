@@ -227,6 +227,7 @@ const LATENCY: &[&str] = &[
     "polish_ms",
     "hotkey_wait_ms",
     "paste_ms",
+    "clipboard_wait_ms",
 ];
 const RECORDING: &[&str] = &[
     "hold_ms",
@@ -475,6 +476,7 @@ fn label(metric: &str) -> &str {
         "polish_ms" => "Polishing",
         "hotkey_wait_ms" => "Hotkey still held",
         "paste_ms" => "Pasting",
+        "clipboard_wait_ms" => "… clipboard watchers",
         "hold_ms" => "Hotkey held",
         "audio_secs" => "Audio",
         "rms" => "Loudness (RMS)",
