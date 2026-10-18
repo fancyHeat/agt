@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, GlobalFree, HANDLE, LPARAM, LRESULT, WPARAM},
+    Foundation::{CloseHandle, GetLastError, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
     System::{
         Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree},
         DataExchange::{
@@ -22,7 +22,8 @@ use windows_sys::Win32::{
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::CF_UNICODETEXT,
         Threading::{
-            GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            GetCurrentThread, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
         },
     },
     UI::{
@@ -32,9 +33,10 @@ use windows_sys::Win32::{
             VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_V,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
-            UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+            CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
+            GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
+            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP,
+            WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
         },
     },
 };
@@ -473,10 +475,10 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     })
 }
 
-/// Apps watching the clipboard open it within ~2 ms of every change (measured: Logi Options+
-/// twice at 0.6-2.3 ms, WSLg's msrdc.exe up to 3 times at 1-1.8 ms, each for well under a
-/// millisecond). A plain Win32 edit box whose WM_PASTE comes then can't open it, and pastes
-/// nothing without an error. Waiting a little longer than that costs a few ms per paste.
+/// Clipboard listeners open the clipboard within ~2 ms of every change (measured: Logi
+/// Options+ twice at 0.6-2.3 ms, WSLg's msrdc.exe up to 3 times at 1-1.8 ms, each for well
+/// under a millisecond). A plain Win32 edit box whose WM_PASTE comes then can't open it, and
+/// pastes nothing without an error. Waiting a little longer than that costs a few ms per paste.
 const CLIPBOARD_SETTLE: Duration = Duration::from_millis(3);
 /// After the settle time, a clipboard still open is waited for, up to this in all.
 const CLIPBOARD_BUSY_MAX: Duration = Duration::from_millis(50);
@@ -485,10 +487,15 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
     let start = Instant::now();
     thread::sleep(CLIPBOARD_SETTLE);
     // Only sees whoever opened it with a window, but that's how listeners open it.
-    while !unsafe { GetOpenClipboardWindow() }.is_null() {
+    loop {
+        let holder = unsafe { GetOpenClipboardWindow() };
+        if holder.is_null() {
+            break;
+        }
         if start.elapsed() >= CLIPBOARD_BUSY_MAX {
             tracing::warn!(
-                "clipboard still in use by another app after {} ms; pasting anyway (the paste may be lost)",
+                "clipboard still in use by {} after {} ms; pasting anyway (the paste may be lost)",
+                process_name(holder).unwrap_or_else(|| "another app".into()),
                 CLIPBOARD_BUSY_MAX.as_millis()
             );
             break;
@@ -496,6 +503,22 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
         thread::sleep(Duration::from_micros(200));
     }
     Some(start.elapsed())
+}
+
+/// The file name of the program that owns `hwnd`, e.g. "logioptionsplus_agent.exe".
+fn process_name(hwnd: HWND) -> Option<String> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
+    unsafe { CloseHandle(process) };
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    (ok != 0).then(|| path.rsplit('\\').next().unwrap_or(&path).to_owned())
 }
 
 pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {

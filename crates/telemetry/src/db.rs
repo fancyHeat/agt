@@ -210,9 +210,9 @@ ALTER TABLE dictations ADD COLUMN polish_release_words INTEGER;
 ALTER TABLE dictations ADD COLUMN polish_fallbacks INTEGER;
 ALTER TABLE dictations ADD COLUMN polish_wait_ms REAL;
 "#,
-    // 7: Windows paste waits for clipboard watchers.
+    // 7: Windows paste waits for clipboard listeners.
     r#"
-ALTER TABLE dictations ADD COLUMN clipboard_wait_ms REAL;
+ALTER TABLE dictations ADD COLUMN clipboard_settle_ms REAL;
 "#,
 ];
 
@@ -416,7 +416,7 @@ pub(crate) fn insert_dictation(
             live_skipped, live_tail_joined, live_trimmed_secs, live_tail_secs, live_stt_ms,
             live_busy_at_release, live_idle_ms, live_max_queue, live_discarded_ms,
             polish_ahead_pieces, polish_ahead_ms, polish_release_words, polish_fallbacks,
-            polish_wait_ms, clipboard_wait_ms)
+            polish_wait_ms, clipboard_settle_ms)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
             ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
@@ -463,7 +463,7 @@ pub(crate) fn insert_dictation(
             d.polish_release_words,
             d.polish_fallbacks,
             d.polish_wait_ms,
-            d.clipboard_wait_ms,
+            d.clipboard_settle_ms,
         ],
     )?;
     Ok(())

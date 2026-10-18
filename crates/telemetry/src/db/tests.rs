@@ -283,7 +283,7 @@ fn version_5_database_gains_the_polish_ahead_columns() {
 }
 
 #[test]
-fn version_6_database_gains_clipboard_wait_ms() {
+fn version_6_database_gains_clipboard_settle_ms() {
     let mut conn = Connection::open_in_memory().unwrap();
     for m in &MIGRATIONS[..6] {
         conn.execute_batch(m).unwrap();
@@ -294,12 +294,14 @@ fn version_6_database_gains_clipboard_wait_ms() {
     migrate(&mut conn).unwrap();
     let d = Dictation {
         started_at: 2000,
-        clipboard_wait_ms: Some(3.2),
+        clipboard_settle_ms: Some(3.2),
         ..Default::default()
     };
     insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
     let wait: f64 = conn
-        .query_row("SELECT clipboard_wait_ms FROM dictations", [], |r| r.get(0))
+        .query_row("SELECT clipboard_settle_ms FROM dictations", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(wait, 3.2);
 }

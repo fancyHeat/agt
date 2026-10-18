@@ -405,8 +405,8 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     imp::set_clipboard_text(text).map(PasteToken)
 }
 
-/// Call between [`set_clipboard_text`] and [`send_paste`]. Windows: apps watching the
-/// clipboard (Logi Options+, WSLg, clipboard managers) open it right after every change, and
+/// Call between [`set_clipboard_text`] and [`send_paste`]. Windows: clipboard listeners
+/// (Logi Options+, WSLg, clipboard managers) open the clipboard right after every change, and
 /// an app whose paste finds it open pastes nothing, so this waits until they're likely done
 /// (a few ms). Returns how long it waited; `None` where nothing needs waiting for (macOS).
 pub fn wait_for_clipboard_listeners() -> Option<Duration> {
