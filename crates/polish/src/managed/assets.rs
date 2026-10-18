@@ -167,7 +167,7 @@ impl Assets {
         let mut fetch = |dir: &Path, file: &ModelFile, what| {
             if let Some(wait) = hold.filter(|_| !agt_fetch::is_present(dir, file)) {
                 hold = None;
-                report(Status::Queued);
+                report(Status::Queued { what });
                 wait();
             }
             download(dir, file, what, report)
@@ -559,7 +559,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("failed verification"), "{err}");
         assert_eq!(held.into_inner(), 1);
-        assert_eq!(statuses[0], Status::Queued);
+        assert_eq!(statuses[0], Status::Queued { what: "S1-mini" });
         assert!(!a.server_exe().exists());
         assert!(!dir.join("llama-b2-bin-test.tar.gz.part").exists());
         assert_eq!(fs::read(a.model_path()).unwrap(), gguf);
@@ -568,8 +568,11 @@ mod tests {
             percent: 100
         }));
 
+        // With S1-mini there (e.g. in a shared models folder), the wait names llama.cpp.
         a.server.sha256 = hex(&tar);
-        a.ensure(&mut |_| {}, None).unwrap();
+        statuses.clear();
+        a.ensure(&mut |s| statuses.push(s), Some(&|| {})).unwrap();
+        assert_eq!(statuses[0], Status::Queued { what: "llama.cpp" });
         assert_eq!(
             names(&a.build_dir()),
             [

@@ -210,8 +210,12 @@ pub fn focus_takes_text() -> Option<bool> {
 pub fn prepare_focus_check() {}
 
 pub fn key_down(key: Key) -> Option<bool> {
-    // A swallowed key never updates the system's key state.
-    (!key.swallowed()).then(|| vk_down(key.code))
+    let down = vk_down(key.code);
+    // A swallowed key (F13-F24) updates the system's key state only when the hook didn't
+    // swallow its press (dropped, or too slow for that event). So "up" says nothing, but
+    // "down" is a press the hook missed. (The hook lets that press's release through, so it
+    // doesn't stay "down".)
+    (down || !key.swallowed()).then_some(down)
 }
 
 /// Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
@@ -263,7 +267,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     let Some(chord_key) = classify(&s.hotkey, kb.vkCode, kb.scanCode) else {
                         return;
                     };
-                    swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed());
+                    // A release whose press got past the hook (dropped, or too slow) passes
+                    // too, or the system would take the key as still down (see `key_down`).
+                    // The hook runs before the key state updates: this is the press's.
+                    swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed())
+                        && (down || !vk_down(kb.vkCode as u16));
                     if let (Some(i), true, Some(mask)) = (chord_key, down, &s.mask)
                         && is_win(kb.vkCode)
                         && s.detector.repeat_in_chord(i)

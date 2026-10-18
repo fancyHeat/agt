@@ -353,8 +353,9 @@ pub fn start_hotkey(
     imp::start_hotkey(hotkey.clone(), Box::new(on_event)).map(HotkeyHandle)
 }
 
-/// Whether `key` is physically down right now, if that can be known: `None` for swallowed
-/// keys on Windows (their state never reaches the system) and on unsupported platforms.
+/// Whether `key` is physically down right now, if that can be known: `None` on unsupported
+/// platforms, and for a swallowed key on Windows unless it got past the hook (its state
+/// reaches the system only then).
 pub fn key_down(key: Key) -> Option<bool> {
     imp::key_down(key)
 }

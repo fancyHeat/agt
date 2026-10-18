@@ -491,6 +491,14 @@ fn remove_old_llama_builds(models_dir: &std::path::Path) {
         }
         if own {
             agt_polish::managed::remove_legacy(&dir);
+            if old.exists() {
+                tracing::info!(
+                    "removed AGT's old llama.cpp builds from {}; the folder stays: it has files AGT didn't make",
+                    old.display()
+                );
+            } else {
+                tracing::info!("removed the old llama.cpp folder {}", old.display());
+            }
         } else {
             tracing::warn!(
                 "{} is no longer used (llama.cpp now lives in {}); delete it once no older AGT uses this models folder",

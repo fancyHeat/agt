@@ -620,7 +620,8 @@ fn senders_never_wait_for_the_disk() {
         sending < Duration::from_millis(500),
         "10k sends took {sending:?} while the database was locked"
     );
-    sink.event("DEBUG", "t", "during the lock".into());
+    // INFO: with up to 10k records still queued, a DEBUG one could be dropped at the soft cap.
+    sink.event("INFO", "t", "during the lock".into());
     // Longer than the connection's busy timeout (2 s): the batch is kept and retried, and
     // a flush only succeeds once it's really committed.
     assert!(
