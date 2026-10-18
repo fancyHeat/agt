@@ -218,6 +218,10 @@ pub fn key_down(key: Key) -> Option<bool> {
     (down || !key.swallowed()).then_some(down)
 }
 
+pub fn key_down_past_hook(key: Key) -> Option<bool> {
+    Some(vk_down(key.code))
+}
+
 /// Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
 fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)

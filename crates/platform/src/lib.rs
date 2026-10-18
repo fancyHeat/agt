@@ -360,6 +360,13 @@ pub fn key_down(key: Key) -> Option<bool> {
     imp::key_down(key)
 }
 
+/// [`key_down`] for a press that got past the hook (`key_down` said it was down): on
+/// Windows, a swallowed key's "up" then counts too, since the hook lets that press's
+/// release through to the system.
+pub fn key_down_past_hook(key: Key) -> Option<bool> {
+    imp::key_down_past_hook(key)
+}
+
 /// Identifies the window that has keyboard focus (where a paste would go), if known. Only
 /// meant for comparing: "is it still the same window?".
 pub fn foreground_window() -> Option<usize> {
