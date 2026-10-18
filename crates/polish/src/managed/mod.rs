@@ -59,8 +59,11 @@ pub struct Env {
 /// The managed server's state, for the tray (`Display` is the tray line).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
-    /// Waiting for [`Env::hold_download`] before downloading.
-    Queued,
+    /// Waiting for [`Env::hold_download`] before downloading `what` (S1-mini, or llama.cpp
+    /// when only that is missing, e.g. with S1-mini already in a shared models folder).
+    Queued {
+        what: &'static str,
+    },
     Downloading {
         what: &'static str,
         percent: u8,
@@ -75,7 +78,7 @@ pub enum Status {
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Status::Queued => write!(f, "Polish: waiting to download S1-mini..."),
+            Status::Queued { what } => write!(f, "Polish: waiting to download {what}..."),
             Status::Downloading { what, percent } => {
                 write!(f, "Polish: downloading {what} ({percent}%)...")
             }

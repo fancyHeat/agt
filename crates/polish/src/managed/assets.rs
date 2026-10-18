@@ -167,7 +167,7 @@ impl Assets {
         let mut fetch = |dir: &Path, file: &ModelFile, what| {
             if let Some(wait) = hold.filter(|_| !agt_fetch::is_present(dir, file)) {
                 hold = None;
-                report(Status::Queued);
+                report(Status::Queued { what });
                 wait();
             }
             download(dir, file, what, report)
@@ -260,18 +260,20 @@ pub fn legacy_dir(models_dir: &Path) -> PathBuf {
 }
 
 /// Removes what AGT made in [`legacy_dir`]. Only for a models dir no one else uses: in a
-/// shared one, an older AGT elsewhere may still run those builds.
-pub fn remove_legacy(models_dir: &Path) {
-    clean_up(&legacy_dir(models_dir), None);
+/// shared one, an older AGT elsewhere may still run those builds. Returns whether it
+/// removed anything.
+pub fn remove_legacy(models_dir: &Path) -> bool {
+    clean_up(&legacy_dir(models_dir), None)
 }
 
 /// Removes what AGT left in `dir`: staging folders, archives, and builds it installed
 /// (they have a manifest) other than `keep`; then `dir` itself if that emptied it.
-/// Nothing else.
-fn clean_up(dir: &Path, keep: Option<&str>) {
+/// Nothing else. Returns whether it removed anything; logs what it couldn't.
+fn clean_up(dir: &Path, keep: Option<&str>) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return false;
     };
+    let mut removed = false;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let p = e.path();
@@ -285,14 +287,20 @@ fn clean_up(dir: &Path, keep: Option<&str>) {
             && [".zip", ".tar.gz", ".zip.part", ".tar.gz.part"]
                 .iter()
                 .any(|ext| name.ends_with(ext));
-        if ours_dir {
-            let _ = fs::remove_dir_all(&p);
+        let result = if ours_dir {
+            fs::remove_dir_all(&p)
         } else if ours_file {
-            let _ = fs::remove_file(&p);
+            fs::remove_file(&p)
+        } else {
+            continue;
+        };
+        match result {
+            Ok(()) => removed = true,
+            Err(e) => tracing::warn!("cannot remove {}: {e}", p.display()),
         }
     }
     // Only succeeds if nothing else is left.
-    let _ = fs::remove_dir(dir);
+    fs::remove_dir(dir).is_ok() || removed
 }
 
 #[derive(Debug, PartialEq)]
@@ -559,7 +567,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("failed verification"), "{err}");
         assert_eq!(held.into_inner(), 1);
-        assert_eq!(statuses[0], Status::Queued);
+        assert_eq!(statuses[0], Status::Queued { what: "S1-mini" });
         assert!(!a.server_exe().exists());
         assert!(!dir.join("llama-b2-bin-test.tar.gz.part").exists());
         assert_eq!(fs::read(a.model_path()).unwrap(), gguf);
@@ -568,8 +576,11 @@ mod tests {
             percent: 100
         }));
 
+        // With S1-mini there (e.g. in a shared models folder), the wait names llama.cpp.
         a.server.sha256 = hex(&tar);
-        a.ensure(&mut |_| {}, None).unwrap();
+        statuses.clear();
+        a.ensure(&mut |s| statuses.push(s), Some(&|| {})).unwrap();
+        assert_eq!(statuses[0], Status::Queued { what: "llama.cpp" });
         assert_eq!(
             names(&a.build_dir()),
             [
@@ -592,7 +603,7 @@ mod tests {
             ["agt-llama-server", "llama.cpp", MODEL_DIR],
             "nothing new to run in the models dir; the old install left to remove_legacy"
         );
-        remove_legacy(&root);
+        assert!(remove_legacy(&root));
         assert_eq!(names(&root), ["llama.cpp", MODEL_DIR]);
 
         // An old install in the models dir next to something that isn't AGT's: only the
@@ -600,8 +611,12 @@ mod tests {
         fs::create_dir_all(legacy.join("b1")).unwrap();
         fs::write(legacy.join("b1").join(MARKER), "").unwrap();
         fs::write(legacy.join("notes.txt"), b"mine").unwrap();
-        remove_legacy(&root);
+        assert!(remove_legacy(&root));
         assert_eq!(names(&legacy), ["notes.txt"]);
+        assert!(
+            !remove_legacy(&root),
+            "nothing of AGT's left: nothing to report"
+        );
 
         // Everything present: no network access.
         a.model.url = "http://127.0.0.1:1/unreachable";

@@ -490,7 +490,9 @@ fn remove_old_llama_builds(models_dir: &std::path::Path) {
             return;
         }
         if own {
-            agt_polish::managed::remove_legacy(&dir);
+            if agt_polish::managed::remove_legacy(&dir) {
+                tracing::info!("removed AGT's old llama.cpp builds from {}", old.display());
+            }
         } else {
             tracing::warn!(
                 "{} is no longer used (llama.cpp now lives in {}); delete it once no older AGT uses this models folder",
@@ -824,8 +826,12 @@ impl AudioThread {
         let double_tap = Duration::from_millis(self.config.hotkey.double_tap_ms);
         let min_hold = Duration::from_millis(self.config.hotkey.min_hold_ms);
         let tap = min_hold.max(TAP);
+        // The press ending a hands-free recording was synthesized by `missed_press`: its
+        // release is polled with `key_down_past_hook`.
+        let mut press_missed = false;
 
         loop {
+            press_missed &= latch == Latch::Ending;
             let hands_free = latch == Latch::On && holding.is_some();
             // Esc is ours only while it can end something.
             agt_platform::arm_escape(hands_free);
@@ -862,8 +868,11 @@ impl AudioThread {
                     Err(RecvTimeoutError::Timeout) => {
                         feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
                         let missed = match hands_free {
-                            true => self.missed_press(&events).map(|ev| (ev, false)),
-                            false => self.missed_release(&events, &watch),
+                            true => self.missed_press(&events).map(|(ev, synthesized)| {
+                                press_missed = synthesized;
+                                (ev, false)
+                            }),
+                            false => self.missed_release(&events, &watch, press_missed),
                         };
                         match missed {
                             Some(ev) => ev,
@@ -992,16 +1001,21 @@ impl AudioThread {
     }
 
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
-    /// release (with `true`) if the key turns out not to be down any more.
+    /// release (with `true`) if the key turns out not to be down any more. `press_missed`:
+    /// the press being held was synthesized by [`Self::missed_press`].
     fn missed_release(
         &self,
         events: &Receiver<HotkeyEvent>,
         watch: &ReleaseWatch,
+        press_missed: bool,
     ) -> Option<(HotkeyEvent, bool)> {
         let keys = self.key.keys();
         let mut keys_down = [None; MAX_CHORD];
         for (down, &k) in keys_down.iter_mut().zip(keys) {
-            *down = agt_platform::key_down(k);
+            *down = match press_missed {
+                true => agt_platform::key_down_past_hook(k),
+                false => agt_platform::key_down(k),
+            };
         }
         if !watch.missed(&keys_down[..keys.len()], agt_platform::paste_count()) {
             return None; // still held, can't tell, or our own paste made it look released
@@ -1010,6 +1024,10 @@ impl AudioThread {
         // queued already; give a racing one a moment to arrive.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
             return Some((ev, false));
+        }
+        if press_missed {
+            // Expected: the hook was re-installed after the press, so it never saw it.
+            return Some((HotkeyEvent::Up(Instant::now()), true));
         }
         tracing::warn!(
             "{} is no longer down but no release was seen; finishing the dictation and re-installing the keyboard hook",
@@ -1022,8 +1040,11 @@ impl AudioThread {
     /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
     /// synthesized press if the hotkey turns out to be down without the hook having said so
     /// (macOS disabled the event tap after a timeout, Windows dropped the hook), so the
-    /// recording can still be ended.
-    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<HotkeyEvent> {
+    /// recording can still be ended; with `true` if synthesized. A tap shorter than the poll
+    /// is caught only if a poll falls within it (a 100 ms tap: 40% of the time); the next
+    /// tap then gets another chance. (`GetAsyncKeyState`'s "pressed since the last call" bit
+    /// would catch it, but Windows documents it as unreliable.)
+    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<(HotkeyEvent, bool)> {
         let keys = self.key.keys();
         if !keys
             .iter()
@@ -1033,14 +1054,14 @@ impl AudioThread {
         }
         // As in `missed_release`: a real press would normally be queued already.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
-            return Some(ev);
+            return Some((ev, false));
         }
         tracing::warn!(
             "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
             self.key
         );
         self.reset.reset();
-        Some(HotkeyEvent::Down(Instant::now()))
+        Some((HotkeyEvent::Down(Instant::now()), true))
     }
 
     /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded

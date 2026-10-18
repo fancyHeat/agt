@@ -42,6 +42,7 @@ pub enum Mode {
     Transcribing,
     /// Something failed: a red flash for [`ERROR_FOR`], then hidden. `set_mode` ignores it
     /// while hidden (nothing on screen failed); [`Overlay::flash_error`] shows it anyway.
+    /// `set_mode(Hidden)` doesn't cut it short.
     Error,
 }
 
@@ -156,12 +157,10 @@ impl Overlay {
             return;
         }
         match mode {
-            Mode::Hidden => {
-                self.window.hide();
-                self.mode = Mode::Hidden;
-                self.next = None;
-                return;
-            }
+            // The flash hides itself: a status that hides the pill right after it (the
+            // retry's "Loading model...", download progress) would cut it to nothing.
+            Mode::Hidden if self.mode == Mode::Error => return,
+            Mode::Hidden => return self.hide(),
             // Nothing on screen to flag.
             Mode::Error if self.mode == Mode::Hidden => return,
             _ => {}
@@ -191,7 +190,7 @@ impl Overlay {
     /// model is still loading. Where there is no notice (Windows for now), flashes the error
     /// instead, so the press still shows something.
     pub fn show_getting_ready(&mut self, level: f32, now: Instant) {
-        self.set_mode(Mode::Hidden, level, now);
+        self.hide();
         if !self.show_text(GETTING_READY, false, GETTING_READY_FOR, now) {
             self.flash_error(level, now);
         }
@@ -230,6 +229,14 @@ impl Overlay {
             && let Some(notice) = &mut self.notice
         {
             notice.hide();
+        }
+    }
+
+    fn hide(&mut self) {
+        if self.mode != Mode::Hidden {
+            self.window.hide();
+            self.mode = Mode::Hidden;
+            self.next = None;
         }
     }
 
@@ -288,8 +295,7 @@ impl Overlay {
             return;
         }
         if self.mode == Mode::Error {
-            self.set_mode(Mode::Hidden, level, now);
-            return;
+            return self.hide();
         }
         self.draw(level, now);
         // Keep a steady cadence, but don't try to catch up after a stall.
@@ -457,6 +463,26 @@ mod tests {
     }
 
     #[test]
+    fn hiding_does_not_cut_an_error_flash_short() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        // A press retries the failed model load: "Loading model..." comes right after.
+        o.flash_error(0.0, t);
+        o.set_mode(Mode::Hidden, 0.0, t + Duration::from_millis(1));
+        assert_eq!(o.mode(), Mode::Error);
+        assert!(log.borrow().visible);
+        assert_eq!(o.next_frame(), Some(t + ERROR_FOR));
+        o.tick(0.0, t + ERROR_FOR);
+        assert_eq!(o.mode(), Mode::Hidden);
+        assert!(!log.borrow().visible);
+
+        // A new recording still replaces it at once.
+        o.flash_error(0.0, t + ERROR_FOR * 2);
+        o.set_mode(Mode::Recording, 0.1, t + ERROR_FOR * 2 + FRAME);
+        assert_eq!(o.mode(), Mode::Recording);
+    }
+
+    #[test]
     fn notice_shows_while_hidden_then_times_out() {
         let (mut o, log) = overlay();
         let t = Instant::now();
@@ -587,8 +613,12 @@ mod tests {
     fn getting_ready_without_a_notice_flashes_the_error() {
         let log = Rc::new(RefCell::new(Log::default()));
         let mut o = Overlay::with_surfaces(Box::new(Fake(log.clone())), None, Position::Bottom);
-        o.show_getting_ready(0.0, Instant::now());
+        let t = Instant::now();
+        o.show_getting_ready(0.0, t);
         assert_eq!(o.mode(), Mode::Error);
         assert!(log.borrow().visible);
+        // The next download-progress status doesn't cut it short.
+        o.set_mode(Mode::Hidden, 0.0, t + FRAME);
+        assert_eq!(o.mode(), Mode::Error);
     }
 }
