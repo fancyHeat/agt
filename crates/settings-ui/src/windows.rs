@@ -21,20 +21,22 @@ use windows_sys::Win32::{
         COLOR_GRAYTEXT, COLOR_WINDOW, CreateFontIndirectW, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE,
         DT_WORDBREAK, DeleteObject, DrawTextW, FW_SEMIBOLD, GetDC, GetMonitorInfoW, GetSysColor,
         GetSysColorBrush, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-        MONITORINFO, MonitorFromPoint, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+        MONITORINFO, MonitorFromWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
         TRANSPARENT,
     },
     System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW},
     UI::{
         Controls::{
-            BST_CHECKED, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
-            SetScrollInfo,
+            BST_CHECKED, EM_SETSEL, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+            InitCommonControlsEx, SetScrollInfo,
         },
         HiDpi::{
             AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
             SetProcessDpiAwarenessContext, SystemParametersInfoForDpi,
         },
-        Input::KeyboardAndMouse::{EnableWindow, GetFocus, GetKeyState, SetFocus, VK_LBUTTON},
+        Input::KeyboardAndMouse::{
+            EnableWindow, GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_LBUTTON, VK_SHIFT, VK_TAB,
+        },
         WindowsAndMessaging::*,
     },
 };
@@ -60,6 +62,7 @@ const SCROLLBAR: i32 = 17;
 const ROW_SPACING: i32 = 8;
 const SECTION_SPACING: i32 = 14;
 const LONG_TEXT_HEIGHT: i32 = 72;
+const LIST_ITEM_HEIGHT: i32 = 28;
 /// A full-width row (a table, figures): both columns and the gap between them.
 const FULL_WIDTH: i32 = LABEL_WIDTH + GAP + CONTROL_WIDTH;
 /// A table's columns after the first.
@@ -79,7 +82,10 @@ const EM_SETCUEBANNER: u32 = 0x1501;
 struct State {
     model: Box<dyn Model>,
     pages: Vec<Page>,
+    /// The page shown, and the title of the one the user chose: while the file has an
+    /// error that page is missing (the error page shows), and it's shown again once fixed.
     current: usize,
+    page: String,
     window: HWND,
     pane: HWND,
     list: HWND,
@@ -94,6 +100,12 @@ struct State {
     content_height: i32,
     /// The file changed while an edit field had focus: rebuild once it loses it.
     stale: bool,
+    /// The id of the control focused when the window was last deactivated (0: none).
+    last_focus: i32,
+    /// While the user moves the window: whether its DPI (so its size) changed on the way.
+    moving: Option<bool>,
+    /// The page changed size while the window was minimized: [`place`] it once restored.
+    place_owed: bool,
 }
 
 thread_local! {
@@ -225,6 +237,7 @@ pub fn run(title: &str, mut model: Box<dyn Model>, page: Option<&str>) -> Result
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 model,
+                page: pages[current].title.clone(),
                 pages,
                 current,
                 window,
@@ -236,17 +249,45 @@ pub fn run(title: &str, mut model: Box<dyn Model>, page: Option<&str>) -> Result
                 scroll: 0,
                 content_height: 0,
                 stale: false,
+                last_focus: 0,
+                moving: None,
+                place_owed: false,
             })
         });
         set_fonts(dpi);
         rebuild(true);
-        place(window, true);
+        place(window, Place::Center);
         ShowWindow(window, SW_SHOW);
         SetForegroundWindow(window);
         SetTimer(window, POLL_TIMER, POLL_MS, None);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            // The wheel over a closed pop-up scrolls the page instead of changing the choice.
+            if msg.message == WM_MOUSEWHEEL
+                && is_class(msg.hwnd, "ComboBox")
+                && SendMessageW(msg.hwnd, CB_GETDROPPEDSTATE, 0, 0) == 0
+            {
+                msg.hwnd = pane;
+            }
+            // A multi-line field wants every key, Tab too: move on from it as from any other
+            // (Ctrl+Tab still types a tab).
+            if msg.message == WM_KEYDOWN
+                && msg.wParam == VK_TAB as WPARAM
+                && GetKeyState(VK_CONTROL as i32) >= 0
+                && is_class(msg.hwnd, "Edit")
+                && GetWindowLongW(msg.hwnd, GWL_STYLE) as u32 & ES_MULTILINE as u32 != 0
+            {
+                let back = GetKeyState(VK_SHIFT as i32) < 0;
+                let next = GetNextDlgTabItem(window, msg.hwnd, back as i32);
+                if !next.is_null() {
+                    SetFocus(next);
+                    if is_class(next, "Edit") {
+                        SendMessageW(next, EM_SETSEL, 0, -1);
+                    }
+                }
+                continue;
+            }
             // Tab between controls, Enter as IDOK.
             if IsDialogMessageW(window, &msg) != 0 {
                 continue;
@@ -321,26 +362,35 @@ fn set_fonts(dpi: u32) {
     }
 }
 
-/// Sizes the window for the current page (up to most of the screen; another page resizes
-/// it, like the macOS window), the list and the pane in it. `center`: also centers it on
-/// its monitor.
-fn place(window: HWND, center: bool) {
-    let Some((dpi, list, pane, page_height)) = with(|s| {
+/// Where [`place`] puts the window.
+#[derive(Clone, Copy)]
+enum Place {
+    /// Centered on its monitor.
+    Center,
+    /// Where it is, moved up if it would run off the bottom of the screen.
+    Fit,
+    /// Where it is (the user is dragging it).
+    Keep,
+}
+
+/// Sizes the window for the current page (up to most of the screen, at least the page
+/// list; another page resizes it, like the macOS window), the list and the pane in it.
+fn place(window: HWND, at: Place) {
+    // Minimized: its rectangle is parked off-screen. Done once it's restored.
+    if unsafe { IsIconic(window) } != 0 {
+        with(|s| s.place_owed = true);
+        return;
+    }
+    let Some((dpi, list, pane, page_height, pages, scroll)) = with(|s| {
         let height = s.pages.get(s.current).map_or(0, |p| layout(p, s.dpi).1);
-        (s.dpi, s.list, s.pane, height)
+        (s.dpi, s.list, s.pane, height, s.pages.len(), s.scroll)
     }) else {
         return;
     };
     unsafe {
         let mut rect: RECT = zeroed();
         GetWindowRect(window, &mut rect);
-        let monitor = MonitorFromPoint(
-            windows_sys::Win32::Foundation::POINT {
-                x: rect.left,
-                y: rect.top,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        );
+        let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(monitor, &mut info);
@@ -351,7 +401,11 @@ fn place(window: HWND, center: bool) {
             dpi,
         );
         let width = dip(LIST_WIDTH, dpi) + pane_width;
-        let height = page_height.min((work.bottom - work.top) * 85 / 100);
+        let gutter = dip(8, dpi);
+        let list_height = pages as i32 * dip(LIST_ITEM_HEIGHT, dpi) + 2 * gutter;
+        let height = page_height
+            .max(list_height)
+            .min((work.bottom - work.top) * 85 / 100);
         let mut frame = RECT {
             left: 0,
             top: 0,
@@ -362,13 +416,13 @@ fn place(window: HWND, center: bool) {
         let ex_style = GetWindowLongW(window, GWL_EXSTYLE) as u32;
         AdjustWindowRectExForDpi(&mut frame, style, 0, ex_style, dpi);
         let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
-        let (x, y) = if center {
-            (
+        let (x, y) = match at {
+            Place::Center => (
                 work.left + (work.right - work.left - w) / 2,
                 work.top + (work.bottom - work.top - h) / 2,
-            )
-        } else {
-            (rect.left, rect.top)
+            ),
+            Place::Fit => (rect.left, rect.top.min(work.bottom - h).max(work.top)),
+            Place::Keep => (rect.left, rect.top),
         };
         SetWindowPos(
             window,
@@ -379,7 +433,6 @@ fn place(window: HWND, center: bool) {
             h,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        let gutter = dip(8, dpi);
         MoveWindow(
             list,
             gutter,
@@ -390,6 +443,8 @@ fn place(window: HWND, center: bool) {
         );
         MoveWindow(pane, dip(LIST_WIDTH, dpi), 0, pane_width, height, 1);
     }
+    // A taller pane may no longer scroll that far.
+    scroll_to(scroll);
     update_scrollbar();
 }
 
@@ -582,21 +637,27 @@ fn measure(text: &str, width: i32, single: bool) -> i32 {
 }
 
 /// Shows the current page afresh from the model, keeping the focused control focused. Unless
-/// `force`d (another page, another DPI), only if the pages changed.
-fn rebuild(force: bool) {
+/// `force`d (another page, another DPI), only if the pages changed. Whether it did.
+fn rebuild(force: bool) -> bool {
     let focused = unsafe { GetFocus() };
     let Some(Some((pane, focus_id, page, dpi, scroll, titles, current, list))) = with(|s| {
-        let focus_id = s
+        // `Some(None)`: on the page, but another page shows now.
+        let mut focus_id = s
             .controls
             .contains(&focused)
-            .then(|| unsafe { GetDlgCtrlID(focused) });
+            .then(|| Some(unsafe { GetDlgCtrlID(focused) }));
         s.stale = false;
         let pages = s.model.pages();
         if !force && pages == s.pages {
             return None;
         }
         s.pages = pages;
-        s.current = s.current.min(s.pages.len().saturating_sub(1));
+        let current = s.pages.iter().position(|p| p.title == s.page).unwrap_or(0);
+        if current != s.current {
+            s.current = current;
+            s.scroll = 0;
+            focus_id = focus_id.map(|_| None);
+        }
         let titles: Vec<String> = s.pages.iter().map(|p| p.title.clone()).collect();
         Some((
             s.pane,
@@ -609,12 +670,13 @@ fn rebuild(force: bool) {
             s.list,
         ))
     }) else {
-        return;
+        return false;
     };
-    let Some(page) = page else { return };
+    let Some(page) = page else { return false };
     unsafe {
         SendMessageW(list, WM_SETFONT, Font::Normal.handle() as WPARAM, 0);
-        SendMessageW(list, LB_SETITEMHEIGHT, 0, dip(28, dpi) as LPARAM);
+        let item_height = dip(LIST_ITEM_HEIGHT, dpi);
+        SendMessageW(list, LB_SETITEMHEIGHT, 0, item_height as LPARAM);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
         for t in &titles {
             SendMessageW(list, LB_ADDSTRING, 0, wide(t).as_ptr() as LPARAM);
@@ -651,13 +713,13 @@ fn rebuild(force: bool) {
         SendMessageW(pane, WM_SETREDRAW, 1, 0);
         InvalidateRect(pane, null(), 1);
         if let Some(id) = focus_id {
-            let c = GetDlgItem(pane, id);
-            if !c.is_null() {
-                SetFocus(c);
-            }
+            // Gone: the page list, rather than nothing.
+            let c = id.map_or(null_mut(), |id| GetDlgItem(pane, id));
+            SetFocus(if c.is_null() { list } else { c });
         }
     }
     update_scrollbar();
+    true
 }
 
 /// One control of the page, as a child of `pane`.
@@ -845,6 +907,20 @@ fn scroll_to(pos: i32) {
     update_scrollbar();
 }
 
+/// Shows page `index` (the user chose it), from its top.
+fn show(index: usize) {
+    let Some(Some(window)) = with(|s| {
+        s.page = s.pages.get(index)?.title.clone();
+        s.current = index;
+        s.scroll = 0;
+        Some(s.window)
+    }) else {
+        return;
+    };
+    rebuild(true);
+    place(window, Place::Fit);
+}
+
 /// Rebuilds once queued input has been handled (see the module docs).
 fn schedule_rebuild() {
     if let Some(window) = with(|s| s.window) {
@@ -900,18 +976,49 @@ fn commit_text(id: usize, hwnd: HWND) {
     }
 }
 
-/// The focused control is being edited or has its list open: a rebuild would undo that.
-fn busy() -> bool {
-    unsafe {
-        let focused = GetFocus();
-        is_edit(focused) || SendMessageW(focused, CB_GETDROPPEDSTATE, 0, 0) != 0
+/// A pop-up's choice not yet reported (arrowed to while it's closed): its row and option.
+fn unsent_choice(hwnd: HWND) -> Option<(usize, usize)> {
+    let row = usize::try_from(unsafe { GetDlgCtrlID(hwnd) } - FIRST_ID).ok()?;
+    let selected = with(|s| {
+        let page = s.pages.get(s.current)?;
+        let row = page
+            .sections
+            .iter()
+            .flat_map(|sec| &sec.rows)
+            .find(|r| r.id == row)?;
+        match row.control {
+            Control::Choice { selected, .. } => Some(selected),
+            _ => None,
+        }
+    })??;
+    let index = usize::try_from(unsafe { SendMessageW(hwnd, CB_GETCURSEL, 0, 0) }).ok()?;
+    (index != selected).then_some((row, index))
+}
+
+/// Reports a pop-up's choice if it changed.
+fn commit_choice(hwnd: HWND) {
+    if let Some((row, index)) = unsent_choice(hwnd) {
+        send(Event::Choose(row, index));
+    } else if with(|s| s.stale).unwrap_or(false) {
+        schedule_rebuild();
     }
 }
 
-fn is_edit(hwnd: HWND) -> bool {
+/// The focused control is being edited or has its list open (or a choice not yet made): a
+/// rebuild would undo that.
+fn busy() -> bool {
+    unsafe {
+        let focused = GetFocus();
+        is_class(focused, "Edit")
+            || SendMessageW(focused, CB_GETDROPPEDSTATE, 0, 0) != 0
+            || unsent_choice(focused).is_some()
+    }
+}
+
+fn is_class(hwnd: HWND, name: &str) -> bool {
     let mut class = [0u16; 16];
     let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
-    String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case("edit")
+    String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case(name)
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -924,22 +1031,40 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     let list = lp as HWND;
                     let index = SendMessageW(list, LB_GETCURSEL, 0, 0);
                     if index >= 0 {
-                        with(|s| {
-                            s.current = index as usize;
-                            s.scroll = 0;
-                        });
-                        rebuild(true);
-                        place(hwnd, false);
+                        show(index as usize);
                     }
                 } else if id == IDOK {
-                    // Enter in a one-line field: report it now.
+                    // Enter in a one-line field, or on a pop-up: report it now.
                     let focused = GetFocus();
-                    if is_edit(focused) {
+                    if is_class(focused, "Edit") {
                         let row = GetDlgCtrlID(focused) - FIRST_ID;
                         if row >= 0 {
                             commit_text(row as usize, focused);
                         }
+                    } else if is_class(focused, "ComboBox") {
+                        commit_choice(focused);
                     }
+                }
+                0
+            }
+            WM_ACTIVATE => {
+                // Like a dialog: the focus goes back to the control that had it (at first, the
+                // page list), not to the window.
+                if wp & 0xFFFF == WA_INACTIVE as usize {
+                    let focused = GetFocus();
+                    if IsChild(hwnd, focused) != 0 {
+                        with(|s| s.last_focus = GetDlgCtrlID(focused));
+                    }
+                } else if IsIconic(hwnd) == 0 {
+                    let Some((list, pane, id)) = with(|s| (s.list, s.pane, s.last_focus)) else {
+                        return DefWindowProcW(hwnd, msg, wp, lp);
+                    };
+                    let c = if id >= FIRST_ID {
+                        GetDlgItem(pane, id)
+                    } else {
+                        null_mut()
+                    };
+                    SetFocus(if c.is_null() { list } else { c });
                 }
                 0
             }
@@ -951,7 +1076,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if GetKeyState(VK_LBUTTON as i32) < 0 || dropped {
                     SetTimer(hwnd, REBUILD_TIMER, 50, None);
                 } else {
-                    rebuild(false);
+                    // Re-placed if rows were shown or hidden (e.g. the advanced settings) or
+                    // another page shows, not when only figures changed: a window the user put
+                    // somewhere stays there.
+                    let size = || with(|s| (s.current, s.pages.len(), s.content_height));
+                    let before = size();
+                    if rebuild(false) && size() != before {
+                        place(hwnd, Place::Fit);
+                    }
+                }
+                0
+            }
+            WM_SIZE => {
+                if wp == SIZE_RESTORED as WPARAM
+                    && with(|s| std::mem::take(&mut s.place_owed)).unwrap_or(false)
+                {
+                    place(hwnd, Place::Fit);
                 }
                 0
             }
@@ -981,7 +1121,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 rebuild(true);
-                place(hwnd, false);
+                // Being dragged: where the user puts it, fitted once let go.
+                let dragged = with(|s| {
+                    let dragged = s.moving.is_some();
+                    if dragged {
+                        s.moving = Some(true);
+                    }
+                    dragged
+                })
+                .unwrap_or(false);
+                place(hwnd, if dragged { Place::Keep } else { Place::Fit });
+                0
+            }
+            WM_ENTERSIZEMOVE => {
+                with(|s| s.moving = Some(false));
+                0
+            }
+            WM_EXITSIZEMOVE => {
+                if with(|s| s.moving.take()).flatten() == Some(true) {
+                    place(hwnd, Place::Fit);
+                }
                 0
             }
             WM_COPYDATA => {
@@ -995,14 +1154,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 ));
                 // Moving the focus off an edit field reports its last change.
                 SetFocus(hwnd);
-                let index = with(|s| crate::page_index(&s.pages, Some(&title))).flatten();
-                if let Some(index) = index {
-                    with(|s| {
-                        s.current = index;
-                        s.scroll = 0;
-                    });
-                    rebuild(true);
-                    place(hwnd, false);
+                // The page shown already (e.g. the error page for "Settings" while the file
+                // is broken): the one the user chose is kept for when it's back.
+                let index =
+                    with(|s| crate::page_index(&s.pages, Some(&title)).filter(|&i| i != s.current));
+                if let Some(index) = index.flatten() {
+                    show(index);
+                }
+                if let Some(list) = with(|s| s.list) {
+                    SetFocus(list);
                 }
                 1
             }
@@ -1052,14 +1212,12 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     }
                     (Some(Control::Button(_)), BN_CLICKED) => send(Event::Click(row)),
                     // Once the choice is made (the list closes on it, or the focus moves on
-                    // after arrowing through it), not on every step through the list.
-                    (Some(Control::Choice { selected, .. }), CBN_SELENDOK | CBN_KILLFOCUS) => {
-                        let index = SendMessageW(control, CB_GETCURSEL, 0, 0);
-                        if index >= 0 && index as usize != selected {
-                            send(Event::Choose(row, index as usize));
-                        } else if with(|s| s.stale).unwrap_or(false) {
-                            schedule_rebuild();
-                        }
+                    // after arrowing through it), not on every step through the list: a closed
+                    // one reports `CBN_SELENDOK` for each arrow key too.
+                    (Some(Control::Choice { .. }), CBN_SELENDOK)
+                        if SendMessageW(control, CB_GETDROPPEDSTATE, 0, 0) == 0 => {}
+                    (Some(Control::Choice { .. }), CBN_SELENDOK | CBN_KILLFOCUS) => {
+                        commit_choice(control);
                     }
                     (Some(Control::Text { .. } | Control::LongText { .. }), EN_KILLFOCUS) => {
                         commit_text(row, control);

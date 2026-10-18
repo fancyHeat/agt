@@ -678,6 +678,14 @@ fn dashboard_summarizes_the_window() {
         [now - 500],
     )
     .unwrap();
+    for ago in 1..=20 {
+        conn.execute(
+            "INSERT INTO metric_rollups (day, metric, count, p50, p90, p99)
+            VALUES (date(?1 / 1000, 'unixepoch', 'localtime'), 'latency_ms', 1, 1, 1, 1)",
+            [now - ago * DAY_MS],
+        )
+        .unwrap();
+    }
 
     let d = crate::dashboard::load(&conn, now, Some(1)).unwrap();
     assert_eq!((d.dictations, d.pasted, d.sessions), (2, 1, 1));
@@ -693,7 +701,16 @@ fn dashboard_summarizes_the_window() {
     assert_eq!(d.problems.len(), 1);
     assert_eq!(d.problems[0].2, "careful");
     assert!(d.latest_session.is_some());
+    // Only the days the window touches.
+    assert_eq!(d.daily_latency.len(), 1);
 
+    // Every day of a longer window; the latest few of everything.
+    let month = crate::dashboard::load(&conn, now, Some(30)).unwrap();
+    assert_eq!(month.daily_latency.len(), 20);
     let all = crate::dashboard::load(&conn, now, None).unwrap();
     assert_eq!((all.dictations, all.pasted), (3, 2));
+    assert_eq!(
+        all.daily_latency.len(),
+        crate::dashboard::HISTORY_DAYS as usize
+    );
 }

@@ -322,7 +322,7 @@ fn dashboard_sections(page: &mut Page, d: &Dashboard) {
     }
 
     if !d.daily_latency.is_empty() {
-        page.section("Latency by day (kept forever)");
+        page.section("Latency by day");
         let rows = d
             .daily_latency
             .iter()
