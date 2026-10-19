@@ -26,7 +26,8 @@ pub type Error = Box<dyn std::error::Error>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
     pub title: String,
-    /// SF Symbol shown in the macOS toolbar (ignored elsewhere).
+    /// SF Symbol shown in the macOS toolbar; Windows shows a look-alike icon in its page
+    /// list (none for a symbol it doesn't know).
     pub symbol: &'static str,
     pub sections: Vec<Section>,
 }
@@ -52,7 +53,7 @@ pub struct Row {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Control {
-    /// A checkbox with its own text.
+    /// An on/off setting with its own text: a checkbox on macOS, a switch on Windows.
     Toggle { text: String, on: bool },
     /// A pop-up list; `selected` indexes `options`.
     Choice {
@@ -131,10 +132,19 @@ pub(crate) fn note(pages: &mut [Page], event: &Event) {
 }
 
 /// Shows the window, on the page titled `page` (else the first, see [`activate`]), and runs until it's
-/// closed. Must be called on the main thread, once.
-pub fn run(title: &str, model: Box<dyn Model>, page: Option<&str>) -> Result<(), Error> {
-    platform::run(title, model, page)
+/// closed. Must be called on the main thread, once. `icon`: the window's, on Windows (macOS
+/// shows none).
+pub fn run(
+    title: &str,
+    model: Box<dyn Model>,
+    page: Option<&str>,
+    icon: Option<Icon>,
+) -> Result<(), Error> {
+    platform::run(title, model, page, icon)
 }
+
+/// Draws the app's icon `n` pixels square: `n * n` RGBA pixels, row by row.
+pub type Icon = fn(n: u32) -> Vec<u8>;
 
 /// Brings the window of another process running [`run`] (`pid`) to the front, showing the
 /// page titled `page` if given (a title no page has: the first page). False if it couldn't

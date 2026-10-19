@@ -94,7 +94,8 @@ pub fn run() {
         metrics: metrics::Metrics::new(paths::db_file()),
         advanced: false,
     };
-    if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page)) {
+    let icon = crate::tray::color_icon;
+    if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page), Some(icon)) {
         eprintln!("agt settings: {e}");
     }
 }

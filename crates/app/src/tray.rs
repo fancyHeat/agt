@@ -227,29 +227,46 @@ enum Style {
     Color,
 }
 
-/// A 32x32 glyph drawn in code, so there are no image assets to ship.
+/// The tray's icon, 32x32.
 fn icon(style: Style) -> Result<Icon, tray_icon::BadIcon> {
-    const N: usize = 32;
+    Icon::from_rgba(rgba(style, 32), 32, 32)
+}
+
+/// The app's icon, `n` pixels square, RGBA: the tray's (but on macOS) and the settings
+/// window's.
+pub fn color_icon(n: u32) -> Vec<u8> {
+    rgba(Style::Color, n as usize)
+}
+
+/// A glyph drawn in code, so there are no image assets to ship: `n` pixels square (drawn
+/// for 32, scaled), RGBA.
+fn rgba(style: Style, n: usize) -> Vec<u8> {
     const BLUE: [f32; 3] = [37.0, 99.0, 235.0];
-    let c = (N as f32 - 1.0) / 2.0;
-    let mut rgba = Vec::with_capacity(N * N * 4);
-    for y in 0..N {
-        for x in 0..N {
+    let s = n as f32 / 32.0;
+    let c = (n as f32 - 1.0) / 2.0;
+    let mut rgba = Vec::with_capacity(n * n * 4);
+    for y in 0..n {
+        for x in 0..n {
             let d = (x as f32 - c).hypot(y as f32 - c);
             // Antialiased coverage of the band inner..outer.
             let band = |inner: f32, outer: f32| {
                 (d - inner + 0.5).clamp(0.0, 1.0) * (outer - d + 0.5).clamp(0.0, 1.0)
             };
-            let dot = band(-1.0, 6.0);
+            let dot = band(-1.0, 6.0 * s);
             let px = match style {
-                Style::Template => [0.0, 0.0, 0.0, dot.max(band(11.0, 15.0))],
+                Style::Template => [0.0, 0.0, 0.0, dot.max(band(11.0 * s, 15.0 * s))],
                 Style::Color => {
                     let mix = |b: f32| b + (255.0 - b) * dot;
-                    [mix(BLUE[0]), mix(BLUE[1]), mix(BLUE[2]), band(-1.0, 15.0)]
+                    [
+                        mix(BLUE[0]),
+                        mix(BLUE[1]),
+                        mix(BLUE[2]),
+                        band(-1.0, 15.0 * s),
+                    ]
                 }
             };
             rgba.extend_from_slice(&[px[0] as u8, px[1] as u8, px[2] as u8, (px[3] * 255.0) as u8]);
         }
     }
-    Icon::from_rgba(rgba, N as u32, N as u32)
+    rgba
 }

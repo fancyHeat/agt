@@ -850,7 +850,12 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     bar
 }
 
-pub fn run(title: &str, mut model: Box<dyn Model>, page: Option<&str>) -> Result<(), Error> {
+pub fn run(
+    title: &str,
+    mut model: Box<dyn Model>,
+    page: Option<&str>,
+    _icon: Option<crate::Icon>,
+) -> Result<(), Error> {
     let mtm = MainThreadMarker::new().ok_or("the settings window must run on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
