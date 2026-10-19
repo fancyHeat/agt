@@ -6,6 +6,8 @@
 //!   permissions (see [`missing_permissions`]).
 //! - Ducking other audio while dictating ([`Ducker`]): the default output device's volume
 //!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL).
+//! - Starting AGT at login ([`set_launch_at_login`]; Windows: the `Run` key; macOS:
+//!   `SMAppService`).
 //! - Anything else returns [`Error`]s saying it's unsupported.
 
 use std::{
@@ -317,6 +319,27 @@ pub fn request_permissions(missing: &[Permission]) {
 /// Opens the system settings page where `permission` is granted.
 pub fn open_permission_settings(permission: Permission) {
     imp::open_permission_settings(permission)
+}
+
+/// What [`set_launch_at_login`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginItem {
+    /// It already was as asked.
+    Unchanged,
+    Registered,
+    Unregistered,
+    /// macOS: registered, but turned off in System Settings > General > Login Items (or not
+    /// approved there yet). Left as the user set it.
+    NeedsApproval,
+}
+
+/// Makes the OS start AGT when the user logs in, or not, writing only if that changes.
+/// Windows: the `AGT` value of HKCU's `Run` key, starting `program`; a program the user turned
+/// off in Task Manager's Startup apps stays off (that's kept elsewhere, which this leaves
+/// alone). macOS: the app bundle AGT runs from, as a login item (`SMAppService`); `program`
+/// is unused.
+pub fn set_launch_at_login(on: bool, program: &std::path::Path) -> Result<LoginItem, Error> {
+    imp::set_launch_at_login(on, program)
 }
 
 /// Keeps the global hotkey alive; dropping it removes the hook.
