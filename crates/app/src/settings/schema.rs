@@ -129,7 +129,14 @@ fn section(title: &'static str, items: Vec<Item>) -> Section {
 /// Always the same pages (they're the macOS toolbar's items), sections without an item to
 /// show left out.
 pub fn pages(c: &Config, advanced: bool) -> Vec<Page> {
-    let mut pages = vec![general(c), speech(c), polish(c), history(c), updates(c)];
+    let mut pages = vec![
+        general(c),
+        speech(c),
+        polish(c),
+        snippets(c),
+        history(c),
+        updates(c),
+    ];
     for page in &mut pages {
         for section in &mut page.sections {
             section.items.retain(|i| advanced || !i.advanced);
@@ -618,6 +625,29 @@ fn polish(c: &Config) -> Page {
         title: "Polish",
         symbol: "wand.and.stars",
         sections,
+    }
+}
+
+fn snippets(c: &Config) -> Page {
+    let list = Item::text(
+        "Snippets",
+        Text {
+            path: &["snippets", "list"],
+            value: c.snippets.list.clone(),
+            placeholder: String::new(),
+            secret: false,
+            multiline: true,
+        },
+    )
+    .note(
+        "Say a phrase and AGT types something else in its place. One per line, what you say = \
+         what AGT types, e.g. Reddit True Tide = retatrutide. Capitals and the spaces between \
+         words don't matter; \\n starts a new line.",
+    );
+    Page {
+        title: "Snippets",
+        symbol: "character.book.closed",
+        sections: vec![section("", vec![list])],
     }
 }
 

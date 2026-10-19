@@ -4,6 +4,7 @@
 pub mod config;
 pub mod paths;
 pub mod polish;
+pub mod snippets;
 pub mod stt;
 
 pub use config::Config;

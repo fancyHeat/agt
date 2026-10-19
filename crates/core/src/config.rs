@@ -171,6 +171,15 @@ device = "auto"
 # differently where two choices were nearly tied. Only the S1-mini that AGT runs uses it.
 fast_drafting = false
 
+[snippets]
+# Say a phrase and AGT types something else in its place: a word the speech model mishears,
+# a name, an email address. One per line, what you say = what AGT types, e.g.
+#   Reddit True Tide = retatrutide
+# Capitals don't matter in what you say, nor what's between its words (a space, a hyphen, a
+# comma or nothing), but it must be whole words. What AGT types starts with a capital where
+# the transcript starts a sentence with one; \n in it starts a new line. Applied after polish.
+list = ""
+
 [overlay]
 # Show a small bar with a live waveform while recording and an animation while transcribing.
 # It never takes focus or catches clicks.
@@ -254,6 +263,7 @@ pub struct Config {
     pub stt: SttConfig,
     pub paste: PasteConfig,
     pub polish: PolishConfig,
+    pub snippets: SnippetsConfig,
     pub overlay: OverlayConfig,
     pub history: HistoryConfig,
     pub update: UpdateConfig,
@@ -599,6 +609,14 @@ impl Default for OverlayConfig {
     }
 }
 
+/// `[snippets]`: phrases typed as something else (see [`crate::snippets`]).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnippetsConfig {
+    /// One per line, `phrase = text`, as written.
+    pub list: String,
+}
+
 /// `[history]`: optional copies of dictations on this machine (see `agt-history`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -644,6 +662,7 @@ impl Default for Config {
             stt: SttConfig::default(),
             paste: PasteConfig::default(),
             polish: PolishConfig::default(),
+            snippets: SnippetsConfig::default(),
             overlay: OverlayConfig::default(),
             history: HistoryConfig::default(),
             update: UpdateConfig::default(),
@@ -1388,6 +1407,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "stt = { threads = 3 }\npolish.enabled = true\n");
+    }
+
+    #[test]
+    fn snippets_are_written_as_typed() {
+        // From the settings window's box: several lines, `\n` written out, a quote.
+        let list = "Reddit True Tide = retatrutide\r\nsig = Thanks,\\nGrant\nquote = \"hi\"\n";
+        let out = with_settings(DEFAULT_CONFIG, &[(&["snippets", "list"], list.into())]).unwrap();
+        assert_eq!(Config::parse(&out).unwrap().snippets.list, list);
+        assert!(out.contains("# Say a phrase and AGT types"), "{out}");
     }
 
     #[test]

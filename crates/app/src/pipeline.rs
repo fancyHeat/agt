@@ -20,10 +20,11 @@
 //!   while it's still being recorded, and their texts joined at release; a dropped
 //!   (cancelled) recording's are skipped, or discarded if already being transcribed.
 //! - `polish`: with `polish.enabled`, cleans each transcript up with an LLM (`agt-polish`),
-//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted. Then hands
-//!   it to `paste`. A long dictation transcribed while recording is also polished while
-//!   recording, in pieces that end at a sentence end (`agt_polish::ahead`, local servers
-//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]).
+//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted. A long
+//!   dictation transcribed while recording is also polished while recording, in pieces that
+//!   end at a sentence end (`agt_polish::ahead`, local servers only), so at release only the
+//!   rest is left to polish (see [`Partial::feed_ahead`]). Then replaces the `[snippets]`
+//!   phrases in the text (`agt_core::snippets`) and hands it to `paste`.
 //! - `permissions` (macOS, only while something is missing): asks for the Microphone and
 //!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
 //!   both are granted, so no restart is needed.
@@ -51,6 +52,7 @@ use agt_core::{
     config::{PolishConfig, PolishProvider},
     paths,
     polish::Polisher,
+    snippets::Snippets,
     stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
 use agt_history::{self as history, History};
@@ -1640,6 +1642,10 @@ fn polish_thread(
         min_words: 1,
         ..config.polish.clone()
     };
+    let snippets = Snippets::parse(&config.snippets.list);
+    if !snippets.is_empty() {
+        tracing::info!("snippets: {}", snippets.len());
+    }
     // The recording in progress, or the last one, if it's polished in pieces.
     let mut pieces: Option<Pieces> = None;
     for msg in jobs {
@@ -1726,6 +1732,12 @@ fn polish_thread(
             t.polish_outcome = d.polish_outcome;
             t.polished =
                 matches!(d.polish_outcome, Some("polished" | "partial")).then(|| text.clone());
+        }
+        // After polish, so a snippet is typed exactly as written.
+        let (with_snippets, replaced) = snippets.apply(&text);
+        if replaced > 0 {
+            tracing::debug!("snippets: {replaced} replaced");
+            text = with_snippets;
         }
         if config.paste.trailing_space && !text.is_empty() {
             text.push(' ');
@@ -2380,6 +2392,11 @@ mod tests {
 
     /// Runs the polish thread over `msgs`; returns what it hands to `paste`.
     fn polish_all(msgs: Vec<ToPolish>) -> Vec<(String, Box<Dictation>)> {
+        polish_with_snippets(msgs, "")
+    }
+
+    /// [`polish_all`] with `snippets` as `[snippets] list`.
+    fn polish_with_snippets(msgs: Vec<ToPolish>, snippets: &str) -> Vec<(String, Box<Dictation>)> {
         let (tx, rx) = mpsc::channel();
         let (to_paste, pasted) = mpsc::channel();
         for m in msgs {
@@ -2390,6 +2407,7 @@ mod tests {
         config.paste.trailing_space = false;
         config.polish.timeout_ms = TEST_TIMEOUT.as_millis() as u64;
         config.polish.timeout_per_word_ms = 0;
+        config.snippets.list = snippets.into();
         polish_thread(config, rx, to_paste, Some(Arc::new(Marks)));
         pasted
             .try_iter()
@@ -2430,6 +2448,27 @@ mod tests {
 
     fn piece(text: &str, shared: &Arc<Shared>) -> ToPolish {
         ToPolish::Piece(text.into(), shared.clone())
+    }
+
+    #[test]
+    fn snippets_are_typed_after_polish() {
+        let list = "Reddit True Tide = retatrutide\nsig = Thanks,\\nGrant";
+        let out = polish_with_snippets(
+            vec![
+                whole("I take Reddit true-tide weekly", None),
+                whole("FAIL so here is sig", None),
+            ],
+            list,
+        );
+        let texts: Vec<_> = out.iter().map(|(t, _)| t.as_str()).collect();
+        // Polished ("ok."), then replaced; a failed polish pastes the raw text, replaced too.
+        assert_eq!(
+            texts,
+            [
+                "I take retatrutide weekly ok.",
+                "FAIL so here is Thanks,\nGrant"
+            ]
+        );
     }
 
     #[test]

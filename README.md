@@ -100,8 +100,8 @@ clicks. The settings window's **Updates** page turns the background checks on or
 ## Settings
 
 Tray menu → **Settings...** opens the settings window, in pages (General, Speech, Polish,
-History, Updates). Each page shows the settings most people need; **Show advanced settings**
-at the bottom adds the rest (timeouts, devices, prompts, log level and so on).
+Snippets, History, Updates). Each page shows the settings most people need; **Show advanced
+settings** at the bottom adds the rest (timeouts, devices, prompts, log level and so on).
 
 Settings live in a plain text file, `config.toml`, with a comment on every option:
 
@@ -113,6 +113,22 @@ a few seconds after the last change, once dictation is idle; tray menu → **Res
 apply settings** does it right away. You can change the hotkey, turn the
 overlay off, or turn off AI clean-up of your text (removes "um"s, fixes punctuation; on by
 default, and it runs locally unless you point it at a cloud service).
+
+## Snippets
+
+**Settings... → Snippets** lists phrases AGT types as something else: a word the speech model
+keeps mishearing, a name, an email address. One per line, what you say, `=`, what AGT types:
+
+```text
+Reddit True Tide = retatrutide
+my email = me@example.com
+```
+
+Capitals don't matter in what you say, nor what's between its words (a space, a hyphen, a
+comma or nothing: "true-tide" and "truetide" both match "true tide"), but only whole words
+match. The snippet is typed as written, after AI clean-up, except that it starts with a
+capital where the sentence does. `\n` in a snippet starts a new line. In `config.toml` it's
+the `[snippets]` section.
 
 ## Dictation history
 
