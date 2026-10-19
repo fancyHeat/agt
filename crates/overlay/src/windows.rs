@@ -118,28 +118,10 @@ impl Window {
         if self.bitmap_size == (w, h) && !self.bitmap.is_null() {
             return true;
         }
+        let Some((bitmap, bits)) = dib_section(self.dc, w, h) else {
+            return false;
+        };
         unsafe {
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    biHeight: -(h as i32), // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    ..zeroed()
-                },
-                ..zeroed()
-            };
-            let mut bits = null_mut();
-            let bitmap = CreateDIBSection(self.dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if bitmap.is_null() || bits.is_null() {
-                tracing::warn!(
-                    "overlay: CreateDIBSection failed (error {})",
-                    GetLastError()
-                );
-                return false;
-            }
             let prev = SelectObject(self.dc, bitmap);
             if self.bitmap.is_null() {
                 self.old_bitmap = prev;
@@ -147,7 +129,7 @@ impl Window {
                 DeleteObject(self.bitmap);
             }
             self.bitmap = bitmap;
-            self.bits = bits.cast();
+            self.bits = bits;
             self.bitmap_size = (w, h);
         }
         true
@@ -355,28 +337,13 @@ fn rasterize(text: &str, px: f32) -> Option<(usize, usize, Vec<u8>)> {
         let mut size = SIZE { cx: 0, cy: 0 };
         GetTextExtentPoint32W(dc, text.as_ptr(), len, &mut size);
         let (w, h) = (size.cx.max(0) as usize, size.cy.max(0) as usize);
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w as i32,
-                biHeight: -(h as i32), // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                ..zeroed()
-            },
-            ..zeroed()
-        };
-        let mut bits: *mut c_void = null_mut();
-        let bitmap = if w > 0 && h > 0 {
-            CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0)
-        } else {
-            null_mut()
-        };
         let mut coverage = None;
-        if !bitmap.is_null() && !bits.is_null() {
+        if w > 0
+            && h > 0
+            && let Some((bitmap, bits)) = dib_section(dc, w, h)
+        {
             let old_bitmap = SelectObject(dc, bitmap);
-            let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), w * h);
+            let pixels = std::slice::from_raw_parts_mut(bits, w * h);
             pixels.fill(0);
             SetTextColor(dc, 0x00FF_FFFF);
             SetBkMode(dc, TRANSPARENT as i32);
@@ -394,8 +361,39 @@ fn rasterize(text: &str, px: f32) -> Option<(usize, usize, Vec<u8>)> {
         }
         DeleteDC(dc);
         if coverage.is_none() {
-            tracing::warn!("notice: cannot draw its text (error {})", GetLastError());
+            tracing::warn!("notice: cannot draw its text");
         }
         coverage.map(|c| (w, h, c))
+    }
+}
+
+/// A `w`×`h` top-down 32-bit DIB section for `dc` and its pixels.
+fn dib_section(dc: HDC, w: usize, h: usize) -> Option<(HBITMAP, *mut u32)> {
+    unsafe {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32), // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..zeroed()
+            },
+            ..zeroed()
+        };
+        let mut bits: *mut c_void = null_mut();
+        let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if bitmap.is_null() || bits.is_null() {
+            tracing::warn!(
+                "overlay: CreateDIBSection failed (error {})",
+                GetLastError()
+            );
+            if !bitmap.is_null() {
+                DeleteObject(bitmap);
+            }
+            return None;
+        }
+        Some((bitmap, bits.cast()))
     }
 }

@@ -155,7 +155,14 @@ impl ApplicationHandler<Ev> for Demo {
             }
             if self.getting_ready {
                 overlay.show_getting_ready(0.0, Instant::now());
-                println!("showing: {:?}", overlay.mode());
+                println!(
+                    "{}",
+                    if overlay.notice_visible() {
+                        "\"Getting ready...\" shown"
+                    } else {
+                        "no notice: fell back to the error flash"
+                    }
+                );
             }
             self.overlay = Some(overlay);
             self.foreground = foreground().0;
