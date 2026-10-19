@@ -13,8 +13,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, GlobalFree, HANDLE, HWND,
-        LPARAM, LRESULT, WPARAM,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, GetLastError,
+        GlobalFree, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
     },
     System::{
         Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree},
@@ -708,7 +708,7 @@ fn set_run_value(key: &str, name: &str, command: Option<&OsStr>) -> Result<Login
     Err(std::io::Error::from_raw_os_error(code as i32).into())
 }
 
-/// A REG_SZ value under HKCU (`None` if it or its key doesn't exist).
+/// A REG_SZ value under HKCU (`None` if it or its key doesn't exist; "" if it isn't a REG_SZ).
 fn read_string(key: &[u16], name: &[u16]) -> Result<Option<OsString>, Error> {
     let get = |data: *mut c_void, size: &mut u32| unsafe {
         RegGetValueW(
@@ -734,6 +734,8 @@ fn read_string(key: &[u16], name: &[u16]) -> Result<Option<OsString>, Error> {
             Ok(Some(OsString::from_wide(&buf[..end])))
         }
         ERROR_FILE_NOT_FOUND => Ok(None),
+        // Not a REG_SZ (not as AGT writes it): replaced, or deleted.
+        ERROR_UNSUPPORTED_TYPE => Ok(Some(OsString::new())),
         code => Err(std::io::Error::from_raw_os_error(code as i32).into()),
     }
 }
@@ -1075,6 +1077,21 @@ mod tests {
         assert_eq!(set(None), LoginItem::Unregistered);
         assert_eq!(set(None), LoginItem::Unchanged);
         assert_eq!(read_string(&wide(&key), &wide("AGT")).unwrap(), None);
+        // A value of another type is replaced.
+        let n = 1u32;
+        let code = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                wide(&key).as_ptr(),
+                wide("AGT").as_ptr(),
+                windows_sys::Win32::System::Registry::REG_DWORD,
+                (&raw const n).cast(),
+                4,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS);
+        assert_eq!(set(Some(a)), LoginItem::Registered);
+        assert_eq!(set(None), LoginItem::Unregistered);
         assert_eq!(
             unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&key).as_ptr()) },
             ERROR_SUCCESS
