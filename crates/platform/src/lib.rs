@@ -9,12 +9,14 @@
 //! - Meeting notes: the system audio recording permission ([`system_audio_permission`]) and
 //!   which apps are using the microphone ([`mic_users`], [`meeting_app_name`]), to offer notes
 //!   when a call starts.
+//! - Starting AGT at login ([`set_launch_at_login`]; Windows: the `Run` key; macOS:
+//!   `SMAppService`).
 //! - Anything else returns [`Error`]s saying it's unsupported.
 
 use std::{
     fmt,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -388,6 +390,27 @@ pub fn meeting_app_name(bundle_id: &str) -> Option<&'static str> {
         .map(|&(_, name)| name)
 }
 
+/// What [`set_launch_at_login`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginItem {
+    /// It already was as asked.
+    Unchanged,
+    Registered,
+    Unregistered,
+    /// macOS: registered, but turned off in System Settings > General > Login Items (or not
+    /// approved there yet). Left as the user set it.
+    NeedsApproval,
+}
+
+/// Makes the OS start AGT when the user logs in, or not, writing only if that changes.
+/// Windows: the `AGT` value of HKCU's `Run` key, starting `program`; a program the user turned
+/// off in Task Manager's Startup apps stays off (that's kept elsewhere, which this leaves
+/// alone). macOS: the app bundle AGT runs from, as a login item (`SMAppService`); `program`
+/// is unused.
+pub fn set_launch_at_login(on: bool, program: &std::path::Path) -> Result<LoginItem, Error> {
+    imp::set_launch_at_login(on, program)
+}
+
 /// Keeps the global hotkey alive; dropping it removes the hook.
 pub struct HotkeyHandle(imp::HotkeyHandle);
 
@@ -422,10 +445,18 @@ pub fn start_hotkey(
     imp::start_hotkey(hotkey.clone(), Box::new(on_event)).map(HotkeyHandle)
 }
 
-/// Whether `key` is physically down right now, if that can be known: `None` for swallowed
-/// keys on Windows (their state never reaches the system) and on unsupported platforms.
+/// Whether `key` is physically down right now, if that can be known: `None` on unsupported
+/// platforms, and for a swallowed key on Windows unless it got past the hook (its state
+/// reaches the system only then).
 pub fn key_down(key: Key) -> Option<bool> {
     imp::key_down(key)
+}
+
+/// [`key_down`] for a press that got past the hook (`key_down` said it was down): on
+/// Windows, a swallowed key's "up" then counts too, since the hook lets that press's
+/// release through to the system.
+pub fn key_down_past_hook(key: Key) -> Option<bool> {
+    imp::key_down_past_hook(key)
 }
 
 /// Identifies the window that has keyboard focus (where a paste would go), if known. Only
@@ -480,6 +511,14 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
 /// window's Copy). Nothing is restored afterwards.
 pub fn copy_text(text: &str) -> Result<(), Error> {
     imp::copy_text(text)
+}
+
+/// Call between [`set_clipboard_text`] and [`send_paste`]. Windows: clipboard listeners
+/// (Logi Options+, WSLg, clipboard managers) open the clipboard right after every change, and
+/// an app whose paste finds it open pastes nothing, so this waits until they're likely done
+/// (a few ms). Returns how long it waited; `None` where nothing needs waiting for (macOS).
+pub fn wait_for_clipboard_listeners() -> Option<Duration> {
+    imp::wait_for_clipboard_listeners()
 }
 
 /// Sends Ctrl+V to the focused window (Windows: releasing held Shift/Alt/Win first, so e.g. a
@@ -915,7 +954,7 @@ mod tests {
     #[test]
     fn chord_starts_when_all_keys_are_down_in_any_order() {
         let t0 = Instant::now();
-        let t1 = t0 + std::time::Duration::from_millis(300);
+        let t1 = t0 + Duration::from_millis(300);
         for (first, second) in [(CTRL, WIN), (WIN, CTRL)] {
             let mut d = HoldDetector::new(2);
             assert_eq!(d.on_key(first, true, 0, t0), None);

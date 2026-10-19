@@ -49,6 +49,10 @@ pub const DEFAULT_CONFIG: &str = concat!(
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
 log_level = "info"
+# Start AGT when you log in (installed AGT only, not development builds). Applied on AGT's
+# first start and whenever you change it here. Turning AGT off or removing it in Task Manager's
+# Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks until then.
+launch_at_login = true
 
 [hotkey]
 # Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
@@ -236,7 +240,7 @@ claude_model = "sonnet"
 command_line = false
 
 [update]
-# Check GitHub Releases for updates on startup and periodically (tray "Update now" works
+# Check GitHub Releases for updates on startup and periodically (tray "Check for updates" works
 # either way).
 enabled = true
 # Minutes between update checks (minimum 30).
@@ -292,6 +296,7 @@ pub const MIN_CHECK_INTERVAL_MINUTES: u64 = 30;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub log_level: String,
+    pub launch_at_login: bool,
     pub hotkey: HotkeyConfig,
     pub audio: AudioConfig,
     pub stt: SttConfig,
@@ -742,6 +747,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             log_level: "info".into(),
+            launch_at_login: true,
             hotkey: HotkeyConfig::default(),
             audio: AudioConfig::default(),
             stt: SttConfig::default(),
@@ -1098,7 +1104,13 @@ mod tests {
         assert!(!c.update.enabled);
         assert_eq!(c.update.check_interval_minutes(), 240);
         assert_eq!(c.log_level, "info");
+        assert!(c.launch_at_login);
         assert_eq!(c.stt, SttConfig::default());
+        assert!(
+            !Config::parse("launch_at_login = false")
+                .unwrap()
+                .launch_at_login
+        );
     }
 
     #[test]
@@ -1517,10 +1529,11 @@ mod tests {
                 (&["polish", "enabled"], false.into()),
                 (&["polish", "s1-mini", "styling"], "casual".into()),
                 (&["paste", "restore_clipboard_ms"], 1000i64.into()),
+                (&["launch_at_login"], false.into()),
             ],
         )
         .unwrap();
-        // Only the four values changed: every comment line is still there.
+        // Only the five values changed: every comment line is still there.
         let comments = |t: &str| t.lines().filter(|l| l.starts_with('#')).count();
         assert_eq!(comments(&out), comments(DEFAULT_CONFIG));
         assert!(out.contains("\ndevice = \"cpu\"\n# CPU threads"), "{out}");
@@ -1535,6 +1548,7 @@ mod tests {
         expected.polish.enabled = false;
         expected.polish.s1_mini.styling = S1Styling::Casual;
         expected.paste.restore_clipboard_ms = 1000;
+        expected.launch_at_login = false;
         assert_eq!(c, expected);
     }
 

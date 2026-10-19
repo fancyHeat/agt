@@ -13,7 +13,7 @@
 //! it works, the microphone is checked each time a recording starts, and system audio applies
 //! to the next system audio capture (the next meeting).
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, MicUser, Permission};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, MicUser, Permission};
 use block2::RcBlock;
 use objc2::{
     msg_send,
@@ -33,10 +33,12 @@ use objc2_core_graphics::{
     CGPreflightListenEventAccess, CGPreflightPostEventAccess, CGWindowListCopyWindowInfo,
     CGWindowListOption, kCGNullWindowID, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSNumber, NSString};
+use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::{
     collections::HashSet,
     ffi::c_void,
+    path::Path,
     ptr::{NonNull, null_mut},
     sync::{
         Arc, LazyLock, Mutex,
@@ -334,6 +336,11 @@ unsafe extern "C-unwind" fn tap_callback(
 /// and V, neither of which can be a hotkey key, and nothing for the keys the user holds.
 pub fn paste_may_release(_key: Key) -> bool {
     false
+}
+
+/// Swallowing doesn't hide a key's state here: the same as [`key_down`].
+pub fn key_down_past_hook(key: Key) -> Option<bool> {
+    key_down(key)
 }
 
 pub fn key_down(key: Key) -> Option<bool> {
@@ -726,6 +733,11 @@ pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Re
     Ok(true)
 }
 
+/// Reading the pasteboard never fails because someone else is reading it: nothing to wait for.
+pub fn wait_for_clipboard_listeners() -> Option<Duration> {
+    None
+}
+
 /// Never releases a held modifier (see [`paste_may_release`]), so `_before_releasing` is never
 /// called.
 pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
@@ -977,6 +989,38 @@ pub fn system_audio_permission() -> Option<bool> {
 
 pub fn open_system_audio_settings() {
     open_privacy_pane("Privacy_AudioCapture");
+}
+
+// ---------------------------------------------------------------------------------------
+// Launch at login: the app as a login item (`SMAppService.mainAppService`, macOS 13+). Listed
+// in System Settings > General > Login Items, where the user can turn it off.
+
+pub fn set_launch_at_login(on: bool, _program: &Path) -> Result<LoginItem, Error> {
+    let service = unsafe { SMAppService::mainAppService() };
+    let status = unsafe { service.status() };
+    let error = |e: Retained<NSError>| -> Error {
+        format!("{} (code {})", e.localizedDescription(), e.code()).into()
+    };
+    match (on, status) {
+        (true, SMAppServiceStatus::Enabled) => Ok(LoginItem::Unchanged),
+        // Turned off in System Settings: registering again would only fail with "denied".
+        (true, SMAppServiceStatus::RequiresApproval) => Ok(LoginItem::NeedsApproval),
+        (true, _) => {
+            unsafe { service.registerAndReturnError() }.map_err(error)?;
+            Ok(match unsafe { service.status() } {
+                SMAppServiceStatus::RequiresApproval => LoginItem::NeedsApproval,
+                _ => LoginItem::Registered,
+            })
+        }
+        // `NotFound` too: what it says before the first registration on some versions.
+        (false, SMAppServiceStatus::NotRegistered | SMAppServiceStatus::NotFound) => {
+            Ok(LoginItem::Unchanged)
+        }
+        (false, _) => {
+            unsafe { service.unregisterAndReturnError() }.map_err(error)?;
+            Ok(LoginItem::Unregistered)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------

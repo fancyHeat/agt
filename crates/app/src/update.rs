@@ -3,7 +3,7 @@
 //! With `update.enabled`, checks on startup and every `update.check_interval_minutes`, downloads
 //! in the background, and applies the update when the user quits (or on the next launch, via
 //! `VelopackApp`). On macOS that asks for an admin password when the bundle isn't the user's
-//! (see `silent`). The tray's "Update now" ([`check_now`]) also installs the update and restarts
+//! (see `silent`). The tray's "Check for updates" ([`check_now`]) also installs the update and restarts
 //! as soon as dictation is idle, and works even with updates disabled: a click is an explicit
 //! request.
 //!
@@ -34,7 +34,7 @@ const FEED_ENV: &str = "AGT_UPDATE_FEED";
 const FEED_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// Held for a whole check + download, so the background thread and "Update now" never run
+/// Held for a whole check + download, so the background thread and "Check for updates" never run
 /// at the same time (the second one waits, then finds the update already downloaded).
 static CHECK: Mutex<()> = Mutex::new(());
 
@@ -60,7 +60,7 @@ fn manager(timeout: Duration) -> Result<UpdateManager, velopack::Error> {
     UpdateManager::new_boxed(source, None, None)
 }
 
-/// Returns the updater (for "Update now" and applying on quit), or `None` if the app isn't a
+/// Returns the updater (for "Check for updates" and applying on quit), or `None` if the app isn't a
 /// Velopack install. Starts the background updater only if updates are enabled.
 pub fn start(cfg: &UpdateConfig) -> Option<Updater> {
     let updater = match (manager(DOWNLOAD_TIMEOUT), manager(FEED_TIMEOUT)) {

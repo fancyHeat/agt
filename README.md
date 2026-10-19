@@ -53,6 +53,11 @@ Good to know:
   and comes back when you let go. Settings... → **Lower other audio while dictating** turns
   this off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
   in `config.toml`).
+- AGT starts when you log in. Settings... → **Start AGT when you log in** turns that off
+  (`launch_at_login` in `config.toml`). Turning AGT off or removing it in Task Manager's
+  Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks too. If
+  you removed it there, switching the setting off and on again adds it back (one switched off
+  there stays off until you switch it on there).
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
 - macOS: if focus clearly wasn't in a text box when the text was pasted (you'd clicked a web
   page, a link or the desktop), the text is still pasted, and a note where the bar was says so,
@@ -88,23 +93,24 @@ or Colemak layout (other than "Dvorak - QWERTY ⌘") the paste may not work.
 ## Updates
 
 AGT updates itself from this page's releases in the background; the new version is used the
-next time it starts. Tray menu → **Update now** checks right away and, if there is an update,
-downloads and installs it and restarts AGT (as soon as dictation is idle) — no further clicks.
+next time it starts. Tray menu → **Check for updates** checks right away and, if there is an
+update, downloads and installs it and restarts AGT (as soon as dictation is idle) — no further
+clicks. The settings window's **Updates** page turns the background checks on or off.
 
 ## Settings
 
-Tray menu → **Settings...** opens the settings window: every option, in pages (General,
-Speech, Polish, History, Advanced). The tray's **Quick settings** submenu has the same
-choices without opening a window.
+Tray menu → **Settings...** opens the settings window, in pages (General, Speech, Polish,
+History, Updates). Each page shows the settings most people need; **Show advanced settings**
+at the bottom adds the rest (timeouts, devices, prompts, log level and so on).
 
-Either way, settings live in a plain text file, `config.toml`, with a comment on every option:
+Settings live in a plain text file, `config.toml`, with a comment on every option:
 
 - Windows: `%APPDATA%\AGT\config.toml`
 - macOS: `~/Library/Application Support/AGT/config.toml`
 
 Tray menu → **Open config folder** takes you there. AGT restarts on its own to apply a change
-(once dictation is idle): right away for one made in **Quick settings**, a few seconds after
-the last change for one made in the settings window or the file. You can change the hotkey, turn the
+a few seconds after the last change, once dictation is idle; tray menu → **Restart now to
+apply settings** does it right away. You can change the hotkey, turn the
 overlay off, or turn off AI clean-up of your text (removes "um"s, fixes punctuation; on by
 default, and it runs locally unless you point it at a cloud service).
 

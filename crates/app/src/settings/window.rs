@@ -2,7 +2,7 @@
 //! and is gone once closed. It changes `config.toml` the way the tray does; the running AGT
 //! notices the change (`watch_config`) and applies it once dictation is idle.
 
-use super::{Action, schema};
+use super::{Action, metrics, schema};
 use agt_core::{
     Config,
     config::{self, SettingPath, SettingValue},
@@ -15,8 +15,9 @@ use std::{
     time::SystemTime,
 };
 
-/// Opens the window: starts `agt settings`, which brings an open one to the front instead.
-pub fn open() {
+/// Opens the window, on the Metrics page if `metrics`: starts `agt settings [metrics]`,
+/// which brings an open one to the front instead.
+pub fn open(metrics: bool) {
     // Lets the new process take the foreground (Windows only hands it to the process the
     // user last clicked in, AGT, which spawns it).
     #[cfg(windows)]
@@ -25,8 +26,14 @@ pub fn open() {
             windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
         );
     }
-    let spawned = std::env::current_exe()
-        .and_then(|exe| std::process::Command::new(exe).arg("settings").spawn());
+    let spawned = std::env::current_exe().and_then(|exe| {
+        let mut command = std::process::Command::new(exe);
+        command.arg("settings");
+        if metrics {
+            command.arg("metrics");
+        }
+        command.spawn()
+    });
     match spawned {
         // Reaped when it exits (on macOS it would otherwise stay a zombie while AGT runs).
         Ok(mut child) => {
@@ -38,8 +45,16 @@ pub fn open() {
     }
 }
 
-/// `agt settings`. One window at a time: if one is open, this brings it to the front.
+/// `agt settings [metrics]`. One window at a time: if one is open, this brings it to the
+/// front (on the Metrics page if asked for).
 pub fn run() {
+    // Any title but the Metrics page's shows the first page: "Settings..." while the window
+    // is open on Metrics goes back to the settings.
+    let page = if std::env::args().nth(2).as_deref() == Some("metrics") {
+        metrics::TITLE
+    } else {
+        "Settings"
+    };
     let dir = paths::data_dir();
     let _ = fs::create_dir_all(&dir);
     let pid_file = dir.join("settings.pid");
@@ -54,7 +69,7 @@ pub fn run() {
                     let pid = fs::read_to_string(&pid_file).ok();
                     if pid
                         .and_then(|p| p.trim().parse().ok())
-                        .is_some_and(agt_settings_ui::activate)
+                        .is_some_and(|pid| agt_settings_ui::activate(pid, Some(page)))
                     {
                         break;
                     }
@@ -76,8 +91,11 @@ pub fn run() {
         path: paths::config_file(),
         actions: Vec::new(),
         stamp: None,
+        metrics: metrics::Metrics::new(paths::db_file()),
+        advanced: false,
     };
-    if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model)) {
+    let icon = crate::tray::color_icon;
+    if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page), Some(icon)) {
         eprintln!("agt settings: {e}");
     }
 }
@@ -90,6 +108,9 @@ enum Act {
     /// `multiline`: kept as typed; one line is trimmed.
     Text(SettingPath, bool),
     Button(Action),
+    Metrics(metrics::Act),
+    /// "Show advanced settings" / "Hide advanced settings".
+    Advanced,
     None,
 }
 
@@ -99,6 +120,9 @@ struct Model {
     actions: Vec<Act>,
     /// The file's modification time and size when last read or written.
     stamp: Option<(Option<SystemTime>, u64)>,
+    metrics: metrics::Metrics,
+    /// Showing every setting, not just the basic ones (until the window closes).
+    advanced: bool,
 }
 
 impl Model {
@@ -157,6 +181,42 @@ impl Model {
         }
     }
 
+    /// The Metrics page, after the settings.
+    fn metrics_page(&mut self) -> Page {
+        let actions = &mut self.actions;
+        let sections = self.metrics.sections(&mut |act| {
+            actions.push(act.map_or(Act::None, Act::Metrics));
+            actions.len() - 1
+        });
+        Page {
+            title: metrics::TITLE.into(),
+            symbol: metrics::SYMBOL,
+            sections,
+        }
+    }
+
+    /// A section with the button that shows or hides the advanced settings (the last of
+    /// every settings page).
+    fn advanced_section(&mut self) -> Section {
+        let id = self.actions.len();
+        self.actions.push(Act::Advanced);
+        let label = if self.advanced {
+            "Hide advanced settings"
+        } else {
+            "Show advanced settings"
+        };
+        Section {
+            title: String::new(),
+            rows: vec![Row {
+                id,
+                label: String::new(),
+                control: Control::Button(label.into()),
+                note: String::new(),
+                enabled: true,
+            }],
+        }
+    }
+
     fn set(&mut self, changes: &[(SettingPath, SettingValue)]) -> Result<(), String> {
         let result = config::set(&self.path, changes);
         self.stamp = self.stamp();
@@ -181,36 +241,51 @@ impl agt_settings_ui::Model for Model {
                                 "config.toml has an error; fix it to change settings here.\n\n{e}"
                             )),
                             note: String::new(),
+                            advanced: false,
                         },
                         false,
                     ),
                     self.row(schema::edit_file(), true),
                 ];
-                return vec![Page {
-                    title: "Settings".into(),
-                    symbol: "exclamationmark.triangle",
-                    sections: vec![Section {
-                        title: String::new(),
-                        rows,
-                    }],
-                }];
+                return vec![
+                    Page {
+                        title: "Settings".into(),
+                        symbol: "exclamationmark.triangle",
+                        sections: vec![Section {
+                            title: String::new(),
+                            rows,
+                        }],
+                    },
+                    self.metrics_page(),
+                ];
             }
         };
-        schema::pages(&config)
+        let pages = schema::pages(&config, self.advanced);
+        // The buttons' ids come first, so they're the same either way: the focus (by id)
+        // stays on the button that was clicked.
+        let buttons: Vec<Section> = pages.iter().map(|_| self.advanced_section()).collect();
+        let mut pages: Vec<Page> = pages
             .into_iter()
-            .map(|page| Page {
-                title: page.title.into(),
-                symbol: page.symbol,
-                sections: page
+            .zip(buttons)
+            .map(|(page, button)| {
+                let mut sections: Vec<Section> = page
                     .sections
                     .into_iter()
                     .map(|s| Section {
                         title: s.title.into(),
                         rows: s.items.into_iter().map(|i| self.row(i, true)).collect(),
                     })
-                    .collect(),
+                    .collect();
+                sections.push(button);
+                Page {
+                    title: page.title.into(),
+                    symbol: page.symbol,
+                    sections,
+                }
             })
-            .collect()
+            .collect();
+        pages.push(self.metrics_page());
+        pages
     }
 
     fn handle(&mut self, event: Event) -> Result<(), String> {
@@ -228,12 +303,24 @@ impl agt_settings_ui::Model for Model {
                 let text = if *multiline { &text } else { text.trim() };
                 vec![(*path, text.into())]
             }
+            (Some(Act::Metrics(metrics::Act::Period)), Event::Choose(_, i)) => {
+                self.metrics.set_period(i);
+                return Ok(());
+            }
+            (Some(Act::Metrics(metrics::Act::OpenFolder)), Event::Click(_)) => {
+                crate::open_folder(&self.metrics.folder());
+                return Ok(());
+            }
             (Some(Act::Button(action)), Event::Click(_)) => {
                 match action {
                     Action::EditFile => crate::open_in_editor(&self.path),
                     Action::OpenHistory => crate::open_history(),
-                    _ => {}
                 }
+                return Ok(());
+            }
+            // The window asks for the pages again after this.
+            (Some(Act::Advanced), Event::Click(_)) => {
+                self.advanced = !self.advanced;
                 return Ok(());
             }
             _ => return Ok(()),
@@ -245,6 +332,9 @@ impl agt_settings_ui::Model for Model {
     }
 
     fn changed_elsewhere(&mut self) -> bool {
-        self.stamp() != self.stamp
+        let file = self.stamp() != self.stamp;
+        // Always asked: it keeps the figures current.
+        let figures = self.metrics.refresh();
+        file || figures
     }
 }

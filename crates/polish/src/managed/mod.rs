@@ -1,10 +1,10 @@
 //! `provider = "s1-mini"`: S1-mini by Superwhisper, run by AGT itself.
 //!
 //! On start ([`start`]) a background thread:
-//! 1. downloads what's missing ([`assets`]): the S1-mini GGUF (pinned Hugging Face
-//!    revision) into the models folder and an official llama.cpp release build (pinned tag)
-//!    into AGT's own folder, both SHA-256 verified; the llama.cpp archive is unpacked with
-//!    the OS's `tar`;
+//! 1. downloads what's missing ([`assets`]), once [`Env::hold_download`] lets it: the
+//!    S1-mini GGUF (pinned Hugging Face revision) into the models folder and an official
+//!    llama.cpp release build (pinned tag) into AGT's own folder, both SHA-256 verified; the
+//!    llama.cpp archive is unpacked with the OS's `tar`;
 //! 2. starts `llama-server` on a free 127.0.0.1 port with a random API key ([`process`]),
 //!    tied to AGT's lifetime: on Windows it's in a job object that kills it when AGT exits
 //!    or crashes; on Unix a small `sh` watchdog kills it when AGT's end of a pipe closes;
@@ -50,11 +50,20 @@ pub struct Env {
     pub log_file: Option<PathBuf>,
     /// Called from a background thread whenever the managed server's state changes.
     pub on_status: Arc<dyn Fn(&Status) + Send + Sync>,
+    /// Called on the S1-mini thread before it downloads anything (not when everything is on
+    /// disk); blocks until downloading may start, e.g. after a download the app needs first.
+    /// `None`: downloads at once.
+    pub hold_download: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The managed server's state, for the tray (`Display` is the tray line).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
+    /// Waiting for [`Env::hold_download`] before downloading `what` (S1-mini, or llama.cpp
+    /// when only that is missing, e.g. with S1-mini already in a shared models folder).
+    Queued {
+        what: &'static str,
+    },
     Downloading {
         what: &'static str,
         percent: u8,
@@ -69,6 +78,7 @@ pub enum Status {
 impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Status::Queued { what } => write!(f, "Polish: waiting to download {what}..."),
             Status::Downloading { what, percent } => {
                 write!(f, "Polish: downloading {what} ({percent}%)...")
             }
@@ -87,7 +97,12 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// for this platform.
 pub(crate) fn start(cfg: &PolishConfig, env: &Env) -> std::result::Result<Managed, String> {
     let assets = assets::Assets::for_this_platform(&env.models_dir, &env.llama_dir)?;
-    let launcher = process::LlamaLauncher::new(assets, &cfg.s1_mini, env.log_file.clone());
+    let launcher = process::LlamaLauncher::new(
+        assets,
+        &cfg.s1_mini,
+        env.log_file.clone(),
+        env.hold_download.clone(),
+    );
     let shared = Arc::new(Shared::default());
     let (s, report) = (shared.clone(), env.on_status.clone());
     std::thread::Builder::new()

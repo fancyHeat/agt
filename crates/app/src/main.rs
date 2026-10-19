@@ -11,7 +11,6 @@ mod tray;
 mod update;
 
 use agt_core::{Config, config::OverlayPosition, paths};
-use settings::Action;
 use std::{
     fs::{File, TryLockError},
     path::PathBuf,
@@ -19,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
-use velopack::{VelopackApp, VelopackAsset};
+use velopack::{VelopackApp, VelopackAsset, locator::LocationContext};
 use winit::{
     application::ApplicationHandler,
     event::{StartCause, WindowEvent},
@@ -30,11 +29,8 @@ use winit::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long dictation must be idle (no status change) before a restart: covers the clipboard
-/// restore after a paste and back-to-back dictations. A settings click in the tray only waits
-/// for the clipboard restore.
+/// restore after a paste and back-to-back dictations.
 const RESTART_SETTLE: Duration = Duration::from_secs(5);
-/// Allowance on top of `restore_clipboard_ms`: for the paste thread to wake and the restore to run.
-const RESTORE_MARGIN: Duration = Duration::from_millis(500);
 
 /// Set for the instance a settings restart starts, so it waits for this one to exit and
 /// release the instance lock (for up to [`RELAUNCH_WAIT`]) instead of quitting at once.
@@ -75,13 +71,13 @@ enum AppEvent {
 
 /// Why AGT is waiting to restart.
 enum Restart {
-    /// Into a downloaded update ("Update now"); it applies changed settings as well.
+    /// Into a downloaded update ("Check for updates"); it applies changed settings as well.
     Update(VelopackAsset),
     /// To apply changed settings: the file differs from what the pipeline runs with.
     Settings,
 }
 
-/// Progress of an "Update now" check, from its worker thread.
+/// Progress of an "Check for updates" check, from its worker thread.
 #[derive(Debug)]
 enum UpdateEvent {
     /// Found this version; downloading it.
@@ -135,7 +131,9 @@ fn main() {
     #[allow(unused_mut)]
     let mut velopack = VelopackApp::build();
     // The usage history lives outside the install folder so reinstalls keep it (see
-    // `paths`); uninstalling still removes it. Models are left, as before.
+    // `paths`); uninstalling still removes it. Models are left, as before. The Run key value
+    // (launch at login) goes too, and so does the marker of it, so a reinstall registers
+    // again (it's in the install folder, which goes anyway; this doesn't count on that).
     #[cfg(windows)]
     {
         velopack = velopack.on_before_uninstall_fast_callback(|_| {
@@ -143,9 +141,20 @@ fn main() {
             if history != paths::data_dir() {
                 let _ = std::fs::remove_dir_all(history);
             }
+            let _ = agt_platform::set_launch_at_login(false, std::path::Path::new(""));
+            let _ = std::fs::remove_file(paths::login_item_file());
         });
     }
-    velopack.run();
+    // Not a Velopack install (a dev build; `run` makes the same check): nothing to do, and
+    // `run` would log an ERROR saying so on every start. A hook (`--veloapp-install`, ...)
+    // always runs: `run` handles it before that check, and exits.
+    let hook = std::env::args()
+        .nth(1)
+        .is_some_and(|a| a.to_ascii_lowercase().starts_with("--veloapp-"));
+    let install = velopack::locator::auto_locate_app_manifest(LocationContext::FromCurrentExe).ok();
+    if hook || install.is_some() {
+        velopack.run();
+    }
 
     tracing::info!(
         "AGT {VERSION} starting; config at {}",
@@ -163,6 +172,13 @@ fn main() {
             (Config::fallback(), true)
         }
     };
+    // Installed builds only (a dev build must never start at login), and not on defaults:
+    // the file may well have it off. A changed setting applies with the restart it causes.
+    // Existing installs have no `launch_at_login` line: the first start of this version turns
+    // it on for them too (intended).
+    if let (Some(install), false) = (&install, config_error) {
+        launch_at_login(config.launch_at_login, install);
+    }
     // After the lock and Velopack's hooks, so neither a second instance nor a hook run
     // counts as a session.
     agt_telemetry::global().start(paths::db_file(), session_start(&config, config_error));
@@ -247,7 +263,6 @@ fn main() {
         restart_with: None,
         changes: 0,
         changed_at: Instant::now(),
-        status_at: Instant::now(),
         config_path,
         file,
         running: config.clone(),
@@ -327,7 +342,57 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
     }
 }
 
-/// `agt stats`.
+/// Registers AGT to start at login, or unregisters it, as `on` says, but only when that
+/// differs from what AGT last applied ([`paths::login_item_file`]; none yet on the first
+/// start): turning AGT off or removing it in the OS sticks until the setting changes, and a
+/// normal start asks the OS nothing. Windows starts the stub Velopack keeps in the install
+/// folder (`%LocalAppData%\AGT\agt.exe`, the path it means launchers to use): it starts the
+/// current version through Update.exe, outside the `current` folder each update replaces.
+/// Failing here never stops AGT (it's tried again on the next start).
+fn launch_at_login(on: bool, install: &velopack::locator::VelopackLocator) {
+    let marker = paths::login_item_file();
+    let applied = if on { "on" } else { "off" };
+    if std::fs::read_to_string(&marker).is_ok_and(|s| s.trim() == applied) {
+        return;
+    }
+    // macOS registers the app bundle AGT runs from.
+    let program = if cfg!(windows) {
+        let main_exe = install.get_main_exe_path();
+        main_exe
+            .file_name()
+            .map(|name| install.get_root_dir().join(name))
+            .filter(|stub| stub.is_file())
+            .unwrap_or(main_exe)
+    } else {
+        PathBuf::new()
+    };
+    match agt_platform::set_launch_at_login(on, &program) {
+        Ok(result) => {
+            match result {
+                agt_platform::LoginItem::Unchanged => {}
+                agt_platform::LoginItem::Registered if cfg!(windows) => {
+                    tracing::info!("AGT now starts at login ({})", program.display())
+                }
+                agt_platform::LoginItem::Registered => tracing::info!("AGT now starts at login"),
+                agt_platform::LoginItem::Unregistered => {
+                    tracing::info!("AGT no longer starts at login")
+                }
+                agt_platform::LoginItem::NeedsApproval => tracing::info!(
+                    "AGT is turned off in System Settings > General > Login Items: not starting at login"
+                ),
+            }
+            if let Err(e) = std::fs::write(&marker, applied) {
+                tracing::warn!("cannot write {}: {e}", marker.display());
+            }
+        }
+        Err(e) if on => tracing::warn!("cannot make AGT start at login: {e}"),
+        Err(e) => tracing::warn!("cannot stop AGT starting at login: {e}"),
+    }
+}
+
+/// `agt stats`. Release builds on Windows are GUI-subsystem programs with no console, so
+/// attach to the one we were started from (output then interleaves with the shell's prompt,
+/// which doesn't wait for GUI programs; `agt stats | more` or `> file` avoids that).
 fn print_stats() {
     attach_console();
     let path = paths::db_file();
@@ -431,19 +496,16 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     /// `None` if this isn't a Velopack install.
     updater: Option<update::Updater>,
-    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] (a settings click
-    /// skips that, see [`Self::settings_action`]; "Install update X now" / "Restart now to
-    /// apply" restart regardless).
+    /// A restart waiting for dictation to be idle for [`RESTART_SETTLE`] ("Install update X
+    /// now" / "Restart now to apply" restart regardless).
     restart_with: Option<Restart>,
     /// Counts pipeline status changes and settings changes: a restart timer is stale if this
     /// moved on.
     changes: u64,
     /// When [`Self::changes`] last moved on.
     changed_at: Instant,
-    /// When the pipeline status last changed (a paste's clipboard restore follows its Ready).
-    status_at: Instant,
     config_path: PathBuf,
-    /// `config.toml` as last read (or its error): what the Settings menu shows.
+    /// `config.toml` as last read (or its error).
     file: Result<Config, String>,
     /// What the pipeline was started with (defaults if the file had an error then).
     running: Config,
@@ -544,7 +606,6 @@ impl ApplicationHandler<AppEvent> for App {
                     if let (Some(m), Some(p)) = (&mut self.meetings, &self.pipeline) {
                         m.speech_model(&p.speech_model());
                     }
-                    self.status_at = Instant::now();
                     self.changes += 1;
                     self.changed_at = Instant::now();
                     self.start_restart_timer();
@@ -552,6 +613,11 @@ impl ApplicationHandler<AppEvent> for App {
                 pipeline::Event::Rejected => {
                     if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
                         o.flash_error(p.level.get(), Instant::now());
+                    }
+                }
+                pipeline::Event::NotReady => {
+                    if let (Some(o), Some(p)) = (&mut self.overlay, &self.pipeline) {
+                        o.show_getting_ready(p.level.get(), Instant::now());
                     }
                 }
                 pipeline::Event::NotInTextBox => {
@@ -593,11 +659,6 @@ impl ApplicationHandler<AppEvent> for App {
         if let AppEvent::ConfigFile = event {
             return self.config_file_changed();
         }
-        if let AppEvent::Menu(e) = &event
-            && let Some(action) = self.tray.as_ref().and_then(|t| t.settings.action(&e.id))
-        {
-            return self.settings_action(action.clone(), event_loop);
-        }
         if let AppEvent::NoticeCopy = event {
             if let Some(p) = &self.pipeline {
                 p.copy_last_transcript();
@@ -623,7 +684,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Menu(e) if e.id == tray.update => self.update_now(event_loop),
-            AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(),
+            AppEvent::Menu(e) if e.id == tray.apply_now => {
+                let restart = self.restart_with.take().unwrap_or(Restart::Settings);
+                self.restart_now(restart, event_loop);
+            }
+            AppEvent::Menu(e) if e.id == tray.open_settings => settings::window::open(false),
+            AppEvent::Menu(e) if e.id == tray.open_metrics => settings::window::open(true),
             AppEvent::Menu(e) if e.id == tray.open_config => open_folder(&paths::config_dir()),
             AppEvent::Menu(e) if tray.privacy.as_ref() == Some(&e.id) => {
                 // The page for the first missing permission (or Accessibility, to review).
@@ -656,10 +722,8 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Update(UpdateEvent::Done(Ok(None))) => {
-                tray.set_update(
-                    &format!("{} - up to date ({VERSION})", tray::UPDATE_NOW),
-                    true,
-                );
+                // Clickable: checks again.
+                tray.set_update(&format!("AGT is up to date ({VERSION})"), true);
             }
             AppEvent::Update(UpdateEvent::Done(Err(e))) => {
                 tracing::error!("update failed: {e}");
@@ -788,7 +852,7 @@ impl App {
         }
     }
 
-    /// "Update now": with an update already downloaded, installs it once idle; else checks
+    /// "Check for updates": with an update already downloaded, installs it once idle; else checks
     /// and downloads on a worker thread, which reports back as [`AppEvent::Update`] (an
     /// update it downloads is installed the same way, with no further click). Clicked while
     /// an install waits for idle, installs right away (the way out if dictation is stuck).
@@ -804,6 +868,7 @@ impl App {
             return self.restart_when_idle(asset);
         }
         tray.set_update("Checking for updates...", false);
+        tray.reopen_menu();
         let (updater, proxy) = (updater.clone(), self.proxy.clone());
         let spawned = thread::Builder::new()
             .name("update-now".into())
@@ -935,55 +1000,6 @@ impl App {
         self.settings_changed();
     }
 
-    fn settings_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
-        match action {
-            Action::Set(changes) => match agt_core::config::set(&self.config_path, &changes) {
-                Ok(c) => {
-                    self.file = Ok(c);
-                    self.settings_changed();
-                    // A click is an explicit request: apply it now, without the settle wait
-                    // (that's for edits to the file, which may come in a few saves). Only a
-                    // paste's clipboard restore, if one may still be pending, is waited for.
-                    if matches!(self.restart_with, Some(Restart::Settings)) && self.idle() {
-                        let restore =
-                            Duration::from_millis(self.running.paste.restore_clipboard_ms);
-                        let wait =
-                            (restore + RESTORE_MARGIN).saturating_sub(self.status_at.elapsed());
-                        if wait.is_zero() {
-                            let restart = self.restart_with.take().unwrap();
-                            self.restart_now(restart, event_loop);
-                        } else {
-                            self.restart_timer(wait);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("cannot change config.toml: {e}");
-                    // Puts back the checkmark the click moved.
-                    self.show_settings();
-                }
-            },
-            Action::Toggle(path, get) => {
-                let file = Config::load(&self.config_path).map_err(|e| e.to_string());
-                match file {
-                    Ok(c) => self
-                        .settings_action(Action::Set(vec![(path, (!get(&c)).into())]), event_loop),
-                    Err(e) => {
-                        tracing::error!("cannot change config.toml: {e}");
-                        self.file = Err(e);
-                        self.settings_changed();
-                    }
-                }
-            }
-            Action::EditFile => open_in_editor(&self.config_path),
-            Action::OpenHistory => open_history(),
-            Action::ApplyNow => {
-                let restart = self.restart_with.take().unwrap_or(Restart::Settings);
-                self.restart_now(restart, event_loop);
-            }
-        }
-    }
-
     /// The file's settings now differ from the running ones (restart once idle), or match
     /// them again, or can't be read (keep running as is).
     fn settings_changed(&mut self) {
@@ -1000,17 +1016,12 @@ impl App {
         self.show_settings();
     }
 
-    /// Rebuilds the Settings submenu and the config error line from [`Self::file`].
+    /// Shows "Restart now to apply" (while changed settings wait for a restart) and the
+    /// config error line, from [`Self::file`].
     fn show_settings(&mut self) {
         let applying = self.file.as_ref().is_ok_and(|c| *c != self.running);
         let Some(tray) = &mut self.tray else { return };
-        let (shown, editable) = match &self.file {
-            Ok(c) => (c, true),
-            Err(_) => (&self.running, false),
-        };
-        if let Err(e) = tray.settings.show(shown, editable, applying) {
-            tracing::error!("cannot build the Settings menu: {e}");
-        }
+        tray.set_applying(applying);
         tray.set_warning(match (&self.file, self.config_error) {
             (Ok(_), _) => None,
             (Err(_), true) => Some("Config error (auto-updates off) - see log"),
@@ -1080,7 +1091,7 @@ pub(crate) fn open_history() {
 }
 
 /// Opens `dir` in Finder / Explorer.
-fn open_folder(dir: &std::path::Path) {
+pub(crate) fn open_folder(dir: &std::path::Path) {
     let opener = if cfg!(windows) {
         "explorer"
     } else if cfg!(target_os = "macos") {

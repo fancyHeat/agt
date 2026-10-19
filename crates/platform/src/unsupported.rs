@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation (anything but Windows and macOS).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, Hotkey, HotkeyEvent, Key, MicUser, Permission};
+use crate::{Error, Hotkey, HotkeyEvent, Key, LoginItem, MicUser, Permission};
 
 const MSG: &str = "not supported on this platform";
 
@@ -36,6 +36,10 @@ pub fn key_down(_key: Key) -> Option<bool> {
     None
 }
 
+pub fn key_down_past_hook(_key: Key) -> Option<bool> {
+    None
+}
+
 pub fn foreground_window() -> Option<usize> {
     None
 }
@@ -60,6 +64,10 @@ pub fn set_clipboard_text(_text: &str) -> Result<PasteToken, Error> {
 
 pub fn copy_text(_text: &str) -> Result<(), Error> {
     Err(format!("clipboard access {MSG}").into())
+}
+
+pub fn wait_for_clipboard_listeners() -> Option<std::time::Duration> {
+    None
 }
 
 pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
@@ -90,6 +98,10 @@ pub fn open_system_audio_settings() {}
 
 pub fn mic_users() -> Vec<MicUser> {
     Vec::new()
+}
+
+pub fn set_launch_at_login(_on: bool, _program: &std::path::Path) -> Result<LoginItem, Error> {
+    Err(format!("launch at login {MSG}").into())
 }
 
 /// No volume control here: ducking does nothing.

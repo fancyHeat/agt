@@ -1,27 +1,38 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, MicUser, Permission};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, MicUser, Permission};
 use std::{
     cell::RefCell,
-    ffi::c_void,
+    ffi::{OsStr, OsString, c_void},
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::Path,
     ptr::{null, null_mut},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, GlobalFree, HANDLE, LPARAM, LRESULT, WPARAM},
+    Foundation::{
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, GetLastError,
+        GlobalFree, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    },
     System::{
         Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree},
         DataExchange::{
             CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
-            GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+            GetClipboardSequenceNumber, GetOpenClipboardWindow, OpenClipboard,
+            RegisterClipboardFormatW, SetClipboardData,
         },
         LibraryLoader::GetModuleHandleW,
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::CF_UNICODETEXT,
+        Registry::{
+            HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+            RegSetKeyValueW,
+        },
         Threading::{
-            GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            GetCurrentThread, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
         },
     },
     UI::{
@@ -31,9 +42,10 @@ use windows_sys::Win32::{
             VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_V,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, HC_ACTION, HHOOK,
-            KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
-            UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+            CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
+            GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
+            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP,
+            WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
         },
     },
 };
@@ -210,8 +222,16 @@ pub fn focus_takes_text() -> Option<bool> {
 pub fn prepare_focus_check() {}
 
 pub fn key_down(key: Key) -> Option<bool> {
-    // A swallowed key never updates the system's key state.
-    (!key.swallowed()).then(|| vk_down(key.code))
+    let down = vk_down(key.code);
+    // A swallowed key (F13-F24) updates the system's key state only when the hook didn't
+    // swallow its press (dropped, or too slow for that event). So "up" says nothing, but
+    // "down" is a press the hook missed. (The hook lets that press's release through, so it
+    // doesn't stay "down".)
+    (down || !key.swallowed()).then_some(down)
+}
+
+pub fn key_down_past_hook(key: Key) -> Option<bool> {
+    Some(vk_down(key.code))
 }
 
 /// Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
@@ -263,7 +283,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     let Some(chord_key) = classify(&s.hotkey, kb.vkCode, kb.scanCode) else {
                         return;
                     };
-                    swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed());
+                    // A release whose press got past the hook (dropped, or too slow) passes
+                    // too, or the system would take the key as still down (see `key_down`).
+                    // The hook runs before the key state updates: this is the press's.
+                    swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed())
+                        && (down || !vk_down(kb.vkCode as u16));
                     if let (Some(i), true, Some(mask)) = (chord_key, down, &s.mask)
                         && is_win(kb.vkCode)
                         && s.detector.repeat_in_chord(i)
@@ -484,6 +508,55 @@ fn put_text(text: &str, transient: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// Clipboard listeners open the clipboard within ~2 ms of every change (measured: Logi
+/// Options+ twice at 0.6-2.3 ms, WSLg's msrdc.exe up to 3 times at 1-1.8 ms, each for well
+/// under a millisecond). A plain Win32 edit box whose WM_PASTE comes then can't open it, and
+/// pastes nothing without an error. Waiting a little longer than that costs a few ms per paste.
+const CLIPBOARD_SETTLE: Duration = Duration::from_millis(3);
+/// After the settle time, a clipboard still open is waited for, up to this in all.
+const CLIPBOARD_BUSY_MAX: Duration = Duration::from_millis(50);
+
+pub fn wait_for_clipboard_listeners() -> Option<Duration> {
+    let start = Instant::now();
+    thread::sleep(CLIPBOARD_SETTLE);
+    // Only sees whoever opened it with a window, but that's how listeners open it.
+    loop {
+        let holder = unsafe { GetOpenClipboardWindow() };
+        if holder.is_null() {
+            break;
+        }
+        if start.elapsed() >= CLIPBOARD_BUSY_MAX {
+            tracing::warn!(
+                "clipboard still in use by {} after {} ms; pasting anyway (the paste may be lost)",
+                process_name(holder).unwrap_or_else(|| "another app".into()),
+                CLIPBOARD_BUSY_MAX.as_millis()
+            );
+            break;
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+    Some(start.elapsed())
+}
+
+/// The file name of the program that owns `hwnd`, e.g. "logioptionsplus_agent.exe".
+fn process_name(hwnd: HWND) -> Option<String> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
+    unsafe { CloseHandle(process) };
+    if ok == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(buf.get(..len as usize)?);
+    path.rsplit('\\').next().map(str::to_owned)
+}
+
 pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {
     let mut inputs = Vec::with_capacity(12);
     // Modifiers that are down would change the shortcut (Ctrl+Shift+V pastes without
@@ -613,6 +686,105 @@ pub fn open_system_audio_settings() {
 /// Not implemented on Windows yet (meeting detection is macOS-only in v1).
 pub fn mic_users() -> Vec<MicUser> {
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------------------
+// Launch at login: a value in HKCU's Run key. Task Manager's Startup apps on/off switch is
+// kept in `Explorer\StartupApproved\Run` under the same name, which is never touched here.
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "AGT";
+
+pub fn set_launch_at_login(on: bool, program: &Path) -> Result<LoginItem, Error> {
+    let command = on.then(|| {
+        let mut c = OsString::from("\"");
+        c.push(program);
+        c.push("\"");
+        c
+    });
+    set_run_value(RUN_KEY, RUN_VALUE, command.as_deref())
+}
+
+/// Sets HKCU `key`'s `name` value to `command`, or deletes it (`None`), unless it already is.
+fn set_run_value(key: &str, name: &str, command: Option<&OsStr>) -> Result<LoginItem, Error> {
+    let (key, name) = (wide(key), wide(name));
+    let current = read_string(&key, &name)?;
+    let code = match (command, current) {
+        // Paths are case-insensitive (the stub on disk is `AGT.exe`; this writes `agt.exe`).
+        (Some(c), Some(current))
+            if current
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&c.to_string_lossy()) =>
+        {
+            return Ok(LoginItem::Unchanged);
+        }
+        (None, None) => return Ok(LoginItem::Unchanged),
+        (Some(c), _) => {
+            let data = wide(c);
+            let code = unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    key.as_ptr(),
+                    name.as_ptr(),
+                    REG_SZ,
+                    data.as_ptr().cast(),
+                    (data.len() * 2) as u32,
+                )
+            };
+            if code == ERROR_SUCCESS {
+                return Ok(LoginItem::Registered);
+            }
+            code
+        }
+        (None, Some(_)) => {
+            let code =
+                unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+            match code {
+                ERROR_SUCCESS => return Ok(LoginItem::Unregistered),
+                // Deleted since it was read.
+                ERROR_FILE_NOT_FOUND => return Ok(LoginItem::Unchanged),
+                code => code,
+            }
+        }
+    };
+    Err(std::io::Error::from_raw_os_error(code as i32).into())
+}
+
+/// A REG_SZ value under HKCU (`None` if it or its key doesn't exist; "" if it isn't a REG_SZ).
+fn read_string(key: &[u16], name: &[u16]) -> Result<Option<OsString>, Error> {
+    let get = |data: *mut c_void, size: &mut u32| unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            data,
+            size,
+        )
+    };
+    let mut size = 0;
+    let mut code = get(null_mut(), &mut size);
+    let mut buf = Vec::new();
+    if code == ERROR_SUCCESS {
+        buf = vec![0u16; (size as usize).div_ceil(2)];
+        code = get(buf.as_mut_ptr().cast(), &mut size);
+    }
+    match code {
+        ERROR_SUCCESS => {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Ok(Some(OsString::from_wide(&buf[..end])))
+        }
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        // Not a REG_SZ (not as AGT writes it): replaced, or deleted.
+        ERROR_UNSUPPORTED_TYPE => Ok(Some(OsString::new())),
+        code => Err(std::io::Error::from_raw_os_error(code as i32).into()),
+    }
+}
+
+/// NUL-terminated UTF-16.
+fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain([0]).collect()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -927,6 +1099,50 @@ mod tests {
             matches!(got[..], [HotkeyEvent::Down(_), HotkeyEvent::Cancel]),
             "{got:?}"
         );
+    }
+
+    /// The Run key code, on a key of its own (the real Run key is left alone).
+    #[test]
+    fn run_value_is_written_only_when_it_changes() {
+        use windows_sys::Win32::System::Registry::RegDeleteKeyW;
+        /// Deletes the test key, also when an assert fails.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&self.0).as_ptr()) };
+            }
+        }
+        let key = format!(r"Software\AGT-test-{}", std::process::id());
+        let _cleanup = Cleanup(key.clone());
+        let set = |c: Option<&str>| set_run_value(&key, "AGT", c.map(OsStr::new)).unwrap();
+        let a = r#""C:\Users\A B\AppData\Local\AGT\agt.exe""#;
+        assert_eq!(set(None), LoginItem::Unchanged); // no key yet
+        assert_eq!(set(Some(a)), LoginItem::Registered);
+        assert_eq!(set(Some(a)), LoginItem::Unchanged);
+        assert_eq!(set(Some(&a.to_uppercase())), LoginItem::Unchanged);
+        assert_eq!(
+            read_string(&wide(&key), &wide("AGT")).unwrap().unwrap(),
+            OsStr::new(a)
+        );
+        assert_eq!(set(Some(r#""D:\AGT\agt.exe""#)), LoginItem::Registered);
+        assert_eq!(set(None), LoginItem::Unregistered);
+        assert_eq!(set(None), LoginItem::Unchanged);
+        assert_eq!(read_string(&wide(&key), &wide("AGT")).unwrap(), None);
+        // A value of another type is replaced.
+        let n = 1u32;
+        let code = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                wide(&key).as_ptr(),
+                wide("AGT").as_ptr(),
+                windows_sys::Win32::System::Registry::REG_DWORD,
+                (&raw const n).cast(),
+                4,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS);
+        assert_eq!(set(Some(a)), LoginItem::Registered);
+        assert_eq!(set(None), LoginItem::Unregistered);
     }
 
     #[test]

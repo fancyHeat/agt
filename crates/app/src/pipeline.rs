@@ -73,7 +73,7 @@ use std::{
     collections::VecDeque,
     fmt,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -161,9 +161,12 @@ pub enum Event {
     /// The status line changed. With the number of failures (microphone, transcription,
     /// paste) so far: a `Status::Error` is a new failure only if that went up since.
     Status(Status, u64),
-    /// The hotkey was pressed but no recording started (model not ready, or no microphone);
-    /// the status line says why.
+    /// The hotkey was pressed but no recording started (the model failed to load, or no
+    /// microphone); the status line says why.
     Rejected,
+    /// The hotkey was pressed while the model is still loading (or downloading): no
+    /// recording.
+    NotReady,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
     CopyAvailable(bool),
     /// A dictation was pasted, but keyboard focus wasn't in anything that takes text (macOS):
@@ -262,6 +265,10 @@ impl Hub {
         (self.notify)(Event::Rejected);
     }
 
+    fn not_ready(&self) {
+        (self.notify)(Event::NotReady);
+    }
+
     fn copy_available(&self, available: bool) {
         (self.notify)(Event::CopyAvailable(available));
     }
@@ -284,6 +291,35 @@ impl Hub {
 
     fn missing(&self, p: Permission) -> bool {
         self.state.lock().unwrap().missing.contains(&p)
+    }
+}
+
+/// Set once the speech model has loaded (or failed to): S1-mini waits for it before
+/// downloading, so on a first run the two don't share a slow link and dictation, which needs
+/// the speech model, can start sooner (issue #64).
+#[derive(Clone, Default)]
+struct SttLoaded(Arc<(Mutex<bool>, Condvar)>);
+
+impl SttLoaded {
+    fn set(&self) {
+        let (done, cv) = &*self.0;
+        *done.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let (done, cv) = &*self.0;
+        let _done = cv.wait_while(done.lock().unwrap(), |d| !*d).unwrap();
+    }
+}
+
+/// Sets [`SttLoaded`] when dropped: also if loading the model panics, so S1-mini isn't held
+/// forever.
+struct SetOnDrop(SttLoaded);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.set();
     }
 }
 
@@ -542,12 +578,15 @@ pub fn start(
     spawn("audio", move || audio.run(audio_rx, lvl));
 
     remove_old_llama_builds(&config.stt.models_path());
-    let (polisher, polish_info) = load_polisher(config, &hub);
+    let stt_loaded = SttLoaded::default();
+    let (polisher, polish_info) = load_polisher(config, &hub, &stt_loaded);
     let saver = history::start(&config.history, paths::dictations_dir());
     let polishing = polisher.is_some();
     let (h, cfg, hs) = (hub.clone(), config.clone(), saver.clone());
     spawn("stt", move || {
-        stt_thread(cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs)
+        stt_thread(
+            cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs, stt_loaded,
+        )
     });
     let (cfg, tp) = (config.clone(), to_paste.clone());
     spawn("polish", move || {
@@ -585,7 +624,9 @@ fn remove_old_llama_builds(models_dir: &std::path::Path) {
             return;
         }
         if own {
-            agt_polish::managed::remove_legacy(&dir);
+            if agt_polish::managed::remove_legacy(&dir) {
+                tracing::info!("removed AGT's old llama.cpp builds from {}", old.display());
+            }
         } else {
             tracing::warn!(
                 "{} is no longer used (llama.cpp now lives in {}); delete it once no older AGT uses this models folder",
@@ -598,7 +639,11 @@ fn remove_old_llama_builds(models_dir: &std::path::Path) {
 
 /// Builds the polisher if enabled (no network: cheap) and warms it up in the background,
 /// so a local server loads its model before the first dictation. Returns the tray line.
-fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, String) {
+fn load_polisher(
+    config: &Config,
+    hub: &Hub,
+    stt_loaded: &SttLoaded,
+) -> (Option<Arc<dyn Polisher>>, String) {
     if let Some(e) = &config.polish_error {
         tracing::error!("polish disabled, config error: {e}; the rest of the config is used");
         return (None, "Polish: off (config error, see log)".into());
@@ -619,13 +664,24 @@ fn load_polisher(config: &Config, hub: &Hub) -> (Option<Arc<dyn Polisher>>, Stri
             tracing::info!("polish: {s}");
             notify(Event::PolishInfo(s.to_string()));
         }),
+        hold_download: Some(Arc::new({
+            let stt_loaded = stt_loaded.clone();
+            move || stt_loaded.wait()
+        })),
     };
     match agt_polish::load(&config.polish, &env) {
         Ok(p) => {
             let p: Arc<dyn Polisher> = Arc::from(p);
             tracing::info!("polish: {}", p.name());
             let warm = p.clone();
+            // S1-mini's own wait for the server is bounded; don't count the speech model's
+            // download (it holds S1-mini's) against it, or in polish_warmup_ms.
+            let held =
+                (config.polish.provider == PolishProvider::S1Mini).then(|| stt_loaded.clone());
             spawn("polish-warmup", move || {
+                if let Some(held) = held {
+                    held.wait();
+                }
                 let t = Instant::now();
                 let result = warm.warmup();
                 let took = ms(t.elapsed());
@@ -906,8 +962,12 @@ impl AudioThread {
         let double_tap = Duration::from_millis(self.config.hotkey.double_tap_ms);
         let min_hold = Duration::from_millis(self.config.hotkey.min_hold_ms);
         let tap = min_hold.max(TAP);
+        // The press ending a hands-free recording was synthesized by `missed_press`: its
+        // release is polled with `key_down_past_hook`.
+        let mut press_missed = false;
 
         loop {
+            press_missed &= latch == Latch::Ending;
             let hands_free = latch == Latch::On && holding.is_some();
             // Esc is ours only while it can end something.
             agt_platform::arm_escape(hands_free);
@@ -944,8 +1004,11 @@ impl AudioThread {
                     Err(RecvTimeoutError::Timeout) => {
                         feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
                         let missed = match hands_free {
-                            true => self.missed_press(&events).map(|ev| (ev, false)),
-                            false => self.missed_release(&events, &watch),
+                            true => self.missed_press(&events).map(|(ev, synthesized)| {
+                                press_missed = synthesized;
+                                (ev, false)
+                            }),
+                            false => self.missed_release(&events, &watch, press_missed),
                         };
                         match missed {
                             Some(ev) => ev,
@@ -1082,16 +1145,21 @@ impl AudioThread {
     }
 
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
-    /// release (with `true`) if the key turns out not to be down any more.
+    /// release (with `true`) if the key turns out not to be down any more. `press_missed`:
+    /// the press being held was synthesized by [`Self::missed_press`].
     fn missed_release(
         &self,
         events: &Receiver<HotkeyEvent>,
         watch: &ReleaseWatch,
+        press_missed: bool,
     ) -> Option<(HotkeyEvent, bool)> {
         let keys = self.key.keys();
         let mut keys_down = [None; MAX_CHORD];
         for (down, &k) in keys_down.iter_mut().zip(keys) {
-            *down = agt_platform::key_down(k);
+            *down = match press_missed {
+                true => agt_platform::key_down_past_hook(k),
+                false => agt_platform::key_down(k),
+            };
         }
         if !watch.missed(&keys_down[..keys.len()], agt_platform::paste_count()) {
             return None; // still held, can't tell, or our own paste made it look released
@@ -1100,6 +1168,10 @@ impl AudioThread {
         // queued already; give a racing one a moment to arrive.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
             return Some((ev, false));
+        }
+        if press_missed {
+            // Expected: the hook was re-installed after the press, so it never saw it.
+            return Some((HotkeyEvent::Up(Instant::now()), true));
         }
         tracing::warn!(
             "{} is no longer down but no release was seen; finishing the dictation and re-installing the keyboard hook",
@@ -1112,8 +1184,11 @@ impl AudioThread {
     /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
     /// synthesized press if the hotkey turns out to be down without the hook having said so
     /// (macOS disabled the event tap after a timeout, Windows dropped the hook), so the
-    /// recording can still be ended.
-    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<HotkeyEvent> {
+    /// recording can still be ended; with `true` if synthesized. A tap shorter than the poll
+    /// is caught only if a poll falls within it (a 100 ms tap: 40% of the time); the next
+    /// tap then gets another chance. (`GetAsyncKeyState`'s "pressed since the last call" bit
+    /// would catch it, but Windows documents it as unreliable.)
+    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<(HotkeyEvent, bool)> {
         let keys = self.key.keys();
         if !keys
             .iter()
@@ -1123,14 +1198,14 @@ impl AudioThread {
         }
         // As in `missed_release`: a real press would normally be queued already.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
-            return Some(ev);
+            return Some((ev, false));
         }
         tracing::warn!(
             "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
             self.key
         );
         self.reset.reset();
-        Some(HotkeyEvent::Down(Instant::now()))
+        Some((HotkeyEvent::Down(Instant::now()), true))
     }
 
     /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded
@@ -1157,11 +1232,13 @@ impl AudioThread {
             ..Default::default()
         });
         if !self.hub.engine_ready() {
+            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
             if self.hub.engine_failed() {
                 let _ = self.to_stt.send(ToStt::RetryLoad);
+                self.hub.reject();
+            } else {
+                self.hub.not_ready();
             }
-            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
-            self.hub.reject();
             telemetry::global().dictation(d, Ended::NotReady);
             return None;
         }
@@ -1450,6 +1527,7 @@ fn transcribe_segment(
 
 /// Transcribes dictations and meeting segments, one at a time, dictation first (see the
 /// module docs).
+#[allow(clippy::too_many_arguments)]
 fn stt_thread(
     config: Config,
     hub: Hub,
@@ -1458,9 +1536,13 @@ fn stt_thread(
     polishing: bool,
     history: Option<History>,
     chunk_secs: Arc<AtomicU32>,
+    stt_loaded: SttLoaded,
 ) {
     let polish = polishing.then_some(&config.polish);
+    let loading = SetOnDrop(stt_loaded);
     let mut engine = load_engine(&config, &hub);
+    // Loaded or failed: either way S1-mini no longer competes with it for the network.
+    drop(loading);
     if let Some(e) = &engine {
         set_chunk_secs(e.as_ref(), &chunk_secs);
     }
@@ -2148,6 +2230,11 @@ fn paste_thread(
                 } else {
                     None
                 };
+                if matches!(set, Some(Ok(_))) {
+                    // Else clipboard listeners may still hold the clipboard when the target
+                    // reads it, and some targets then paste nothing (#75).
+                    d.clipboard_settle_ms = agt_platform::wait_for_clipboard_listeners().map(ms);
+                }
                 let result = match set {
                     None => Err(PasteError::WindowChanged),
                     Some(Err(e)) => Err(PasteError::ClipboardBusy(e)),

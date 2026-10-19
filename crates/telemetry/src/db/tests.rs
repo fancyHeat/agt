@@ -283,6 +283,30 @@ fn version_5_database_gains_the_polish_ahead_columns() {
 }
 
 #[test]
+fn version_6_database_gains_clipboard_settle_ms() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..6] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 6).unwrap();
+    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
+    migrate(&mut conn).unwrap();
+    let d = Dictation {
+        started_at: 2000,
+        clipboard_settle_ms: Some(3.2),
+        ..Default::default()
+    };
+    insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    let wait: f64 = conn
+        .query_row("SELECT clipboard_settle_ms FROM dictations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(wait, 3.2);
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);
@@ -620,7 +644,8 @@ fn senders_never_wait_for_the_disk() {
         sending < Duration::from_millis(500),
         "10k sends took {sending:?} while the database was locked"
     );
-    sink.event("DEBUG", "t", "during the lock".into());
+    // INFO: with up to 10k records still queued, a DEBUG one could be dropped at the soft cap.
+    sink.event("INFO", "t", "during the lock".into());
     // Longer than the connection's busy timeout (2 s): the batch is kept and retried, and
     // a flush only succeeds once it's really committed.
     assert!(
@@ -663,4 +688,54 @@ fn senders_never_wait_for_the_disk() {
     assert!(report.contains("10000 dictations"), "{report}");
     drop(conn);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dashboard_summarizes_the_window() {
+    let conn = memory();
+    let now = 100 * DAY_MS;
+    insert_session(&conn, &SessionStart::default(), now - 1000).unwrap();
+    dictation(&conn, now - 2 * DAY_MS, 400.0, Outcome::Pasted);
+    dictation(&conn, now - 1000, 200.0, Outcome::Pasted);
+    dictation(&conn, now - 900, 100.0, Outcome::NoSpeech);
+    conn.execute(
+        "INSERT INTO events (ts, level, target, message) VALUES (?1, 'WARN', 't', 'careful')",
+        [now - 500],
+    )
+    .unwrap();
+    for ago in 1..=20 {
+        conn.execute(
+            "INSERT INTO metric_rollups (day, metric, count, p50, p90, p99)
+            VALUES (date(?1 / 1000, 'unixepoch', 'localtime'), 'latency_ms', 1, 1, 1, 1)",
+            [now - ago * DAY_MS],
+        )
+        .unwrap();
+    }
+
+    let d = crate::dashboard::load(&conn, now, Some(1)).unwrap();
+    assert_eq!((d.dictations, d.pasted, d.sessions), (2, 1, 1));
+    assert_eq!(d.audio_secs, 2.0);
+    assert_eq!(
+        d.outcomes,
+        vec![("no_speech".into(), 1), ("pasted".into(), 1)]
+    );
+    // Only pasted dictations count toward the metrics.
+    let stt = d.metrics.iter().find(|(m, _)| *m == "stt_ms").unwrap();
+    assert_eq!((stt.1.count, stt.1.max), (1, 100.0));
+    assert!(d.metrics.iter().all(|(m, _)| *m != "live_stt_ms"));
+    assert_eq!(d.problems.len(), 1);
+    assert_eq!(d.problems[0].2, "careful");
+    assert!(d.latest_session.is_some());
+    // Only the days the window touches.
+    assert_eq!(d.daily_latency.len(), 1);
+
+    // Every day of a longer window; the latest few of everything.
+    let month = crate::dashboard::load(&conn, now, Some(30)).unwrap();
+    assert_eq!(month.daily_latency.len(), 20);
+    let all = crate::dashboard::load(&conn, now, None).unwrap();
+    assert_eq!((all.dictations, all.pasted), (3, 2));
+    assert_eq!(
+        all.daily_latency.len(),
+        crate::dashboard::HISTORY_DAYS as usize
+    );
 }

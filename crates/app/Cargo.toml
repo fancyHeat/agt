@@ -43,10 +43,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Whether the app bundle is writable (see `update::silent`). The meeting pill: a
-# non-activating panel, cursor and mouse button polling; the Edit menu the notes window's
-# shortcuts need.
+# Whether the app bundle is writable (see `update::silent`); reopening the tray menu after
+# "Check for updates" (see `tray::Tray::reopen_menu`). The meeting pill: a non-activating
+# panel, cursor and mouse button polling; the Edit menu the notes window's shortcuts need.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
@@ -64,6 +65,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSView",
     "NSWindow",
 ] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "CFRunLoop"] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSGeometry",

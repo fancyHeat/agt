@@ -4,6 +4,7 @@
 //! cargo run --release -p agt-overlay --example demo -- --png <dir>   # render each state to PNGs (off-screen)
 //! cargo run --release -p agt-overlay --example demo -- --show        # show it on screen for ~4 s and measure
 //! cargo run --release -p agt-overlay --example demo -- --notice      # the "not in a text box" notice; click Copy
+//! cargo run --release -p agt-overlay --example demo -- --getting-ready [png]   # "Getting ready...", optionally captured
 //! ```
 //!
 //! `--show` drives the overlay from a winit event loop the way the app does (status events
@@ -13,7 +14,7 @@
 //! changed. It never takes focus or sends input.
 
 use agt_overlay::{
-    FRAME, Mode, NOTICE_FOR, Overlay, Position,
+    FRAME, GETTING_READY_FOR, Mode, NOTICE_FOR, Overlay, Position,
     canvas::Canvas,
     scene::{self, BARS, Scene},
 };
@@ -35,7 +36,8 @@ fn main() {
         Some("--png") if args.len() == 2 => write_pngs(Path::new(&args[1])),
         Some("--show") => show(args.get(1).map(Into::into)),
         Some("--notice") => notice(),
-        _ => eprintln!("usage: demo --png <dir> | --show | --notice"),
+        Some("--getting-ready") => getting_ready(args.get(1).map(Into::into)),
+        _ => eprintln!("usage: demo --png <dir> | --show | --notice | --getting-ready [png]"),
     }
 }
 
@@ -108,6 +110,8 @@ struct Demo {
     capture: Option<PathBuf>,
     /// `--notice`: show the notice at start; its Copy button posts [`Ev::Copy`] here.
     notice: Option<EventLoopProxy<Ev>>,
+    /// `--getting-ready`: say "Getting ready..." at start.
+    getting_ready: bool,
 }
 
 impl Demo {
@@ -148,6 +152,17 @@ impl ApplicationHandler<Ev> for Demo {
             let mut overlay = Overlay::new(Position::Bottom, on_copy).expect("create overlay");
             if self.notice.is_some() {
                 overlay.show_notice(Instant::now());
+            }
+            if self.getting_ready {
+                overlay.show_getting_ready(0.0, Instant::now());
+                println!(
+                    "{}",
+                    if overlay.notice_visible() {
+                        "\"Getting ready...\" shown"
+                    } else {
+                        "no notice: fell back to the error flash"
+                    }
+                );
             }
             self.overlay = Some(overlay);
             self.foreground = foreground().0;
@@ -256,6 +271,34 @@ fn show(capture: Option<PathBuf>) {
         foreground: 0,
         capture,
         notice: None,
+        getting_ready: false,
+    };
+    event_loop.run_app(&mut demo).expect("run");
+}
+
+/// Says "Getting ready..." (as for a key press while the model loads) until it hides itself,
+/// saving a screen capture of it to `capture` if given.
+fn getting_ready(capture: Option<PathBuf>) {
+    let event_loop = EventLoop::<Ev>::with_user_event()
+        .build()
+        .expect("event loop");
+    let proxy = event_loop.create_proxy();
+    thread::spawn(move || {
+        thread::sleep(GETTING_READY_FOR / 2);
+        if let Some(path) = capture {
+            capture_overlay(&path);
+        }
+        thread::sleep(GETTING_READY_FOR);
+        let _ = proxy.send_event(Ev::Done);
+    });
+    let mut demo = Demo {
+        overlay: None,
+        t0: Instant::now(),
+        phase: Phase::default(),
+        foreground: 0,
+        capture: None,
+        notice: None,
+        getting_ready: true,
     };
     event_loop.run_app(&mut demo).expect("run");
 }
@@ -279,6 +322,7 @@ fn notice() {
         foreground: 0,
         capture: None,
         notice: Some(proxy),
+        getting_ready: false,
     };
     event_loop.run_app(&mut demo).expect("run");
 }
@@ -358,18 +402,24 @@ fn save_png(path: &Path, w: usize, h: usize, rgba: &[u8]) {
     println!("wrote {}", path.display());
 }
 
-/// Copies what's on screen where the overlay window is (the pill composited over whatever is
-/// below it) into a PNG.
+/// Copies what's on screen where the visible overlay window is (the pill or the notice,
+/// composited over whatever is below it) into a PNG.
 #[cfg(windows)]
 fn capture_overlay(path: &Path) {
     use windows_sys::Win32::{
         Foundation::RECT,
         Graphics::Gdi::*,
-        UI::WindowsAndMessaging::{FindWindowW, GetWindowRect},
+        UI::WindowsAndMessaging::{FindWindowExW, GetWindowRect, IsWindowVisible},
     };
     let class: Vec<u16> = "AGT.Overlay\0".encode_utf16().collect();
     unsafe {
-        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        let mut hwnd = std::ptr::null_mut();
+        loop {
+            hwnd = FindWindowExW(std::ptr::null_mut(), hwnd, class.as_ptr(), std::ptr::null());
+            if hwnd.is_null() || IsWindowVisible(hwnd) != 0 {
+                break;
+            }
+        }
         let mut r: RECT = std::mem::zeroed();
         if hwnd.is_null() || GetWindowRect(hwnd, &mut r) == 0 {
             eprintln!("overlay window not found");
