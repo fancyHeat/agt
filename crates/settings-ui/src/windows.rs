@@ -20,7 +20,7 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{
         Dwm::{
             DWMWA_CAPTION_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -35,9 +35,10 @@ use windows_sys::Win32::{
             DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint,
             EnumFontFamiliesExW, FW_NORMAL, FW_SEMIBOLD, FillRect, FrameRect, GetDC,
             GetMonitorInfoW, GetSysColor, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect,
-            LOGFONTW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
-            RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC,
-            SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
+            LOGFONTW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromWindow,
+            PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow,
+            ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, TEXTMETRICW,
+            TRANSPARENT,
         },
         GdiPlus::{
             CombineModeReplace, FillModeAlternate, FlushIntentionSync, GdipAddPathArc,
@@ -57,12 +58,12 @@ use windows_sys::Win32::{
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         Controls::{
-            BST_CHECKED, CDDS_PREPAINT, CDIS_DISABLED, CDIS_HOT, CDIS_SELECTED, CDRF_SKIPDEFAULT,
-            COMBOBOXINFO, DRAWITEMSTRUCT, EM_GETLINECOUNT, EM_SETSEL, GetComboBoxInfo,
-            ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, MEASUREITEMSTRUCT,
-            NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, ODS_COMBOBOXEDIT, ODS_FOCUS, ODS_NOFOCUSRECT,
-            ODS_SELECTED, ODT_COMBOBOX, ODT_LISTBOX, SetScrollInfo, SetWindowTheme, ShowScrollBar,
-            WM_MOUSELEAVE,
+            BCM_SETNOTE, BS_COMMANDLINK, BS_DEFCOMMANDLINK, BST_CHECKED, CDDS_PREPAINT,
+            CDIS_DISABLED, CDIS_HOT, CDIS_SELECTED, CDRF_SKIPDEFAULT, COMBOBOXINFO, DRAWITEMSTRUCT,
+            EM_GETLINECOUNT, EM_SETSEL, GetComboBoxInfo, ICC_STANDARD_CLASSES,
+            INITCOMMONCONTROLSEX, InitCommonControlsEx, MEASUREITEMSTRUCT, NM_CUSTOMDRAW,
+            NMCUSTOMDRAW, NMHDR, ODS_COMBOBOXEDIT, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED,
+            ODT_COMBOBOX, ODT_LISTBOX, SetScrollInfo, SetWindowTheme, ShowScrollBar, WM_MOUSELEAVE,
         },
         HiDpi::{
             AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
@@ -118,11 +119,13 @@ const TEXT_WIDTH: i32 = 260;
 const FIELD_PADDING: i32 = 10;
 const LONG_TEXT_HEIGHT: i32 = 88;
 const CHOICE_MIN: i32 = 120;
-const CHOICE_MAX: i32 = 280;
+const CHOICE_MAX: i32 = 320;
 /// A pop-up's text inset, and the room for its chevron (a card's too).
 const CHOICE_TEXT: i32 = 11;
 const CHEVRON: i32 = 32;
 const DROP_ITEM: i32 = 32;
+/// An open pop-up's text inset (its highlight's and selection bar's included).
+const DROP_TEXT: i32 = 16;
 const DROP_HEIGHT: i32 = 300;
 const BUTTON_MIN: i32 = 120;
 const BUTTON_PADDING: i32 = 12;
@@ -768,11 +771,15 @@ pub fn run(
                     if is_class(next, "Edit") {
                         SendMessageW(next, EM_SETSEL, 0, -1);
                     }
+                    reveal(next);
                 }
                 continue;
             }
-            // Tab between controls, Enter as IDOK.
+            // Tab between controls (scrolled into view), Enter as IDOK.
             if IsDialogMessageW(window, &msg) != 0 {
+                if msg.message == WM_KEYDOWN && msg.wParam == VK_TAB as WPARAM {
+                    reveal(GetFocus());
+                }
                 continue;
             }
             TranslateMessage(&msg);
@@ -1279,7 +1286,9 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
             for (i, (texts, header)) in lines.enumerate() {
                 let top = y + d(TABLE_PADDING) + i as i32 * line;
                 if i > 0 {
-                    out.decor.rules.push(rect(x + pad, top, inner, d(1).max(1)));
+                    out.decor
+                        .rules
+                        .push(rect(x + pad, top, inner, hairline() as i32));
                 }
                 let (font, color) = if header {
                     (Font::Strong, Ink::Secondary)
@@ -1365,7 +1374,7 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
     } else {
         y + (h - block) / 2
     };
-    // Each text before its control: a screen reader names the control after it.
+    // The title right before its control: a screen reader names the control after it.
     let r = rect(x + pad, top, text_w, title_h);
     out.text(title, Font::Body, title_ink, true, SS_LEFT, r);
     if let Some((w, ch, m)) = right {
@@ -1380,6 +1389,17 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
             }
         }
     }
+    if let Control::LongText { .. } = row.control {
+        let r = rect(
+            x + pad,
+            top + block + d(UNDER_GAP),
+            inner,
+            d(LONG_TEXT_HEIGHT),
+        );
+        out.decor.fields.push((r, FIRST_ID + row.id as i32));
+        out.items.push((Placed::Row(row.clone()), r));
+    }
+    // After the control, so it's not what names it.
     let r = rect(x + pad, top + title_h + gap, text_w, note_h);
     out.text(
         &row.note,
@@ -1389,27 +1409,14 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
         SS_LEFT,
         r,
     );
-    match (&row.control, long_value) {
-        (Control::LongText { .. }, _) => {
-            let r = rect(
-                x + pad,
-                top + block + d(UNDER_GAP),
-                inner,
-                d(LONG_TEXT_HEIGHT),
-            );
-            out.decor.fields.push((r, FIRST_ID + row.id as i32));
-            out.items.push((Placed::Row(row.clone()), r));
-        }
-        (_, Some(text)) => {
-            let r = rect(
-                x + pad,
-                top + block + d(NOTE_GAP),
-                inner,
-                under - d(NOTE_GAP),
-            );
-            out.text(text, Font::Body, Ink::Secondary, true, SS_LEFT, r);
-        }
-        _ => {}
+    if let Some(text) = long_value {
+        let r = rect(
+            x + pad,
+            top + block + d(NOTE_GAP),
+            inner,
+            under - d(NOTE_GAP),
+        );
+        out.text(text, Font::Body, Ink::Secondary, true, SS_LEFT, r);
     }
     out.decor.cards.push(rect(x, y, width, h));
     h
@@ -1644,7 +1651,14 @@ unsafe fn create(
                     } else {
                         Look::Button
                     };
-                    let style = BS_PUSHBUTTON as u32 | WS_TABSTOP;
+                    // A command link: its note (`BCM_SETNOTE`) is its description for
+                    // screen readers. Drawn here all the same.
+                    let kind = if row.label.is_empty() {
+                        BS_COMMANDLINK
+                    } else {
+                        BS_PUSHBUTTON
+                    };
+                    let style = kind as u32 | WS_TABSTOP;
                     ("BUTTON", title.clone(), style, Some(look))
                 }
             };
@@ -1714,6 +1728,13 @@ unsafe fn create(
                     let field = SendMessageW(hwnd, CB_GETITEMHEIGHT, usize::MAX, 0) as i32;
                     let want = field + (r.bottom - r.top) - (closed.bottom - closed.top);
                     SendMessageW(hwnd, CB_SETITEMHEIGHT, usize::MAX, want as LPARAM);
+                    // The open list shows whole options (a long microphone name), up to a
+                    // card's width.
+                    let widest = options.iter().map(|o| text_width(Font::Body, o)).max();
+                    let scrollbar = GetSystemMetricsForDpi(SM_CXVSCROLL, DPI.get());
+                    let list = widest.unwrap_or(0) + d(DROP_TEXT + 8) + scrollbar;
+                    let list = list.clamp(r.right - r.left, d(CARD_WIDTH));
+                    SendMessageW(hwnd, CB_SETDROPPEDWIDTH, list as WPARAM, 0);
                     SetWindowSubclass(hwnd, Some(combo_proc), 0, 0);
                     let list = drop_list(hwnd);
                     SetWindowSubclass(list, Some(drop_list_proc), 0, 0);
@@ -1730,6 +1751,9 @@ unsafe fn create(
                 Control::LongText { .. } => {
                     set_scrollbar_theme(hwnd);
                     fit_scrollbar(hwnd);
+                }
+                Control::Button(_) if row.label.is_empty() && !row.note.is_empty() => {
+                    SendMessageW(hwnd, BCM_SETNOTE, 0, wide(&row.note).as_ptr() as LPARAM);
                 }
                 _ => {}
             }
@@ -1927,6 +1951,52 @@ fn is_class(hwnd: HWND, name: &str) -> bool {
     String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case(name)
 }
 
+/// Whether `hwnd` is a push button (or a command link): Enter clicks it.
+fn pushed(hwnd: HWND) -> bool {
+    let kind = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } & BS_TYPEMASK;
+    is_class(hwnd, "Button")
+        && [
+            BS_PUSHBUTTON,
+            BS_DEFPUSHBUTTON,
+            BS_COMMANDLINK,
+            BS_DEFCOMMANDLINK,
+        ]
+        .contains(&kind)
+}
+
+/// Scrolls the pane so `control` shows, with its whole card if that fits: the keyboard
+/// moved to it.
+fn reveal(control: HWND) {
+    let Some((pane, scroll)) = with(|s| (s.pane, s.scroll)) else {
+        return;
+    };
+    unsafe {
+        if GetParent(control) != pane {
+            return;
+        }
+        let mut r: RECT = zeroed();
+        GetWindowRect(control, &mut r);
+        MapWindowPoints(null_mut(), pane, &mut r as *mut RECT as *mut POINT, 2);
+        let r = up(&r, -scroll);
+        let mut client: RECT = zeroed();
+        GetClientRect(pane, &mut client);
+        let card = DECOR.with(|d| {
+            let d = d.borrow();
+            let around = |c: &&RECT| c.top <= r.top && r.bottom <= c.bottom;
+            d.cards.iter().find(around).copied()
+        });
+        let shown = card
+            .filter(|c| c.bottom - c.top <= client.bottom)
+            .unwrap_or(r);
+        let margin = d(CARD_PADDING);
+        if shown.top - margin < scroll {
+            scroll_to(shown.top - margin);
+        } else if shown.bottom + margin > scroll + client.bottom {
+            scroll_to(shown.bottom + margin - client.bottom);
+        }
+    }
+}
+
 /// Whether focus rectangles show (the keyboard was used), as for dialogs.
 fn cues(hwnd: HWND) -> bool {
     unsafe { SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) as u32 & UISF_HIDEFOCUS == 0 }
@@ -1977,7 +2047,7 @@ impl Canvas {
             unsafe { GdipDeletePath(path) };
         }
         if let Some(color) = stroke {
-            self.ring(r, radius, 1.0, color);
+            self.ring(r, radius, hairline(), color);
         }
     }
 
@@ -2092,6 +2162,11 @@ fn buffered(dc: HDC, r: &RECT, draw: impl FnOnce(&Canvas)) {
     }
 }
 
+/// A line's width: 1 DIP, in whole pixels.
+fn hairline() -> f32 {
+    scale().round().max(1.0)
+}
+
 fn radius() -> f32 {
     RADIUS as f32 * scale()
 }
@@ -2101,7 +2176,7 @@ fn radius() -> f32 {
 fn control_box(c: &Canvas, r: &RECT, fill: Argb) {
     let p = colors();
     c.round(r, radius(), Some(fill), Some(p.stroke));
-    c.bottom(r, radius(), 1.0, p.stroke_bottom);
+    c.bottom(r, radius(), hairline(), p.stroke_bottom);
 }
 
 /// A focus ring around `r` (a control's window, the box inside it by [`FOCUS`]).
@@ -2110,7 +2185,7 @@ fn focus_ring(c: &Canvas, r: &RECT, radius: f32) {
     c.ring(
         r,
         radius + FOCUS as f32 * s,
-        2.0 * s,
+        2.0 * hairline(),
         Argb::solid(colors().text),
     );
 }
@@ -2182,7 +2257,7 @@ fn draw_nav_item(item: &DRAWITEMSTRUCT) {
         let flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
         c.text(&title, &text, Font::Body, ink, flags);
         if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
-            c.ring(&pill, radius(), 2.0 * scale(), Argb::solid(p.text));
+            c.ring(&pill, radius(), 2.0 * hairline(), Argb::solid(p.text));
         }
     });
 }
@@ -2253,7 +2328,7 @@ fn draw_drop_item(item: &DRAWITEMSTRUCT) {
         let text = option(item.hwndItem, item.itemID as usize);
         let ink = if selected { p.selected_text } else { p.text };
         let label = RECT {
-            left: b.left + d(12),
+            left: r.left + d(DROP_TEXT),
             right: b.right - d(8),
             ..r
         };
@@ -2434,10 +2509,9 @@ fn paint_pane(pane: HWND, dc: HDC, dirty: &RECT) {
                 let fill = Argb::solid(if focus { p.field_focus } else { p.field });
                 c.round(&field, radius(), Some(fill), Some(p.stroke));
                 if focus {
-                    let s = scale();
-                    c.bottom(&field, radius(), (2.0 * s).round(), Argb::solid(p.accent));
+                    c.bottom(&field, radius(), 2.0 * hairline(), Argb::solid(p.accent));
                 } else {
-                    c.bottom(&field, radius(), 1.0, p.field_bottom);
+                    c.bottom(&field, radius(), hairline(), p.field_bottom);
                 }
             }
         });
@@ -2475,6 +2549,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     if index >= 0 {
                         show(index as usize);
                     }
+                } else if pushed(GetFocus()) && (id == IDOK || id == GetDlgCtrlID(GetFocus())) {
+                    // Enter on a button clicks it, as Space does.
+                    SendMessageW(GetFocus(), BM_CLICK, 0, 0);
                 } else if id == IDOK {
                     // Enter in a one-line field, or on a pop-up: report it now.
                     let focused = GetFocus();
@@ -2981,7 +3058,9 @@ unsafe extern "system" fn drop_list_proc(
                 let frame = rect(0, 0, r.right - r.left, r.bottom - r.top);
                 let dc = GetWindowDC(hwnd);
                 let brush = CreateSolidBrush(colors().flyout_border);
-                FrameRect(dc, &frame, brush);
+                for i in 0..hairline() as i32 {
+                    FrameRect(dc, &inset(&frame, i, i), brush);
+                }
                 DeleteObject(brush as HGDIOBJ);
                 ReleaseDC(hwnd, dc);
                 return result;
