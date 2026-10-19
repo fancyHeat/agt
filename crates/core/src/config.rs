@@ -34,9 +34,9 @@ pub const DEFAULT_CONFIG: &str = concat!(
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
 log_level = "info"
-# Start AGT when you log in (installed AGT only, not development builds). Turning it off in
-# Task Manager's Startup apps (Windows) or System Settings > General > Login Items (macOS)
-# works too, and AGT leaves that as you set it.
+# Start AGT when you log in (installed AGT only, not development builds). Applied on AGT's
+# first start and whenever you change it here. Turning AGT off or removing it in Task Manager's
+# Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks until then.
 launch_at_login = true
 
 [hotkey]

@@ -677,7 +677,14 @@ fn set_run_value(key: &str, name: &str, command: Option<&OsStr>) -> Result<Login
     let (key, name) = (wide(key), wide(name));
     let current = read_string(&key, &name)?;
     let code = match (command, current) {
-        (Some(c), Some(current)) if current == c => return Ok(LoginItem::Unchanged),
+        // Paths are case-insensitive (the stub on disk is `AGT.exe`; this writes `agt.exe`).
+        (Some(c), Some(current))
+            if current
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&c.to_string_lossy()) =>
+        {
+            return Ok(LoginItem::Unchanged);
+        }
         (None, None) => return Ok(LoginItem::Unchanged),
         (Some(c), _) => {
             let data = wide(c);
@@ -699,10 +706,12 @@ fn set_run_value(key: &str, name: &str, command: Option<&OsStr>) -> Result<Login
         (None, Some(_)) => {
             let code =
                 unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
-            if code == ERROR_SUCCESS {
-                return Ok(LoginItem::Unregistered);
+            match code {
+                ERROR_SUCCESS => return Ok(LoginItem::Unregistered),
+                // Deleted since it was read.
+                ERROR_FILE_NOT_FOUND => return Ok(LoginItem::Unchanged),
+                code => code,
             }
-            code
         }
     };
     Err(std::io::Error::from_raw_os_error(code as i32).into())
@@ -1063,12 +1072,21 @@ mod tests {
     #[test]
     fn run_value_is_written_only_when_it_changes() {
         use windows_sys::Win32::System::Registry::RegDeleteKeyW;
+        /// Deletes the test key, also when an assert fails.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&self.0).as_ptr()) };
+            }
+        }
         let key = format!(r"Software\AGT-test-{}", std::process::id());
+        let _cleanup = Cleanup(key.clone());
         let set = |c: Option<&str>| set_run_value(&key, "AGT", c.map(OsStr::new)).unwrap();
         let a = r#""C:\Users\A B\AppData\Local\AGT\agt.exe""#;
         assert_eq!(set(None), LoginItem::Unchanged); // no key yet
         assert_eq!(set(Some(a)), LoginItem::Registered);
         assert_eq!(set(Some(a)), LoginItem::Unchanged);
+        assert_eq!(set(Some(&a.to_uppercase())), LoginItem::Unchanged);
         assert_eq!(
             read_string(&wide(&key), &wide("AGT")).unwrap().unwrap(),
             OsStr::new(a)
@@ -1092,10 +1110,6 @@ mod tests {
         assert_eq!(code, ERROR_SUCCESS);
         assert_eq!(set(Some(a)), LoginItem::Registered);
         assert_eq!(set(None), LoginItem::Unregistered);
-        assert_eq!(
-            unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&key).as_ptr()) },
-            ERROR_SUCCESS
-        );
     }
 
     #[test]
