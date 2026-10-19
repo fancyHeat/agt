@@ -162,12 +162,12 @@ type into during the call. Dictation keeps working; what you dictate isn't part 
   decisions and action items with your own Claude Code CLI (`claude`, signed in with your
   Claude account; AGT holds no API key). A new meeting reads "New meeting..." until then, and
   the AI notes give it a title, unless you typed one first; without AI notes it goes by its
-  date. If `ANTHROPIC_API_KEY` is set in AGT's environment,
-  the CLI uses that key instead, and the notes are billed to it. The transcript and your notes
-  go to Claude when you click Generate notes, or automatically after each meeting if you turn
-  on `auto_summary = true` under `[meeting]` in `config.toml`. This is the only time meeting
-  text leaves your computer, and it goes only to Claude. `summary = "off"` turns AI notes off;
-  `claude_path` and `claude_model` pick the program and the model.
+  date. If `ANTHROPIC_API_KEY` is set in AGT's environment, the CLI uses that key instead,
+  and the notes are billed to it. The transcript and your notes go to Claude when you click
+  Generate notes, or automatically after each meeting if you turn on `auto_summary = true`
+  under `[meeting]` in `config.toml`. This is the only time meeting text leaves your
+  computer, and it goes only to Claude. `summary = "off"` turns AI notes off; `claude_path`
+  and `claude_model` pick the program and the model.
 - **Files:** one folder per meeting in `meetings` next to `agt.db`, with `meeting.json` (the
   title, your notes, the AI notes), `transcript.jsonl` (one line per thing said) and
   `meeting.md` (all of it as Markdown). The window's **Copy** and **Folder** buttons get you
