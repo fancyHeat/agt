@@ -6,7 +6,7 @@ use super::{Action, metrics, schema};
 use agt_core::{
     Config,
     config::{self, SettingPath, SettingValue},
-    paths,
+    paths, snippets,
 };
 use agt_settings_ui::{Control, Event, Page, Row, Section};
 use std::{
@@ -93,6 +93,7 @@ pub fn run() {
         stamp: None,
         metrics: metrics::Metrics::new(paths::db_file()),
         advanced: false,
+        draft: schema::Draft::default(),
     };
     let icon = crate::tray::color_icon;
     if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page), Some(icon)) {
@@ -107,6 +108,7 @@ enum Act {
     Choice(Vec<Vec<(SettingPath, SettingValue)>>),
     /// `multiline`: kept as typed; one line is trimmed.
     Text(SettingPath, bool),
+    Snippet(schema::SnippetField),
     Button(Action),
     Metrics(metrics::Act),
     /// "Show advanced settings" / "Hide advanced settings".
@@ -123,6 +125,8 @@ struct Model {
     metrics: metrics::Metrics,
     /// Showing every setting, not just the basic ones (until the window closes).
     advanced: bool,
+    /// The snippet being typed on the Snippets page, until "Add snippet".
+    draft: schema::Draft,
 }
 
 impl Model {
@@ -163,6 +167,19 @@ impl Model {
                 };
                 (item.label, control, Act::Text(t.path, t.multiline))
             }
+            schema::Kind::Snippet {
+                field,
+                value,
+                placeholder,
+            } => (
+                item.label,
+                Control::Text {
+                    value,
+                    placeholder,
+                    secret: false,
+                },
+                Act::Snippet(field),
+            ),
             schema::Kind::Info(text) => (item.label, Control::Value(text), Act::None),
             schema::Kind::Button(action) => (
                 String::new(),
@@ -222,6 +239,39 @@ impl Model {
         self.stamp = self.stamp();
         result.map(drop).map_err(|e| e.to_string())
     }
+
+    /// Writes `[snippets] list` as `change` makes it from the list in the file now.
+    fn change_snippets(
+        &mut self,
+        change: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
+        let config = Config::load(&self.path).map_err(|e| e.to_string())?;
+        let list = change(&config.snippets.list)?;
+        self.set(&[(&["snippets", "list"], list.into())])
+    }
+
+    fn add_snippet(&mut self) -> Result<(), String> {
+        let (speech, text) = (self.draft.speech.clone(), self.draft.text.clone());
+        if let Some(problem) = snippet_problem(&speech, &text) {
+            return Err(problem.into());
+        }
+        self.change_snippets(|list| Ok(snippets::add(list, &speech, &text)))?;
+        self.draft = schema::Draft::default();
+        Ok(())
+    }
+}
+
+/// Why the Snippets page's speech and inserted text can't be added, if they can't.
+fn snippet_problem(speech: &str, text: &str) -> Option<&'static str> {
+    if !speech.chars().any(char::is_alphanumeric) {
+        Some("Type the speech first: the words you say.")
+    } else if speech.contains('=') || speech.starts_with('#') {
+        Some("The speech can't contain \"=\" or start with \"#\".")
+    } else if text.is_empty() {
+        Some("Type the inserted text: what AGT types when it hears the speech.")
+    } else {
+        None
+    }
 }
 
 impl agt_settings_ui::Model for Model {
@@ -260,7 +310,7 @@ impl agt_settings_ui::Model for Model {
                 ];
             }
         };
-        let pages = schema::pages(&config, self.advanced);
+        let pages = schema::pages(&config, self.advanced, &self.draft);
         // The buttons' ids come first, so they're the same either way: the focus (by id)
         // stays on the button that was clicked.
         let buttons: Vec<Section> = pages.iter().map(|_| self.advanced_section()).collect();
@@ -303,6 +353,23 @@ impl agt_settings_ui::Model for Model {
                 let text = if *multiline { &text } else { text.trim() };
                 vec![(*path, text.into())]
             }
+            (Some(Act::Snippet(field)), Event::Text(_, text)) => {
+                let text = text.trim().to_owned();
+                match field.clone() {
+                    schema::SnippetField::NewSpeech => self.draft.speech = text,
+                    schema::SnippetField::NewText => self.draft.text = text,
+                    schema::SnippetField::Text(entry) => {
+                        return self.change_snippets(|list| {
+                            // Changed in the file since the page was shown: not this line.
+                            if !snippets::entries(list).contains(&entry) {
+                                return Err("config.toml changed; try again.".into());
+                            }
+                            Ok(snippets::set_text(list, &entry, &text))
+                        });
+                    }
+                }
+                return Ok(());
+            }
             (Some(Act::Metrics(metrics::Act::Period)), Event::Choose(_, i)) => {
                 self.metrics.set_period(i);
                 return Ok(());
@@ -315,6 +382,7 @@ impl agt_settings_ui::Model for Model {
                 match action {
                     Action::EditFile => crate::open_in_editor(&self.path),
                     Action::OpenHistory => crate::open_history(),
+                    Action::AddSnippet => return self.add_snippet(),
                 }
                 return Ok(());
             }
@@ -336,5 +404,20 @@ impl agt_settings_ui::Model for Model {
         // Always asked: it keeps the figures current.
         let figures = self.metrics.refresh();
         file || figures
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_snippet_needs_words_and_text() {
+        assert!(snippet_problem("", "").is_some());
+        assert!(snippet_problem("...", "x").is_some());
+        assert!(snippet_problem("a = b", "x").is_some());
+        assert!(snippet_problem("#tag", "x").is_some());
+        assert!(snippet_problem("Reddit True Tide", "").is_some());
+        assert_eq!(snippet_problem("Reddit True Tide", "retatrutide"), None);
     }
 }

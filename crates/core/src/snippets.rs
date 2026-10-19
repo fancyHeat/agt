@@ -23,27 +23,20 @@ struct Snippet {
 }
 
 impl Snippets {
-    /// One snippet per line, `phrase = text`. `\n` in the text types a new line. Lines
-    /// starting with `#`, without `=`, or with nothing on either side are skipped.
+    /// One snippet per line, `phrase = text` (see [`entries`]). `\n` in the text types a
+    /// new line.
     pub fn parse(list: &str) -> Self {
-        let mut list: Vec<Snippet> = list
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with('#'))
-            .filter_map(|l| l.split_once('='))
-            .filter_map(|(phrase, text)| {
-                let words = words(phrase);
-                let text = text.trim().replace("\\n", "\n");
-                if words.is_empty() || text.is_empty() {
-                    return None;
-                }
+        let mut list: Vec<Snippet> = entries(list)
+            .into_iter()
+            .map(|e| {
+                let text = e.text.replace("\\n", "\n");
                 let first = text.split_whitespace().next().unwrap_or_default();
                 let capitalize = first.chars().all(|c| c.is_alphabetic() && c.is_lowercase());
-                Some(Snippet {
-                    words,
+                Snippet {
+                    words: words(&e.phrase),
                     text,
                     capitalize,
-                })
+                }
             })
             .collect();
         // "Reddit True Tide" before "true tide"; equal lengths keep their order.
@@ -127,6 +120,70 @@ impl Snippet {
         let next = text[end..].chars().next();
         (!next.is_some_and(char::is_alphanumeric)).then_some(end)
     }
+}
+
+/// A line of a `[snippets] list` that holds a snippet, as written there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    /// Which line of the list (0-based).
+    pub line: usize,
+    /// What you say.
+    pub phrase: String,
+    /// What's typed instead (`\n` still written out).
+    pub text: String,
+}
+
+/// The snippets of a `[snippets] list`, in its order. Lines starting with `#`, without `=`,
+/// or with nothing on either side hold none.
+pub fn entries(list: &str) -> Vec<Entry> {
+    list.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with('#'))
+        .filter_map(|(line, l)| {
+            let (phrase, text) = l.split_once('=')?;
+            let (phrase, text) = (phrase.trim(), text.trim());
+            (!words(phrase).is_empty() && !text.is_empty()).then(|| Entry {
+                line,
+                phrase: phrase.into(),
+                text: text.into(),
+            })
+        })
+        .collect()
+}
+
+/// `list` with the snippet `phrase = text`: on the line of a snippet with the same words if
+/// there is one ("reddit true-tide" is "Reddit True Tide"), else on a new last line.
+pub fn add(list: &str, phrase: &str, text: &str) -> String {
+    let line = format!("{} = {}", phrase.trim(), text.trim());
+    let same = entries(list)
+        .into_iter()
+        .find(|e| words(&e.phrase) == words(phrase));
+    let mut lines: Vec<&str> = list.lines().collect();
+    match same {
+        Some(e) => lines[e.line] = &line,
+        None => lines.push(&line),
+    }
+    joined(&lines)
+}
+
+/// `list` with the snippet on line `entry.line` typing `text` instead, or without that line if
+/// `text` is empty.
+pub fn set_text(list: &str, entry: &Entry, text: &str) -> String {
+    let line = format!("{} = {}", entry.phrase, text.trim());
+    let mut lines: Vec<&str> = list.lines().collect();
+    if entry.line < lines.len() {
+        if text.trim().is_empty() {
+            lines.remove(entry.line);
+        } else {
+            lines[entry.line] = &line;
+        }
+    }
+    joined(&lines)
+}
+
+/// One line each, each ending with a new line.
+fn joined(lines: &[&str]) -> String {
+    lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
 /// The words of a phrase, lowercase: its runs of letters and digits.
@@ -243,6 +300,34 @@ mod tests {
         assert_eq!(apply("math = a = b", "math"), "a = b");
         assert!(Snippets::parse("").is_empty());
         assert_eq!(Snippets::parse("").apply("text"), ("text".into(), 0));
+    }
+
+    #[test]
+    fn entries_add_and_set_text_keep_the_other_lines() {
+        let list = "# mine\nReddit True Tide = retatrutide\nnot a snippet\ntirz = tirzepatide";
+        let e = entries(list);
+        let phrases: Vec<_> = e.iter().map(|e| (e.line, e.phrase.as_str())).collect();
+        assert_eq!(phrases, [(1, "Reddit True Tide"), (3, "tirz")]);
+        // Added last; the same words again change that line instead.
+        let added = add(list, " sig ", " Thanks,\\nGrant ");
+        assert_eq!(
+            added,
+            "# mine\nReddit True Tide = retatrutide\nnot a snippet\ntirz = tirzepatide\nsig = Thanks,\\nGrant\n"
+        );
+        assert_eq!(
+            add(list, "reddit true-tide", "Retatrutide"),
+            "# mine\nreddit true-tide = Retatrutide\nnot a snippet\ntirz = tirzepatide\n"
+        );
+        assert_eq!(add("", "a b", "c"), "a b = c\n");
+        // Changed in place, or removed when emptied.
+        assert_eq!(
+            set_text(list, &e[1], "tirzepatide (Zepbound)"),
+            "# mine\nReddit True Tide = retatrutide\nnot a snippet\ntirz = tirzepatide (Zepbound)\n"
+        );
+        assert_eq!(
+            set_text(list, &e[0], " "),
+            "# mine\nnot a snippet\ntirz = tirzepatide\n"
+        );
     }
 
     #[test]

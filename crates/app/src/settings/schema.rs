@@ -5,9 +5,12 @@
 //! once the window's "Show advanced settings" is clicked.
 
 use super::Action;
-use agt_core::config::{
-    self, Config, Device, Engine, OverlayPosition, PolishProvider, PolishStyle, Precision,
-    S1Context, S1Device, S1Structure, S1Styling, SettingPath, SettingValue,
+use agt_core::{
+    config::{
+        self, Config, Device, Engine, OverlayPosition, PolishProvider, PolishStyle, Precision,
+        S1Context, S1Device, S1Structure, S1Styling, SettingPath, SettingValue,
+    },
+    snippets,
 };
 
 /// A page of the window.
@@ -46,6 +49,30 @@ pub enum Kind {
     Info(String),
     /// Not a setting: works while the file has an error too.
     Button(Action),
+    /// A field of the Snippets page: what's typed goes into `[snippets] list` by way of the
+    /// window ([`super::window`]), not straight to a setting.
+    Snippet {
+        field: SnippetField,
+        value: String,
+        placeholder: String,
+    },
+}
+
+/// Which field of the Snippets page.
+#[derive(Clone)]
+pub enum SnippetField {
+    /// The new snippet's speech or inserted text: kept by the window until "Add snippet".
+    NewSpeech,
+    NewText,
+    /// The inserted text of a snippet in the list.
+    Text(snippets::Entry),
+}
+
+/// The snippet being added, as typed so far (it isn't in the file until it's added).
+#[derive(Default)]
+pub struct Draft {
+    pub speech: String,
+    pub text: String,
 }
 
 pub struct Text {
@@ -125,15 +152,15 @@ fn section(title: &'static str, items: Vec<Item>) -> Section {
     Section { title, items }
 }
 
-/// The settings, with `c`'s values: the basic ones, or all of them with `advanced`.
-/// Always the same pages (they're the macOS toolbar's items), sections without an item to
-/// show left out.
-pub fn pages(c: &Config, advanced: bool) -> Vec<Page> {
+/// The settings, with `c`'s values (and the snippet being added): the basic ones, or all of
+/// them with `advanced`. Always the same pages (they're the macOS toolbar's items), sections
+/// without an item to show left out.
+pub fn pages(c: &Config, advanced: bool, draft: &Draft) -> Vec<Page> {
     let mut pages = vec![
         general(c),
         speech(c),
         polish(c),
-        snippets(c),
+        snippets(c, draft),
         history(c),
         updates(c),
     ];
@@ -628,26 +655,53 @@ fn polish(c: &Config) -> Page {
     }
 }
 
-fn snippets(c: &Config) -> Page {
-    let list = Item::text(
-        "Snippets",
-        Text {
-            path: &["snippets", "list"],
-            value: c.snippets.list.clone(),
-            placeholder: String::new(),
-            secret: false,
-            multiline: true,
-        },
-    )
-    .note(
-        "Say a phrase and AGT types something else in its place. One per line, what you say = \
-         what AGT types, e.g. Reddit True Tide = retatrutide. Capitals and the spaces between \
-         words don't matter; \\n starts a new line.",
-    );
+fn snippets(c: &Config, draft: &Draft) -> Page {
+    let field = |label: &str, field: SnippetField, value: &str, placeholder: &str| {
+        Item::new(
+            label,
+            Kind::Snippet {
+                field,
+                value: value.into(),
+                placeholder: placeholder.into(),
+            },
+        )
+    };
+    let new = vec![
+        field(
+            "Speech",
+            SnippetField::NewSpeech,
+            &draft.speech,
+            "Reddit True Tide",
+        ),
+        field(
+            "Inserted text",
+            SnippetField::NewText,
+            &draft.text,
+            "retatrutide",
+        )
+        .note(
+            "When AGT hears the speech, it types the inserted text instead. Capitals and the \
+             spaces between words don't matter; \\n starts a new line.",
+        ),
+        Item::new("Add snippet", Kind::Button(Action::AddSnippet)),
+    ];
+    let mut list: Vec<Item> = snippets::entries(&c.snippets.list)
+        .into_iter()
+        .map(|e| {
+            let (phrase, text) = (e.phrase.clone(), e.text.clone());
+            field(&phrase, SnippetField::Text(e), &text, "")
+        })
+        .collect();
+    match list.last_mut() {
+        Some(last) => {
+            last.note = "Change the inserted text here; empty it to remove the snippet.".into()
+        }
+        None => list.push(Item::new("", Kind::Info("None yet.".into()))),
+    }
     Page {
         title: "Snippets",
         symbol: "character.book.closed",
-        sections: vec![section("", vec![list])],
+        sections: vec![section("New snippet", new), section("Your snippets", list)],
     }
 }
 
@@ -936,7 +990,7 @@ mod tests {
             )
             .unwrap();
             let c = Config::parse(&text).unwrap();
-            for page in super::pages(&c, true) {
+            for page in super::pages(&c, true, &Draft::default()) {
                 for item in page.sections.iter().flat_map(|s| &s.items) {
                     let changes: Vec<_> = match &item.kind {
                         Kind::Check { path, on, .. } => vec![vec![(*path, (!on).into())]],
@@ -944,7 +998,7 @@ mod tests {
                             choices.iter().map(|c| c.changes.clone()).collect()
                         }
                         Kind::Text(t) => vec![vec![(t.path, "x".into())]],
-                        Kind::Info(_) | Kind::Button(_) => Vec::new(),
+                        Kind::Info(_) | Kind::Button(_) | Kind::Snippet { .. } => Vec::new(),
                     };
                     for change in changes {
                         config::with_settings(&text, &change)
@@ -958,7 +1012,11 @@ mod tests {
     fn basic_pages_hide_advanced_settings() {
         // The same pages either way (the macOS toolbar's items), each with something basic.
         let c = Config::default();
-        let (basic, all) = (super::pages(&c, false), super::pages(&c, true));
+        let draft = Draft::default();
+        let (basic, all) = (
+            super::pages(&c, false, &draft),
+            super::pages(&c, true, &draft),
+        );
         let titles = |p: &[Page]| p.iter().map(|p| p.title).collect::<Vec<_>>();
         assert_eq!(titles(&basic), titles(&all));
         let items = |p: &Page| p.sections.iter().flat_map(|s| &s.items).count();

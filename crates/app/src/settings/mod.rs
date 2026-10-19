@@ -13,4 +13,6 @@ pub enum Action {
     EditFile,
     /// Open the saved dictations' folder (created if needed).
     OpenHistory,
+    /// Add the snippet typed on the Snippets page ([`schema::Draft`]).
+    AddSnippet,
 }

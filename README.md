@@ -116,19 +116,25 @@ default, and it runs locally unless you point it at a cloud service).
 
 ## Snippets
 
-**Settings... → Snippets** lists phrases AGT types as something else: a word the speech model
-keeps mishearing, a name, an email address. One per line, what you say, `=`, what AGT types:
+**Settings... → Snippets** holds phrases AGT types as something else: a word the speech model
+keeps mishearing, a name, an email address. Type the **Speech** (what you say, e.g. "Reddit
+True Tide") and the **Inserted text** (what AGT types instead, e.g. "retatrutide"), then click
+**Add snippet**. Your snippets are listed under it, each with its inserted text in a field:
+change it there, or empty it to remove the snippet.
 
-```text
+Capitals don't matter in the speech, nor what's between its words (a space, a hyphen, a comma
+or nothing: "true-tide" and "truetide" both match "true tide"), but only whole words match.
+The inserted text is typed as written, after AI clean-up, except that it starts with a capital
+where the sentence does. `\n` in it starts a new line. In `config.toml` it's the `[snippets]`
+section, one snippet per line:
+
+```toml
+[snippets]
+list = """
 Reddit True Tide = retatrutide
 my email = me@example.com
+"""
 ```
-
-Capitals don't matter in what you say, nor what's between its words (a space, a hyphen, a
-comma or nothing: "true-tide" and "truetide" both match "true tide"), but only whole words
-match. The snippet is typed as written, after AI clean-up, except that it starts with a
-capital where the sentence does. `\n` in a snippet starts a new line. In `config.toml` it's
-the `[snippets]` section.
 
 ## Dictation history
 
