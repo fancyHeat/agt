@@ -160,6 +160,7 @@
   .row:hover { background: var(--fill); }
   .row .r-main { flex: 1; min-width: 0; }
   .row .r-title { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .r-title.is-new, .live-card .lc-title.is-new { color: var(--text-3); }
   .row .r-sub { font-size: 12.5px; color: var(--text-2); display: flex; align-items: center; gap: 6px; }
   .tag {
     flex: none; font-size: 11.5px; font-weight: 600; color: var(--text-2);
@@ -181,6 +182,9 @@
   }
   .title-input:hover { background: var(--fill); }
   .title-input:focus { outline: none; background: var(--fill); }
+  /* Untitled: the date title reads like a title; "New meeting..." (and any hint being typed over) is grey. */
+  .title-input::placeholder { color: var(--text); opacity: 1; }
+  .title-input.is-new::placeholder, .title-input:focus::placeholder { color: var(--text-3); }
   .indent { padding-left: 32px; }
   .meta { font-size: 13px; color: var(--text-2); }
   .live-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
@@ -630,6 +634,11 @@
     return n;
   }
   function hasContent() { return !!S.m && (S.m.lines.length > 0 || !!(S.m.notes || '').trim()); }
+  // An untitled meeting reads "New meeting..." (greyed) while it records and while Claude writes
+  // its notes, which name it; otherwise its date title (default_title). Typing names it.
+  var NEW_TITLE = 'New meeting\u2026';
+  function naming(id) { var st = S.sum[id]; return !!liveOf(id) || !!(st && st.state === 'running'); }
+  function untitledText(x) { return naming(x.id) ? NEW_TITLE : (x.default_title || 'Untitled meeting'); }
 
   // ------------------------------------------------------------------ elements
   var el = {
@@ -709,6 +718,7 @@
     S.m = {
       id: m.id,
       title: keepTitle ? prev.title : (m.title || ''),
+      default_title: m.default_title || '',
       started_at: m.started_at,
       ended_at: m.ended_at,
       notes: keepNotes ? prev.notes : (m.notes || ''),
@@ -878,9 +888,20 @@
         S.m.summary_by = msg.by || null;
       }
       S.meetings.forEach(function (x) { if (x.id === id) x.has_summary = true; });
+      if (typeof msg.title === 'string' && msg.title) onNamed(id, msg.title);
     } else return;
-    if (S.m && S.m.id === id) { renderAi(); renderFooter(); }
+    if (S.m && S.m.id === id) { renderTitleHint(); renderAi(); renderFooter(); }
     if (S.view === 'list') renderList();
+  }
+
+  // The AI notes named untitled meeting `id`. Rust has the title now; a title the user is
+  // typing still wins (it is sent and saved after this one).
+  function onNamed(id, title) {
+    S.meetings.forEach(function (x) { if (x.id === id && !(x.title || '').trim()) x.title = title; });
+    if (!S.m || S.m.id !== id) return;
+    lastSentTitle[id] = title;
+    var typing = (pending.title && pending.title.id === id) || (document.activeElement === el.title && el.title.value.trim());
+    if (!typing) { S.m.title = title; el.title.value = title; }
   }
 
   // One line under the header: a session error, a start that failed, the model still loading.
@@ -977,8 +998,15 @@
     return parts.join(' · ');
   }
 
+  function renderTitleHint() {
+    if (!S.m) return;
+    el.title.placeholder = untitledText(S.m);
+    el.title.classList.toggle('is-new', naming(S.m.id));
+  }
+
   function renderHeader() {
     var m = S.m, live = liveOf(m.id);
+    renderTitleHint();
     el.meta.textContent = metaText(m, live);
     el.liveRow.hidden = !live;
     if (live) {
@@ -1183,7 +1211,7 @@
       box.appendChild(h('div', { class: 'live-card' }, [
         h('span', { class: 'rec-dot' + (live.paused || finishing ? ' paused' : '') }),
         h('span', { class: 'lc-label' }, [finishing ? 'Finishing...' : (live.paused ? 'Paused ' : 'Recording '), finishing ? null : listTimeEl]),
-        h('span', { class: 'lc-title', text: title }),
+        h('span', { class: 'lc-title' + (title ? '' : ' is-new'), text: title || NEW_TITLE }),
         h('button', { class: 'btn sm', onclick: function () { send({ type: 'open', id: S.liveId }); } }, ['Open']),
         finishing ? null : h('button', { class: 'btn sm', onclick: stopMeeting }, [h('span', { class: 'sq', 'aria-hidden': 'true' }), 'Stop'])
       ]));
@@ -1228,7 +1256,9 @@
         onclick: function () { flushAll(); send({ type: 'open', id: x.id }); }
       }, [
         h('div', { class: 'r-main' }, [
-          h('div', { class: 'r-title', text: x.title || 'Untitled meeting' }),
+          (x.title || '').trim()
+            ? h('div', { class: 'r-title', text: x.title })
+            : h('div', { class: 'r-title' + (naming(x.id) ? ' is-new' : ''), text: untitledText(x) }),
           h('div', { class: 'r-sub' }, [
             isLive ? h('span', { class: 'rec-dot' }) : null,
             isLive ? 'Recording' : null,
@@ -1248,6 +1278,7 @@
     S.sum[S.m.id] = { state: 'running' };
     send({ type: 'summarize', id: S.m.id });
     setTab('ai');
+    renderTitleHint();
     renderAi();
     renderFooter();
   }
@@ -1260,7 +1291,7 @@
     if (S.view === 'list') renderListAction();
   }
   function meetingMarkdown(m) {
-    var out = ['# ' + ((m.title || '').trim() || 'Meeting')];
+    var out = ['# ' + ((m.title || '').trim() || m.default_title || 'Meeting')];
     var meta = metaText(m, liveOf(m.id));
     if (meta) out.push('', meta);
     // The same headings as meeting.md, Claude's own a level under "## Notes".
@@ -1311,7 +1342,8 @@
     if (e.key === 'Enter') { e.preventDefault(); el.title.blur(); }
     else if (e.key === 'Escape' && S.m) {
       if (pending.title) { clearTimeout(pending.title.timer); pending.title = null; }
-      S.m.title = lastSentTitle[S.m.id] || S.m.title;
+      // Back to what Rust has, untitled included.
+      if (lastSentTitle[S.m.id] != null) S.m.title = lastSentTitle[S.m.id];
       el.title.value = S.m.title;
       el.title.blur();
     }
@@ -1423,6 +1455,10 @@
     }[params.get('fail')] || null;
     var now = Date.now();
     function at(daysAgo, hh, mm) { var d = new Date(now); d.setDate(d.getDate() - daysAgo); d.setHours(hh, mm, 0, 0); return d.getTime(); }
+    function dateTitle(ts) {
+      var d = new Date(ts);
+      return 'Meeting ' + new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(d) + ', ' + new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(d);
+    }
     function idFor(ts) {
       var d = new Date(ts);
       return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
@@ -1489,7 +1525,9 @@
       { started: at(3, 13, 0), mins: 72, title: 'Vendor call', summary: null, failOnce: true },
       { started: at(7, 11, 15), mins: 55, title: 'Weekly planning', summary: '### Notes\n* Planning for the next two weeks\n* Hiring update: *two* interviews booked\n\nRaw HTML stays as text: <img src=x onerror="alert(1)"> and <b>not bold</b>. A [link](javascript:alert(1)) is only text.' },
       { started: at(16, 16, 45), mins: 31, title: 'Interview: support lead', summary: null },
-      { started: new Date(new Date(now).getFullYear() - 1, 11, 12, 10, 0).getTime(), mins: 40, title: 'Year end review', summary: '## Summary\nA calm year end review.' }
+      { started: new Date(new Date(now).getFullYear() - 1, 11, 12, 10, 0).getTime(), mins: 40, title: 'Year end review', summary: '## Summary\nA calm year end review.' },
+      // Never named: its notes were never written.
+      { started: at(2, 14, 0), mins: 20, title: '', summary: null }
     ].forEach(function (x, i) {
       add({
         id: idFor(x.started), title: x.title, started_at: x.started, ended_at: x.started + x.mins * 60000,
@@ -1503,7 +1541,7 @@
     function list() {
       return Object.keys(store).map(function (k) {
         var m = store[k];
-        return { id: m.id, title: m.title, started_at: m.started_at, ended_at: m.ended_at, has_summary: !!m.summary };
+        return { id: m.id, title: m.title, default_title: dateTitle(m.started_at), started_at: m.started_at, ended_at: m.ended_at, has_summary: !!m.summary };
       });
     }
     function sendList() { deliver({ type: 'meetings', list: list() }); }
@@ -1523,7 +1561,7 @@
       if (!m) return null;
       return {
         type: 'meeting',
-        meeting: { id: m.id, title: m.title, started_at: m.started_at, ended_at: m.ended_at, notes: m.notes, summary: m.summary, summary_by: m.summary_by, lines: m.lines },
+        meeting: { id: m.id, title: m.title, default_title: dateTitle(m.started_at), started_at: m.started_at, ended_at: m.ended_at, notes: m.notes, summary: m.summary, summary_by: m.summary_by, lines: m.lines },
         live: live && live.id === id ? liveObj() : null
       };
     }
@@ -1531,9 +1569,8 @@
       if (live) return;
       if (FAIL) { setTimeout(function () { notice(FAIL); }, 300); return; }
       var ts = Date.now();
-      var d = new Date(ts);
       var m = add({
-        id: idFor(ts), title: 'Meeting ' + new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(d) + ', ' + new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(d),
+        id: idFor(ts), title: '',
         started_at: ts, ended_at: null, notes: '', summary: null, summary_by: null, lines: []
       });
       live = { id: m.id, elapsed: 0, paused: false, stopping: false, system: sysParam || 'ok', next: 0, talker: 'them', last: Date.now() };
@@ -1593,11 +1630,12 @@
         clearInterval(live.tickTimer); clearInterval(live.lineTimer); clearInterval(live.levelTimer);
         store[id].ended_at = Date.now();
         live = null;
+        // With auto_summary off (the default) the page shows Generate notes instead. On, the
+        // page hears "running" before the stop, as from Rust.
+        var words = store[id].lines.reduce(function (n, l) { return n + l.text.split(/\s+/).length; }, 0);
+        if (params.has('auto') && words >= 30) summarize(id);
         deliver({ type: 'live', id: id, live: null });
         sendList();
-        // With auto_summary off (the default) the page shows Generate notes instead.
-        var words = store[id].lines.reduce(function (n, l) { return n + l.text.split(/\s+/).length; }, 0);
-        if (params.has('auto') && words >= 30) setTimeout(function () { summarize(id); }, 300);
       }, 1200);
     }
     function summarize(id) {
@@ -1612,7 +1650,10 @@
         }
         m.summary = m.summary && m.title !== 'Vendor call' ? m.summary : SUMMARY + (m.title === 'Vendor call' ? '\n\nRaw HTML stays as text: <script>alert(1)<\/script>' : '');
         m.summary_by = 'Claude (sonnet)';
-        deliver({ type: 'summary', id: id, state: 'done', markdown: m.summary, by: m.summary_by });
+        var done = { type: 'summary', id: id, state: 'done', markdown: m.summary, by: m.summary_by };
+        // An untitled meeting is named by its notes.
+        if (!(m.title || '').trim()) m.title = done.title = 'Rollout plan and pilot size';
+        deliver(done);
         sendList();
       }, fast ? 600 : 2600);
     }

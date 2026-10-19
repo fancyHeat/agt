@@ -15,7 +15,8 @@
 //!
 //! One folder per meeting, `<root>/<id>/`, `id` being the local start time
 //! `YYYY-MM-DD-HHMMSS`:
-//! - `meeting.json`: the [`Meeting`] (title, times, the user's notes, the AI notes).
+//! - `meeting.json`: the [`Meeting`] (title, times, the user's notes, the AI notes). A new
+//!   meeting has no title; the AI notes give it one, unless the user named it first.
 //! - `transcript.jsonl`: one [`Line`] per line of text, appended as each is final.
 //! - `meeting.md`: the Markdown export ([`markdown`]), rewritten on stop and after a summary.
 //!
@@ -75,6 +76,7 @@ pub struct Line {
 pub struct Meeting {
     /// The folder's name, `YYYY-MM-DD-HHMMSS` (local start time).
     pub id: String,
+    /// Empty until the user or the AI notes name the meeting ([`Meeting::shown_title`]).
     pub title: String,
     /// Unix ms.
     pub started_at: i64,
@@ -95,11 +97,35 @@ pub struct Meeting {
     pub audio: Vec<String>,
 }
 
+impl Meeting {
+    /// What the meeting goes by until it is named: `Meeting Oct 16, 2:30 PM`.
+    pub fn default_title(&self) -> String {
+        format!("Meeting {}", time::LocalTime::at(self.started_at).short())
+    }
+
+    /// Not named yet: no title, or the date title meetings were saved under before they waited
+    /// for a name. The AI notes name an untitled meeting ([`summary::split_title`]).
+    pub fn untitled(&self) -> bool {
+        let title = self.title.trim();
+        title.is_empty() || title == self.default_title()
+    }
+
+    /// The title, or [`Meeting::default_title`] while it has none.
+    pub fn shown_title(&self) -> String {
+        match self.title.trim() {
+            "" => self.default_title(),
+            title => title.to_owned(),
+        }
+    }
+}
+
 /// One row of the past meetings list.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MeetingInfo {
     pub id: String,
+    /// Empty until named; the list shows `default_title` (or "New meeting..." while it records).
     pub title: String,
+    pub default_title: String,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub has_summary: bool,
@@ -111,4 +137,36 @@ pub trait Transcriber: Send + Sync {
     /// Transcribes `audio` (16 kHz mono) and calls `done` with the text or an error, on any
     /// thread, possibly much later.
     fn transcribe(&self, audio: Vec<f32>, done: Box<dyn FnOnce(Result<String, String>) + Send>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::time::LocalTime;
+
+    /// 2026-10-16 12:30:05 UTC.
+    const START: i64 = 1_792_153_805_000;
+
+    fn titled(title: &str) -> Meeting {
+        Meeting {
+            title: title.into(),
+            started_at: START,
+            ..Meeting::default()
+        }
+    }
+
+    #[test]
+    fn untitled_until_named() {
+        let date = format!("Meeting {}", LocalTime::at(START).short());
+        assert!(titled("").untitled());
+        assert!(titled("  ").untitled());
+        // Meetings from before titles waited for a name were saved under the date.
+        assert!(titled(&date).untitled());
+        assert!(!titled("Weekly sync").untitled());
+        assert!(!titled("Meeting Oct 1, 9:00 AM").untitled());
+
+        assert_eq!(titled("").default_title(), date);
+        assert_eq!(titled("").shown_title(), date);
+        assert_eq!(titled(" Weekly sync ").shown_title(), "Weekly sync");
+    }
 }

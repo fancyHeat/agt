@@ -33,7 +33,7 @@ use crate::{
     AppEvent,
     control::{Command, Reply},
     meeting_ui::{
-        FromNotes, FromPill, Live, MeetingOut, PillState, PillView, ToNotes, Ui, UiEvent,
+        AiNotes, FromNotes, FromPill, Live, MeetingOut, PillState, PillView, ToNotes, Ui, UiEvent,
     },
     pipeline::{Pipeline, SpeechModel},
 };
@@ -143,10 +143,10 @@ pub enum Msg {
     Session(Event),
     /// [`Session::start`] returned, on the `meeting-start` thread.
     Started(Result<Session, String>),
-    /// AI notes for `id`: `(markdown, by)` (already saved), or the message to show.
+    /// AI notes for `id` (already saved), or the message to show.
     Summary {
         id: String,
-        result: Result<(String, String), String>,
+        result: Result<AiNotes, String>,
     },
     /// The meeting apps using the microphone now (detection).
     MicUsers(Vec<String>),
@@ -728,10 +728,6 @@ impl Meetings {
                 let _ = r.send(format!("stopped {id}"));
             }
         }
-        self.ui.send_notes(&ToNotes::Live {
-            id: id.clone(),
-            live: None,
-        });
         let count = || match self.store.lines(&id) {
             Ok(lines) => Some(words(&lines)),
             Err(e) => {
@@ -740,9 +736,12 @@ impl Meetings {
             }
         };
         // Off (the default), the page shows Generate notes: nothing is sent without a click.
+        // On, the page hears "running" before the stop, so an untitled meeting goes straight
+        // from recording to its notes being written, still "New meeting...".
         if auto_summary(&self.cfg, self.exiting, count) {
-            self.summarize(id);
+            self.summarize(id.clone());
         }
+        self.ui.send_notes(&ToNotes::Live { id, live: None });
     }
 
     // --------------------------------------------------------------- AI notes
@@ -1045,14 +1044,16 @@ struct SummaryJob {
     thread: thread::JoinHandle<()>,
 }
 
-/// [`Msg::Summary`]'s result for meeting `id`, saved in `meeting.json` and `meeting.md`.
+/// [`Msg::Summary`]'s result for meeting `id`, saved in `meeting.json` and `meeting.md`. The
+/// title Claude writes above the notes ([`summary::split_title`]) names the meeting if it is
+/// still untitled; a title the user gave stays.
 fn write_summary(
     store: &Store,
     claude_path: &str,
     model: &str,
     id: &str,
     cancel: &summary::Cancel,
-) -> Result<(String, String), String> {
+) -> Result<AiNotes, String> {
     let claude = summary::find_claude(claude_path).ok_or(NO_CLAUDE)?;
     let m = store
         .load(id)
@@ -1062,14 +1063,13 @@ fn write_summary(
         .map_err(|e| format!("Couldn't read the transcript: {e}"))?;
     let started = Instant::now();
     let dir = store.dir(id);
-    let markdown =
-        summary::run_cancellable(&claude, model, &m, &lines, &dir, SUMMARY_TIMEOUT, cancel)
-            .map_err(|raw| {
-                // Not `raw`: the CLI's message can quote the meeting.
-                let kind = summary::failure_kind(&raw);
-                tracing::warn!("AI notes for meeting {id} failed: {kind}");
-                summary::friendly_error(&raw)
-            })?;
+    let out = summary::run_cancellable(&claude, model, &m, &lines, &dir, SUMMARY_TIMEOUT, cancel)
+        .map_err(|raw| {
+        // Not `raw`: the CLI's message can quote the meeting.
+        let kind = summary::failure_kind(&raw);
+        tracing::warn!("AI notes for meeting {id} failed: {kind}");
+        summary::friendly_error(&raw)
+    })?;
     tracing::info!(
         "AI notes for meeting {id} written in {:.1} s",
         started.elapsed().as_secs_f64()
@@ -1078,17 +1078,32 @@ fn write_summary(
         "" => "Claude".to_owned(),
         model => format!("Claude ({model})"),
     };
+    let (title, markdown) = summary::split_title(&out);
+    if markdown.is_empty() {
+        return Err("Claude wrote a title but no notes. Try again.".into());
+    }
     let (md, author) = (markdown.clone(), by.clone());
+    let mut named = None;
     store
-        .update(id, move |m| {
+        .update(id, |m| {
             m.summary = Some(md);
             m.summary_by = Some(author);
+            if let Some(title) = title
+                && m.untitled()
+            {
+                m.title = title.clone();
+                named = Some(title);
+            }
         })
         .map_err(|e| format!("Couldn't save the notes: {e}"))?;
     if let Err(e) = store.write_markdown(id) {
         tracing::warn!("cannot write meeting {id}'s meeting.md: {e}");
     }
-    Ok((markdown, by))
+    Ok(AiNotes {
+        markdown,
+        by,
+        title: named,
+    })
 }
 
 /// Whether a meeting that just stopped gets its AI notes by itself: only with
@@ -1338,6 +1353,51 @@ impl Detector {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A store in a fresh folder, and a stand-in `claude` there that answers `answer`.
+    #[cfg(unix)]
+    fn store_and_claude(name: &str, answer: &str) -> (Store, String) {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("agt-app-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let claude = dir.join("claude");
+        fs::write(
+            &claude,
+            format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{answer}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = claude.to_str().unwrap().to_owned();
+        (Store::new(dir.join("meetings")), claude)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_notes_name_an_untitled_meeting() {
+        let answer = "Title: Acme kickoff\n\n## Summary\n\nWe start Monday.";
+        let (store, claude) = store_and_claude("titled-by-notes", answer);
+        let cancel = summary::Cancel::default();
+        let m = store.create(1_792_153_805_000).unwrap();
+        let notes = write_summary(&store, &claude, "sonnet", &m.id, &cancel).unwrap();
+        assert_eq!(notes.markdown, "## Summary\n\nWe start Monday.");
+        assert_eq!(notes.title.as_deref(), Some("Acme kickoff"));
+        let saved = store.load(&m.id).unwrap();
+        assert_eq!(saved.title, "Acme kickoff");
+        assert_eq!(
+            saved.summary.as_deref(),
+            Some("## Summary\n\nWe start Monday.")
+        );
+
+        // A title the user gave is kept.
+        let mine = store.create(1_792_153_805_000).unwrap();
+        store
+            .update(&mine.id, |m| m.title = "Weekly sync".into())
+            .unwrap();
+        let notes = write_summary(&store, &claude, "sonnet", &mine.id, &cancel).unwrap();
+        assert_eq!(notes.title, None);
+        assert_eq!(store.load(&mine.id).unwrap().title, "Weekly sync");
+    }
 
     fn using(apps: &[&str]) -> Vec<String> {
         apps.iter().map(|&a| a.to_owned()).collect()

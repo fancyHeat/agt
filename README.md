@@ -154,7 +154,9 @@ type into during the call. Dictation keeps working; what you dictate isn't part 
   those echoes from the transcript, but headphones avoid them.
 - **AI notes:** **Generate notes** turns the transcript and your notes into a summary,
   decisions and action items with your own Claude Code CLI (`claude`, signed in with your
-  Claude account; AGT holds no API key). If `ANTHROPIC_API_KEY` is set in AGT's environment,
+  Claude account; AGT holds no API key). A new meeting reads "New meeting..." until then, and
+  the AI notes give it a title, unless you typed one first; without AI notes it goes by its
+  date. If `ANTHROPIC_API_KEY` is set in AGT's environment,
   the CLI uses that key instead, and the notes are billed to it. The transcript and your notes
   go to Claude when you click Generate notes, or automatically after each meeting if you turn
   on `auto_summary = true` under `[meeting]` in `config.toml`. This is the only time meeting

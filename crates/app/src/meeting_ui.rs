@@ -205,6 +205,9 @@ pub enum ToNotes {
         markdown: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         by: Option<String>,
+        /// The title the notes gave the meeting (it had none).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -236,24 +239,39 @@ impl ToNotes {
             state: SummaryState::Running,
             markdown: None,
             by: None,
+            title: None,
             error: None,
         }
     }
 
-    /// The AI notes for `id`: `(markdown, by)`, or the message to show.
-    pub fn summary(id: &str, result: Result<(String, String), String>) -> ToNotes {
-        let (state, markdown, by, error) = match result {
-            Ok((markdown, by)) => (SummaryState::Done, Some(markdown), Some(by), None),
-            Err(e) => (SummaryState::Error, None, None, Some(e)),
+    /// The AI notes for `id`, or the message to show.
+    pub fn summary(id: &str, result: Result<AiNotes, String>) -> ToNotes {
+        let (state, notes, error) = match result {
+            Ok(notes) => (SummaryState::Done, Some(notes), None),
+            Err(e) => (SummaryState::Error, None, Some(e)),
+        };
+        let (markdown, by, title) = match notes {
+            Some(n) => (Some(n.markdown), Some(n.by), n.title),
+            None => (None, None, None),
         };
         ToNotes::Summary {
             id: id.into(),
             state,
             markdown,
             by,
+            title,
             error,
         }
     }
+}
+
+/// AI notes as written (and saved): the Markdown, what wrote it (`Claude (sonnet)`), and the
+/// title they gave the meeting, if it had none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiNotes {
+    pub markdown: String,
+    pub by: String,
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -268,7 +286,10 @@ pub enum SummaryState {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MeetingOut {
     pub id: String,
+    /// Empty until named: the page shows "New meeting..." while it records or its notes are
+    /// written, `default_title` otherwise.
     pub title: String,
+    pub default_title: String,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub notes: String,
@@ -280,6 +301,7 @@ pub struct MeetingOut {
 impl MeetingOut {
     pub fn new(m: Meeting, lines: Vec<Line>) -> MeetingOut {
         MeetingOut {
+            default_title: m.default_title(),
             id: m.id,
             title: m.title,
             started_at: m.started_at,
@@ -1698,12 +1720,14 @@ mod tests {
             audio: vec!["mic.wav".into()],
             ..Meeting::default()
         };
+        let default_title = m.default_title();
         assert_eq!(
             out(&ToNotes::Meeting {
                 meeting: MeetingOut::new(m, vec![line()]),
                 live: None
             }),
-            json!({"type":"meeting","meeting":{"id":"m1","title":"Standup","started_at":1_792_161_005_000_i64,
+            json!({"type":"meeting","meeting":{"id":"m1","title":"Standup","default_title":default_title,
+                "started_at":1_792_161_005_000_i64,
                 "ended_at":null,"notes":"Ask about Q3","summary":null,"summary_by":null,
                 "lines":[{"id":1,"speaker":"them","start_ms":0,"end_ms":1200,"text":"Hi all"}]},
                 "live":null})
@@ -1716,12 +1740,23 @@ mod tests {
             out(&ToNotes::running("m1")),
             json!({"type":"summary","id":"m1","state":"running"})
         );
+        let notes = |title: Option<&str>| AiNotes {
+            markdown: "## Summary".into(),
+            by: "Claude (sonnet)".into(),
+            title: title.map(Into::into),
+        };
+        assert_eq!(
+            out(&ToNotes::summary("m1", Ok(notes(None)))),
+            json!({"type":"summary","id":"m1","state":"done","markdown":"## Summary","by":"Claude (sonnet)"})
+        );
+        // The title the notes gave an untitled meeting.
         assert_eq!(
             out(&ToNotes::summary(
                 "m1",
-                Ok(("## Summary".into(), "Claude (sonnet)".into()))
+                Ok(notes(Some("Q3 pricing review")))
             )),
-            json!({"type":"summary","id":"m1","state":"done","markdown":"## Summary","by":"Claude (sonnet)"})
+            json!({"type":"summary","id":"m1","state":"done","markdown":"## Summary","by":"Claude (sonnet)",
+                "title":"Q3 pricing review"})
         );
         assert_eq!(
             out(&ToNotes::summary(
@@ -1732,14 +1767,16 @@ mod tests {
         );
         let info = MeetingInfo {
             id: "m1".into(),
-            title: "Standup".into(),
+            title: String::new(),
+            default_title: "Meeting Oct 16, 2:30 PM".into(),
             started_at: 5,
             ended_at: Some(9),
             has_summary: true,
         };
         assert_eq!(
             out(&ToNotes::Meetings { list: vec![info] }),
-            json!({"type":"meetings","list":[{"id":"m1","title":"Standup","started_at":5,"ended_at":9,"has_summary":true}]})
+            json!({"type":"meetings","list":[{"id":"m1","title":"","default_title":"Meeting Oct 16, 2:30 PM",
+                "started_at":5,"ended_at":9,"has_summary":true}]})
         );
         assert_eq!(
             out(&ToNotes::Notice {

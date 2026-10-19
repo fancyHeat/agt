@@ -43,8 +43,8 @@ impl Store {
     }
 
     /// Makes the folder of a meeting that started at `started_at_ms` (unix) and its
-    /// `meeting.json`, titled `Meeting Oct 16, 2:30 PM`. A second meeting started in the same
-    /// second gets `-2` (then `-3`, ...) after its id: a folder is never reused.
+    /// `meeting.json`, untitled (see [`Meeting::shown_title`]). A second meeting started in
+    /// the same second gets `-2` (then `-3`, ...) after its id: a folder is never reused.
     pub fn create(&self, started_at_ms: i64) -> io::Result<Meeting> {
         let t = LocalTime::at(started_at_ms);
         fs::create_dir_all(&self.root).map_err(at(&self.root))?;
@@ -64,7 +64,6 @@ impl Store {
         }
         let m = Meeting {
             id,
-            title: format!("Meeting {}", t.short()),
             started_at: started_at_ms,
             ..Meeting::default()
         };
@@ -90,6 +89,7 @@ impl Store {
                 match self.load(&id) {
                     Ok(m) => Some(MeetingInfo {
                         has_summary: m.summary.as_deref().is_some_and(|s| !s.trim().is_empty()),
+                        default_title: m.default_title(),
                         id: m.id,
                         title: m.title,
                         started_at: m.started_at,
@@ -238,14 +238,14 @@ impl Store {
     }
 }
 
-/// The meeting as Markdown: `# <title>`, the date, `## Notes` (the AI notes, their headings
+/// The meeting as Markdown: `# <title>` (the date one while untitled), the date, `## Notes` (the AI notes, their headings
 /// moved down under it, `nested_headings`), `## My notes` (what the user typed) and
 /// `## Transcript` (`[mm:ss] Me: ...` / `[mm:ss] Them: ...`, one paragraph each, in the order
 /// they were said, not the order they were written). Empty sections are left out. The notes
 /// window's Copy builds the same (`meetingMarkdown` in `notes.html`).
 pub fn markdown(m: &Meeting, lines: &[Line]) -> String {
     let lines = in_order(lines);
-    let mut md = format!("# {}\n\n{}\n", m.title.trim(), when(m));
+    let mut md = format!("# {}\n\n{}\n", m.shown_title(), when(m));
     let summary = nested_headings(m.summary.as_deref().map(str::trim).unwrap_or_default());
     for (heading, body) in [("Notes", summary.as_str()), ("My notes", m.notes.trim())] {
         if !body.is_empty() {
@@ -468,7 +468,9 @@ mod tests {
         let m = store.create(START).unwrap();
         let t = LocalTime::at(START);
         assert_eq!(m.id, t.id());
-        assert_eq!(m.title, format!("Meeting {}", t.short()));
+        // No title until the user or the AI notes give it one; the date stands in for it.
+        assert_eq!(m.title, "");
+        assert_eq!(m.default_title(), format!("Meeting {}", t.short()));
         assert_eq!(m.started_at, START);
         assert_eq!((m.ended_at, &*m.notes, &m.summary), (None, "", &None));
         assert!(store.dir(&m.id).join("meeting.json").is_file());
@@ -522,8 +524,9 @@ mod tests {
         assert_eq!(
             list[1],
             MeetingInfo {
+                default_title: old.default_title(),
                 id: old.id,
-                title: old.title,
+                title: String::new(),
                 started_at: START,
                 ended_at: None,
                 has_summary: true,
@@ -631,6 +634,13 @@ mod tests {
         ];
         let md = markdown(&m, &lines);
         assert!(md.starts_with("# Weekly sync\n"), "{md}");
+        // Untitled: the date stands in.
+        let untitled = Meeting {
+            title: " ".into(),
+            ..m.clone()
+        };
+        let want = format!("# Meeting {}\n", LocalTime::at(START).short());
+        assert!(markdown(&untitled, &lines).starts_with(&want), "{md}");
         assert!(md.contains("45 min"), "{md}");
         // Claude's own `## Summary` goes under `## Notes`, a level down.
         let notes = md
