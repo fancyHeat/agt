@@ -220,6 +220,22 @@ fn general(c: &Config) -> Page {
             ),
         ],
     );
+    let startup = section(
+        "",
+        vec![
+            Item::check(
+                "Start AGT when you log in",
+                &["launch_at_login"],
+                |c| c.launch_at_login,
+                c,
+            )
+            .note(if cfg!(target_os = "macos") {
+                "Also in System Settings > General > Login Items."
+            } else {
+                "Also in Task Manager's Startup apps."
+            }),
+        ],
+    );
     let levels = ["error", "warn", "info", "debug", "trace"];
     let mut level_choices: Vec<Choice> = levels
         .iter()
@@ -240,7 +256,7 @@ fn general(c: &Config) -> Page {
     Page {
         title: "General",
         symbol: "gearshape",
-        sections: vec![hotkey, audio, paste, overlay, other],
+        sections: vec![hotkey, audio, paste, overlay, startup, other],
     }
 }
 

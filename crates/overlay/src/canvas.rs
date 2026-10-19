@@ -93,6 +93,29 @@ impl Canvas {
         self.round_rect(x, y, w, h, r, width, color);
     }
 
+    /// Paints `color` through a `w`×`h` coverage mask (one byte per pixel, rows top to
+    /// bottom; e.g. rasterized text) placed at `x`, `y`. Clipped to the canvas.
+    pub fn fill_mask(&mut self, x: usize, y: usize, w: usize, coverage: &[u8], color: Rgba) {
+        if w == 0 {
+            return;
+        }
+        let Rgba(cr, cg, cb, ca) = color;
+        for (row, src) in coverage.chunks_exact(w).enumerate() {
+            let py = y + row;
+            if py >= self.height {
+                break;
+            }
+            let dst = &mut self.pixels[py * self.width..(py + 1) * self.width];
+            for (d, &c) in dst.iter_mut().skip(x).zip(src) {
+                if c == 0 {
+                    continue;
+                }
+                let a = ca * c as f32 / 255.0;
+                *d = blend(*d, cr * a, cg * a, cb * a, a);
+            }
+        }
+    }
+
     /// Covers the band of the shape within `band` pixels of its edge (infinite = filled).
     #[allow(clippy::too_many_arguments)]
     fn round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, band: f32, color: Rgba) {
@@ -186,6 +209,26 @@ mod tests {
         assert_eq!(c.pixels()[10 * 20] >> 24, 255, "left edge");
         assert_eq!(c.pixels()[10 * 20 + 1] >> 24, 0, "just inside");
         assert_eq!(c.pixels()[10 * 20 + 10], 0, "center");
+    }
+
+    #[test]
+    fn mask_paints_by_coverage_and_is_clipped() {
+        let mut c = Canvas::new(4, 3);
+        // 3x2 mask at (2, 2): only its top-left 2x1 lands on the canvas.
+        c.fill_mask(
+            2,
+            2,
+            3,
+            &[255, 128, 255, 255, 255, 255],
+            Rgba(1.0, 1.0, 1.0, 1.0),
+        );
+        assert_eq!(c.pixels()[2 * 4 + 2], 0xFFFFFFFF);
+        assert_eq!(
+            c.pixels()[2 * 4 + 3],
+            0x80808080,
+            "half coverage, premultiplied"
+        );
+        assert_eq!(c.pixels()[..2 * 4 + 2], [0; 10]);
     }
 
     #[test]

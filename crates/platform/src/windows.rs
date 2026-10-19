@@ -1,16 +1,21 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
 use std::{
     cell::RefCell,
-    ffi::c_void,
+    ffi::{OsStr, OsString, c_void},
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::Path,
     ptr::{null, null_mut},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, GetLastError,
+        GlobalFree, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    },
     System::{
         Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree},
         DataExchange::{
@@ -21,6 +26,10 @@ use windows_sys::Win32::{
         LibraryLoader::GetModuleHandleW,
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::CF_UNICODETEXT,
+        Registry::{
+            HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+            RegSetKeyValueW,
+        },
         Threading::{
             GetCurrentThread, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             QueryFullProcessImageNameW, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
@@ -647,6 +656,105 @@ pub fn request_permissions(_missing: &[Permission]) {}
 pub fn open_permission_settings(_permission: Permission) {}
 
 // ---------------------------------------------------------------------------------------
+// Launch at login: a value in HKCU's Run key. Task Manager's Startup apps on/off switch is
+// kept in `Explorer\StartupApproved\Run` under the same name, which is never touched here.
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "AGT";
+
+pub fn set_launch_at_login(on: bool, program: &Path) -> Result<LoginItem, Error> {
+    let command = on.then(|| {
+        let mut c = OsString::from("\"");
+        c.push(program);
+        c.push("\"");
+        c
+    });
+    set_run_value(RUN_KEY, RUN_VALUE, command.as_deref())
+}
+
+/// Sets HKCU `key`'s `name` value to `command`, or deletes it (`None`), unless it already is.
+fn set_run_value(key: &str, name: &str, command: Option<&OsStr>) -> Result<LoginItem, Error> {
+    let (key, name) = (wide(key), wide(name));
+    let current = read_string(&key, &name)?;
+    let code = match (command, current) {
+        // Paths are case-insensitive (the stub on disk is `AGT.exe`; this writes `agt.exe`).
+        (Some(c), Some(current))
+            if current
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&c.to_string_lossy()) =>
+        {
+            return Ok(LoginItem::Unchanged);
+        }
+        (None, None) => return Ok(LoginItem::Unchanged),
+        (Some(c), _) => {
+            let data = wide(c);
+            let code = unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    key.as_ptr(),
+                    name.as_ptr(),
+                    REG_SZ,
+                    data.as_ptr().cast(),
+                    (data.len() * 2) as u32,
+                )
+            };
+            if code == ERROR_SUCCESS {
+                return Ok(LoginItem::Registered);
+            }
+            code
+        }
+        (None, Some(_)) => {
+            let code =
+                unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+            match code {
+                ERROR_SUCCESS => return Ok(LoginItem::Unregistered),
+                // Deleted since it was read.
+                ERROR_FILE_NOT_FOUND => return Ok(LoginItem::Unchanged),
+                code => code,
+            }
+        }
+    };
+    Err(std::io::Error::from_raw_os_error(code as i32).into())
+}
+
+/// A REG_SZ value under HKCU (`None` if it or its key doesn't exist; "" if it isn't a REG_SZ).
+fn read_string(key: &[u16], name: &[u16]) -> Result<Option<OsString>, Error> {
+    let get = |data: *mut c_void, size: &mut u32| unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            data,
+            size,
+        )
+    };
+    let mut size = 0;
+    let mut code = get(null_mut(), &mut size);
+    let mut buf = Vec::new();
+    if code == ERROR_SUCCESS {
+        buf = vec![0u16; (size as usize).div_ceil(2)];
+        code = get(buf.as_mut_ptr().cast(), &mut size);
+    }
+    match code {
+        ERROR_SUCCESS => {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Ok(Some(OsString::from_wide(&buf[..end])))
+        }
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        // Not a REG_SZ (not as AGT writes it): replaced, or deleted.
+        ERROR_UNSUPPORTED_TYPE => Ok(Some(OsString::new())),
+        code => Err(std::io::Error::from_raw_os_error(code as i32).into()),
+    }
+}
+
+/// NUL-terminated UTF-16.
+fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain([0]).collect()
+}
+
+// ---------------------------------------------------------------------------------------
 // Output volume (ducking): the default render endpoint's IAudioEndpointVolume, through
 // hand-written vtables (windows-sys has no COM interfaces, and the `windows` crate is a lot of
 // code for three calls).
@@ -958,6 +1066,50 @@ mod tests {
             matches!(got[..], [HotkeyEvent::Down(_), HotkeyEvent::Cancel]),
             "{got:?}"
         );
+    }
+
+    /// The Run key code, on a key of its own (the real Run key is left alone).
+    #[test]
+    fn run_value_is_written_only_when_it_changes() {
+        use windows_sys::Win32::System::Registry::RegDeleteKeyW;
+        /// Deletes the test key, also when an assert fails.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, wide(&self.0).as_ptr()) };
+            }
+        }
+        let key = format!(r"Software\AGT-test-{}", std::process::id());
+        let _cleanup = Cleanup(key.clone());
+        let set = |c: Option<&str>| set_run_value(&key, "AGT", c.map(OsStr::new)).unwrap();
+        let a = r#""C:\Users\A B\AppData\Local\AGT\agt.exe""#;
+        assert_eq!(set(None), LoginItem::Unchanged); // no key yet
+        assert_eq!(set(Some(a)), LoginItem::Registered);
+        assert_eq!(set(Some(a)), LoginItem::Unchanged);
+        assert_eq!(set(Some(&a.to_uppercase())), LoginItem::Unchanged);
+        assert_eq!(
+            read_string(&wide(&key), &wide("AGT")).unwrap().unwrap(),
+            OsStr::new(a)
+        );
+        assert_eq!(set(Some(r#""D:\AGT\agt.exe""#)), LoginItem::Registered);
+        assert_eq!(set(None), LoginItem::Unregistered);
+        assert_eq!(set(None), LoginItem::Unchanged);
+        assert_eq!(read_string(&wide(&key), &wide("AGT")).unwrap(), None);
+        // A value of another type is replaced.
+        let n = 1u32;
+        let code = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                wide(&key).as_ptr(),
+                wide("AGT").as_ptr(),
+                windows_sys::Win32::System::Registry::REG_DWORD,
+                (&raw const n).cast(),
+                4,
+            )
+        };
+        assert_eq!(code, ERROR_SUCCESS);
+        assert_eq!(set(Some(a)), LoginItem::Registered);
+        assert_eq!(set(None), LoginItem::Unregistered);
     }
 
     #[test]

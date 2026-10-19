@@ -53,6 +53,11 @@ Good to know:
   and comes back when you let go. Settings... → **Lower other audio while dictating** turns
   this off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
   in `config.toml`).
+- AGT starts when you log in. Settings... → **Start AGT when you log in** turns that off
+  (`launch_at_login` in `config.toml`). Turning AGT off or removing it in Task Manager's
+  Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks too. If
+  you removed it there, switching the setting off and on again adds it back (one switched off
+  there stays off until you switch it on there).
 - If a paste didn't land, tray menu → **Copy last transcript** puts the text on your clipboard.
 - macOS: if focus clearly wasn't in a text box when the text was pasted (you'd clicked a web
   page, a link or the desktop), the text is still pasted, and a note where the bar was says so,

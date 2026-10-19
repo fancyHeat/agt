@@ -14,7 +14,7 @@
 //!   weren't in a text box", with a Copy button (macOS; the only window here that takes a
 //!   click, and it still never activates AGT or moves keyboard focus). A key press while
 //!   the speech model is still loading shows "Getting ready..." the same way, without the
-//!   button.
+//!   button (on Windows too, where it's the only notice).
 //!
 //! All methods must be called on the UI (main) thread.
 
@@ -91,7 +91,7 @@ trait NoticeSurface {
 
 pub struct Overlay {
     window: Box<dyn Surface>,
-    /// `None` where there is no notice (Windows for now).
+    /// `None` where there is no notice (it couldn't be created).
     notice: Option<Box<dyn NoticeSurface>>,
     /// While the notice is up: when it hides.
     notice_until: Option<Instant>,
@@ -117,7 +117,7 @@ impl Overlay {
         let notice = match sys::Notice::new(Box::new(on_copy)) {
             Ok(n) => Some(Box::new(n) as Box<dyn NoticeSurface>),
             Err(e) => {
-                tracing::info!("no \"not in a text box\" notice: {e}");
+                tracing::info!("no notice: {e}");
                 None
             }
         };
@@ -187,7 +187,7 @@ impl Overlay {
     }
 
     /// Says "Getting ready..." for [`GETTING_READY_FOR`]: for a key press while the speech
-    /// model is still loading. Where there is no notice (Windows for now), flashes the error
+    /// model is still loading. If the notice can't be shown, flashes the error
     /// instead, so the press still shows something.
     pub fn show_getting_ready(&mut self, level: f32, now: Instant) {
         self.hide();

@@ -11,7 +11,7 @@
 //! restart once granted: the hotkey thread retries creating its tap every second until it
 //! works, and the others are checked when used.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, Permission};
+use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
 use block2::RcBlock;
 use objc2::{
     msg_send,
@@ -31,10 +31,12 @@ use objc2_core_graphics::{
     CGPreflightListenEventAccess, CGPreflightPostEventAccess, CGWindowListCopyWindowInfo,
     CGWindowListOption, kCGNullWindowID, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber, NSString};
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSNumber, NSString};
+use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::{
     collections::HashSet,
     ffi::c_void,
+    path::Path,
     ptr::{NonNull, null_mut},
     sync::{
         Arc, LazyLock, Mutex,
@@ -918,6 +920,38 @@ pub fn open_permission_settings(permission: Permission) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
         tracing::error!("cannot open {url}: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Launch at login: the app as a login item (`SMAppService.mainAppService`, macOS 13+). Listed
+// in System Settings > General > Login Items, where the user can turn it off.
+
+pub fn set_launch_at_login(on: bool, _program: &Path) -> Result<LoginItem, Error> {
+    let service = unsafe { SMAppService::mainAppService() };
+    let status = unsafe { service.status() };
+    let error = |e: Retained<NSError>| -> Error {
+        format!("{} (code {})", e.localizedDescription(), e.code()).into()
+    };
+    match (on, status) {
+        (true, SMAppServiceStatus::Enabled) => Ok(LoginItem::Unchanged),
+        // Turned off in System Settings: registering again would only fail with "denied".
+        (true, SMAppServiceStatus::RequiresApproval) => Ok(LoginItem::NeedsApproval),
+        (true, _) => {
+            unsafe { service.registerAndReturnError() }.map_err(error)?;
+            Ok(match unsafe { service.status() } {
+                SMAppServiceStatus::RequiresApproval => LoginItem::NeedsApproval,
+                _ => LoginItem::Registered,
+            })
+        }
+        // `NotFound` too: what it says before the first registration on some versions.
+        (false, SMAppServiceStatus::NotRegistered | SMAppServiceStatus::NotFound) => {
+            Ok(LoginItem::Unchanged)
+        }
+        (false, _) => {
+            unsafe { service.unregisterAndReturnError() }.map_err(error)?;
+            Ok(LoginItem::Unregistered)
+        }
     }
 }
 

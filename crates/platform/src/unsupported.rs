@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation (anything but Windows and macOS).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, Hotkey, HotkeyEvent, Key, Permission};
+use crate::{Error, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
 
 const MSG: &str = "not supported on this platform";
 
@@ -85,6 +85,10 @@ pub fn missing_permissions() -> Vec<Permission> {
 pub fn request_permissions(_missing: &[Permission]) {}
 
 pub fn open_permission_settings(_permission: Permission) {}
+
+pub fn set_launch_at_login(_on: bool, _program: &std::path::Path) -> Result<LoginItem, Error> {
+    Err(format!("launch at login {MSG}").into())
+}
 
 /// No volume control here: ducking does nothing.
 pub struct OutputVolume;
