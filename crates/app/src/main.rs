@@ -108,7 +108,8 @@ fn main() {
     #[allow(unused_mut)]
     let mut velopack = VelopackApp::build();
     // The usage history lives outside the install folder so reinstalls keep it (see
-    // `paths`); uninstalling still removes it. Models are left, as before.
+    // `paths`); uninstalling still removes it. Models are left, as before. The Run key value
+    // (launch at login) goes too.
     #[cfg(windows)]
     {
         velopack = velopack.on_before_uninstall_fast_callback(|_| {
@@ -116,6 +117,7 @@ fn main() {
             if history != paths::data_dir() {
                 let _ = std::fs::remove_dir_all(history);
             }
+            let _ = agt_platform::set_launch_at_login(false, std::path::Path::new(""));
         });
     }
     // Not a Velopack install (a dev build; `run` makes the same check): nothing to do, and
@@ -124,8 +126,8 @@ fn main() {
     let hook = std::env::args()
         .nth(1)
         .is_some_and(|a| a.to_ascii_lowercase().starts_with("--veloapp-"));
-    if hook || velopack::locator::auto_locate_app_manifest(LocationContext::FromCurrentExe).is_ok()
-    {
+    let install = velopack::locator::auto_locate_app_manifest(LocationContext::FromCurrentExe).ok();
+    if hook || install.is_some() {
         velopack.run();
     }
 
@@ -144,6 +146,11 @@ fn main() {
             (Config::fallback(), true)
         }
     };
+    // Installed builds only (a dev build must never start at login), and not on defaults:
+    // the file may well have it off. A changed setting applies with the restart it causes.
+    if let (Some(install), false) = (&install, config_error) {
+        launch_at_login(config.launch_at_login, install);
+    }
     // After the lock and Velopack's hooks, so neither a second instance nor a hook run
     // counts as a session.
     agt_telemetry::global().start(paths::db_file(), session_start(&config, config_error));
@@ -281,6 +288,33 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         history_save_text: config.history.save_text,
         history_save_audio: config.history.save_audio,
         history_keep_days: config.history.keep_days as i64,
+    }
+}
+
+/// Registers AGT to start at login, or unregisters it, as `on` says. Windows starts the stub
+/// Velopack keeps in the install folder (`%LocalAppData%\AGT\agt.exe`, the path it means
+/// launchers to use): it starts the current version through Update.exe, outside the
+/// `current` folder each update replaces. Failing here never stops AGT.
+fn launch_at_login(on: bool, install: &velopack::locator::VelopackLocator) {
+    let main_exe = install.get_main_exe_path();
+    let program = main_exe
+        .file_name()
+        .map(|name| install.get_root_dir().join(name))
+        .filter(|stub| stub.is_file())
+        .unwrap_or(main_exe);
+    match agt_platform::set_launch_at_login(on, &program) {
+        Ok(agt_platform::LoginItem::Unchanged) => {}
+        Ok(agt_platform::LoginItem::Registered) => {
+            tracing::info!("AGT now starts at login ({})", program.display())
+        }
+        Ok(agt_platform::LoginItem::Unregistered) => {
+            tracing::info!("AGT no longer starts at login")
+        }
+        Ok(agt_platform::LoginItem::NeedsApproval) => tracing::info!(
+            "AGT is turned off in System Settings > General > Login Items: not starting at login"
+        ),
+        Err(e) if on => tracing::warn!("cannot make AGT start at login: {e}"),
+        Err(e) => tracing::warn!("cannot stop AGT starting at login: {e}"),
     }
 }
 
