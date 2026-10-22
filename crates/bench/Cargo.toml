@@ -16,6 +16,7 @@ agt-audio.workspace = true
 agt-stt.workspace = true
 agt-polish.workspace = true
 agt-history.workspace = true
+agt-telemetry.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 tracing.workspace = true
 serde.workspace = true

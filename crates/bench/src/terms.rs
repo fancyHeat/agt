@@ -25,12 +25,12 @@ impl TermCount {
     }
 }
 
-/// The terms to count for `dictionary`: its terms, then each replacement's `to`, in file
-/// order, without duplicates.
+/// The terms to count for `dictionary`: its terms (global, then the profiles'), then each
+/// replacement's `to`, in file order, without duplicates.
 pub fn of(dictionary: &Dictionary) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     let tos = dictionary.replacements().iter().map(|r| &r.to);
-    for t in dictionary.terms().iter().chain(tos) {
+    for t in dictionary.all_terms().iter().chain(tos) {
         if !terms.contains(t) {
             terms.push(t.clone());
         }
@@ -165,10 +165,10 @@ mod tests {
     #[test]
     fn terms_of_a_dictionary() {
         let d = Dictionary::parse(
-            "terms = [\"main\", \".env\"]\n[[replace]]\nfrom = \"dot env\"\nto = \".env\"\n[[replace]]\nfrom = \"maine\"\nto = \"Main\"\n",
+            "terms = [\"main\", \".env\"]\n[profiles.code]\nterms = [\"rebase\", \"main\"]\n[[replace]]\nfrom = \"dot env\"\nto = \".env\"\n[[replace]]\nfrom = \"maine\"\nto = \"Main\"\n",
         )
         .unwrap();
-        // Terms first; a `to` that is already a term isn't counted twice.
-        assert_eq!(of(&d), ["main", ".env", "Main"]);
+        // Terms first (the profiles' too); a `to` that is already a term isn't counted twice.
+        assert_eq!(of(&d), ["main", ".env", "rebase", "Main"]);
     }
 }

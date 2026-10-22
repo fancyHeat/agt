@@ -363,6 +363,17 @@ pub fn foreground_window() -> Option<usize> {
     Some(((pid as u32 as usize) << 32) | window as u32 as usize)
 }
 
+/// The frontmost app's bundle identifier (`com.microsoft.VSCode`); `None` for an app without
+/// one (a bare executable).
+pub fn foreground_app() -> Option<String> {
+    autoreleasepool(|_| {
+        NSWorkspace::sharedWorkspace()
+            .frontmostApplication()?
+            .bundleIdentifier()
+            .map(|b| b.to_string())
+    })
+}
+
 /// The window number of `pid`'s frontmost on-screen normal window. Window-server data only:
 /// needs no permission and doesn't talk to the app (which may be busy).
 fn front_window_of(pid: i32) -> Option<i64> {

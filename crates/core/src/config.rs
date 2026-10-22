@@ -99,6 +99,12 @@ precision = "int8"
 device = "auto"
 # CPU threads for inference; 0 = automatic.
 threads = 0
+# Parakeet: how strongly to favor the words in dictionary.toml (its terms, and those of the
+# focused app's profiles) where they sound like what was said. 0 = off; 1 to 4 is the useful
+# range: more fixes more homophones ("Maine" for "main") and also changes more words that
+# only sound a bit like a term. Each model gets the same effect from a value (Parakeet v3, whose
+# pieces are longer, uses half of it). See docs/benchmarks.md.
+boost = 2.0
 # Where models are downloaded to. "" = the default: %LOCALAPPDATA%\AGT-models on Windows,
 # ~/Library/Application Support/AGT/models on macOS.
 models_dir = ""
@@ -319,6 +325,8 @@ pub struct SttConfig {
     pub precision: Precision,
     pub device: Device,
     pub threads: usize,
+    /// As written; use [`SttConfig::boost`], which clamps it.
+    pub boost: f32,
     /// As written in the config ("" = default); use [`SttConfig::models_path`] to resolve it.
     pub models_dir: String,
 }
@@ -671,12 +679,27 @@ impl Default for SttConfig {
             precision: Precision::Int8,
             device: Device::Auto,
             threads: 0,
+            boost: DEFAULT_BOOST,
             models_dir: String::new(),
         }
     }
 }
 
+/// Default `stt.boost`.
+pub const DEFAULT_BOOST: f32 = 2.0;
+/// Largest `stt.boost` used: far past where it helps (see docs/benchmarks.md).
+pub const MAX_BOOST: f32 = 10.0;
+
 impl SttConfig {
+    /// The configured boost, clamped to 0..=[`MAX_BOOST`] (NaN: the default).
+    pub fn boost(&self) -> f32 {
+        if self.boost.is_nan() {
+            DEFAULT_BOOST
+        } else {
+            self.boost.clamp(0.0, MAX_BOOST)
+        }
+    }
+
     /// `models_dir` if set, else [`crate::paths::models_dir`].
     pub fn models_path(&self) -> PathBuf {
         if self.models_dir.is_empty() {
@@ -1021,6 +1044,23 @@ mod tests {
         let c = Config::parse("[audio]\nduck = false\n").unwrap();
         assert!(!c.audio.duck);
         assert_eq!(c.audio.duck_level(), DEFAULT_DUCK_LEVEL);
+    }
+
+    #[test]
+    fn boost_is_clamped() {
+        let boost = |v: &str| {
+            Config::parse(&format!("[stt]\nboost = {v}\n"))
+                .unwrap()
+                .stt
+                .boost()
+        };
+        assert_eq!(boost("1.5"), 1.5);
+        assert_eq!(boost("3"), 3.0); // an integer is fine too
+        assert_eq!(boost("0"), 0.0);
+        assert_eq!(boost("-1"), 0.0);
+        assert_eq!(boost("100"), MAX_BOOST);
+        assert_eq!(boost("nan"), DEFAULT_BOOST);
+        assert_eq!(Config::default().stt.boost(), DEFAULT_BOOST);
     }
 
     #[test]

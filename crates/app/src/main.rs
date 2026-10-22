@@ -203,11 +203,7 @@ fn main() {
     let (dictionary, dictionary_error) = match load_dictionary(&dictionary_path) {
         Ok(d) => {
             if !d.is_empty() {
-                tracing::info!(
-                    "dictionary: {} terms, {} replacements",
-                    d.terms().len(),
-                    d.replacements().len()
-                );
+                tracing::info!("dictionary: {}", size(&d));
             }
             (d, None)
         }
@@ -292,6 +288,7 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         stt_precision: lower(&config.stt.precision),
         stt_device: lower(&config.stt.device),
         stt_threads: config.stt.threads as i64,
+        stt_boost: config.stt.boost().into(),
         polish_enabled: on,
         polish_provider: on.then(|| lower(&polish.provider)),
         polish_model: on.then(|| polish.model().to_owned()),
@@ -483,11 +480,22 @@ fn watch_config(config: PathBuf, dictionary: PathBuf, proxy: EventLoopProxy<AppE
     }
 }
 
+/// "3 terms, 1 profile, 2 replacements" (the profiles' terms included).
+fn size(d: &agt_core::Dictionary) -> String {
+    let profiles = d.profiles().len();
+    format!(
+        "{} terms, {profiles} profile{}, {} replacements",
+        d.all_terms().len(),
+        if profiles == 1 { "" } else { "s" },
+        d.replacements().len()
+    )
+}
+
 /// Loads `dictionary.toml` (missing: empty) and records its size in the session.
 fn load_dictionary(path: &std::path::Path) -> Result<agt_core::Dictionary, String> {
     let dictionary = agt_core::Dictionary::load(path).map_err(|e| e.to_string())?;
     agt_telemetry::global().session(agt_telemetry::SessionUpdate {
-        dictionary_terms: Some(dictionary.terms().len() as i64),
+        dictionary_terms: Some(dictionary.all_terms().len() as i64),
         dictionary_rules: Some(dictionary.replacements().len() as i64),
         ..Default::default()
     });
@@ -898,11 +906,7 @@ impl App {
     fn dictionary_file_changed(&mut self) {
         match load_dictionary(&self.dictionary_path) {
             Ok(d) => {
-                tracing::info!(
-                    "dictionary reloaded: {} terms, {} replacements",
-                    d.terms().len(),
-                    d.replacements().len()
-                );
+                tracing::info!("dictionary reloaded: {}", size(&d));
                 if let Some(p) = &self.pipeline {
                     p.set_dictionary(d);
                 }

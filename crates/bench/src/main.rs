@@ -17,11 +17,22 @@
 //!   --quiet             no per-file lines, only the summary
 //!   --dictionary <file> use this dictionary.toml (default: AGT's, if there is one)
 //!   --no-dictionary     don't apply it (its terms are still counted, for a before/after)
+//!   --boost <w,...>     override stt.boost; several weights: one pass each, then a table
+//!   --app <id>          the focused app for every clip (picks the dictionary's profiles);
+//!                       default: each clip's `<name>.app`, if any
 //! ```
 //!
-//! With a dictionary, its terms go to the engine and its replacements are applied to each
-//! transcript, exactly as AGT does before polish, and a per-term table (see [`terms`]) counts
-//! each term (and each replacement's `to`) in the references and transcripts, case-sensitive.
+//! With a dictionary, the terms that apply in a clip's app (its global terms, and those of
+//! the profiles the app is in) go to the engine with the boost weight, and its replacements
+//! for that app are applied to each transcript, exactly as AGT does before polish. A per-term
+//! table (see [`terms`]) counts every term (and each replacement's `to`) in the references
+//! and transcripts, case-sensitive. A clip's app comes from `--app`, else from `<name>.app`
+//! (one line: an exe name or bundle id; `export-history` writes them from agt.db); without
+//! either, only the global terms and replacements apply.
+//!
+//! With several `--boost` weights, every pass is printed, then one line per weight: WER,
+//! the term counts, how many words differ (case-sensitive) from the first weight's
+//! transcripts, and the median transcription time per clip.
 //!
 //! `agt-bench export-history [--days n] [--out dir]` turns the dictation history into an
 //! eval set of `.wav` + `.txt` reference pairs (see [`export`]).
@@ -49,19 +60,20 @@ mod terms;
 mod wer;
 
 use agt_core::{
-    Config, Dictionary,
+    Config, Dictionary, Scope,
     config::SttConfig,
     paths,
-    stt::{SAMPLE_RATE, TranscribeOpts},
+    stt::{SAMPLE_RATE, SttEngine, TranscribeOpts},
 };
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--no-warmup] [--quiet] [--dictionary f] [--no-dictionary] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--no-warmup] [--quiet] [--dictionary f] [--no-dictionary] [--boost w,...] [--app id] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
 
 fn main() -> ExitCode {
     match run() {
@@ -86,6 +98,25 @@ struct Clip {
     secs: f64,
     median_ms: f64,
     errors: Option<(usize, usize)>,
+    /// The transcript, after the dictionary's replacements.
+    text: String,
+}
+
+/// A WAV with what's known about it.
+struct Input {
+    name: String,
+    audio: Vec<f32>,
+    reference: Option<String>,
+    /// The dictionary as it applies in the clip's app.
+    scope: Scope,
+}
+
+/// One pass over every clip at one boost weight.
+struct Pass {
+    weight: f32,
+    clips: Vec<Clip>,
+    terms: terms::Terms,
+    replacements: usize,
 }
 
 fn run() -> Result<(), String> {
@@ -105,6 +136,7 @@ fn run() -> Result<(), String> {
     let (mut runs, mut warmup, mut quiet, mut dir) = (3usize, true, false, None);
     // `None`: AGT's own, if there is one.
     let (mut dictionary_file, mut apply_dictionary) = (None, true);
+    let (mut weights, mut app): (Option<Vec<f32>>, Option<String>) = (None, None);
     let mut gap = std::time::Duration::ZERO;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -121,6 +153,14 @@ fn run() -> Result<(), String> {
             "--quiet" => quiet = true,
             "--dictionary" => dictionary_file = Some(PathBuf::from(val()?)),
             "--no-dictionary" => apply_dictionary = false,
+            "--boost" => {
+                let list = val()?
+                    .split(',')
+                    .map(|w| w.trim().parse::<f32>().map_err(|_| "bad --boost"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                weights = Some(list);
+            }
+            "--app" => app = Some(val()?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -130,6 +170,18 @@ fn run() -> Result<(), String> {
         }
     }
     let dir = dir.ok_or(format!("{USAGE}  (--help for options)"))?;
+    // As the app clamps it.
+    let weights: Vec<f32> = weights
+        .unwrap_or_else(|| vec![cfg.boost])
+        .into_iter()
+        .map(|w| {
+            SttConfig {
+                boost: w,
+                ..cfg.clone()
+            }
+            .boost()
+        })
+        .collect();
 
     let mut wavs: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -148,10 +200,24 @@ fn run() -> Result<(), String> {
         Some(p) => Dictionary::load(p).map_err(|e| format!("{}: {e}", p.display()))?,
         None => Dictionary::default(),
     };
-    let dictionary = match apply_dictionary {
+    let dictionary = Arc::new(match apply_dictionary {
         true => counted.clone(),
         false => Dictionary::default(),
-    };
+    });
+    let mut apps: BTreeMap<String, usize> = BTreeMap::new();
+    let mut inputs = Vec::with_capacity(wavs.len());
+    for wav in &wavs {
+        let clip_app = app.clone().or_else(|| read_app(wav));
+        *apps
+            .entry(clip_app.clone().unwrap_or_else(|| "(none)".into()))
+            .or_default() += 1;
+        inputs.push(Input {
+            name: name(wav),
+            audio: agt_audio::wav::read_16k_mono(wav)?,
+            reference: read_reference(wav),
+            scope: Scope::new(dictionary.clone(), clip_app),
+        });
+    }
 
     let rss_before = mem::peak_rss();
     let t = Instant::now();
@@ -175,9 +241,10 @@ fn run() -> Result<(), String> {
 
     match &dictionary_file {
         Some(p) => println!(
-            "dictionary: {} ({} terms, {} replacements){}",
+            "dictionary: {} ({} terms, {} profiles, {} replacements){}",
             p.display(),
-            counted.terms().len(),
+            counted.all_terms().len(),
+            counted.profiles().len(),
             counted.replacements().len(),
             if apply_dictionary {
                 ""
@@ -187,66 +254,26 @@ fn run() -> Result<(), String> {
         ),
         None => println!("dictionary: none"),
     }
-    // As the app passes them (see the pipeline's `Hints`).
-    let opts = TranscribeOpts {
-        vocabulary: dictionary.terms().to_vec(),
-        ..Default::default()
-    };
-    let mut term_counts = terms::Terms::new(terms::of(&counted));
-    let mut replacements = 0;
-    let mut clips = Vec::new();
-    if !quiet {
-        println!();
-        println!(
-            "{:<22} {:>7} {:>9} {:>9} {:>7} {:>6}  transcript",
-            "file", "audio s", "first ms", "median ms", "RTF", "WER"
-        );
+    let apps: Vec<String> = apps.iter().map(|(a, n)| format!("{a} ({n})")).collect();
+    println!("apps: {}", apps.join(", "));
+
+    let mut passes = Vec::with_capacity(weights.len());
+    for &weight in &weights {
+        if weights.len() > 1 {
+            println!();
+            println!("== boost {weight} ==");
+        }
+        let pass = transcribe_all(engine.as_mut(), &inputs, weight, runs, gap, quiet, &counted)?;
+        report(&pass, &categories, dictionary.replacements().is_empty());
+        passes.push(pass);
     }
-    for wav in &wavs {
-        let audio = agt_audio::wav::read_16k_mono(wav)?;
-        let secs = audio.len() as f64 / SAMPLE_RATE as f64;
-        let mut times = Vec::with_capacity(runs);
-        let mut text = String::new();
-        for _ in 0..runs {
-            std::thread::sleep(gap);
-            let t = Instant::now();
-            text = engine
-                .transcribe(&audio, &opts)
-                .map_err(|e| e.to_string())?
-                .text;
-            times.push(ms(t));
-        }
-        let first = times[0];
-        times.sort_by(f64::total_cmp);
-        let median = times[times.len() / 2];
-        // What AGT does before polish (the pipeline's polish thread).
-        let (replaced, n) = dictionary.replace(&text);
-        replacements += n;
-        let text = replaced.into_owned();
-        let reference = read_reference(wav);
-        if let Some(r) = &reference {
-            term_counts.add(r, &text);
-        }
-        let errors = reference.map(|r| wer::word_errors(&r, &text));
-        let name = name(wav);
-        if !quiet {
-            println!(
-                "{:<22} {secs:>7.2} {first:>9.1} {median:>9.1} {:>7.4} {:>6}  {text}",
-                name,
-                median / 1000.0 / secs,
-                errors.map_or("-".into(), |(e, w)| format!("{:5.1}%", pct(e, w))),
-            );
-        }
-        clips.push(Clip {
-            set: set_of(&name),
-            name,
-            secs,
-            median_ms: median,
-            errors,
-        });
+    if passes.len() > 1 {
+        sweep_table(&passes, &categories);
     }
 
-    let (audio, total): (f64, f64) = clips
+    let last = passes.last().expect("one weight at least");
+    let (audio, total): (f64, f64) = last
+        .clips
         .iter()
         .fold((0.0, 0.0), |(a, t), c| (a + c.secs, t + c.median_ms));
     println!();
@@ -267,7 +294,8 @@ fn run() -> Result<(), String> {
         ("medium", 6.0, 20.0),
         ("long", 20.0, f64::MAX),
     ] {
-        let mut t: Vec<f64> = clips
+        let mut t: Vec<f64> = last
+            .clips
             .iter()
             .filter(|c| c.secs >= lo && c.secs < hi)
             .map(|c| c.median_ms)
@@ -275,7 +303,8 @@ fn run() -> Result<(), String> {
         if t.is_empty() {
             continue;
         }
-        let avg_s = clips
+        let avg_s = last
+            .clips
             .iter()
             .filter(|c| c.secs >= lo && c.secs < hi)
             .map(|c| c.secs)
@@ -290,66 +319,17 @@ fn run() -> Result<(), String> {
         );
         lat.push(format!("{p50:.0}/{p90:.0}"));
     }
-
-    // WER by set, then by category, then overall.
-    let mut wers = Vec::new();
-    if clips.iter().any(|c| c.errors.is_some()) {
-        let mut by_set: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-        let mut by_cat: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-        let mut all = (0, 0, 0);
-        for c in &clips {
-            if let Some((e, w)) = c.errors {
-                for acc in [by_set.entry(c.set.clone()).or_default(), &mut all] {
-                    *acc = (acc.0 + 1, acc.1 + e, acc.2 + w);
-                }
-                if let Some(cat) = categories.get(&c.name) {
-                    let acc = by_cat.entry(cat.clone()).or_default();
-                    *acc = (acc.0 + 1, acc.1 + e, acc.2 + w);
-                }
-            }
-        }
-        println!();
-        println!("{:<12} {:>5} {:>6} {:>7}", "WER", "clips", "words", "WER");
-        for (k, (n, e, w)) in by_set.iter().chain(by_cat.iter()) {
-            println!("{k:<12} {n:>5} {w:>6} {:>6.2}%", pct(*e, *w));
-        }
-        println!(
-            "{:<12} {:>5} {:>6} {:>6.2}%",
-            "all",
-            all.0,
-            all.2,
-            pct(all.1, all.2)
-        );
-        for k in ["read", "real"] {
-            if let Some((_, e, w)) = by_cat.get(k) {
-                wers.push(format!("{:.2}", pct(*e, *w)));
-            }
-        }
-        wers.push(format!("{:.2}", pct(all.1, all.2)));
-    }
-
-    if !dictionary.replacements().is_empty() {
-        println!();
-        println!("replacements made: {replacements}");
-    }
-    if !term_counts.is_empty() && clips.iter().any(|c| c.errors.is_some()) {
-        println!();
-        println!(
-            "{:<24} {:>6} {:>6} {:>6} {:>9}",
-            "term (case-sensitive)", "in ref", "hits", "misses", "false ins"
-        );
-        let total = term_counts.total();
-        for c in term_counts.counts().iter().chain([&total]) {
-            println!(
-                "{:<24} {:>6} {:>6} {:>6} {:>9}",
-                c.term,
-                c.expected(),
-                c.hits,
-                c.misses,
-                c.false_insertions
-            );
-        }
-    }
+    let wers: Vec<String> = wer_by(&last.clips, &categories)
+        .map(|w| {
+            let mut out: Vec<String> = ["read", "real"]
+                .iter()
+                .filter_map(|k| w.by_cat.get(*k))
+                .map(|&(_, e, n)| format!("{:.2}", pct(e, n)))
+                .collect();
+            out.push(format!("{:.2}", pct(w.all.1, w.all.2)));
+            out
+        })
+        .unwrap_or_default();
 
     println!();
     let rss = mem::peak_rss();
@@ -372,6 +352,216 @@ fn run() -> Result<(), String> {
         vram.map_or("-".into(), |b| (b / (1 << 20)).to_string()),
     );
     Ok(())
+}
+
+/// Transcribes every clip `runs` times at `weight`, as the app would in its app (see the
+/// module docs), and prints a line per clip unless `quiet`.
+fn transcribe_all(
+    engine: &mut dyn SttEngine,
+    inputs: &[Input],
+    weight: f32,
+    runs: usize,
+    gap: std::time::Duration,
+    quiet: bool,
+    counted: &Dictionary,
+) -> Result<Pass, String> {
+    let mut pass = Pass {
+        weight,
+        clips: Vec::with_capacity(inputs.len()),
+        terms: terms::Terms::new(terms::of(counted)),
+        replacements: 0,
+    };
+    if !quiet {
+        println!();
+        println!(
+            "{:<22} {:>7} {:>9} {:>9} {:>7} {:>6}  transcript",
+            "file", "audio s", "first ms", "median ms", "RTF", "WER"
+        );
+    }
+    for input in inputs {
+        // As the app passes them (see the pipeline's `stt_thread`).
+        let opts = TranscribeOpts {
+            vocabulary: input.scope.terms().clone(),
+            boost: weight,
+            ..Default::default()
+        };
+        let secs = input.audio.len() as f64 / SAMPLE_RATE as f64;
+        let mut times = Vec::with_capacity(runs);
+        let mut text = String::new();
+        for _ in 0..runs {
+            std::thread::sleep(gap);
+            let t = Instant::now();
+            text = engine
+                .transcribe(&input.audio, &opts)
+                .map_err(|e| e.to_string())?
+                .text;
+            times.push(ms(t));
+        }
+        let first = times[0];
+        times.sort_by(f64::total_cmp);
+        let median = times[times.len() / 2];
+        // What AGT does before polish (the pipeline's polish thread).
+        let (replaced, n) = input.scope.replace(&text);
+        pass.replacements += n;
+        let text = replaced.into_owned();
+        if let Some(r) = &input.reference {
+            pass.terms.add(r, &text);
+        }
+        let errors = input.reference.as_ref().map(|r| wer::word_errors(r, &text));
+        if !quiet {
+            println!(
+                "{:<22} {secs:>7.2} {first:>9.1} {median:>9.1} {:>7.4} {:>6}  {text}",
+                input.name,
+                median / 1000.0 / secs,
+                errors.map_or("-".into(), |(e, w)| format!("{:5.1}%", pct(e, w))),
+            );
+        }
+        pass.clips.push(Clip {
+            set: set_of(&input.name),
+            name: input.name.clone(),
+            secs,
+            median_ms: median,
+            errors,
+            text,
+        });
+    }
+    Ok(pass)
+}
+
+/// WER totals: (clips, errors, reference words) by set, by category and overall.
+struct Wers {
+    by_set: BTreeMap<String, (usize, usize, usize)>,
+    by_cat: BTreeMap<String, (usize, usize, usize)>,
+    all: (usize, usize, usize),
+}
+
+/// `None` if no clip has a reference.
+fn wer_by(clips: &[Clip], categories: &BTreeMap<String, String>) -> Option<Wers> {
+    if clips.iter().all(|c| c.errors.is_none()) {
+        return None;
+    }
+    let mut w = Wers {
+        by_set: BTreeMap::new(),
+        by_cat: BTreeMap::new(),
+        all: (0, 0, 0),
+    };
+    for c in clips {
+        if let Some((e, n)) = c.errors {
+            for acc in [w.by_set.entry(c.set.clone()).or_default(), &mut w.all] {
+                *acc = (acc.0 + 1, acc.1 + e, acc.2 + n);
+            }
+            if let Some(cat) = categories.get(&c.name) {
+                let acc = w.by_cat.entry(cat.clone()).or_default();
+                *acc = (acc.0 + 1, acc.1 + e, acc.2 + n);
+            }
+        }
+    }
+    Some(w)
+}
+
+/// WER by set, then by category, then overall; the replacements; the per-term table.
+fn report(pass: &Pass, categories: &BTreeMap<String, String>, no_rules: bool) {
+    if !no_rules {
+        println!();
+        println!("replacements made: {}", pass.replacements);
+    }
+    let Some(w) = wer_by(&pass.clips, categories) else {
+        return;
+    };
+    println!();
+    println!("{:<12} {:>5} {:>6} {:>7}", "WER", "clips", "words", "WER");
+    for (k, (n, e, words)) in w.by_set.iter().chain(w.by_cat.iter()) {
+        println!("{k:<12} {n:>5} {words:>6} {:>6.2}%", pct(*e, *words));
+    }
+    println!(
+        "{:<12} {:>5} {:>6} {:>6.2}%",
+        "all",
+        w.all.0,
+        w.all.2,
+        pct(w.all.1, w.all.2)
+    );
+    if !pass.terms.is_empty() {
+        println!();
+        println!(
+            "{:<24} {:>6} {:>6} {:>6} {:>9}",
+            "term (case-sensitive)", "in ref", "hits", "misses", "false ins"
+        );
+        let total = pass.terms.total();
+        for c in pass.terms.counts().iter().chain([&total]) {
+            println!(
+                "{:<24} {:>6} {:>6} {:>6} {:>9}",
+                c.term,
+                c.expected(),
+                c.hits,
+                c.misses,
+                c.false_insertions
+            );
+        }
+    }
+}
+
+/// One line per weight (see the module docs).
+fn sweep_table(passes: &[Pass], categories: &BTreeMap<String, String>) {
+    let sets: Vec<String> = wer_by(&passes[0].clips, categories)
+        .map(|w| w.by_set.into_keys().collect())
+        .unwrap_or_default();
+    println!();
+    print!("{:>6} {:>7}", "boost", "WER all");
+    for s in &sets {
+        print!(" {:>10}", format!("WER {s}"));
+    }
+    println!(
+        " {:>5} {:>6} {:>9} {:>8} {:>9}",
+        "hits", "misses", "false ins", "changed", "median ms"
+    );
+    for p in passes {
+        let w = wer_by(&p.clips, categories);
+        let all = w.as_ref().map_or(0.0, |w| pct(w.all.1, w.all.2));
+        print!("{:>6} {all:>6.2}%", p.weight);
+        for s in &sets {
+            let (_, e, n) = w
+                .as_ref()
+                .and_then(|w| w.by_set.get(s).copied())
+                .unwrap_or_default();
+            print!(" {:>9.2}%", pct(e, n));
+        }
+        let t = p.terms.total();
+        let changed: usize = p
+            .clips
+            .iter()
+            .zip(&passes[0].clips)
+            .map(|(a, b)| changed_words(&b.text, &a.text))
+            .sum();
+        let mut times: Vec<f64> = p.clips.iter().map(|c| c.median_ms).collect();
+        times.sort_by(f64::total_cmp);
+        println!(
+            " {:>5} {:>6} {:>9} {changed:>8} {:>9.1}",
+            t.hits,
+            t.misses,
+            t.false_insertions,
+            percentile(&times, 0.5)
+        );
+    }
+}
+
+/// Word-level edits (substitutions, deletions, insertions) from `a` to `b`, words split on
+/// whitespace and compared exactly: case and punctuation count.
+fn changed_words(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<&str>, Vec<&str>) = (
+        a.split_whitespace().collect(),
+        b.split_whitespace().collect(),
+    );
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, y) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(x != y))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Applies one of the `[stt]` flags (`--config`, `--engine`, `--model`, `--precision`,
@@ -461,6 +651,13 @@ fn read_reference(wav: &Path) -> Option<String> {
         .filter(|r| !r.trim().is_empty())
 }
 
+/// The app in `<name>.app` next to `wav` (its first line), if any.
+fn read_app(wav: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(wav.with_extension("app")).ok()?;
+    let app = text.lines().next()?.trim();
+    (!app.is_empty()).then(|| app.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +688,20 @@ mod tests {
             read_reference(&dir.join("said.wav")).as_deref(),
             Some("hello\n")
         );
+        for (name, text) in [("code", " Code.exe \r\nignored\n"), ("blank", "\n")] {
+            std::fs::write(dir.join(format!("{name}.app")), text).unwrap();
+        }
+        assert_eq!(read_app(&dir.join("code.wav")).as_deref(), Some("Code.exe"));
+        assert_eq!(read_app(&dir.join("blank.wav")), None);
+        assert_eq!(read_app(&dir.join("missing.wav")), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changed_words_are_exact() {
+        assert_eq!(changed_words("push to Maine.", "push to main."), 1);
+        assert_eq!(changed_words("a b c", "a b c"), 0);
+        assert_eq!(changed_words("a b", "a x b y"), 2);
+        assert_eq!(changed_words("", "a"), 1);
     }
 }

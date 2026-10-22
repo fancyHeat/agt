@@ -396,6 +396,14 @@ pub fn foreground_window() -> Option<usize> {
     imp::foreground_window()
 }
 
+/// Identifies the app that has focus, for the dictionary's app profiles: on Windows the file
+/// name of the foreground window's program (`Code.exe`), on macOS the frontmost app's bundle
+/// identifier (`com.microsoft.VSCode`). `None` if there's none or it can't be told. Doesn't
+/// talk to the app: microseconds (it runs at key-down).
+pub fn foreground_app() -> Option<String> {
+    imp::foreground_app()
+}
+
 /// Whether keyboard focus is in something that takes typed text (a text field or area, an
 /// editable part of a web page), so a paste has somewhere to land. `Some(false)` only when
 /// focus is clearly elsewhere (a web page, a link, a button, a list, the Finder's desktop).
@@ -1030,5 +1038,20 @@ mod tests {
         d.on_key(WIN, false, 2100, t);
         d.on_key(WIN, true, 3000, t);
         assert!(!d.repeat_in_chord(1));
+    }
+
+    /// It runs at every key-down: never slow, whatever has focus (or nothing, on a CI
+    /// runner without a desktop).
+    #[test]
+    fn foreground_app_is_quick() {
+        let t = Instant::now();
+        let mut app = None;
+        for _ in 0..100 {
+            app = foreground_app();
+        }
+        let each = t.elapsed() / 100;
+        eprintln!("foreground app: {app:?}, {each:?} per call");
+        assert!(app.as_deref() != Some(""));
+        assert!(each < std::time::Duration::from_millis(5), "{each:?}");
     }
 }

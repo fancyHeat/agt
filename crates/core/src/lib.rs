@@ -8,7 +8,7 @@ pub mod polish;
 pub mod stt;
 
 pub use config::Config;
-pub use dictionary::Dictionary;
+pub use dictionary::{Dictionary, Scope};
 
 /// Human-readable app name.
 pub const APP_NAME: &str = "AGT";
