@@ -813,11 +813,7 @@ fn keep_days(current: u64) -> Vec<Choice> {
 /// The keys `agt-platform` accepts on their own, the default chord, and the file's value
 /// if it's another one (a chord the user wrote).
 fn hotkey_choices(current: &str) -> Vec<Choice> {
-    let mut names: Vec<&str> = agt_platform::KEYS
-        .iter()
-        .filter(|(_, _, kind)| *kind != agt_platform::KeyKind::ChordOnly)
-        .map(|(name, _, _)| *name)
-        .collect();
+    let mut names: Vec<&str> = agt_platform::KEYS.iter().map(|&(name, ..)| name).collect();
     if !names.contains(&config::DEFAULT_HOTKEY) {
         names.insert(0, config::DEFAULT_HOTKEY);
     }
