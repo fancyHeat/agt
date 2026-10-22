@@ -1,6 +1,9 @@
 //! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
+use crate::{
+    Error, HotkeyEvent, Hotkeys, Key, KeyKind, LoginItem, Permission, hotkeys::Detector,
+    needs_masker,
+};
 use std::{
     cell::RefCell,
     ffi::{OsStr, OsString, c_void},
@@ -65,20 +68,21 @@ const WM_RESET_HOOK: u32 = WM_APP + 1;
 // Hotkey
 
 struct HookState {
-    hotkey: Hotkey,
-    detector: HoldDetector,
+    detector: Detector,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
-    /// For chords with Win: asks the masking thread to inject [`VK_MASK`].
+    /// With Win or Alt in a hotkey ([`needs_masker`]): asks the masking thread to inject
+    /// [`VK_MASK`].
     mask: Option<mpsc::Sender<()>>,
     /// [`crate::paste_count`] when the mask was last sent.
     masked_at_paste: u64,
 }
 
-/// For a chord that includes Win: once the chord is complete, injects a [`VK_MASK`] press so
-/// that Win is no longer "the last key pressed" when it's released, and Windows doesn't open
-/// the Start menu (which it does when Win is released last, e.g. after Ctrl down, Win down,
-/// Ctrl up, Win up). Done from its own thread, not inside the hook callback: the hook must
-/// return fast, and the injected keys pass through the hook themselves.
+/// For hotkeys with Win or Alt ([`KeyKind::Masked`]): once a hotkey is held, injects a
+/// [`VK_MASK`] press so that Win or Alt is no longer "the last key pressed" when it's
+/// released, and Windows doesn't open the Start menu or the focused app's menu bar (which it
+/// does when Win or Alt is released last: held alone, or after Ctrl down, Win down, Ctrl up,
+/// Win up). Done from its own thread, not inside the hook callback: the hook must return
+/// fast, and the injected keys pass through the hook themselves.
 fn spawn_masker() -> Result<mpsc::Sender<()>, Error> {
     let (tx, rx) = mpsc::channel::<()>();
     thread::Builder::new()
@@ -143,15 +147,16 @@ fn install_hook() -> HHOOK {
 }
 
 pub fn start_hotkey(
-    hotkey: Hotkey,
+    hotkeys: Hotkeys,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
-    let name = hotkey.to_string();
-    let mask = if hotkey.keys().iter().any(|k| is_win(k.code as u32)) {
+    let mask = if needs_masker(&hotkeys) {
         Some(spawn_masker()?)
     } else {
         None
     };
+    let detector = Detector::new(&hotkeys);
+    let name = detector.hotkeys().to_string();
     let (tx, rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("hotkey".into())
@@ -161,8 +166,7 @@ pub fn start_hotkey(
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
             HOOK.with(|h| {
                 *h.borrow_mut() = Some(HookState {
-                    detector: HoldDetector::new(hotkey.keys().len()),
-                    hotkey,
+                    detector,
                     on_event,
                     mask,
                     masked_at_paste: 0,
@@ -244,40 +248,43 @@ pub fn key_down_past_hook(key: Key) -> Option<bool> {
     Some(vk_down(key.code))
 }
 
-/// Ctrl, Shift, Alt and Win (generic and left/right virtual-key codes).
-fn is_modifier(vk: u32) -> bool {
-    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C)
-}
-
-fn is_win(vk: u32) -> bool {
-    vk == VK_LWIN as u32 || vk == VK_RWIN as u32
+/// Win or Alt: releasing it alone would open the Start menu or the menu bar.
+fn is_masked(vk: u16) -> bool {
+    Key::from_code(vk).is_some_and(|k| k.kind() == KeyKind::Masked)
 }
 
 /// `KBDLLHOOKSTRUCT::scanCode` of the fake Left Ctrl press/release that Windows sends along
 /// with Right Alt on keyboard layouts where Right Alt is AltGr (German, French, ...).
 const ALTGR_FAKE_LCTRL_SCAN: u32 = 0x21D;
 
-/// What the hold detector should see of a (physical) key event: `None` to ignore it, else
-/// `Some(chord_key)` with the index of the chord key it is, `None` for any other key.
+/// The key code the detector should see of a (physical) key event, or `None` to leave the
+/// event alone.
 ///
-/// Modifiers that aren't part of the chord are ignored: they're part of a shortcut only
-/// together with a non-modifier key, which does cancel. The fake Left Ctrl of AltGr is
-/// ignored even when Left Ctrl is a chord key: it's really Right Alt, and with
-/// `LeftCtrl+LeftWin` holding Win and pressing AltGr would otherwise start a dictation.
-fn classify(hotkey: &Hotkey, vk: u32, scan_code: u32) -> Option<Option<usize>> {
-    if vk == VK_LCONTROL as u32 && scan_code == ALTGR_FAKE_LCTRL_SCAN {
+/// Left alone: the fake Left Ctrl of AltGr (it's really Right Alt: with `LeftCtrl+LeftWin`,
+/// holding Win and pressing AltGr would otherwise start a dictation), and the generic Shift,
+/// Ctrl and Alt codes (`VK_SHIFT`...; a low-level hook normally sees the left and right ones,
+/// which the detector tracks): as another key, either would cancel a hold.
+fn classify(vk: u32, scan_code: u32) -> Option<u16> {
+    let vk = u16::try_from(vk).ok()?;
+    if (vk == VK_LCONTROL && scan_code == ALTGR_FAKE_LCTRL_SCAN)
+        || [VK_SHIFT, VK_CONTROL, VK_MENU].contains(&vk)
+    {
         return None;
     }
-    match hotkey.index_of(vk) {
-        Some(i) => Some(Some(i)),
-        None if is_modifier(vk) => None,
-        None => Some(None),
-    }
+    Some(vk)
 }
 
-/// Windows side of [`crate::paste_may_release`]: Shift, Left Ctrl and Win.
+/// Whether the modifier `key` is down, as the system has it (for
+/// [`Detector::resync_modifiers`]).
+/// While Right Alt is down, Left Ctrl may be AltGr's fake one, which the hook leaves out:
+/// what the hook saw of Left Ctrl stands then (`None`).
+fn modifier_down(key: Key) -> Option<bool> {
+    (key.code != VK_LCONTROL || !vk_down(VK_RMENU)).then(|| vk_down(key.code))
+}
+
+/// Windows side of [`crate::paste_may_release`]: Shift, Left Ctrl, Alt and Win.
 pub fn paste_may_release(key: Key) -> bool {
-    matches!(key.code, 0xA0..=0xA2 | 0x5B | 0x5C)
+    matches!(key.code, 0xA0..=0xA2 | 0xA4 | 0xA5 | 0x5B | 0x5C)
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -290,44 +297,43 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 if let Ok(mut h) = h.try_borrow_mut()
                     && let Some(s) = h.as_mut()
                 {
-                    let Some(chord_key) = classify(&s.hotkey, kb.vkCode, kb.scanCode) else {
+                    let Some(key) = classify(kb.vkCode, kb.scanCode) else {
                         return;
                     };
-                    // A release whose press got past the hook (dropped, or too slow) passes
-                    // too, or the system would take the key as still down (see `key_down`).
-                    // The hook runs before the key state updates: this is the press's.
-                    swallow = chord_key.is_some_and(|i| s.hotkey.keys()[i].swallowed())
-                        && (down || !vk_down(kb.vkCode as u16));
-                    if let (Some(i), true, Some(mask)) = (chord_key, down, &s.mask)
-                        && is_win(kb.vkCode)
-                        && s.detector.repeat_in_chord(i)
+                    if let (true, Some(mask)) = (down, &s.mask)
+                        && is_masked(key)
+                        && s.detector.repeat_in_chord(key)
                     {
-                        // Win auto-repeat while the chord is held or being released. If a
-                        // paste released Win in software since we last masked, the system
-                        // takes this repeat for a fresh Win press, and the physical release
-                        // would then open the Start menu: mask again. (A lone Win held after
-                        // some unrelated paste is left alone: its tap still opens Start.)
+                        // Win or Alt auto-repeat while a hotkey with it is held or being
+                        // released. If a paste released it in software since we last masked,
+                        // the system takes this repeat for a fresh press, and the physical
+                        // release would then open the Start menu or the menu bar: mask again.
+                        // (A Win held without the rest of its hotkey, after some unrelated
+                        // paste, is left alone: its tap still opens Start.)
                         let pastes = crate::paste_count();
                         if pastes != s.masked_at_paste {
                             s.masked_at_paste = pastes;
                             let _ = mask.send(());
                         }
                     }
-                    let esc = kb.vkCode == VK_ESCAPE as u32;
+                    if down && s.detector.press_needs_resync(key) {
+                        // A modifier's release the hook missed (Win+L, Ctrl+Alt+Del) may be
+                        // what keeps this press from completing a combo: ask the system.
+                        s.detector.resync_modifiers(modifier_down);
+                    }
+                    let esc = key == VK_ESCAPE;
                     let armed = esc
                         && crate::escape_armed()
                         && ![VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
                             .into_iter()
                             .any(vk_down);
-                    let (ev, swallow_esc) = s.detector.on_hook_key(
-                        chord_key,
-                        esc,
-                        armed,
-                        down,
-                        kb.time,
-                        Instant::now(),
-                    );
-                    swallow |= swallow_esc;
+                    let (ev, keep) =
+                        s.detector
+                            .on_key(key, down, esc, armed, kb.time, Instant::now());
+                    // A release whose press got past the hook (dropped, or too slow) passes
+                    // too, or the system would take the key as still down (see `key_down`).
+                    // The hook runs before the key state updates: this is the press's.
+                    swallow = keep && (down || !vk_down(key));
                     if let Some(ev) = ev {
                         if let (HotkeyEvent::Down(..), Some(mask)) = (ev, &s.mask) {
                             // Covers both a dictation and a hold later cancelled by another
@@ -342,10 +348,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         }
     }
     if swallow {
-        // F13-F24 hotkeys, and the Esc that ends a hands-free recording: apps never see them.
+        // A hotkey's key that isn't a modifier while it counts (F13-F24, a combo's Space...),
+        // and the Esc that ends a hands-free recording: apps never see them.
         return 1;
     }
-    // Ctrl/Shift/Win hotkey keys and every other key pass through.
+    // Modifiers (hotkey keys or not) and every other key pass through.
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 
@@ -1014,14 +1021,13 @@ mod tests {
 
     /// Feeds hook events through [`classify`] and the detector, like `hook_proc` does.
     fn run(hotkey: &str, events: &[Ev]) -> Vec<HotkeyEvent> {
-        let hotkey = Hotkey::parse(hotkey).unwrap();
-        let mut d = HoldDetector::new(hotkey.keys().len());
+        let mut d = Detector::new(&Hotkeys::parse(&[hotkey.to_owned()]).unwrap());
         let t = Instant::now();
         events
             .iter()
             .filter_map(|&(vk, scan, down, time)| {
-                let chord_key = classify(&hotkey, vk, scan)?;
-                d.on_key(chord_key, down, time, t)
+                let key = classify(vk, scan)?;
+                d.on_key(key, down, false, false, time, t).0
             })
             .collect()
     }
@@ -1082,6 +1088,21 @@ mod tests {
             matches!(got[..], [HotkeyEvent::Down(..), HotkeyEvent::Cancel]),
             "{got:?}"
         );
+        // The generic Shift, Ctrl and Alt codes (some injected input has them) aren't another
+        // key either.
+        let events = [
+            (0xA3, 0x1D, true, 0),
+            (0x10, 0x2A, true, 100),
+            (0x11, 0x1D, true, 200),
+            (0x12, 0x38, true, 300),
+            (0x10, 0x2A, false, 400),
+            (0xA3, 0x1D, false, 1000),
+        ];
+        let got = run("RightCtrl", &events);
+        assert!(
+            matches!(got[..], [HotkeyEvent::Down(..), HotkeyEvent::Up(_)]),
+            "{got:?}"
+        );
     }
 
     /// The Run key code, on a key of its own (the real Run key is left alone).
@@ -1129,11 +1150,20 @@ mod tests {
     }
 
     #[test]
-    fn paste_may_release_shift_left_ctrl_and_win() {
+    fn paste_may_release_shift_left_ctrl_alt_and_win() {
         let k = |n| Key::parse(n).unwrap();
         assert!(!paste_may_release(k("RightCtrl")));
         assert!(!paste_may_release(k("F13")));
-        for n in ["LeftCtrl", "LeftShift", "RightShift", "LeftWin", "RightWin"] {
+        assert!(!paste_may_release(k("V")));
+        for n in [
+            "LeftCtrl",
+            "LeftShift",
+            "RightShift",
+            "LeftAlt",
+            "RightAlt",
+            "LeftWin",
+            "RightWin",
+        ] {
             assert!(paste_may_release(k(n)), "{n}");
         }
     }

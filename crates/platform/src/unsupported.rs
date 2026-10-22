@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation (anything but Windows and macOS).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
+use crate::{Error, HotkeyEvent, Hotkeys, Key, LoginItem, Permission};
 
 const MSG: &str = "not supported on this platform";
 
@@ -22,7 +22,7 @@ impl HotkeyReset {
 }
 
 pub fn start_hotkey(
-    _hotkey: Hotkey,
+    _hotkeys: Hotkeys,
     _on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
     Err(format!("global hotkey {MSG}").into())

@@ -492,13 +492,15 @@ pub fn start(
     };
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     let ducker = Ducker::start(paths::ducked_volume_file());
-    // Every hotkey is checked, but only the first one dictates for now.
-    let key = Hotkeys::parse(&config.hotkey.keys)?.list()[0].clone();
+    let hotkeys = Hotkeys::parse(&config.hotkey.keys)?;
+    // The hook watches every hotkey; the audio and paste threads still go by the first one's
+    // keys (for a missed release, and the paste wait).
+    let key = hotkeys.list()[0].clone();
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);
 
     let (to_audio, audio_rx) = mpsc::channel::<HotkeyEvent>();
-    let hotkey = agt_platform::start_hotkey(&key, move |ev| {
+    let hotkey = agt_platform::start_hotkey(&hotkeys, move |ev| {
         let _ = to_audio.send(ev);
     })
     .map_err(|e| e.to_string())?;

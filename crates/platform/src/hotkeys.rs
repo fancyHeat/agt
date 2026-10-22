@@ -76,18 +76,24 @@ impl fmt::Display for Hotkeys {
 ///
 /// - A modifier that isn't in a hotkey never reaches its detector: it neither cancels nor
 ///   blocks that hotkey's hold (Shift + Fn still dictates).
-/// - A combo's key that isn't a modifier counts for it only if, at its press, exactly the
-///   combo's modifiers are down (they went down first, and no others); its auto-repeat and
-///   release count only if its press did. Otherwise it's just another key: Space alone,
-///   Space then Left Control, and Left Control + Left Shift + Space all reach apps. A key
-///   that is a whole hotkey on its own always counts.
+/// - A combo's key that isn't a modifier counts for it only if its press completes the
+///   combo: the combo is armed (not waiting for its keys to be released after a hold or a
+///   shortcut), its modifiers went down first, and no other modifier is down. Its auto-repeat
+///   and release count only if its press did. Otherwise it's just another key: Space alone,
+///   Space then Left Control, Left Control + Left Shift + Space, and a Space typed after
+///   Left Control + A with Left Control still held all reach apps. A key that is a whole
+///   hotkey on its own always counts.
 /// - One hold at a time, judged by the state before each event: while one hotkey is held,
 ///   another one completing starts nothing, and waits until all its keys are up (as after a
 ///   hold of its own). Of two completing on the same key, the first in the list holds.
+/// - The modifiers down are tracked from the hook's events, and a hook can miss a release
+///   (it happened on the secure desktop, say). When an extra modifier is all that keeps a
+///   press from completing a combo ([`Self::press_needs_resync`]), the hook asks the OS which
+///   modifiers are down ([`Self::resync_modifiers`]) before passing the press on.
 ///
 /// Allocation-free per key event: it sees every keystroke on the system. Platform-independent
 /// so it can be unit-tested.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) struct Detector {
     hotkeys: Hotkeys,
     /// One per hotkey, in [`Hotkeys::list`]'s order.
@@ -111,6 +117,15 @@ struct Watch {
     press: Press,
 }
 
+impl Watch {
+    /// Whether a fresh press of its key that isn't a modifier (chord key `j`), with
+    /// `modifiers` down, counts for it: always for a lone key; for a combo, if it completes
+    /// the combo with no other modifier down.
+    fn counts(&self, j: usize, modifiers: u64) -> bool {
+        self.modifiers == 0 || (self.modifiers == modifiers && self.hold.would_complete(j))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Press {
     /// Released (or never pressed).
@@ -122,7 +137,8 @@ enum Press {
 }
 
 /// The bit of the modifier with platform key code `code` in a set of modifiers (its place
-/// among [`KEYS`]' modifiers, of which there are well under 64), if it's one.
+/// among [`KEYS`]' modifiers, of which there are well under 64), if it's one. The same order
+/// as [`Detector::resync_modifiers`].
 fn modifier_bit(code: u16) -> Option<u64> {
     KEYS.iter()
         .map(Key::from_entry)
@@ -131,7 +147,7 @@ fn modifier_bit(code: u16) -> Option<u64> {
         .map(|i| 1u64 << i)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 impl Detector {
     pub(crate) fn new(hotkeys: &Hotkeys) -> Self {
         let watches = hotkeys
@@ -196,8 +212,7 @@ impl Detector {
             let chord_key = match hotkey.index_of(code.into()) {
                 Some(j) if Some(j) == w.other => {
                     if down && w.press == Press::Up {
-                        let exact = w.modifiers == 0 || w.modifiers == self.modifiers;
-                        w.press = if exact {
+                        w.press = if w.counts(j, self.modifiers) {
                             Press::Counted
                         } else {
                             Press::Ignored
@@ -244,9 +259,45 @@ impl Detector {
         (ev, false)
     }
 
+    /// Whether a press of `code` (call before [`Self::on_key`]) would complete a combo but for
+    /// another modifier believed down: that may be a release the hook missed, so the hook
+    /// should [`Self::resync_modifiers`] first. Only for a fresh press (not its auto-repeat),
+    /// and not when the OS's answer can't make it count (the combo is waiting for its keys to
+    /// be released, or one of its own modifiers isn't down): the OS is asked at most once per
+    /// press, and only on this rare path.
+    pub(crate) fn press_needs_resync(&self, code: u16) -> bool {
+        self.hotkeys
+            .list()
+            .iter()
+            .zip(&self.watches)
+            .any(|(hotkey, w)| {
+                w.press == Press::Up
+                    && w.modifiers != 0
+                    && w.modifiers != self.modifiers
+                    && hotkey
+                        .index_of(code.into())
+                        .is_some_and(|j| Some(j) == w.other && w.hold.would_complete(j))
+            })
+    }
+
+    /// Replaces the modifiers believed down with what the OS says: `down` tells, for each
+    /// modifier in [`KEYS`], whether it's down, or `None` if the OS can't tell (that one is
+    /// left as the hook saw it). Allocation-free.
+    pub(crate) fn resync_modifiers(&mut self, down: impl Fn(Key) -> Option<bool>) {
+        let modifiers = KEYS.iter().map(Key::from_entry).filter(Key::is_modifier);
+        for (i, key) in modifiers.enumerate() {
+            match down(key) {
+                Some(true) => self.modifiers |= 1 << i,
+                Some(false) => self.modifiers &= !(1 << i),
+                None => {}
+            }
+        }
+    }
+
     /// Whether a press of `code` (call before [`Self::on_key`]) is an auto-repeat in a chord
     /// that is held or being released, for any hotkey with that key (see
     /// [`HoldDetector::repeat_in_chord`]).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn repeat_in_chord(&self, code: u16) -> bool {
         self.hotkeys
             .list()
@@ -421,6 +472,66 @@ mod tests {
     }
 
     #[test]
+    fn disarmed_combo_key_reaches_apps() {
+        let mut d = detector(&["LeftShift+Space"]);
+        // Shift+A types a capital and disarms the combo until its keys are up: the space typed
+        // next, Left Shift still held, is the app's.
+        assert_eq!(press(&mut d, "LeftShift", true), (None, false));
+        assert_eq!(press(&mut d, "A", true), (None, false));
+        assert_eq!(press(&mut d, "A", false), (None, false));
+        assert_eq!(press(&mut d, "Space", true), (None, false));
+        assert_eq!(press(&mut d, "Space", true), (None, false)); // auto-repeat
+        assert_eq!(press(&mut d, "Space", false), (None, false));
+        // Once everything is up, the combo works again.
+        assert_eq!(press(&mut d, "LeftShift", false), (None, false));
+        assert_eq!(press(&mut d, "LeftShift", true), (None, false));
+        assert_eq!(press(&mut d, "Space", true), (Some(Down(*T, 0)), true));
+    }
+
+    #[test]
+    fn resync_drops_a_stale_modifier() {
+        let space = code("Space");
+        let stale = || {
+            // Right Shift's release was missed (it happened on the secure desktop, say).
+            let mut d = detector(&["LeftShift+Space"]);
+            press(&mut d, "RightShift", true);
+            press(&mut d, "LeftShift", true);
+            d
+        };
+        // As an extra modifier, it blocks the combo: Space types.
+        let mut d = stale();
+        assert!(d.press_needs_resync(space));
+        assert_eq!(press(&mut d, "Space", true), (None, false));
+        assert!(
+            !d.press_needs_resync(space),
+            "nor is its auto-repeat judged again"
+        );
+        // So the hook asks the OS before passing the press on (`None`: what the hook saw
+        // stands): only Left Shift is down, and the same press counts.
+        let mut d = stale();
+        d.resync_modifiers(|k| (k.name != "LeftShift").then_some(false));
+        assert!(!d.press_needs_resync(space));
+        assert_eq!(press(&mut d, "Space", true), (Some(Down(*T, 0)), true));
+        // A modifier that really is down still blocks it.
+        let mut d = stale();
+        d.resync_modifiers(|k| Some(k.name.ends_with("Shift")));
+        assert!(d.press_needs_resync(space));
+        assert_eq!(press(&mut d, "Space", true), (None, false));
+        // Nothing to ask when the press counts anyway, or isn't a combo's.
+        let mut d = detector(&["LeftShift+Space", "F13"]);
+        press(&mut d, "LeftShift", true);
+        assert!(!d.press_needs_resync(space));
+        assert!(!d.press_needs_resync(code("F13")));
+        assert!(!d.press_needs_resync(code("A")));
+        // Nor while the combo waits for its keys to be released (Shift+A, then Space): the
+        // OS can't make that press count.
+        press(&mut d, "RightShift", true);
+        assert!(d.press_needs_resync(space));
+        press(&mut d, "A", true);
+        assert!(!d.press_needs_resync(space));
+    }
+
+    #[test]
     fn lone_regular_key_is_kept() {
         let mut d = detector(&["A"]);
         assert_eq!(press(&mut d, "A", true), (Some(Down(*T, 0)), true));
@@ -461,13 +572,15 @@ mod tests {
         let mut d = detector(&["LeftShift+F13", "LeftShift+F14"]);
         assert_eq!(press(&mut d, "LeftShift", true), (None, false));
         assert_eq!(press(&mut d, "F13", true), (Some(Down(*T, 0)), true));
-        // Another key while holding (kept: with exactly its modifiers down, it's the other
-        // combo's), and the other combo starts nothing until its keys are up.
-        assert_eq!(press(&mut d, "F14", true), (Some(Cancel), true));
+        // Another key while holding cancels, and reaches the app: to the other combo, F13 was
+        // another key with its Left Shift down (a shortcut), so it waits until its keys are up
+        // and F14 doesn't count for it either.
+        assert_eq!(press(&mut d, "F14", true), (Some(Cancel), false));
         assert_eq!(press(&mut d, "F13", false), (None, true));
-        assert_eq!(press(&mut d, "F14", false), (None, true));
-        assert_eq!(press(&mut d, "F14", true), (None, true)); // Left Shift still down
-        assert_eq!(press(&mut d, "F14", false), (None, true));
+        assert_eq!(press(&mut d, "F14", false), (None, false));
+        // Left Shift still down: still waiting.
+        assert_eq!(press(&mut d, "F14", true), (None, false));
+        assert_eq!(press(&mut d, "F14", false), (None, false));
         assert_eq!(press(&mut d, "LeftShift", false), (None, false));
         assert_eq!(press(&mut d, "LeftShift", true), (None, false));
         assert_eq!(press(&mut d, "F14", true), (Some(Down(*T, 1)), true));

@@ -3,7 +3,7 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkey (event tap), swallowing F13-F20 and the Globe key, sending Cmd+V | Accessibility |
+//! | Seeing the hotkeys (event tap), swallowing their keys that aren't modifiers and the Globe key, sending Cmd+V | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
 //!
 //! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
@@ -11,7 +11,7 @@
 //! restart once granted: the hotkey thread retries creating its tap every second until it
 //! works, and the others are checked when used.
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
+use crate::{Error, Hotkey, HotkeyEvent, Hotkeys, Key, LoginItem, Permission, hotkeys::Detector};
 use block2::RcBlock;
 use objc2::{
     msg_send,
@@ -62,7 +62,7 @@ const KVK_GLOBE: u16 = 0xB3;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
-/// Event times for [`HoldDetector`], in ms since this module was first used (wraps after 49
+/// Event times for the [`Detector`], in ms since this module was first used (wraps after 49
 /// days, which the detector handles). Our own clock: `CGEventGetTimestamp`'s unit differs
 /// between Intel and Apple Silicon.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -74,21 +74,56 @@ fn now_ms() -> u32 {
 // ---------------------------------------------------------------------------------------
 // Hotkey
 
-/// Command, Shift, CapsLock, Option, Control (left and right) and Fn: the keys that arrive as
-/// `flagsChanged` events.
-fn is_modifier(code: u16) -> bool {
-    matches!(code, 0x36..=0x3F)
+/// The modifier flag that is set while the modifier with key code `code` (one in
+/// [`crate::KEYS`]) is down: its device-dependent left/right bit from IOKit's
+/// `NX_DEVICE*KEYMASK` (IOLLEvent.h), or Fn's flag. Empty for any other key, Caps Lock
+/// included: macOS reports Caps Lock switching on and off, not being held.
+fn down_flag(code: u16) -> CGEventFlags {
+    let bits = match code {
+        0x3B => 0x0001, // Left Control: NX_DEVICELCTLKEYMASK
+        0x38 => 0x0002, // Left Shift: NX_DEVICELSHIFTKEYMASK
+        0x3C => 0x0004, // Right Shift: NX_DEVICERSHIFTKEYMASK
+        0x37 => 0x0008, // Left Command: NX_DEVICELCMDKEYMASK
+        0x36 => 0x0010, // Right Command: NX_DEVICERCMDKEYMASK
+        0x3A => 0x0020, // Left Option: NX_DEVICELALTKEYMASK
+        0x3D => 0x0040, // Right Option: NX_DEVICERALTKEYMASK
+        0x3E => 0x2000, // Right Control: NX_DEVICERCTLKEYMASK
+        KVK_FUNCTION => return CGEventFlags::MaskSecondaryFn,
+        _ => 0,
+    };
+    CGEventFlags::from_bits_retain(bits)
 }
 
-/// The modifier flag that is set while `code` (a modifier hotkey) is down: the
-/// device-dependent left/right bits from IOKit's `NX_DEVICE*KEYMASK`, or Fn's flag.
-fn down_flag(code: u16) -> CGEventFlags {
-    match code {
-        0x3D => CGEventFlags::from_bits_retain(0x40), // NX_DEVICERALTKEYMASK
-        0x36 => CGEventFlags::from_bits_retain(0x10), // NX_DEVICERCMDKEYMASK
-        0x3F => CGEventFlags::MaskSecondaryFn,
-        _ => CGEventFlags::empty(),
+/// Whether macOS sets Fn's flag on every key event of `code`, Fn held or not: it does for the
+/// F-keys and the navigation keys (arrows, Home, End, Page Up, Page Down, Forward Delete).
+fn fn_flag_always(code: u16) -> bool {
+    Key::from_code(code).is_some_and(|k| {
+        k.name
+            .strip_prefix('F')
+            .is_some_and(|n| n.parse::<u8>().is_ok())
+            || matches!(
+                k.name,
+                "LeftArrow"
+                    | "RightArrow"
+                    | "UpArrow"
+                    | "DownArrow"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
+                    | "ForwardDelete"
+            )
+    })
+}
+
+/// Whether the modifier `key` is down, by the `flags` of a key event of `code` (for
+/// [`Detector::resync_modifiers`]): its own left/right bit, and Fn's flag unless `code` is a
+/// key that always carries it (`None`: Fn stays as the tap saw it).
+fn modifier_down_in(flags: CGEventFlags, code: u16, key: Key) -> Option<bool> {
+    if key.code == KVK_FUNCTION && fn_flag_always(code) {
+        return None;
     }
+    Some(flags.intersects(down_flag(key.code)))
 }
 
 /// CoreFoundation objects owned by the hotkey thread but poked from others: enabling a tap
@@ -97,19 +132,19 @@ struct Cf<T>(T);
 unsafe impl<T> Send for Cf<T> {}
 
 struct TapState {
-    detector: HoldDetector,
+    detector: Detector,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
     tap: Option<Cf<CFRetained<CFMachPort>>>,
     run_loop: Option<Cf<CFRetained<CFRunLoop>>>,
 }
 
 struct Shared {
-    hotkey: Hotkey,
-    /// Whether any chord key is swallowed (F13-F20), or `hide_globe`: both take an active tap.
+    /// Whether a key of any hotkey can be swallowed (one that isn't a modifier: F13-F20, A,
+    /// Space...), or `hide_globe`: both take an active tap.
     swallow: bool,
-    /// Whether the hotkey is Fn alone, whose every tap is followed by [`KVK_GLOBE`]: apps never
-    /// see that, or each dictation would also do what "Press 🌐 key to" says (the emoji
-    /// picker, by default), which then takes the paste. Fn itself still reaches apps.
+    /// Whether one of the hotkeys is Fn alone, whose every tap is followed by [`KVK_GLOBE`]:
+    /// apps never see that, or each dictation would also do what "Press 🌐 key to" says (the
+    /// emoji picker, by default), which then takes the paste. Fn itself still reaches apps.
     hide_globe: bool,
     stop: AtomicBool,
     state: Mutex<TapState>,
@@ -157,21 +192,28 @@ impl Drop for HotkeyHandle {
 }
 
 pub fn start_hotkey(
-    hotkey: Hotkey,
+    hotkeys: Hotkeys,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
-    let hide_globe = matches!(hotkey.keys(), [k] if k.code == KVK_FUNCTION);
+    let hide_globe = hotkeys
+        .list()
+        .iter()
+        .any(|h| matches!(h.keys(), [k] if k.code == KVK_FUNCTION));
+    let swallow = hotkeys
+        .list()
+        .iter()
+        .flat_map(Hotkey::keys)
+        .any(Key::swallowed);
     let shared = Arc::new(Shared {
-        swallow: hotkey.keys().iter().any(Key::swallowed) || hide_globe,
+        swallow: swallow || hide_globe,
         hide_globe,
         stop: AtomicBool::new(false),
         state: Mutex::new(TapState {
-            detector: HoldDetector::new(hotkey.keys().len()),
+            detector: Detector::new(&hotkeys),
             on_event,
             tap: None,
             run_loop: None,
         }),
-        hotkey,
     });
     let s = shared.clone();
     thread::Builder::new()
@@ -211,8 +253,8 @@ fn run_tap_thread(shared: Arc<Shared>) {
             let mut st = shared.state.lock().unwrap();
             st.tap = Some(Cf(tap.clone()));
             st.run_loop = Some(Cf(run_loop));
+            tracing::info!("hotkey: hold {} to dictate", st.detector.hotkeys());
         }
-        tracing::info!("hotkey: hold {} to dictate", shared.hotkey);
         // Until the handle is dropped. Its `stop()` ends a wait at once; the timeout catches a
         // stop that came before the run loop was running (stopping an idle loop does nothing).
         while !shared.stop.load(Ordering::SeqCst) {
@@ -292,16 +334,16 @@ unsafe extern "C-unwind" fn tap_callback(
     {
         return null_mut();
     }
-    let chord_key = shared.hotkey.index_of(code as u32);
-    let down = match (ty, chord_key) {
-        // Modifiers that aren't in the chord don't cancel: they're part of a shortcut only
-        // together with a non-modifier key, which does cancel.
-        (_, None) if is_modifier(code) => return pass,
-        (CGEventType::FlagsChanged, Some(_)) => {
-            CGEvent::flags(Some(ev)).intersects(down_flag(code))
+    let flags = CGEvent::flags(Some(ev));
+    let down = match ty {
+        CGEventType::KeyDown => true,
+        CGEventType::KeyUp => false,
+        // A modifier is down while its flag is set. Caps Lock (and any other key that changes
+        // the flags but isn't a modifier in KEYS) is left alone: as another key, it would
+        // cancel a hold.
+        CGEventType::FlagsChanged if !down_flag(code).is_empty() => {
+            flags.intersects(down_flag(code))
         }
-        (CGEventType::KeyDown, _) => true,
-        (CGEventType::KeyUp, _) => false,
         _ => return pass,
     };
     let Ok(mut st) = shared.state.lock() else {
@@ -311,29 +353,37 @@ unsafe extern "C-unwind" fn tap_callback(
         | CGEventFlags::MaskControl
         | CGEventFlags::MaskAlternate
         | CGEventFlags::MaskCommand;
-    let armed = crate::escape_armed() && !CGEvent::flags(Some(ev)).intersects(modifiers);
-    let (e, swallow_esc) = st.detector.on_hook_key(
-        chord_key,
+    let armed = crate::escape_armed() && !flags.intersects(modifiers);
+    if down && st.detector.press_needs_resync(code) {
+        // A modifier's release the tap missed may be what keeps this press from completing a
+        // combo: the event's own flags say which modifiers are down.
+        st.detector
+            .resync_modifiers(|key| modifier_down_in(flags, code, key));
+    }
+    let (e, keep) = st.detector.on_key(
+        code,
+        down,
         code == KVK_ESCAPE,
         armed,
-        down,
         now_ms(),
         Instant::now(),
     );
     if let Some(e) = e {
         (st.on_event)(e);
     }
-    if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
-        // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
+    if keep {
+        // A hotkey's key that isn't a modifier while it counts (F13-F20, a combo's Space...),
+        // and the Esc that ends a hands-free recording: apps never see them.
         return null_mut();
     }
     pass
 }
 
-/// macOS side of [`crate::paste_may_release`]: never. [`send_paste`] only posts Left Command
-/// and V, neither of which can be a hotkey key, and nothing for the keys the user holds.
-pub fn paste_may_release(_key: Key) -> bool {
-    false
+/// macOS side of [`crate::paste_may_release`]: Left Command and V. [`send_paste`] posts their
+/// key-ups at the HID level, whose key state [`key_down`] reads, so either one held as (part
+/// of) a hotkey looks released. It posts nothing for the other keys the user holds.
+pub fn paste_may_release(key: Key) -> bool {
+    matches!(key.code, KVK_COMMAND | KVK_ANSI_V)
 }
 
 /// Swallowing doesn't hide a key's state here: the same as [`key_down`].
@@ -343,7 +393,7 @@ pub fn key_down_past_hook(key: Key) -> Option<bool> {
 
 pub fn key_down(key: Key) -> Option<bool> {
     // The HID system state: swallowing at the session tap doesn't change it. (Events posted at
-    // the HID tap do; `send_paste` posts none for hotkey keys.)
+    // the HID tap do: `send_paste`'s Left Command and V, see `paste_may_release`.)
     Some(CGEventSource::key_state(
         CGEventSourceStateID::HIDSystemState,
         key.code,
@@ -736,15 +786,19 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
     None
 }
 
-/// Never releases a held modifier (see [`paste_may_release`]), so `_before_releasing` is never
-/// called.
-pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
+/// Calls `before_releasing` first if Left Command or V is held: its posted key-up makes that
+/// key look released (see [`paste_may_release`]).
+pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {
     if !post_access() {
         let name = accessibility_name();
         return Err(format!(
             "AGT doesn't have the {name} permission (System Settings > Privacy & Security > {name})"
         )
         .into());
+    }
+    let held = |code| CGEventSource::key_state(CGEventSourceStateID::HIDSystemState, code);
+    if held(KVK_COMMAND) || held(KVK_ANSI_V) {
+        before_releasing();
     }
     // A private source: the events carry exactly the flags we set, not the modifiers the user
     // is holding (e.g. Option for the next dictation, which would make it Cmd+Option+V).
@@ -1162,6 +1216,92 @@ impl OutputVolume {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{KEYS, keys::CAPS_LOCK_CODE};
+
+    #[test]
+    fn every_modifier_has_its_own_flag() {
+        // IOKit's NX_DEVICE*KEYMASK bits (IOLLEvent.h), and Fn's flag.
+        for (name, bits) in [
+            ("LeftControl", 0x1),
+            ("LeftShift", 0x2),
+            ("RightShift", 0x4),
+            ("LeftCommand", 0x8),
+            ("RightCommand", 0x10),
+            ("LeftOption", 0x20),
+            ("RightOption", 0x40),
+            ("RightControl", 0x2000),
+            ("Fn", CGEventFlags::MaskSecondaryFn.bits()),
+        ] {
+            assert_eq!(
+                down_flag(Key::parse(name).unwrap().code).bits(),
+                bits,
+                "{name}"
+            );
+        }
+        // Those are all of the modifiers; Caps Lock and the keys that aren't modifiers have none.
+        for &(name, _, code, _) in KEYS {
+            let modifier = Key::parse(name).unwrap().is_modifier();
+            assert_eq!(!down_flag(code).is_empty(), modifier, "{name}");
+        }
+        assert!(down_flag(CAPS_LOCK_CODE).is_empty());
+    }
+
+    #[test]
+    fn modifiers_read_from_a_key_event() {
+        let key = |n| Key::parse(n).unwrap();
+        // Left Shift, Right Option and Fn held.
+        let flags = CGEventFlags::from_bits_retain(0x2 | 0x40) | CGEventFlags::MaskSecondaryFn;
+        let a = key("A").code;
+        assert_eq!(modifier_down_in(flags, a, key("LeftShift")), Some(true));
+        assert_eq!(modifier_down_in(flags, a, key("RightShift")), Some(false));
+        assert_eq!(modifier_down_in(flags, a, key("RightOption")), Some(true));
+        assert_eq!(modifier_down_in(flags, a, key("Fn")), Some(true));
+        let none = CGEventFlags::empty();
+        assert_eq!(modifier_down_in(none, a, key("Fn")), Some(false));
+        // These carry Fn's flag whether or not it's held: Fn stays as the tap saw it.
+        for n in [
+            "LeftArrow",
+            "DownArrow",
+            "F1",
+            "F5",
+            "F13",
+            "F20",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "ForwardDelete",
+        ] {
+            assert_eq!(modifier_down_in(none, key(n).code, key("Fn")), None, "{n}");
+            assert_eq!(
+                modifier_down_in(flags, key(n).code, key("LeftShift")),
+                Some(true),
+                "{n}"
+            );
+        }
+        for n in ["A", "F", "Space", "Return", "Backspace", "Keypad5", "Slash"] {
+            assert!(!fn_flag_always(key(n).code), "{n}");
+        }
+    }
+
+    #[test]
+    fn paste_may_release_left_command_and_v() {
+        // Cmd+V goes out at the HID level, whose key state `key_down` reads.
+        let sensitive = |spec: &str| {
+            Hotkey::parse(spec)
+                .unwrap()
+                .keys()
+                .iter()
+                .filter(|&&k| paste_may_release(k))
+                .map(|k| k.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sensitive("LeftCommand"), ["LeftCommand"]);
+        assert_eq!(sensitive("LeftControl+V"), ["V"]);
+        for spec in ["Fn", "RightOption", "RightCommand+F13", "Fn+RightOption"] {
+            assert!(sensitive(spec).is_empty(), "{spec}");
+        }
+    }
 
     #[test]
     fn text_roles_and_editable_regions_take_text() {

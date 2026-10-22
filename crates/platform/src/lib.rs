@@ -302,9 +302,9 @@ impl std::fmt::Display for Hotkey {
 pub enum Permission {
     /// Recording (without it, macOS delivers silence).
     Microphone,
-    /// Seeing the hotkey (the keyboard event tap), sending Cmd+V and swallowing F13-F20. (With
-    /// it, Input Monitoring isn't needed.) Listed as "Device Control" in System Settings from
-    /// macOS 27 on.
+    /// Seeing the hotkeys (the keyboard event tap), sending Cmd+V and swallowing hotkey keys.
+    /// (With it, Input Monitoring isn't needed.) Listed as "Device Control" in System Settings
+    /// from macOS 27 on.
     Accessibility,
 }
 
@@ -375,18 +375,31 @@ impl HotkeyReset {
     }
 }
 
-/// Starts watching `hotkey` on a dedicated, high-priority thread. `on_event` runs on that
-/// thread and must return quickly (e.g. just send on a channel): a slow handler delays every
-/// keystroke on the system. Modifier keys are passed through; the hotkey's other keys are
-/// swallowed.
+/// Starts watching `hotkeys` on a dedicated, high-priority thread: any of them dictates, one
+/// hold at a time. `on_event` runs on that thread and must return quickly (e.g. just send on
+/// a channel): a slow handler delays every keystroke on the system. Modifier keys are passed
+/// through; a hotkey's key that isn't a modifier is swallowed while it counts for that
+/// hotkey (always for a key that is a whole hotkey on its own; for a combo's, only when its
+/// press completes the combo, with the combo's modifiers and no others held first).
 ///
 /// macOS: if Accessibility isn't granted yet, this still succeeds; the thread waits for the
 /// permission and starts watching as soon as it's granted (no restart needed).
 pub fn start_hotkey(
-    hotkey: &Hotkey,
+    hotkeys: &Hotkeys,
     on_event: impl Fn(HotkeyEvent) + Send + 'static,
 ) -> Result<HotkeyHandle, Error> {
-    imp::start_hotkey(hotkey.clone(), Box::new(on_event)).map(HotkeyHandle)
+    imp::start_hotkey(hotkeys.clone(), Box::new(on_event)).map(HotkeyHandle)
+}
+
+/// Whether a key of any of `hotkeys` is [`KeyKind::Masked`] (Windows: Win, Alt), so the hook
+/// needs its masking thread.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn needs_masker(hotkeys: &Hotkeys) -> bool {
+    hotkeys
+        .list()
+        .iter()
+        .flat_map(Hotkey::keys)
+        .any(|k| k.kind == KeyKind::Masked)
 }
 
 /// Whether `key` is physically down right now, if that can be known: `None` on unsupported
@@ -498,17 +511,17 @@ fn escape_armed() -> bool {
     ESCAPE_ARMED.load(Ordering::Relaxed)
 }
 
-/// How many times [`send_paste`] released a modifier that was held down (and so could have
-/// made a hotkey key look released). With [`paste_may_release`], lets a caller tell a real
-/// release of the hotkey from our own injected key-ups.
+/// How many times [`send_paste`] released a key that was held down (and so could have made a
+/// hotkey key look released). With [`paste_may_release`], lets a caller tell a real release
+/// of the hotkey from our own injected key-ups.
 pub fn paste_count() -> u64 {
     PASTES.load(Ordering::SeqCst)
 }
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
-/// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
-/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, Cmd+V only posts Left
-/// Command and V).
+/// physically held (Windows: it injects key-ups for held Shift, Alt and Win keys, and a
+/// Ctrl-up that maps to Left Ctrl; Right Ctrl is never touched. macOS: Left Command and V,
+/// whose key-ups Cmd+V posts at the level `key_down` reads).
 pub fn paste_may_release(key: Key) -> bool {
     imp::paste_may_release(key)
 }
@@ -553,8 +566,6 @@ pub(crate) struct HoldDetector {
     down: u8,
     /// Event time (ms, wrapping) of each chord key's last transition.
     last_ms: [u32; MAX_CHORD],
-    /// The last Esc press was reported as `Escape`: its release is kept from the app too.
-    escape_down: bool,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -577,12 +588,17 @@ impl HoldDetector {
             state: Hold::Idle,
             down: 0,
             last_ms: [0; MAX_CHORD],
-            escape_down: false,
         }
     }
 
     fn complete(&self) -> bool {
         self.down == (1u8 << self.len) - 1
+    }
+
+    /// Whether a press of chord key `i` would start the hold now: the chord is armed (not
+    /// waiting for its keys to be released) and every other chord key is down.
+    pub(crate) fn would_complete(&self, i: usize) -> bool {
+        self.state == Hold::Idle && (self.down | (1 << i)) == (1u8 << self.len) - 1
     }
 
     /// `chord_key`: which chord key this transition is for (`None`: another key); `down`:
@@ -664,38 +680,6 @@ impl HoldDetector {
         self.down & (1 << i) != 0 && self.state != Hold::Idle
     }
 
-    /// What the hooks call for every key event: [`Self::on_key`], plus Esc (for one hotkey;
-    /// [`Detector::on_key`](hotkeys::Detector::on_key) does it for several). `esc`: the key is
-    /// Esc; `armed`: [`arm_escape`] is on and no modifier is held. An armed Esc press with no
-    /// chord key down is [`HotkeyEvent::Escape`] (with the hotkey held, Esc is a `Cancel`).
-    /// Also returns whether to keep the key from the focused app: an Esc reported as `Escape`,
-    /// its auto-repeat and its release.
-    pub(crate) fn on_hook_key(
-        &mut self,
-        chord_key: Option<usize>,
-        esc: bool,
-        armed: bool,
-        down: bool,
-        time_ms: u32,
-        now: Instant,
-    ) -> (Option<HotkeyEvent>, bool) {
-        let ev = self.on_key(chord_key, down, time_ms, now);
-        if !esc {
-            return (ev, false);
-        }
-        if !down {
-            return (ev, std::mem::take(&mut self.escape_down));
-        }
-        if self.escape_down {
-            return (ev, true); // its auto-repeat
-        }
-        if ev.is_none() && armed && self.idle() {
-            self.escape_down = true;
-            return (Some(HotkeyEvent::Escape), true);
-        }
-        (ev, false)
-    }
-
     /// Whether no chord key is down (so there's no hold, nor a wait for one to end).
     pub(crate) fn idle(&self) -> bool {
         self.state == Hold::Idle && self.down == 0
@@ -772,6 +756,17 @@ mod tests {
         assert_eq!(Key::parse("LeftAlt").unwrap().kind(), Masked);
         assert_eq!(Key::parse("LeftWin").unwrap().kind(), Masked);
         assert_eq!(Key::parse("CapsLock").unwrap().kind(), Swallowed);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn masked_keys_need_masker() {
+        let hk = |v: &[&str]| {
+            Hotkeys::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        assert!(needs_masker(&hk(&["LeftCtrl+LeftWin"])));
+        assert!(needs_masker(&hk(&["RightCtrl", "LeftAlt"])));
+        assert!(!needs_masker(&hk(&["RightCtrl", "F13"])));
     }
 
     #[test]
@@ -976,51 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_is_reported_only_when_armed_and_without_a_hold() {
-        let t = Instant::now();
-        let mut d = HoldDetector::new(1);
-        let esc =
-            |d: &mut HoldDetector, armed, down, ms| d.on_hook_key(OTHER, true, armed, down, ms, t);
-        // Disarmed (not hands-free, or a modifier held): Esc is the app's.
-        assert_eq!(esc(&mut d, false, true, 0), (None, false));
-        assert_eq!(esc(&mut d, false, false, 5), (None, false));
-        // Armed with the hotkey up: ends a hands-free recording, and the app sees neither the
-        // press, its auto-repeat nor its release (even if disarmed in between).
-        assert_eq!(
-            esc(&mut d, true, true, 10),
-            (Some(HotkeyEvent::Escape), true)
-        );
-        assert_eq!(esc(&mut d, false, true, 12), (None, true));
-        assert_eq!(esc(&mut d, false, false, 15), (None, true));
-        // Esc while the hotkey is held is the hold's cancel, not an Escape too.
-        assert_eq!(d.on_key(HOT, true, 20, t), Some(HotkeyEvent::Down(t, 0)));
-        assert_eq!(
-            esc(&mut d, true, true, 30),
-            (Some(HotkeyEvent::Cancel), false)
-        );
-        assert_eq!(esc(&mut d, true, false, 35), (None, false));
-        assert_eq!(
-            esc(&mut d, true, true, 40),
-            (None, false),
-            "still waiting for the hotkey's release"
-        );
-        assert_eq!(d.on_key(HOT, false, 50, t), None);
-        assert_eq!(
-            esc(&mut d, true, true, 60),
-            (Some(HotkeyEvent::Escape), true)
-        );
-        // Other keys are never kept from the app.
-        assert_eq!(
-            d.on_hook_key(OTHER, false, true, true, 70, t),
-            (None, false)
-        );
-        // Part of a chord down: a shortcut, not an Escape.
-        let mut d = HoldDetector::new(2);
-        d.on_key(HOT, true, 0, t);
-        assert_eq!(esc(&mut d, true, true, 10), (None, false));
-    }
-
-    #[test]
     fn missed_release_does_not_turn_next_press_into_repeat() {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
@@ -1140,6 +1090,21 @@ mod tests {
         assert_eq!(d.on_key(OTHER, true, 80, t), None);
         d.on_key(WIN, true, 90, t);
         assert_eq!(d.on_key(CTRL, true, 100, t), Some(HotkeyEvent::Down(t, 0)));
+    }
+
+    #[test]
+    fn would_complete_only_when_armed_with_the_rest_down() {
+        let t = Instant::now();
+        let mut d = HoldDetector::new(2);
+        assert!(!d.would_complete(WIN.unwrap()));
+        d.on_key(CTRL, true, 0, t);
+        assert!(d.would_complete(WIN.unwrap()));
+        assert!(!d.would_complete(CTRL.unwrap()), "Win isn't down");
+        d.on_key(OTHER, true, 10, t); // Ctrl+C disarms the chord
+        assert!(!d.would_complete(WIN.unwrap()));
+        d.on_key(CTRL, false, 20, t);
+        d.on_key(CTRL, true, 30, t);
+        assert!(d.would_complete(WIN.unwrap()));
     }
 
     #[test]

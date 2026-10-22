@@ -59,9 +59,10 @@ launch_at_login = true
 # hold it.
 # macOS: Fn is the Globe key (the default; as a hotkey on its own, tapping it no longer also
 # opens the emoji picker).
-# Windows: with LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once
-# those keys are up: if you already hold the hotkey for the next dictation, the previous text
-# lands when you release it (after 10 s it's pasted anyway).
+# With a key in the hotkey that pasting would let go of (macOS: LeftCommand or V; Windows:
+# LeftCtrl, either Shift, either Alt or either Win), text is only pasted once those keys are
+# up: if you already hold the hotkey for the next dictation, the previous text lands when you
+# release it (after 10 s it's pasted anyway).
 key = ""#,
     default_hotkey!(),
     r#""
