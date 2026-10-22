@@ -1,5 +1,5 @@
 //! Tray icon (on macOS, the menu-bar item): a status line, a polish on/off line, a config
-//! error line (while there is one), "Restart now to apply settings" (while changed settings
+//! (or `dictionary.toml`) error line (while there is one), "Restart now to apply settings" (while changed settings
 //! wait for a restart), "Copy last transcript", "Check for updates", "Settings..." (the
 //! settings window, see [`crate::settings`]), "Metrics..." (the same window on its Metrics
 //! page), (macOS) "Privacy & Security settings", "Open config folder", "Open data folder"

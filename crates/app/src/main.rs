@@ -34,8 +34,8 @@ const RESTART_SETTLE: Duration = Duration::from_secs(5);
 const RELAUNCH_ENV: &str = "AGT_RELAUNCH";
 const RELAUNCH_WAIT: Duration = Duration::from_secs(15);
 
-/// How often `config.toml` is checked for changes made outside AGT (one `stat`; a file
-/// watcher crate isn't worth it for this).
+/// How often `config.toml` and `dictionary.toml` are checked for changes made outside AGT
+/// (one `stat` each; a file watcher crate isn't worth it for this).
 const CONFIG_POLL: Duration = Duration::from_secs(2);
 
 /// Everything other threads post to the UI thread, via `EventLoopProxy<AppEvent>`.
@@ -47,6 +47,8 @@ enum AppEvent {
     Update(UpdateEvent),
     /// `config.toml` was modified (or appeared, or went away).
     ConfigFile,
+    /// `dictionary.toml` was modified (or appeared, or went away): reloaded without a restart.
+    DictionaryFile,
     /// The Copy button on the "not in a text box" notice was clicked.
     NoticeCopy,
 }
@@ -108,15 +110,17 @@ fn main() {
     #[allow(unused_mut)]
     let mut velopack = VelopackApp::build();
     // The usage history lives outside the install folder so reinstalls keep it (see
-    // `paths`); uninstalling still removes it. Models are left, as before. The Run key value
-    // (launch at login) goes too, and so does the marker of it, so a reinstall registers
-    // again (it's in the install folder, which goes anyway; this doesn't count on that).
+    // `paths`); uninstalling still removes it, but not the personal eval set in it
+    // (`paths::eval_dir`: the user's own corrections). Models are left, as before. The Run
+    // key value (launch at login) goes too, and so does the marker of it, so a reinstall
+    // registers again (it's in the install folder, which goes anyway; this doesn't count on
+    // that).
     #[cfg(windows)]
     {
         velopack = velopack.on_before_uninstall_fast_callback(|_| {
             let history = paths::history_dir();
             if history != paths::data_dir() {
-                let _ = std::fs::remove_dir_all(history);
+                remove_all_but(&history, &paths::eval_dir());
             }
             let _ = agt_platform::set_launch_at_login(false, std::path::Path::new(""));
             let _ = std::fs::remove_file(paths::login_item_file());
@@ -189,10 +193,32 @@ fn main() {
         }
     }));
 
-    watch_config(config_path.clone(), event_loop.create_proxy());
+    let dictionary_path = paths::dictionary_file();
+    watch_config(
+        config_path.clone(),
+        dictionary_path.clone(),
+        event_loop.create_proxy(),
+    );
+    // Starting with an error: an empty dictionary until it's fixed (dictation as without one).
+    let (dictionary, dictionary_error) = match load_dictionary(&dictionary_path) {
+        Ok(d) => {
+            if !d.is_empty() {
+                tracing::info!(
+                    "dictionary: {} terms, {} replacements",
+                    d.terms().len(),
+                    d.replacements().len()
+                );
+            }
+            (d, None)
+        }
+        Err(e) => {
+            tracing::error!("{e}; dictation runs without the dictionary until it's fixed");
+            (agt_core::Dictionary::default(), Some(e))
+        }
+    };
 
     let proxy = event_loop.create_proxy();
-    let pipeline = pipeline::start(&config, move |e| {
+    let pipeline = pipeline::start(&config, dictionary, move |e| {
         let _ = proxy.send_event(AppEvent::Pipeline(e));
     })
     .map_err(|e| {
@@ -216,6 +242,8 @@ fn main() {
         file,
         running: config.clone(),
         config_error,
+        dictionary_path,
+        dictionary_error,
         polish_info,
         status,
         pipeline: pipeline.ok(),
@@ -343,6 +371,28 @@ fn launch_at_login(on: bool, install: &velopack::locator::VelopackLocator) {
     }
 }
 
+/// Deletes `dir` and everything in it except `keep` (one of its entries), which stays with
+/// `dir` around it; `dir` itself goes only if nothing is kept. Errors are ignored (an
+/// uninstall must not fail over a file in use).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn remove_all_but(dir: &std::path::Path, keep: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let _ = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+    }
+    // Fails while `keep` is there, as it should.
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// `agt stats`. Release builds on Windows are GUI-subsystem programs with no console, so
 /// attach to the one we were started from (output then interleaves with the shell's prompt,
 /// which doesn't wait for GUI programs; `agt stats | more` or `> file` avoids that).
@@ -394,31 +444,54 @@ fn acquire_instance_lock(wait: Duration) -> Option<Option<File>> {
 }
 
 /// Posts [`AppEvent::ConfigFile`] whenever `config.toml`'s modification time or size
-/// changes (edits in an editor, and AGT's own from the Settings menu).
-fn watch_config(path: PathBuf, proxy: EventLoopProxy<AppEvent>) {
-    let stamp = move || {
-        std::fs::metadata(&path)
+/// changes (edits in an editor, and AGT's own from the Settings menu), and
+/// [`AppEvent::DictionaryFile`] for `dictionary.toml`'s.
+fn watch_config(config: PathBuf, dictionary: PathBuf, proxy: EventLoopProxy<AppEvent>) {
+    let stamp = |path: &PathBuf| {
+        std::fs::metadata(path)
             .ok()
             .map(|m| (m.modified().ok(), m.len()))
     };
     let spawned = thread::Builder::new()
         .name("config-watch".into())
         .spawn(move || {
-            let mut last = stamp();
+            let config_event: fn() -> AppEvent = || AppEvent::ConfigFile;
+            let mut files = [
+                (config, config_event, None),
+                (dictionary, || AppEvent::DictionaryFile, None),
+            ];
+            for (path, _, last) in &mut files {
+                *last = stamp(path);
+            }
             loop {
                 thread::sleep(CONFIG_POLL);
-                let now = stamp();
-                if now != last {
-                    last = now;
-                    if proxy.send_event(AppEvent::ConfigFile).is_err() {
-                        return;
+                for (path, event, last) in &mut files {
+                    let now = stamp(path);
+                    if now != *last {
+                        *last = now;
+                        if proxy.send_event(event()).is_err() {
+                            return;
+                        }
                     }
                 }
             }
         });
     if let Err(e) = spawned {
-        tracing::warn!("cannot watch config.toml ({e}); changes apply on the next start");
+        tracing::warn!(
+            "cannot watch config.toml and dictionary.toml ({e}); changes apply on the next start"
+        );
     }
+}
+
+/// Loads `dictionary.toml` (missing: empty) and records its size in the session.
+fn load_dictionary(path: &std::path::Path) -> Result<agt_core::Dictionary, String> {
+    let dictionary = agt_core::Dictionary::load(path).map_err(|e| e.to_string())?;
+    agt_telemetry::global().session(agt_telemetry::SessionUpdate {
+        dictionary_terms: Some(dictionary.terms().len() as i64),
+        dictionary_rules: Some(dictionary.replacements().len() as i64),
+        ..Default::default()
+    });
+    Ok(dictionary)
 }
 
 /// Starts a new instance with the same arguments; it takes over once this one has exited.
@@ -450,6 +523,10 @@ struct App {
     running: Config,
     /// The file had an error at start-up (so updates are off).
     config_error: bool,
+    dictionary_path: PathBuf,
+    /// Why `dictionary.toml` as last read isn't in use: the pipeline keeps the last good one
+    /// (an empty one if it never loaded).
+    dictionary_error: Option<String>,
     /// Tray line about LLM polish.
     polish_info: String,
     /// Latest pipeline status, kept so it can be shown once the tray exists.
@@ -571,6 +648,9 @@ impl ApplicationHandler<AppEvent> for App {
         if let AppEvent::ConfigFile = event {
             return self.config_file_changed();
         }
+        if let AppEvent::DictionaryFile = event {
+            return self.dictionary_file_changed();
+        }
         if let AppEvent::NoticeCopy = event {
             if let Some(p) = &self.pipeline {
                 p.copy_last_transcript();
@@ -634,6 +714,7 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::Menu(_)
             | AppEvent::Pipeline(_)
             | AppEvent::ConfigFile
+            | AppEvent::DictionaryFile
             | AppEvent::NoticeCopy => {}
         }
     }
@@ -812,6 +893,29 @@ impl App {
         self.settings_changed();
     }
 
+    /// Re-reads `dictionary.toml` after [`AppEvent::DictionaryFile`] and hands it to the
+    /// pipeline: no restart. With an error, the pipeline keeps the dictionary it has.
+    fn dictionary_file_changed(&mut self) {
+        match load_dictionary(&self.dictionary_path) {
+            Ok(d) => {
+                tracing::info!(
+                    "dictionary reloaded: {} terms, {} replacements",
+                    d.terms().len(),
+                    d.replacements().len()
+                );
+                if let Some(p) = &self.pipeline {
+                    p.set_dictionary(d);
+                }
+                self.dictionary_error = None;
+            }
+            Err(e) => {
+                tracing::error!("{e}; keeping the dictionary AGT runs with until it's fixed");
+                self.dictionary_error = Some(e);
+            }
+        }
+        self.show_settings();
+    }
+
     /// The file's settings now differ from the running ones (restart once idle), or match
     /// them again, or can't be read (keep running as is).
     fn settings_changed(&mut self) {
@@ -829,16 +933,27 @@ impl App {
     }
 
     /// Shows "Restart now to apply" (while changed settings wait for a restart) and the
-    /// config error line, from [`Self::file`].
+    /// config error line, from [`Self::file`] and [`Self::dictionary_error`] (both, if both
+    /// files have one).
     fn show_settings(&mut self) {
         let applying = self.file.as_ref().is_ok_and(|c| *c != self.running);
         let Some(tray) = &mut self.tray else { return };
         tray.set_applying(applying);
-        tray.set_warning(match (&self.file, self.config_error) {
+        let config = match (&self.file, self.config_error) {
             (Ok(_), _) => None,
-            (Err(_), true) => Some("Config error (auto-updates off) - see log"),
-            (Err(_), false) => Some("config.toml has an error (not applied) - see log"),
-        });
+            (Err(_), true) => Some("Config error (auto-updates off)"),
+            (Err(_), false) => Some("config.toml has an error (not applied)"),
+        };
+        let dictionary = self
+            .dictionary_error
+            .is_some()
+            .then_some("dictionary.toml has an error (not applied)");
+        let warning = match (config, dictionary) {
+            (Some(c), Some(d)) => Some(format!("{c}; {d} - see log")),
+            (Some(e), None) | (None, Some(e)) => Some(format!("{e} - see log")),
+            (None, None) => None,
+        };
+        tray.set_warning(warning.as_deref());
     }
 
     fn update_overlay(&mut self, status: &pipeline::Status, failures: u64) {
@@ -912,5 +1027,39 @@ pub(crate) fn open_folder(dir: &std::path::Path) {
     };
     if let Err(e) = std::process::Command::new(opener).arg(dir).spawn() {
         tracing::error!("failed to open {}: {e}", dir.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uninstall_keeps_the_eval_set() {
+        let dir = std::env::temp_dir().join(format!("agt-uninstall-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (eval, days) = (dir.join("eval"), dir.join("dictations").join("2026-10-22"));
+        for d in [&eval, &days] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for f in [
+            dir.join("agt.db"),
+            dir.join("agt.db-wal"),
+            dir.join("llama-server.log"),
+            days.join("dictations.jsonl"),
+            eval.join("2026-10-22-090000-001.txt"),
+        ] {
+            std::fs::write(f, "x").unwrap();
+        }
+        super::remove_all_but(&dir, &eval);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["eval"]);
+        assert!(eval.join("2026-10-22-090000-001.txt").is_file());
+        // Without an eval set, the folder goes too.
+        std::fs::remove_dir_all(&eval).unwrap();
+        std::fs::write(dir.join("agt.db"), "x").unwrap();
+        super::remove_all_but(&dir, &eval);
+        assert!(!dir.exists());
     }
 }

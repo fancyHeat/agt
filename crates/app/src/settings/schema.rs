@@ -369,8 +369,22 @@ fn speech(c: &Config) -> Page {
     Page {
         title: "Speech",
         symbol: "waveform",
-        sections: vec![section("", items)],
+        sections: vec![
+            section("", items),
+            section("Dictionary", vec![edit_dictionary()]),
+        ],
     }
+}
+
+/// "Edit dictionary...": `dictionary.toml`, created with an explanation if there's none.
+pub fn edit_dictionary() -> Item {
+    Item::new(
+        "Edit dictionary...",
+        Kind::Button(Action::EditDictionary),
+    )
+    .note(
+        "Words you use, and fixed rewrites of the transcript (e.g. \"Maine\" to \"main\"). Applied as soon as you save the file.",
+    )
 }
 
 fn polish(c: &Config) -> Page {

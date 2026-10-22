@@ -36,16 +36,19 @@
 //! - `time`: the same moment as local time.
 //! - `audio`: the WAV file in the same folder (only with `save_audio`); `audio_secs` its
 //!   length.
-//! - With `save_text` only: `raw`, the transcript before polish (whitespace collapsed);
-//!   `polished`, the polish output, or `null` when polish was off, skipped (short) or failed;
+//! - With `save_text` only: `raw`, the speech engine's transcript (whitespace collapsed),
+//!   before the dictionary's replacements and polish: what a personal eval set
+//!   (`agt-bench export-history`) measures the engine by;
+//!   `polished`, the polish output (replacements made), or `null` when polish was off,
+//!   skipped (short) or failed;
 //!   `polish_outcome`: `"polished"`, `"skipped"`, `"too_long"`, `"fallback"`, `"partial"` (a
 //!   long dictation polished in pieces, some of which failed and are raw in `polished`), or
 //!   `null` (polish off);
-//!   `pasted`, exactly what was pasted (trailing space included), or `null` if nothing was
-//!   (no speech, or the paste failed).
+//!   `pasted`, exactly what was pasted (replacements made, trailing space included), or
+//!   `null` if nothing was (no speech, or the paste failed).
 
 use agt_core::config::HistoryConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read as _, Seek as _, SeekFrom, Write as _},
@@ -231,6 +234,60 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     } else {
         f.write_all(format!("\n{line}").as_bytes())
     }
+}
+
+/// A saved dictation as read back by [`read`] (for `agt-bench export-history`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Saved {
+    /// Key down, unix ms.
+    pub started_at: i64,
+    /// Its day folder's name, `YYYY-MM-DD`.
+    pub day: String,
+    /// Its WAV file (only with `save_audio`; it may have been deleted since).
+    pub audio: Option<PathBuf>,
+    /// The engine's transcript (`None` without `save_text`).
+    pub raw: Option<String>,
+}
+
+/// What [`read`] takes from a line; anything else in it is ignored.
+#[derive(Deserialize)]
+struct Line {
+    started_at: i64,
+    audio: Option<String>,
+    raw: Option<String>,
+}
+
+/// Every record in `dir`'s day folders ([`agt_core::paths::dictations_dir`]), oldest day
+/// first, each day in order. Lines that can't be read (one a crash cut short) are skipped.
+pub fn read(dir: &Path) -> Vec<Saved> {
+    let mut days: Vec<(String, PathBuf)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            parse_day(&name).map(|_| (name, e.path()))
+        })
+        .collect();
+    days.sort();
+    let mut saved = Vec::new();
+    for (day, path) in days {
+        let Ok(text) = fs::read_to_string(path.join(RECORDS_FILE)) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(l) = serde_json::from_str::<Line>(line) else {
+                continue;
+            };
+            saved.push(Saved {
+                started_at: l.started_at,
+                day: day.clone(),
+                audio: l.audio.map(|a| path.join(a)),
+                raw: l.raw,
+            });
+        }
+    }
+    saved
 }
 
 /// Deletes the day folders in `dir` more than `keep_days` before `today` (days since the

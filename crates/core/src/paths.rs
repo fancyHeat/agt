@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-/// Holds `config.toml`. Small, user-edited, fine to roam.
+/// Holds `config.toml` and `dictionary.toml`. Small, user-edited, fine to roam.
 pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
@@ -51,6 +51,11 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// The user's words and fixed rewrites (see [`crate::dictionary`]), next to `config.toml`.
+pub fn dictionary_file() -> PathBuf {
+    config_dir().join("dictionary.toml")
+}
+
 /// The telemetry database (sessions, dictation metrics, events; see `agt-telemetry`).
 pub fn db_file() -> PathBuf {
     history_dir().join("agt.db")
@@ -59,6 +64,13 @@ pub fn db_file() -> PathBuf {
 /// Saved dictations, when `[history]` is on (see `agt-history`): one folder per local day.
 pub fn dictations_dir() -> PathBuf {
     history_dir().join("dictations")
+}
+
+/// `agt-bench export-history`'s default folder: the user's personal eval set (WAVs and
+/// references they corrected by hand). Next to `dictations`, outside the install folder;
+/// uninstalling AGT leaves it (it's the user's own work, not AGT's data).
+pub fn eval_dir() -> PathBuf {
+    history_dir().join("eval")
 }
 
 /// While other audio is ducked, the volume to restore if AGT dies before it does.

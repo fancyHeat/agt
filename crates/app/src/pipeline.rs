@@ -19,11 +19,17 @@
 //!   and are pasted in order (nothing is dropped). A recording's segments are transcribed
 //!   while it's still being recorded, and their texts joined at release; a dropped
 //!   (cancelled) recording's are skipped, or discarded if already being transcribed.
-//! - `polish`: with `polish.enabled`, cleans each transcript up with an LLM (`agt-polish`),
-//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted. Then hands
-//!   it to `paste`. A long dictation transcribed while recording is also polished while
+//! - `polish`: first applies the dictionary's replacements (`dictionary.toml`, see
+//!   [`agt_core::dictionary`]) to each transcript, polish on or off. Then, with
+//!   `polish.enabled`, cleans it up with an LLM (`agt-polish`), bounded by
+//!   `polish.timeout_ms`; on any failure the transcript (replaced) is pasted. Then hands it to
+//!   `paste`. A long dictation transcribed while recording is also polished while
 //!   recording, in pieces that end at a sentence end (`agt_polish::ahead`, local servers
-//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]).
+//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]); the
+//!   replacements are then applied to each piece. A phrase is never split across segments
+//!   (their texts are joined with a space before any replacement), only across pieces, which
+//!   end at a sentence end (or, in a run-on of over `agt_polish::ahead::MAX_HELD_WORDS`
+//!   words, at a segment boundary): a `from` spanning one of those isn't matched.
 //! - `permissions` (macOS, only while something is missing): asks for the Microphone and
 //!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
 //!   both are granted, so no restart is needed.
@@ -43,11 +49,16 @@
 //!
 //! With `[history]` on, a transcribed dictation's text and/or audio also travel with it, as an
 //! [`agt_history::Entry`], and are handed to the history writer (again a channel send) after
-//! the paste. With it off, no entry is built.
+//! the paste. With it off, no entry is built. Its `raw` text is the engine's, before the
+//! dictionary's replacements.
+//!
+//! The dictionary in use is swapped as a whole when `dictionary.toml` changes
+//! ([`Pipeline::set_dictionary`]); no restart. Each dictation keeps the one in use at its
+//! key-down, for the engine's hints and all its replacements (see [`Words`]).
 
 use agt_audio::{Level, Recorder};
 use agt_core::{
-    Config,
+    Config, Dictionary,
     config::{PolishConfig, PolishProvider},
     paths,
     polish::Polisher,
@@ -62,6 +73,7 @@ use agt_polish::{Outcome, ahead::Ahead};
 use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
+    borrow::Cow,
     fmt,
     sync::{
         Arc, Condvar, Mutex,
@@ -293,6 +305,63 @@ impl Drop for SetOnDrop {
     }
 }
 
+/// The dictionary in use, replaced as a whole ([`Pipeline::set_dictionary`]). The `audio`
+/// thread takes it at each key-down (an `Arc` clone under a lock held for nanoseconds), and
+/// that snapshot travels with the dictation ([`Shared::dictionary`], [`Job::dictionary`],
+/// [`Transcribed::dictionary`]): the engine's hints and every replacement in one dictation
+/// come from the same dictionary, whatever is reloaded meanwhile.
+#[derive(Clone, Default)]
+struct Words(Arc<Mutex<Arc<Dictionary>>>);
+
+impl Words {
+    fn new(dictionary: Dictionary) -> Self {
+        Self(Arc::new(Mutex::new(Arc::new(dictionary))))
+    }
+
+    fn get(&self) -> Arc<Dictionary> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn set(&self, dictionary: Dictionary) {
+        *self.0.lock().unwrap() = Arc::new(dictionary);
+    }
+}
+
+/// The engine's options for a dictation's dictionary: rebuilt only when it's another one.
+#[derive(Default)]
+struct Hints {
+    dictionary: Arc<Dictionary>,
+    opts: TranscribeOpts,
+}
+
+impl Hints {
+    fn get(&mut self, dictionary: &Arc<Dictionary>) -> &TranscribeOpts {
+        if !Arc::ptr_eq(dictionary, &self.dictionary) {
+            self.opts = TranscribeOpts {
+                vocabulary: dictionary.terms().to_vec(),
+                ..Default::default()
+            };
+            self.dictionary = dictionary.clone();
+        }
+        &self.opts
+    }
+}
+
+/// Applies `dictionary`'s replacements to `text`; returns how many it made.
+fn replace_in(dictionary: &Dictionary, text: &mut String) -> usize {
+    let replaced = match dictionary.replace(text) {
+        (Cow::Owned(out), n) => Some((out, n)),
+        (Cow::Borrowed(_), _) => None,
+    };
+    match replaced {
+        Some((out, n)) => {
+            *text = out;
+            n
+        }
+        None => 0,
+    }
+}
+
 /// Keeps the pipeline running; dropping it stops the hotkey.
 pub struct Pipeline {
     _hotkey: HotkeyHandle,
@@ -303,9 +372,17 @@ pub struct Pipeline {
     to_paste: Sender<ToPaste>,
     key_down: Arc<Mutex<Option<Instant>>>,
     ducker: Ducker,
+    words: Words,
 }
 
 impl Pipeline {
+    /// Uses `dictionary` for dictations started (key-down) from now on. One recording or
+    /// already transcribing keeps the dictionary it started with, for the engine's hints
+    /// and all its replacements, so no dictation mixes two.
+    pub fn set_dictionary(&self, dictionary: Dictionary) {
+        self.words.set(dictionary);
+    }
+
     /// Before exiting: puts the output volume back if a dictation in progress lowered it.
     pub fn shutdown(&self) {
         self.ducker.shutdown(DUCK_SHUTDOWN_WAIT);
@@ -333,10 +410,12 @@ struct Job {
     dictation: Box<Dictation>,
     /// Segments were sent while recording: only the rest is left to transcribe.
     live: Option<(Vec<Piece>, Arc<Shared>)>,
+    /// The dictionary at key-down (see [`Words`]).
+    dictionary: Arc<Dictionary>,
 }
 
-/// Shared by the audio and stt threads for one recording whose segments are sent while it's
-/// being recorded.
+/// Shared by the audio, stt and polish threads for one recording whose segments are sent
+/// while it's being recorded.
 #[derive(Default)]
 struct Shared {
     /// The recording was dropped (cancelled, too short, stale): its segments still queued
@@ -344,6 +423,8 @@ struct Shared {
     dropped: AtomicBool,
     /// Segments sent and not started yet.
     queued: AtomicUsize,
+    /// The dictionary at key-down, for its segments and pieces (see [`Words`]).
+    dictionary: Arc<Dictionary>,
 }
 
 enum ToStt {
@@ -376,6 +457,8 @@ struct Transcribed {
     dictation: Box<Dictation>,
     /// Only with `[history]` on.
     saved: Option<Box<history::Entry>>,
+    /// The dictionary at key-down (see [`Words`]).
+    dictionary: Arc<Dictionary>,
 }
 
 enum ToPaste {
@@ -397,8 +480,10 @@ enum ToPaste {
 /// platform without support yet); the model is then not loaded either.
 pub fn start(
     config: &Config,
+    dictionary: Dictionary,
     notify: impl Fn(Event) + Send + Sync + 'static,
 ) -> Result<Pipeline, String> {
+    let words = Words::new(dictionary);
     let hub = Hub {
         state: Arc::new(Mutex::new(HubState {
             engine: Engine::Loading("Loading model...".into()),
@@ -443,6 +528,7 @@ pub fn start(
         key_down: key_down.clone(),
         ducker: config.audio.duck.then(|| ducker.clone()),
         chunk_secs: chunk_secs.clone(),
+        words: words.clone(),
     };
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
@@ -474,6 +560,7 @@ pub fn start(
         to_paste,
         key_down,
         ducker,
+        words,
     })
 }
 
@@ -722,6 +809,8 @@ struct AudioThread {
     ducker: Option<Ducker>,
     /// The longest segment to cut a recording into (seconds, `f32` bits; set by `stt`).
     chunk_secs: Arc<AtomicU32>,
+    /// Each recording takes the dictionary in use at key-down (see [`Words`]).
+    words: Words,
 }
 
 /// A recording in progress: taken from the recorder every [`RELEASE_POLL`] and cut as it
@@ -745,14 +834,18 @@ struct Feed {
 }
 
 impl Feed {
-    fn new(chunk_secs: f32) -> Self {
+    /// `dictionary`: the one in use at key-down, for the whole dictation.
+    fn new(chunk_secs: f32, dictionary: Arc<Dictionary>) -> Self {
         Self {
             live: Live::new(CutConfig::live(chunk_secs)),
             audio: Vec::new(),
             // Swapped into the callback: room for 250 ms polls, so it never allocates there.
             buf: Vec::with_capacity(SAMPLE_RATE as usize / 2),
             fed: 0,
-            shared: Arc::default(),
+            shared: Arc::new(Shared {
+                dictionary,
+                ..Shared::default()
+            }),
             sent: false,
             max_queue: 0,
         }
@@ -928,7 +1021,7 @@ impl AudioThread {
                             .as_ref()
                             .map(|k| k.duck(self.config.audio.duck_level()));
                         let secs = f32::from_bits(self.chunk_secs.load(Relaxed));
-                        (t, d, ducked, Feed::new(secs))
+                        (t, d, ducked, Feed::new(secs, self.words.get()))
                     });
                     // After `start_recording`: the status goes straight from lingering to
                     // recording.
@@ -1179,6 +1272,7 @@ impl AudioThread {
         }
         // The last bit of audio may still end a segment.
         feed.push(self.test_wav.as_deref(), &self.to_stt);
+        let dictionary = feed.shared.dictionary.clone();
         let live = feed.live.cut().then(|| {
             let (tail, stats) = feed.live.finish();
             let queued = feed.shared.queued.load(Relaxed) + tail.len();
@@ -1199,6 +1293,7 @@ impl AudioThread {
             target,
             dictation: d,
             live,
+            dictionary,
         }));
     }
 }
@@ -1324,11 +1419,12 @@ impl Partial {
 fn transcribe(
     engine: &mut dyn SttEngine,
     audio: &[f32],
+    opts: &TranscribeOpts,
     hub: &Hub,
     chunk_secs: &AtomicU32,
 ) -> Result<String, String> {
     let notice = engine.notice();
-    let result = engine.transcribe(audio, &TranscribeOpts::default());
+    let result = engine.transcribe(audio, opts);
     if engine.notice() != notice {
         let note = engine.notice();
         telemetry::global().session(telemetry::SessionUpdate {
@@ -1360,6 +1456,7 @@ fn stt_thread(
     stt_loaded: SttLoaded,
 ) {
     let polish = polishing.then_some(&config.polish);
+    let mut hints = Hints::default();
     let loading = SetOnDrop(stt_loaded);
     let mut engine = load_engine(&config, &hub);
     // Loaded or failed: either way S1-mini no longer competes with it for the network.
@@ -1398,7 +1495,8 @@ fn stt_thread(
                     continue;
                 };
                 let t = Instant::now();
-                let result = transcribe(engine.as_mut(), &piece.audio, &hub, &chunk_secs);
+                let opts = hints.get(&shared.dictionary);
+                let result = transcribe(engine.as_mut(), &piece.audio, opts, &hub, &chunk_secs);
                 engine_done = Some(Instant::now());
                 let took = ms(t.elapsed());
                 if shared.dropped.load(Relaxed) {
@@ -1447,8 +1545,9 @@ fn stt_thread(
         let stt_start = Instant::now();
         // Polished in pieces: those left to polish.
         let mut rest = None;
+        let opts = hints.get(&job.dictionary);
         let result = match job.live.take() {
-            None => transcribe(engine.as_mut(), &job.audio, &hub, &chunk_secs),
+            None => transcribe(engine.as_mut(), &job.audio, opts, &hub, &chunk_secs),
             // Most of it was transcribed while recording: only the tail is left.
             Some((tail, shared)) => {
                 let mut p = partial
@@ -1460,7 +1559,7 @@ fn stt_thread(
                 d.live_idle_ms = engine_done.map(|t| ms(stt_start.saturating_duration_since(t)));
                 d.live_stt_ms = Some(p.stt_ms);
                 for piece in tail {
-                    match transcribe(engine.as_mut(), &piece.audio, &hub, &chunk_secs) {
+                    match transcribe(engine.as_mut(), &piece.audio, opts, &hub, &chunk_secs) {
                         Ok(text) => p.texts.add(text, piece.redo),
                         Err(e) => p.error = Some(e),
                     }
@@ -1528,6 +1627,7 @@ fn stt_thread(
                         target: job.target,
                         dictation: d,
                         saved,
+                        dictionary: job.dictionary,
                     })));
                 }
             }
@@ -1548,8 +1648,10 @@ struct Pieces {
     shared: Arc<Shared>,
     texts: Vec<String>,
     outcomes: Vec<Outcome>,
-    /// Words of the pieces as transcribed.
+    /// Words of the pieces as transcribed (before the dictionary's replacements).
     raw_words: usize,
+    /// The dictionary's replacements made in the pieces.
+    replacements: usize,
     /// Time spent on the pieces polished in the background, before the transcript was ready.
     ahead_ms: f64,
     /// A request ran out of time: the rest of the pieces stay raw.
@@ -1563,17 +1665,22 @@ impl Pieces {
             texts: Vec::new(),
             outcomes: Vec::new(),
             raw_words: 0,
+            replacements: 0,
             ahead_ms: 0.0,
             timed_out: false,
         }
     }
 
-    /// Polishes the next piece, or keeps it raw once a request for this dictation failed by
+    /// Applies the dictionary's replacements to the next piece (`raw`, as transcribed) and
+    /// polishes it, or keeps it unpolished once a request for this dictation failed by
     /// running out of time: a hung server would make every piece wait out its own deadline,
     /// one after the other. A quick failure (a server restarting) doesn't stop the rest.
-    fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
+    fn polish(&mut self, p: &dyn Polisher, raw: &str, cfg: &PolishConfig, dictionary: &Dictionary) {
+        self.raw_words += raw.split_whitespace().count();
+        let (piece, replaced) = dictionary.replace(raw);
+        self.replacements += replaced;
+        let piece = piece.as_ref();
         let words = piece.split_whitespace().count();
-        self.raw_words += words;
         let (text, outcome) = if self.timed_out {
             let why = "an earlier piece timed out".to_owned();
             (piece.to_owned(), Outcome::Failed(why))
@@ -1657,7 +1764,7 @@ fn polish_thread(
                 // Dropped (cancelled): its pieces still queued are skipped.
                 if !shared.dropped.load(Relaxed) {
                     let t = Instant::now();
-                    p.polish(polisher, &text, &piece_cfg);
+                    p.polish(polisher, &text, &piece_cfg, &shared.dictionary);
                     p.ahead_ms += ms(t.elapsed());
                 }
                 continue;
@@ -1672,9 +1779,12 @@ fn polish_thread(
             target,
             dictation: mut d,
             mut saved,
+            dictionary,
         } = *job;
         // Pieces sent before it are its own (or a failed dictation's).
         let earlier = pieces.take();
+        // Polished in pieces, the replacements are made in each (see `Pieces::polish`).
+        let mut replacements = None;
         if let Some(polisher) = polisher.as_deref() {
             let start = Instant::now();
             d.polish_wait_ms = Some(ms(start.saturating_duration_since(ready)));
@@ -1696,8 +1806,9 @@ fn polish_thread(
                 Some((mut p, rest, words)) => {
                     let ahead = p.texts.len();
                     for piece in &rest {
-                        p.polish(polisher, piece, &piece_cfg);
+                        p.polish(polisher, piece, &piece_cfg, &dictionary);
                     }
+                    replacements = Some(p.replacements);
                     tracing::debug!(
                         "polished in {} pieces, {ahead} in the background ({:.0} ms); {words} words left at release",
                         ahead + rest.len(),
@@ -1712,6 +1823,7 @@ fn polish_thread(
                     outcome
                 }
                 None => {
+                    replacements = Some(replace_in(&dictionary, &mut text));
                     let (polished, outcome) =
                         agt_polish::polish_or_raw(polisher, &text, &config.polish);
                     log_outcome(&outcome, &text, "transcript");
@@ -1722,6 +1834,8 @@ fn polish_thread(
             d.polish_ms = Some(ms(start.elapsed()));
             d.polish_outcome = Some(outcome);
         }
+        let replacements = replacements.unwrap_or_else(|| replace_in(&dictionary, &mut text));
+        d.replacements = Some(replacements as i64);
         if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
             t.polish_outcome = d.polish_outcome;
             t.polished =
@@ -2380,6 +2494,18 @@ mod tests {
 
     /// Runs the polish thread over `msgs`; returns what it hands to `paste`.
     fn polish_all(msgs: Vec<ToPolish>) -> Vec<(String, Box<Dictation>)> {
+        polish_with(msgs, Some(Arc::new(Marks)))
+            .into_iter()
+            .map(|(text, d, _)| (text, d))
+            .collect()
+    }
+
+    /// [`polish_all`] with a polisher (or none: polish off); also returns the history
+    /// entries. The dictionary is each message's own.
+    fn polish_with(
+        msgs: Vec<ToPolish>,
+        polisher: Option<Arc<dyn Polisher>>,
+    ) -> Vec<(String, Box<Dictation>, Option<Box<history::Entry>>)> {
         let (tx, rx) = mpsc::channel();
         let (to_paste, pasted) = mpsc::channel();
         for m in msgs {
@@ -2390,16 +2516,136 @@ mod tests {
         config.paste.trailing_space = false;
         config.polish.timeout_ms = TEST_TIMEOUT.as_millis() as u64;
         config.polish.timeout_per_word_ms = 0;
-        polish_thread(config, rx, to_paste, Some(Arc::new(Marks)));
+        polish_thread(config, rx, to_paste, polisher);
         pasted
             .try_iter()
             .map(|m| match m {
                 ToPaste::Paste {
-                    text, dictation, ..
-                } => (text, dictation),
+                    text,
+                    dictation,
+                    saved,
+                    ..
+                } => (text, dictation, saved),
                 _ => panic!("not a paste"),
             })
             .collect()
+    }
+
+    /// `maine` -> `main`, `dot env` -> `.env` (two words to one).
+    fn test_dictionary() -> Arc<Dictionary> {
+        Arc::new(
+            Dictionary::parse(
+                "[[replace]]\nfrom = \"maine\"\nto = \"main\"\n\n[[replace]]\nfrom = \"dot env\"\nto = \".env\"\n",
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A recording's `Shared` with `dictionary` (as [`Feed::new`] takes it at key-down).
+    fn shared_with(dictionary: Arc<Dictionary>) -> Arc<Shared> {
+        Arc::new(Shared {
+            dictionary,
+            ..Shared::default()
+        })
+    }
+
+    /// A short dictation's transcript, with the dictionary taken at its key-down.
+    fn whole_with(text: &str, dictionary: Arc<Dictionary>) -> ToPolish {
+        let ToPolish::Text(mut t) = whole(text, None) else {
+            unreachable!()
+        };
+        t.dictionary = dictionary;
+        ToPolish::Text(t)
+    }
+
+    /// A transcript saved to the history with its raw text.
+    fn with_history(msg: ToPolish) -> ToPolish {
+        let ToPolish::Text(mut t) = msg else {
+            panic!("not a transcript")
+        };
+        t.saved = Some(Box::new(history::Entry {
+            text: Some(history::Text {
+                raw: t.text.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        ToPolish::Text(t)
+    }
+
+    #[test]
+    fn replacements_apply_before_polish_and_the_history_keeps_the_raw_text() {
+        let text = "merge it into Maine and copy the dot env file";
+        let out = polish_with(
+            vec![with_history(whole_with(text, test_dictionary()))],
+            Some(Arc::new(Marks)),
+        );
+        let [(pasted, d, saved)] = &out[..] else {
+            panic!()
+        };
+        assert_eq!(pasted, "merge it into main and copy the .env file ok.");
+        assert_eq!(d.replacements, Some(2));
+        let t = saved.as_ref().unwrap().text.as_ref().unwrap();
+        assert_eq!(t.raw, text, "the engine's output, for the eval");
+        assert_eq!(t.polished.as_deref(), Some(pasted.as_str()));
+    }
+
+    #[test]
+    fn replacements_apply_with_polish_off_skipped_or_failed() {
+        let cases = [
+            // Polish off.
+            (None, "into Maine please", "into main please"),
+            // Too short to polish.
+            (Some(Arc::new(Marks) as Arc<dyn Polisher>), "Maine", "main"),
+            // Polish failed: the transcript pasted as is, replaced.
+            (
+                Some(Arc::new(Marks) as Arc<dyn Polisher>),
+                "FAIL into Maine please",
+                "FAIL into main please",
+            ),
+        ];
+        for (polisher, text, want) in cases {
+            let out = polish_with(vec![whole_with(text, test_dictionary())], polisher);
+            let [(pasted, d, _)] = &out[..] else { panic!() };
+            assert_eq!(pasted, want);
+            assert_eq!(d.replacements, Some(1), "{text}");
+        }
+        // Nothing to replace (or no dictionary): the text as it was, and a count of 0.
+        let out = polish_with(vec![whole("hi there", None)], None);
+        assert_eq!(out[0].0, "hi there");
+        assert_eq!(out[0].1.replacements, Some(0));
+    }
+
+    #[test]
+    fn replacements_apply_to_every_piece_of_a_long_dictation() {
+        let a = shared_with(test_dictionary());
+        // Each piece and the rest have a phrase to replace; "dot env" -> ".env" drops a word,
+        // which must not make the pieces look like they don't add up to the transcript.
+        let one = format!("{} Maine dot env.", sentences(25, "one"));
+        let two = format!("{} then dot env.", sentences(25, "two"));
+        let out = polish_with(
+            vec![
+                piece(&one, &a),
+                piece(&two, &a),
+                transcribed(&[&one, &two], &["into Maine"], &a),
+            ],
+            Some(Arc::new(Marks)),
+        );
+        let [(text, d, _)] = &out[..] else { panic!() };
+        assert_eq!(
+            text,
+            &format!(
+                "{} main .env. ok. {} then .env. ok. into main ok.",
+                sentences(25, "one"),
+                sentences(25, "two")
+            )
+        );
+        assert_eq!(
+            d.polish_ahead_pieces,
+            Some(2),
+            "polished in pieces, not whole"
+        );
+        assert_eq!(d.replacements, Some(4));
     }
 
     /// The transcript of `ahead` (sent as pieces before) and `rest`, with `rest` left to
@@ -2415,8 +2661,13 @@ mod tests {
         whole(&text, Some((rest, shared.clone())))
     }
 
+    /// With `rest`, the recording's dictionary is its `Shared`'s (as in the app: both are
+    /// the key-down one); else none.
     fn whole(text: &str, rest: Option<(Vec<String>, Arc<Shared>)>) -> ToPolish {
         let now = Instant::now();
+        let dictionary = rest
+            .as_ref()
+            .map_or_else(Arc::default, |(_, s)| s.dictionary.clone());
         ToPolish::Text(Box::new(Transcribed {
             text: text.into(),
             rest,
@@ -2425,7 +2676,41 @@ mod tests {
             target: None,
             dictation: Box::default(),
             saved: None,
+            dictionary,
         }))
+    }
+
+    #[test]
+    fn a_dictionary_reloaded_mid_dictation_doesnt_mix_into_it() {
+        // Key-down: the recording takes the dictionary in use.
+        let words = Words::new(
+            Dictionary::parse("[[replace]]\nfrom = \"maine\"\nto = \"main\"\n").unwrap(),
+        );
+        let feed = Feed::new(25.0, words.get());
+        // Reloaded while the user is still talking: Maine now becomes "MAIN".
+        words.set(Dictionary::parse("[[replace]]\nfrom = \"maine\"\nto = \"MAIN\"\n").unwrap());
+        assert!(!Arc::ptr_eq(&feed.shared.dictionary, &words.get()));
+        let mut hints = Hints::default();
+        assert!(hints.get(&feed.shared.dictionary).vocabulary.is_empty());
+        // Its pieces polished ahead and the rest at release all use the key-down one.
+        let one = format!("{} Maine.", sentences(25, "one"));
+        let out = polish_all(vec![
+            piece(&one, &feed.shared),
+            transcribed(&[&one], &["into Maine"], &feed.shared),
+        ]);
+        let [(text, d)] = &out[..] else { panic!() };
+        assert_eq!(
+            text,
+            &format!("{} main. ok. into main ok.", sentences(25, "one"))
+        );
+        assert_eq!(d.replacements, Some(2));
+        // The next dictation gets the new one.
+        let next = Feed::new(25.0, words.get());
+        let out = polish_all(vec![whole_with(
+            "merge into Maine please",
+            next.shared.dictionary.clone(),
+        )]);
+        assert_eq!(out[0].0, "merge into MAIN please ok.");
     }
 
     fn piece(text: &str, shared: &Arc<Shared>) -> ToPolish {

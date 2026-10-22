@@ -214,6 +214,13 @@ ALTER TABLE dictations ADD COLUMN polish_wait_ms REAL;
     r#"
 ALTER TABLE dictations ADD COLUMN clipboard_settle_ms REAL;
 "#,
+    // 8: the dictionary (`dictionary.toml`): its size (as last loaded in the session) and the
+    // replacements made in each dictation. Counts only, never its words.
+    r#"
+ALTER TABLE app_sessions ADD COLUMN dictionary_terms INTEGER;
+ALTER TABLE app_sessions ADD COLUMN dictionary_rules INTEGER;
+ALTER TABLE dictations ADD COLUMN replacements INTEGER;
+"#,
 ];
 
 /// Opens (creating if needed) and migrates the database. A file that isn't a database or is
@@ -375,7 +382,9 @@ fn update_session(tx: &Transaction, id: i64, u: &SessionUpdate) -> rusqlite::Res
             model_load_ms = coalesce(?6, model_load_ms),
             warmup_ms = coalesce(?7, warmup_ms),
             polish_warmup_ms = coalesce(?8, polish_warmup_ms),
-            polish_warmup_ok = coalesce(?9, polish_warmup_ok)
+            polish_warmup_ok = coalesce(?9, polish_warmup_ok),
+            dictionary_terms = coalesce(?10, dictionary_terms),
+            dictionary_rules = coalesce(?11, dictionary_rules)
         WHERE id = ?1",
         params![
             id,
@@ -387,6 +396,8 @@ fn update_session(tx: &Transaction, id: i64, u: &SessionUpdate) -> rusqlite::Res
             u.warmup_ms,
             u.polish_warmup_ms,
             u.polish_warmup_ok,
+            u.dictionary_terms,
+            u.dictionary_rules,
         ],
     )?;
     Ok(())
@@ -416,10 +427,10 @@ pub(crate) fn insert_dictation(
             live_skipped, live_tail_joined, live_trimmed_secs, live_tail_secs, live_stt_ms,
             live_busy_at_release, live_idle_ms, live_max_queue, live_discarded_ms,
             polish_ahead_pieces, polish_ahead_ms, polish_release_words, polish_fallbacks,
-            polish_wait_ms, clipboard_settle_ms)
+            polish_wait_ms, clipboard_settle_ms, replacements)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-            ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+            ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
         params![
             session,
             d.started_at,
@@ -464,6 +475,7 @@ pub(crate) fn insert_dictation(
             d.polish_fallbacks,
             d.polish_wait_ms,
             d.clipboard_settle_ms,
+            d.replacements,
         ],
     )?;
     Ok(())

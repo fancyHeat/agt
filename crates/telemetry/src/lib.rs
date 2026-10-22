@@ -28,8 +28,8 @@
 //!
 //! | Table | One row per | Kept |
 //! |---|---|---|
-//! | `app_sessions` | AGT run: version, OS, non-secret settings (the chosen microphone, `audio_device`; polish: provider, model, style, S1-mini options, timeouts, `min_words`, whether a custom prompt is set; never its key, URL or prompt text; `[history]`: `history_save_text`, `history_save_audio`, `history_keep_days`), the engine and device that actually ran (`stt_backend`, `stt_notice` on a GPU → CPU fallback), model download / load / warmup times, `exit_reason`: `quit`, `update_restart`, `settings_restart`, `error`, `crash` (its last event was a panic) or `unknown` (killed, logoff, power loss) | 365 days |
-//! | `dictations` | hotkey press: `outcome` (see [`Outcome`]), `latency_ms` (release → paste, minus `hotkey_wait_ms`: the headline), `release_to_paste_ms` (wall time), `hold_ms`, `audio_secs`, `rms`, `key_down_to_mic_ms`, `first_audio_ms`, `queue_wait_ms`, `stt_ms`, `rtf`, `polish_ms` + `polish_outcome`, `polish_wait_ms`, `hotkey_wait_ms`, `clipboard_save_ms`, `paste_ms`, `clipboard_settle_ms` (Windows, part of `paste_ms`: waiting for clipboard listeners; about 50 ms or more means another app still held the clipboard and the paste may have been lost), `chars_out`, `words_out`, `words_raw` (before polish), `missed_release`, `stt_backend`, `history_saved` (handed to the dictation history; a disk error there is only logged), `release_to_text_ms`; for a long dictation transcribed while recording: `live_pause_cuts` / `live_limit_cuts` / `live_end_cuts`, `live_skipped` (no speech), `live_tail_joined`, `live_trimmed_secs`, `live_tail_secs`, `live_stt_ms`, `live_busy_at_release`, `live_idle_ms`, `live_max_queue`, `live_discarded_ms` (cancelled mid-call); polished in pieces in the background: `polish_ahead_pieces`, `polish_ahead_ms`, `polish_release_words`, `polish_fallbacks` | 180 days |
+//! | `app_sessions` | AGT run: version, OS, non-secret settings (the chosen microphone, `audio_device`; polish: provider, model, style, S1-mini options, timeouts, `min_words`, whether a custom prompt is set; never its key, URL or prompt text; `[history]`: `history_save_text`, `history_save_audio`, `history_keep_days`), the engine and device that actually ran (`stt_backend`, `stt_notice` on a GPU → CPU fallback), model download / load / warmup times, the size of `dictionary.toml` as last loaded (`dictionary_terms`, `dictionary_rules`: counts, never its words), `exit_reason`: `quit`, `update_restart`, `settings_restart`, `error`, `crash` (its last event was a panic) or `unknown` (killed, logoff, power loss) | 365 days |
+//! | `dictations` | hotkey press: `outcome` (see [`Outcome`]), `latency_ms` (release → paste, minus `hotkey_wait_ms`: the headline), `release_to_paste_ms` (wall time), `hold_ms`, `audio_secs`, `rms`, `key_down_to_mic_ms`, `first_audio_ms`, `queue_wait_ms`, `stt_ms`, `rtf`, `polish_ms` + `polish_outcome`, `polish_wait_ms`, `hotkey_wait_ms`, `clipboard_save_ms`, `paste_ms`, `clipboard_settle_ms` (Windows, part of `paste_ms`: waiting for clipboard listeners; about 50 ms or more means another app still held the clipboard and the paste may have been lost), `chars_out`, `words_out`, `words_raw` (before polish), `missed_release`, `stt_backend`, `history_saved` (handed to the dictation history; a disk error there is only logged), `release_to_text_ms`; for a long dictation transcribed while recording: `live_pause_cuts` / `live_limit_cuts` / `live_end_cuts`, `live_skipped` (no speech), `live_tail_joined`, `live_trimmed_secs`, `live_tail_secs`, `live_stt_ms`, `live_busy_at_release`, `live_idle_ms`, `live_max_queue`, `live_discarded_ms` (cancelled mid-call); polished in pieces in the background: `polish_ahead_pieces`, `polish_ahead_ms`, `polish_release_words`, `polish_fallbacks`; `replacements` (`dictionary.toml` rewrites made) | 180 days |
 //! | `events` | event (what the log file had): `level`, `target`, `message`; the app's `log_level` sets which are recorded; the home directory is replaced by `~` | 30 days (DEBUG/TRACE 7) |
 //! | `updates` | update check, download or apply: versions, `result`, `error`, `duration_ms` | 180 days |
 //! | `metric_rollups` | local day and metric: `count`, `min`, `p50`, `p90`, `p99`, `max`, `mean` of each duration over that day's `pasted` dictations, plus `outcome.<x>` and `polish_outcome.<x>` counts | forever |
@@ -205,6 +205,9 @@ pub struct Dictation {
     pub polish_ahead_ms: Option<f64>,
     pub polish_release_words: Option<i64>,
     pub polish_fallbacks: Option<i64>,
+    /// `dictionary.toml` replacements made in the transcript (0 if none matched); `None`
+    /// when it wasn't transcribed.
+    pub replacements: Option<i64>,
 }
 
 /// What is known about this run at start-up. Only non-secret settings: no API key, no URL.
@@ -266,6 +269,10 @@ pub struct SessionUpdate {
     pub warmup_ms: Option<f64>,
     pub polish_warmup_ms: Option<f64>,
     pub polish_warmup_ok: Option<bool>,
+    /// `dictionary.toml` as loaded (at start-up, or reloaded after an edit): its number of
+    /// terms and of `[[replace]]` entries. Never its words.
+    pub dictionary_terms: Option<i64>,
+    pub dictionary_rules: Option<i64>,
 }
 
 /// One update check, download or apply.

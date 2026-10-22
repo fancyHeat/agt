@@ -49,6 +49,7 @@ version = "0.0.21"
 dependencies = [
  "agt-audio",
  "agt-core",
+ "agt-history",
  "agt-polish",
  "agt-stt",
  "libc",

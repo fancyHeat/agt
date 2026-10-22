@@ -726,7 +726,7 @@ pub enum ConfigError {
 /// Removes the values serde/toml quote in their messages (`invalid type: string "..."`,
 /// ``unknown variant `...` ``): a key typed into the wrong field must not end up in
 /// agt.db. Keys and the expected values stay.
-fn redact_values(message: &str) -> String {
+pub(crate) fn redact_values(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     loop {
@@ -770,7 +770,10 @@ impl ConfigError {
 }
 
 /// 1-based line and column where `span` starts in `text`.
-fn line_column(span: Option<std::ops::Range<usize>>, text: &str) -> Option<(usize, usize)> {
+pub(crate) fn line_column(
+    span: Option<std::ops::Range<usize>>,
+    text: &str,
+) -> Option<(usize, usize)> {
     span.map(|span| {
         let before = &text[..span.start.min(text.len())];
         let line = before.matches('\n').count() + 1;
@@ -791,7 +794,7 @@ impl std::fmt::Display for ConfigError {
 }
 
 /// `<what> at line L, column C: <message>`, or without the position if there is none.
-fn located(what: &str, message: &str, at: Option<(usize, usize)>) -> String {
+pub(crate) fn located(what: &str, message: &str, at: Option<(usize, usize)>) -> String {
     match at {
         Some((line, column)) => format!("{what} at line {line}, column {column}: {message}"),
         None => format!("{what}: {message}"),
