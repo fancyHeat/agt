@@ -66,6 +66,13 @@ pub fn dictations_dir() -> PathBuf {
     history_dir().join("dictations")
 }
 
+/// `agt-bench export-history`'s default folder: the user's personal eval set (WAVs and
+/// references they corrected by hand). Next to `dictations`, outside the install folder;
+/// uninstalling AGT leaves it (it's the user's own work, not AGT's data).
+pub fn eval_dir() -> PathBuf {
+    history_dir().join("eval")
+}
+
 /// While other audio is ducked, the volume to restore if AGT dies before it does.
 pub fn ducked_volume_file() -> PathBuf {
     data_dir().join("ducked-volume")

@@ -5,9 +5,14 @@
 //! to `dir` as `<YYYY-MM-DD>-<HHMMSS-mmm>.wav`, with a `.txt` reference next to it holding the
 //! engine's transcript (`raw`; empty if text wasn't saved) for the user to correct by hand.
 //! A `.txt` that is already there is never overwritten, so corrections survive exporting
-//! again. Default `dir`: `eval` in the history folder (next to `dictations`; on Windows
-//! outside the install folder, which a reinstall wipes). It holds what the user said: it
-//! stays on this machine and never belongs in the repository.
+//! again; until one is filled in, the bench skips its clip (an empty reference isn't one).
+//! A WAV is copied under a temporary name and renamed when complete, so an interrupted
+//! export never leaves a truncated one that later exports would skip.
+//!
+//! Default `dir`: [`paths::eval_dir`], `eval` next to `dictations`: on Windows outside the
+//! install folder, which re-running Setup wipes, and kept when AGT is uninstalled (the rest
+//! of the history goes). It holds what the user said: it stays on this machine and never
+//! belongs in the repository.
 
 use agt_core::paths;
 use std::{
@@ -32,7 +37,7 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             _ => return Err(format!("unexpected argument {a}\n{USAGE}")),
         }
     }
-    let out = out.unwrap_or_else(|| paths::history_dir().join("eval"));
+    let out = out.unwrap_or_else(paths::eval_dir);
     let since = days.map(|d| now_ms() - (d as i64).saturating_mul(86_400_000));
     let n = export(&paths::dictations_dir(), &out, since)?;
     println!(
@@ -48,6 +53,12 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         println!(
             "skipped {} dictations without audio ([history] save_audio off then) and {} whose WAV is gone",
             n.no_audio, n.missing
+        );
+    }
+    if n.empty_txts > 0 {
+        println!(
+            "{} references are empty (transcripts weren't saved, or nothing was recognized): write what was said in them, or the bench skips those clips",
+            n.empty_txts
         );
     }
     if n.clips > 0 {
@@ -66,6 +77,8 @@ struct Counts {
     clips: usize,
     new_wavs: usize,
     new_txts: usize,
+    /// Exported with an empty `.txt` (new or not): still to be written by hand.
+    empty_txts: usize,
     no_audio: usize,
     missing: usize,
 }
@@ -96,7 +109,14 @@ fn export(dictations: &Path, out: &Path, since: Option<i64>) -> Result<Counts, S
         let name = format!("{}-{stem}", s.day);
         let to = out.join(format!("{name}.wav"));
         if !to.exists() {
-            fs::copy(wav, &to).map_err(|e| format!("{}: {e}", to.display()))?;
+            // Whole or not at all (see the module docs).
+            let tmp = to.with_extension("wav.tmp");
+            fs::copy(wav, &tmp)
+                .and_then(|_| fs::rename(&tmp, &to))
+                .map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    format!("{}: {e}", to.display())
+                })?;
             n.new_wavs += 1;
         }
         let txt = to.with_extension("txt");
@@ -105,6 +125,8 @@ fn export(dictations: &Path, out: &Path, since: Option<i64>) -> Result<Counts, S
             fs::write(&txt, format!("{text}\n")).map_err(|e| format!("{}: {e}", txt.display()))?;
             n.new_txts += 1;
         }
+        let reference = fs::read_to_string(&txt).unwrap_or_default();
+        n.empty_txts += usize::from(reference.trim().is_empty());
         n.clips += 1;
     }
     Ok(n)
@@ -148,9 +170,18 @@ mod tests {
                 clips: 2,
                 new_wavs: 2,
                 new_txts: 2,
+                empty_txts: 1,
                 no_audio: 1,
                 missing: 1
             }
+        );
+        // No temporary file left behind.
+        assert!(
+            fs::read_dir(&out).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
         );
         let first = out.join("2026-10-16-090000-001");
         assert_eq!(fs::read(first.with_extension("wav")).unwrap(), b"RIFF one");
@@ -160,10 +191,14 @@ mod tests {
             fs::read_to_string(out.join("2026-10-16-090500-002.txt")).unwrap(),
             "\n"
         );
-        // The user's correction survives exporting again.
+        // The user's corrections survive exporting again.
         fs::write(&txt, "merge into main\n").unwrap();
+        fs::write(out.join("2026-10-16-090500-002.txt"), "hello\n").unwrap();
         let n = export(&history, &out, None).unwrap();
-        assert_eq!((n.clips, n.new_wavs, n.new_txts), (2, 0, 0));
+        assert_eq!(
+            (n.clips, n.new_wavs, n.new_txts, n.empty_txts),
+            (2, 0, 0, 0)
+        );
         assert_eq!(fs::read_to_string(&txt).unwrap(), "merge into main\n");
         // Only the recent ones.
         let n = export(&history, &dir.join("recent"), Some(2000)).unwrap();

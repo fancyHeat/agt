@@ -143,7 +143,9 @@ impl Model {
         if let schema::Kind::Button(Action::EditDictionary) = item.kind
             && let Err(e) = Dictionary::load(&paths::dictionary_file())
         {
-            item.note = format!("{e}. AGT keeps using the last version that worked.");
+            item.note = format!(
+                "{e}. Until it's fixed, AGT uses the last version that worked since it started (none if the error was there at start-up)."
+            );
         }
         let id = self.actions.len();
         let (label, control, act) = match item.kind {

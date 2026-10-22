@@ -37,6 +37,17 @@
 //! - A blank `from` or `to` is an error, and so is a `from` given twice (ignoring case and
 //!   spacing): which one applied would depend on their order.
 //!
+//! Edge cases, by design (speech engines write NFC text, where they hardly come up):
+//!
+//! - Only a word character at an end of `from` needs a boundary there: punctuation at either
+//!   end matches with none (`.net` matches in `asp.net`; `e.g.` turns `e.g.x` into `…x`).
+//! - Apostrophes are word characters, so a word in single quotes (`'Maine'`, or `‘Maine’`,
+//!   whose closing `’` is one too) is part of a longer word and not matched.
+//! - Case is compared by lowercasing each character, not by full case folding: `straße`
+//!   doesn't match `STRASSE`, and a final `ς` doesn't match `Σ` (which lowercases to `σ`).
+//! - Combining marks aren't word characters: a decomposed `café` (`e` + U+0301) is two words
+//!   to the matcher, and only matches a `from` written the same way.
+//!
 //! Rules are compiled at load into lowercased pieces indexed by their first character, so
 //! applying them is one scan of the text, and no allocation at all when nothing matches.
 
@@ -47,7 +58,8 @@ use std::{borrow::Cow, collections::HashMap, fs, io, path::Path};
 /// Written by "Edit dictionary..." when there is no file yet. Kept as text so the comments
 /// explain the format; it parses to an empty dictionary.
 pub const TEMPLATE: &str = r#"# AGT dictionary. AGT applies your changes as soon as you save this file. If it has an
-# error, AGT keeps using the last version that worked and says so in its menu.
+# error, AGT says so in its menu and keeps using the last version that worked since it
+# started (none, if the file already had the error when AGT started) until it's fixed.
 
 # Words and names you use, for the speech model to expect (not used yet: a later version
 # makes Parakeet favor them). For example: terms = ["main", "kubectl", "AGT"]
@@ -128,6 +140,36 @@ struct Entry {
     to: toml::Spanned<String>,
 }
 
+/// The file's own keys: kept in error messages, which say what was expected.
+const KEYS: &[&str] = &["terms", "replace", "from", "to"];
+
+/// toml's message without anything the user wrote: quoted values (as for `config.toml`) and
+/// also names in backticks, which in this file are the user's words (``unknown field
+/// `maine` `` for `maine = "main"`). The file's own [`KEYS`] and punctuation (``expected
+/// `"` ``) stay.
+fn redact(message: &str) -> String {
+    let message = redact_values(message);
+    let parts: Vec<&str> = message.split('`').collect();
+    let mut out = String::with_capacity(message.len());
+    for (i, part) in parts.iter().enumerate() {
+        let quoted = i % 2 == 1;
+        if !quoted {
+            out.push_str(part);
+        } else if i == parts.len() - 1 {
+            // A lone backtick: what follows isn't quoted.
+            out.push('`');
+            out.push_str(part);
+        } else if KEYS.contains(part) || !part.chars().any(char::is_alphanumeric) {
+            out.push('`');
+            out.push_str(part);
+            out.push('`');
+        } else {
+            out.push_str("(redacted)");
+        }
+    }
+    out
+}
+
 /// Word characters (see the module docs); everything else is a boundary.
 pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '\'' || c == '’'
@@ -201,7 +243,7 @@ impl Dictionary {
     /// Parses the file's text (see the module docs for what's rejected).
     pub fn parse(text: &str) -> Result<Self, DictionaryError> {
         let error = |message: &str, span: Option<std::ops::Range<usize>>| DictionaryError::Parse {
-            message: redact_values(message.trim()),
+            message: redact(message.trim()),
             at: line_column(span, text),
         };
         let file: File = toml::from_str(text).map_err(|e| error(e.message(), e.span()))?;
@@ -479,11 +521,42 @@ mod tests {
             );
             assert!(e.contains(what), "{text}: {e}");
         }
-        // Values are never quoted (errors go to agt.db).
-        let e = Dictionary::parse("terms = \"secret word\"")
+    }
+
+    /// Errors go to the log and agt.db, which never hold the user's words: whatever toml
+    /// quotes back (a value, or a key written where a key isn't expected) is taken out.
+    #[test]
+    fn errors_never_quote_the_users_words() {
+        for text in [
+            "terms = \"secretword\"",
+            "secretword = \"main\"",
+            "terms = []\nsecretword = \"main\"\n",
+            "[[replace]]\nfrom = \"x\"\nto = \"y\"\nsecretword = \"main\"\n",
+            "[[replace]]\nsecretword = \"main\"\n",
+            "[secretword]\n",
+            "[[secretword]]\nfrom = \"x\"\nto = \"y\"\n",
+            "terms = [\"a\"]\nterms = [\"secretword\"]\n",
+            "secretword = 1\nsecretword = 2\n",
+            "terms = [secretword]\n",
+            "terms = [\"secretword\", 1]\n",
+            "[[replace]]\nfrom = \"secretword\"\nto = 1\n",
+            "[[replace]]\nfrom = \"secretword\"\nto = \"secretword\"\n[[replace]]\nfrom = \"SECRETWORD\"\nto = \"x\"\n",
+            "[[replace]]\nfrom = 'secretword\nto = \"x\"\n",
+            "secretword\n",
+            "secretword.x = 1\n",
+            "\"secretword\" = 1\n",
+            "terms = [\"secretword\"\n",
+        ] {
+            let e = Dictionary::parse(text).unwrap_err().to_string();
+            assert!(!e.to_lowercase().contains("secretword"), "{text:?}: {e}");
+            assert!(e.contains("line "), "{text:?}: {e}");
+        }
+        // The file's own keys stay: they say what's wrong.
+        let e = Dictionary::parse("maine = \"main\"")
             .unwrap_err()
             .to_string();
-        assert!(!e.contains("secret"), "{e}");
+        assert!(e.contains("expected `terms` or `replace`"), "{e}");
+        assert!(!e.contains("maine"), "{e}");
     }
 
     #[test]

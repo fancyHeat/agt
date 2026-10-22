@@ -136,8 +136,10 @@ to = "main"
   version will make Parakeet favor them. They are what `agt-bench` counts when you measure
   how well your words come out (see [docs/benchmarks.md](docs/benchmarks.md#personal-eval-set)).
 
-AGT applies the file as soon as you save it, without restarting. If it has an error, AGT keeps
-using the last version that worked and says so in its tray menu. The file stays on your
+AGT applies the file as soon as you save it, without restarting. If it has an error, AGT says
+so in its tray menu and keeps using the last version that worked since it started; if the
+error was already there when AGT started, it runs without a dictionary until you fix it. A
+dictation uses the dictionary as it was when you pressed the hotkey. The file stays on your
 computer; `agt.db` only records how many terms and replacements it has and how many
 replacements each dictation got, never the words.
 
@@ -155,8 +157,9 @@ Off by default. **Settings... → History** lets AGT keep a copy of each dictati
 `%LOCALAPPDATA%\AGT-data\dictations`, macOS: `~/Library/Application Support/AGT/dictations`),
 one folder per day with a `dictations.jsonl` file (one dictation per line) and the WAV files.
 They stay on your computer as plain files and are never uploaded. Turning saving off keeps
-what's already there until it's due for deletion. Uninstalling AGT on Windows removes it; on
-macOS, delete the folder yourself. In `config.toml` it's the `[history]` section.
+what's already there until it's due for deletion. Uninstalling AGT on Windows removes it
+(but not an `eval` folder next to it, made by `agt-bench export-history`: your own
+corrections); on macOS, delete the folder yourself. In `config.toml` it's the `[history]` section.
 
 Each line looks like this (fields for what you chose not to save are left out):
 

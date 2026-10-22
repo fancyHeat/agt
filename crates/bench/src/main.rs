@@ -453,8 +453,12 @@ fn read_categories(dir: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// `<name>.txt` next to `wav`. An empty (or blank) one is no reference: one exported but not
+/// filled in yet would count every transcribed word as an error.
 fn read_reference(wav: &Path) -> Option<String> {
-    std::fs::read_to_string(wav.with_extension("txt")).ok()
+    std::fs::read_to_string(wav.with_extension("txt"))
+        .ok()
+        .filter(|r| !r.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -470,5 +474,23 @@ mod tests {
         assert_eq!(percentile(&v, 0.5), 5.0);
         assert_eq!(percentile(&v, 0.9), 9.0);
         assert_eq!(percentile(&[3.0], 0.9), 3.0);
+    }
+
+    #[test]
+    fn a_blank_reference_is_no_reference() {
+        let dir = std::env::temp_dir().join(format!("agt-bench-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in [("blank", " \r\n\t\n"), ("empty", ""), ("said", "hello\n")] {
+            std::fs::write(dir.join(format!("{name}.txt")), text).unwrap();
+        }
+        assert_eq!(read_reference(&dir.join("blank.wav")), None);
+        assert_eq!(read_reference(&dir.join("empty.wav")), None);
+        assert_eq!(read_reference(&dir.join("missing.wav")), None);
+        assert_eq!(
+            read_reference(&dir.join("said.wav")).as_deref(),
+            Some("hello\n")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

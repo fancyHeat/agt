@@ -1022,9 +1022,12 @@ about your words, so it is measured on your own dictations, with references you 
 3. `agt-bench export-history [--days 7] [--out dir]` copies every saved dictation with audio
    to `dir` (default: `eval` next to `dictations`: `%LOCALAPPDATA%\AGT-data\eval` on Windows,
    `~/Library/Application Support/AGT/eval` on macOS) as `<YYYY-MM-DD>-<HHMMSS-mmm>.wav`, with
-   a `.txt` holding what the engine wrote (`raw`: before the dictionary and the clean-up).
+   a `.txt` holding what the engine wrote (`raw`: before the dictionary and the clean-up;
+   empty if transcripts weren't saved). Re-running Setup doesn't touch that folder, and
+   uninstalling AGT on Windows leaves it (the rest of the history goes).
 4. Fix each `.txt` by hand to exactly what you said, with the capitalization you want ("main",
-   not "Maine"). Exporting again adds new dictations and never overwrites a `.txt`.
+   not "Maine"). Exporting again adds new dictations and never overwrites a `.txt`. Until
+   an empty `.txt` is filled in, the bench skips its clip (the export says how many are).
 5. Compare: `agt-bench <dir>` (applies AGT's `dictionary.toml`, as the app does) and
    `agt-bench --no-dictionary <dir>` (doesn't; its terms are still counted). `--dictionary f`
    picks another file.
