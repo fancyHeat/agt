@@ -199,7 +199,16 @@ fn main() {
     );
     // Starting with an error: an empty dictionary until it's fixed (dictation as without one).
     let (dictionary, dictionary_error) = match load_dictionary(&dictionary_path) {
-        Ok(d) => (d, None),
+        Ok(d) => {
+            if !d.is_empty() {
+                tracing::info!(
+                    "dictionary: {} terms, {} replacements",
+                    d.terms().len(),
+                    d.replacements().len()
+                );
+            }
+            (d, None)
+        }
         Err(e) => {
             tracing::error!("{e}; dictation runs without the dictionary until it's fixed");
             (agt_core::Dictionary::default(), Some(e))

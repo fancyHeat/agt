@@ -114,12 +114,39 @@ apply settings** does it right away. You can change the hotkey, turn the
 overlay off, or turn off AI clean-up of your text (removes "um"s, fixes punctuation; on by
 default, and it runs locally unless you point it at a cloud service).
 
+## Dictionary
+
+For words the speech model keeps getting wrong in the same way (you say "main", the git
+branch, and it writes "Maine"). **Settings... → Speech → Edit dictionary...** opens
+`dictionary.toml`, next to `config.toml` (created with an explanation the first time):
+
+```toml
+terms = ["main", "kubectl", "AGT"]
+
+[[replace]]
+from = "Maine"
+to = "main"
+```
+
+- **Replacements** (`[[replace]]`) rewrite every transcript before the AI clean-up: `from`
+  matches whole words and phrases, ignoring case; `to` is pasted exactly as you wrote it.
+  Only use them for things that are never meant: a replacement of a real word applies
+  everywhere, so with the one above you can't dictate the state of Maine any more.
+- **Terms** are words and names you use. Today they don't change transcription yet; a later
+  version will make Parakeet favor them. They are what `agt-bench` counts when you measure
+  how well your words come out (see [docs/benchmarks.md](docs/benchmarks.md#personal-eval-set)).
+
+AGT applies the file as soon as you save it, without restarting. If it has an error, AGT keeps
+using the last version that worked and says so in its tray menu. The file stays on your
+computer; `agt.db` only records how many terms and replacements it has and how many
+replacements each dictation got, never the words.
+
 ## Dictation history
 
 Off by default. **Settings... → History** lets AGT keep a copy of each dictation:
 
-- **Save transcripts**: the transcript as recognized, the cleaned-up text (if AI clean-up is
-  on) and the text that was pasted.
+- **Save transcripts**: the transcript as recognized (before the dictionary's replacements),
+  the cleaned-up text (if AI clean-up is on) and the text that was pasted.
 - **Save audio**: the recording, as a WAV file (about 1.9 MB per minute of speech).
 - **Keep for**: 7, 30 (the default) or 90 days, or forever. Older days are deleted
   automatically (a whole day at a time, so up to one day more may be kept).

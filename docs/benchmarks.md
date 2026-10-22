@@ -1012,6 +1012,47 @@ same.
   attention / KV cache / thread / batch settings, `ngram-mod` (it learns across requests, so it
   is fast on a repeated text and slower on a new one: 336 vs 772 ms), smaller `max_tokens`.
 
+## Personal eval set
+
+The eval set above is other people's speech. The [dictionary](../README.md#dictionary) is
+about your words, so it is measured on your own dictations, with references you corrected:
+
+1. **Settings... → History**: turn on **Save transcripts** and **Save audio**.
+2. Dictate as usual for a while (the words you care about included).
+3. `agt-bench export-history [--days 7] [--out dir]` copies every saved dictation with audio
+   to `dir` (default: `eval` next to `dictations`: `%LOCALAPPDATA%\AGT-data\eval` on Windows,
+   `~/Library/Application Support/AGT/eval` on macOS) as `<YYYY-MM-DD>-<HHMMSS-mmm>.wav`, with
+   a `.txt` holding what the engine wrote (`raw`: before the dictionary and the clean-up).
+4. Fix each `.txt` by hand to exactly what you said, with the capitalization you want ("main",
+   not "Maine"). Exporting again adds new dictations and never overwrites a `.txt`.
+5. Compare: `agt-bench <dir>` (applies AGT's `dictionary.toml`, as the app does) and
+   `agt-bench --no-dictionary <dir>` (doesn't; its terms are still counted). `--dictionary f`
+   picks another file.
+
+Besides WER, the bench then prints a table per term (each of `terms`, and each replacement's
+`to`): how often the references have it, and of those how many the transcripts got exactly
+(case-sensitive, whole words; "hits"), missed, or wrote where the reference doesn't
+("false ins"). WER can't show this: it lowercases both sides, so "Maine" for "main" isn't
+an error there. The folder holds your own speech and words: keep it on your machine (it is
+outside the repository, and must stay there).
+
+Example (2026-10-22, Windows, Parakeet v2 int8 on DirectML, one run per clip) with a test
+dictionary made from names Parakeet gets wrong on the eval set: six `[[replace]]` entries
+(`doning street` → `Downing Street`, `lincon` → `Lincoln`, `vioks` → `Vioxx`, `britainula`
+→ `Britannula`, `captain leek` → `Captain Lake`, `dross bookings` → `gross bookings`) and
+those names as terms:
+
+| Run | WER read | WER real | WER all | replacements |
+|---|---|---|---|---|
+| no dictionary | 2.09 | 5.10 | 3.99 | - |
+| `dictionary.toml` template (empty) | 2.09 | 5.10 | 3.99 | 0 (every transcript identical) |
+| test dictionary | 1.54 | 4.94 | 3.68 | 6 (exactly the 6 targeted errors; no other transcript changed) |
+
+On 9 of those clips with cased references (as a user would correct them), the term table:
+7 occurrences, 1 hit without the dictionary ("Captain Lake" once), 7 with it, no false
+insertions either way; WER 4.93 → 0.70%. (On the eval set's own references, which are mostly
+lowercase, the same terms show as false insertions: the term counts need cased references.)
+
 ## Reproducing
 
 ```sh
@@ -1020,6 +1061,8 @@ cargo build --release -p agt-bench                  # Parakeet: auto, cpu, direc
 target/release/agt-bench --device directml eval-data/clips
 target/release/agt-bench --device directml --gap-ms 3000 --runs 1 eval-data/clips   # pauses between calls
 AGT_LOG=info target/release/agt-bench --device auto eval-data/clips   # logs the start-up probe
+target/release/agt-bench --device directml --no-dictionary eval-data/clips   # without your dictionary.toml
+target/release/agt-bench export-history --days 30   # personal eval set (see above)
 cargo build --release -p agt-bench --features cuda  # + CUDA 13 / cuDNN 9 DLLs on PATH
 cargo build --release -p agt-bench --features whisper-vulkan   # needs CMake, libclang, Vulkan headers (see below)
 target/release/agt-bench --engine whisper --model whisper-large-v3-turbo-q5_0 --device vulkan eval-data/clips
