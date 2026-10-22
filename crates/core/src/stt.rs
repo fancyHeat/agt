@@ -5,6 +5,8 @@
 //! engine can be added later as a separate, optional trait (e.g. `SttEngine::stream()`
 //! returning `Option<Box<dyn SttStream>>`) without changing this one.
 
+use std::sync::Arc;
+
 /// Sample rate of the audio passed to [`SttEngine::transcribe`].
 pub const SAMPLE_RATE: u32 = 16_000;
 
@@ -17,11 +19,14 @@ pub struct TranscribeOpts {
     /// BCP-47-ish language hint (`"en"`); `None` = engine default / auto-detect.
     /// Engines that can't use it ignore it.
     pub language: Option<String>,
-    /// Words and names the user says ([`crate::Dictionary::terms`]), in the dictionary's
-    /// order; empty without a dictionary. No engine uses them yet: the next step of the
-    /// dictionary work biases Parakeet's decoder toward them. Engines that can't use them
+    /// Words and names the user says, as they apply in the focused app
+    /// ([`crate::dictionary::Scope::terms`]), in the dictionary's order; empty without a
+    /// dictionary. Parakeet boosts them by [`Self::boost`]; engines that can't use them
     /// ignore them.
-    pub vocabulary: Vec<String>,
+    pub vocabulary: Arc<[String]>,
+    /// How strongly to favor `vocabulary` (`stt.boost`); 0 = not at all. Engine-specific:
+    /// for Parakeet, nats of log probability per piece (see `agt_stt::boost`).
+    pub boost: f32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

@@ -1,0 +1,11 @@
+# 50 developer terms, all global (boosted in every app): the worst case for the regression
+# check of dictionary boosting on the stock eval set (docs/benchmarks.md, "Dictionary
+# boosting"). Several are everyday words too (main, cargo, trait, rust, await), which is the
+# point.
+terms = [
+    "main", "rebase", "kubectl", "PR", "AGT", "Parakeet", "GitHub", "git", "npm", "pnpm",
+    "Rust", "cargo", "clippy", "rustfmt", "Tokio", "serde", "async", "await", "struct", "enum",
+    "impl", "trait", "JSON", "YAML", "TOML", "API", "SDK", "CLI", "CI", "Docker",
+    "Kubernetes", "Terraform", "AWS", "Azure", "Postgres", "SQLite", "Redis", "Kafka", "gRPC", "GraphQL",
+    "OAuth", "JWT", "localhost", "stdout", "regex", "monorepo", "refactor", "TypeScript", "ONNX", "DirectML",
+]

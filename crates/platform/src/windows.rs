@@ -214,6 +214,16 @@ pub fn foreground_window() -> Option<usize> {
     (!hwnd.is_null()).then_some(hwnd as usize)
 }
 
+/// The file name of the foreground window's program. A classic console's window reports
+/// the shell it runs (`cmd.exe`, `powershell.exe`), not conhost.
+pub fn foreground_app() -> Option<String> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return None;
+    }
+    process_name(hwnd)
+}
+
 /// Not checked on Windows yet (that takes UI Automation): always "can't tell".
 pub fn focus_takes_text() -> Option<bool> {
     None

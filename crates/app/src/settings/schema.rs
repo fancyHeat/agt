@@ -371,7 +371,17 @@ fn speech(c: &Config) -> Page {
         symbol: "waveform",
         sections: vec![
             section("", items),
-            section("Dictionary", vec![edit_dictionary()]),
+            section("Dictionary", {
+                let mut items = vec![edit_dictionary()];
+                if c.stt.engine == Engine::Parakeet {
+                    items.push(
+                        Item::choice("Favor dictionary words", boost_levels(c.stt.boost()))
+                            .note("How strongly Parakeet favors the dictionary's terms where they sound like what you said. Stronger fixes more words like \"main\" written \"Maine\", and changes more words that only sound a bit like a term.")
+                            .advanced(),
+                    );
+                }
+                items
+            }),
         ],
     }
 }
@@ -761,6 +771,28 @@ fn duck_levels(current: f32) -> Vec<Choice> {
     choices
 }
 
+/// `stt.boost` presets, plus the weight in use if it's another one. `current`: the clamped
+/// weight ([`agt_core::config::SttConfig::boost`]).
+fn boost_levels(current: f32) -> Vec<Choice> {
+    let tenths = |v: f32| (f64::from(v) * 10.0).round();
+    let mut choices: Vec<Choice> = [(0, "Off"), (10, "Light"), (20, "Medium"), (30, "Strong")]
+        .into_iter()
+        .map(|(t, name)| {
+            let w = f64::from(t) / 10.0;
+            let label = match w == f64::from(config::DEFAULT_BOOST) {
+                true => format!("{name} (default)"),
+                false => name.to_owned(),
+            };
+            let checked = tenths(current) == f64::from(t);
+            Choice::set(&["stt", "boost"], label, SettingValue::from(w), checked)
+        })
+        .collect();
+    if !choices.iter().any(|c| c.checked) {
+        choices.push(Choice::current(&format!("{current}")));
+    }
+    choices
+}
+
 fn ms(n: u64) -> String {
     format!("{n} ms")
 }
@@ -989,6 +1021,7 @@ mod tests {
         ));
         all.extend(keep_days(c.history.keep_days));
         all.extend(duck_levels(c.audio.duck_level()));
+        all.extend(boost_levels(c.stt.boost()));
         for choice in all.iter().filter(|c| !c.changes.is_empty()) {
             config::with_settings(config::DEFAULT_CONFIG, &choice.changes)
                 .unwrap_or_else(|e| panic!("{}: {e}", choice.label));
@@ -1038,5 +1071,16 @@ mod tests {
         assert_eq!(shown("3"), "100% (from config.toml)");
         assert_eq!(shown("nan"), "10%");
         assert_eq!(shown("-1"), "Silent");
+        // The default boost is a preset; another weight is shown as is.
+        let boost = |v: &str| {
+            let c = Config::parse(&format!("[stt]\nboost = {v}\n")).unwrap();
+            let levels = boost_levels(c.stt.boost());
+            assert_eq!(levels.iter().filter(|c| c.checked).count(), 1, "{v}");
+            levels.into_iter().find(|c| c.checked).unwrap().label
+        };
+        assert!(boost(&config::DEFAULT_BOOST.to_string()).ends_with(" (default)"));
+        assert_eq!(boost("0"), "Off");
+        assert_eq!(boost("-2"), "Off");
+        assert_eq!(boost("2.5"), "2.5 (from config.toml)");
     }
 }

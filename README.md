@@ -121,27 +121,76 @@ branch, and it writes "Maine"). **Settings... → Speech → Edit dictionary...*
 `dictionary.toml`, next to `config.toml` (created with an explanation the first time):
 
 ```toml
-terms = ["main", "kubectl", "AGT"]
+terms = ["AGT", "Kubernetes"]
+
+[profiles.code]
+apps = ["Code.exe", "WindowsTerminal.exe", "com.microsoft.VSCode", "com.apple.Terminal"]
+terms = ["main", "rebase", "kubectl"]
 
 [[replace]]
-from = "Maine"
-to = "main"
+from = "dot env"
+to = ".env"
+profiles = ["code"]
 ```
 
+- **Terms** are words and names you use. Parakeet favors them where they sound like what you
+  said: with `main` a term, "push to main" comes out as "main", not "Maine". How strongly is
+  `boost` in `config.toml`'s `[stt]` (**Settings... → Speech → Favor dictionary words**, an
+  advanced setting): 0 is off, 2 the default. It only picks between spellings the model
+  already considered: it never adds a word where you didn't say one, but a stronger boost
+  also turns more words that merely sound like a term into it. Whisper ignores terms.
+- **Profiles** (`[profiles.<name>]`) hold terms that only apply while one of their `apps` has
+  focus, so `main` can be the git branch in your editor and stay "main" or "Maine" as the
+  model hears it in your email. `apps` are, on Windows, the program's file name
+  (`Code.exe`); on macOS, the app's bundle identifier (`com.microsoft.VSCode`); case doesn't
+  matter, and an app can be in several profiles. Terms outside a profile apply everywhere.
 - **Replacements** (`[[replace]]`) rewrite every transcript before the AI clean-up: `from`
   matches whole words and phrases, ignoring case; `to` is pasted exactly as you wrote it.
   Only use them for things that are never meant: a replacement of a real word applies
-  everywhere, so with the one above you can't dictate the state of Maine any more.
-- **Terms** are words and names you use. Today they don't change transcription yet; a later
-  version will make Parakeet favor them. They are what `agt-bench` counts when you measure
-  how well your words come out (see [docs/benchmarks.md](docs/benchmarks.md#personal-eval-set)).
+  everywhere (unless you limit it with `profiles`), so `from = "Maine"`, `to = "main"` means
+  you can't dictate the state of Maine any more.
+
+A new `dictionary.toml` has a commented-out `code` profile with the common editors, terminals
+and IDEs. If you already have the file, paste this in (and remove the apps you don't use):
+
+```toml
+[profiles.code]
+apps = [
+    # Windows: VS Code, Cursor, Zed, Visual Studio, Windows Terminal, consoles, JetBrains
+    "Code.exe", "Cursor.exe", "Zed.exe", "devenv.exe", "WindowsTerminal.exe",
+    "powershell.exe", "pwsh.exe", "cmd.exe", "idea64.exe", "pycharm64.exe",
+    "webstorm64.exe", "clion64.exe", "goland64.exe", "rider64.exe", "rustrover64.exe",
+    "phpstorm64.exe",
+    # macOS: VS Code, Cursor, Zed, Terminal, iTerm2, Ghostty, Warp, JetBrains
+    "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "dev.zed.Zed",
+    "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
+    "dev.warp.Warp-Stable", "com.jetbrains.intellij", "com.jetbrains.pycharm",
+    "com.jetbrains.WebStorm", "com.jetbrains.CLion", "com.jetbrains.goland",
+    "com.jetbrains.rider", "com.jetbrains.rustrover", "com.jetbrains.PhpStorm",
+]
+terms = ["main", "rebase", "kubectl", "PR"]
+```
+
+To find an app's id, dictate a few words in it, then look it up in `agt.db` (next to the
+history: `%LOCALAPPDATA%\AGT-data\agt.db` on Windows, `~/Library/Application
+Support/AGT/agt.db` on macOS) with any SQLite tool:
+
+```sql
+SELECT datetime(started_at / 1000, 'unixepoch', 'localtime'), app_id, profiles
+FROM dictations ORDER BY started_at DESC LIMIT 5;
+```
+
+With `log_level = "debug"`, the `events` table also says at each key-down which app had focus
+and which profiles it matched. A console window (PowerShell or cmd in the classic console)
+shows as the shell (`powershell.exe`); with Windows Terminal it's `WindowsTerminal.exe`.
 
 AGT applies the file as soon as you save it, without restarting. If it has an error, AGT says
 so in its tray menu and keeps using the last version that worked since it started; if the
 error was already there when AGT started, it runs without a dictionary until you fix it. A
-dictation uses the dictionary as it was when you pressed the hotkey. The file stays on your
-computer; `agt.db` only records how many terms and replacements it has and how many
-replacements each dictation got, never the words.
+dictation uses the dictionary as it was when you pressed the hotkey, in the app that had focus
+then. The file stays on your computer; `agt.db` records how many terms and replacements it
+has, how many replacements each dictation got and how many terms were favored, the app and
+the names of the profiles it matched, never the terms or replacements themselves.
 
 ## Dictation history
 
@@ -184,8 +233,9 @@ that no longer joins.
 - The one exception is opt-in: if you configure the clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
 - Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:
-  `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), never audio or text (those only go
-  to the opt-in dictation history). `agt stats` sums it up;
+  `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), with the program each dictation was
+  for (e.g. `Code.exe`, never a window title), never audio or text (those only go to the
+  opt-in dictation history). `agt stats` sums it up;
   raw rows are kept 180 days (events 30, sessions 365), daily summaries for good.
 
 ## Building from source

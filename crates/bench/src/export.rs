@@ -9,6 +9,10 @@
 //! A WAV is copied under a temporary name and renamed when complete, so an interrupted
 //! export never leaves a truncated one that later exports would skip.
 //!
+//! The app that had focus (`dictations.app_id` in agt.db, joined on `started_at`; the history
+//! records don't hold it) goes in a `<name>.app` next to them, one line, when known: the bench
+//! applies the dictionary's profiles for it, as AGT did. Written if missing, never changed.
+//!
 //! Default `dir`: [`paths::eval_dir`], `eval` next to `dictations`: on Windows outside the
 //! install folder, which re-running Setup wipes, and kept when AGT is uninstalled (the rest
 //! of the history goes). It holds what the user said: it stays on this machine and never
@@ -16,6 +20,7 @@
 
 use agt_core::paths;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -39,7 +44,12 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     }
     let out = out.unwrap_or_else(paths::eval_dir);
     let since = days.map(|d| now_ms() - (d as i64).saturating_mul(86_400_000));
-    let n = export(&paths::dictations_dir(), &out, since)?;
+    // Not having the database (or an old one) only means no app context.
+    let apps = agt_telemetry::app_ids(&paths::db_file()).unwrap_or_else(|e| {
+        eprintln!("no app ids ({e}); only the dictionary's global terms will apply");
+        Default::default()
+    });
+    let n = export(&paths::dictations_dir(), &out, since, &apps)?;
     println!(
         "{} clips in {}: {} new, {} already there; {} references written, {} kept (never overwritten)",
         n.clips,
@@ -53,6 +63,12 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         println!(
             "skipped {} dictations without audio ([history] save_audio off then) and {} whose WAV is gone",
             n.no_audio, n.missing
+        );
+    }
+    if n.apps > 0 {
+        println!(
+            "{} clips have the app they were dictated in (.app files)",
+            n.apps
         );
     }
     if n.empty_txts > 0 {
@@ -79,12 +95,20 @@ struct Counts {
     new_txts: usize,
     /// Exported with an empty `.txt` (new or not): still to be written by hand.
     empty_txts: usize,
+    /// Exported with a `.app` (new or not).
+    apps: usize,
     no_audio: usize,
     missing: usize,
 }
 
-/// Exports the records in `dictations` started at or after `since` (unix ms) to `out`.
-fn export(dictations: &Path, out: &Path, since: Option<i64>) -> Result<Counts, String> {
+/// Exports the records in `dictations` started at or after `since` (unix ms) to `out`, with
+/// the app of each in `apps` (by `started_at`).
+fn export(
+    dictations: &Path,
+    out: &Path,
+    since: Option<i64>,
+    apps: &HashMap<i64, String>,
+) -> Result<Counts, String> {
     let mut n = Counts::default();
     let saved = agt_history::read(dictations);
     for s in saved
@@ -125,6 +149,11 @@ fn export(dictations: &Path, out: &Path, since: Option<i64>) -> Result<Counts, S
             fs::write(&txt, format!("{text}\n")).map_err(|e| format!("{}: {e}", txt.display()))?;
             n.new_txts += 1;
         }
+        let app = to.with_extension("app");
+        if let Some(id) = apps.get(&s.started_at).filter(|_| !app.exists()) {
+            fs::write(&app, format!("{id}\n")).map_err(|e| format!("{}: {e}", app.display()))?;
+        }
+        n.apps += usize::from(app.exists());
         let reference = fs::read_to_string(&txt).unwrap_or_default();
         n.empty_txts += usize::from(reference.trim().is_empty());
         n.clips += 1;
@@ -163,7 +192,9 @@ mod tests {
             .join("\n"),
         )
         .unwrap();
-        let n = export(&history, &out, None).unwrap();
+        // The first one's app is known (agt.db); the second's isn't.
+        let apps = HashMap::from([(1000, "Code.exe".to_owned()), (3000, "x.exe".to_owned())]);
+        let n = export(&history, &out, None, &apps).unwrap();
         assert_eq!(
             n,
             Counts {
@@ -171,6 +202,7 @@ mod tests {
                 new_wavs: 2,
                 new_txts: 2,
                 empty_txts: 1,
+                apps: 1,
                 no_audio: 1,
                 missing: 1
             }
@@ -188,20 +220,25 @@ mod tests {
         let txt = first.with_extension("txt");
         assert_eq!(fs::read_to_string(&txt).unwrap(), "merge into Maine\n");
         assert_eq!(
+            fs::read_to_string(first.with_extension("app")).unwrap(),
+            "Code.exe\n"
+        );
+        assert!(!out.join("2026-10-16-090500-002.app").exists());
+        assert_eq!(
             fs::read_to_string(out.join("2026-10-16-090500-002.txt")).unwrap(),
             "\n"
         );
         // The user's corrections survive exporting again.
         fs::write(&txt, "merge into main\n").unwrap();
         fs::write(out.join("2026-10-16-090500-002.txt"), "hello\n").unwrap();
-        let n = export(&history, &out, None).unwrap();
+        let n = export(&history, &out, None, &HashMap::new()).unwrap();
         assert_eq!(
-            (n.clips, n.new_wavs, n.new_txts, n.empty_txts),
-            (2, 0, 0, 0)
+            (n.clips, n.new_wavs, n.new_txts, n.empty_txts, n.apps),
+            (2, 0, 0, 0, 1)
         );
         assert_eq!(fs::read_to_string(&txt).unwrap(), "merge into main\n");
         // Only the recent ones.
-        let n = export(&history, &dir.join("recent"), Some(2000)).unwrap();
+        let n = export(&history, &dir.join("recent"), Some(2000), &apps).unwrap();
         assert_eq!((n.clips, n.no_audio, n.missing), (1, 1, 1));
         fs::remove_dir_all(&dir).unwrap();
     }

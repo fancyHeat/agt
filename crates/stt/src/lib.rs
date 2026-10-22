@@ -3,6 +3,7 @@
 //! Engines are compiled in and picked by `stt.engine` in the config. Each engine is a module
 //! here; heavy engine-specific dependencies can be put behind cargo features as more arrive.
 
+pub mod boost;
 pub mod chunk;
 pub mod models;
 pub mod parakeet;

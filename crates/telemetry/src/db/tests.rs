@@ -21,6 +21,16 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
+/// A session row as an older schema takes it (`insert_session` writes today's columns).
+fn old_session(conn: &Connection) -> i64 {
+    conn.execute(
+        "INSERT INTO app_sessions (started_at, app_version, os, arch) VALUES (1, 'old', 'x', 'y')",
+        [],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
 fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
@@ -248,7 +258,7 @@ fn version_5_database_gains_the_polish_ahead_columns() {
         conn.execute_batch(m).unwrap();
     }
     conn.pragma_update(None, "user_version", 5).unwrap();
-    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    let id = old_session(&conn);
     insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
     migrate(&mut conn).unwrap();
     let d = Dictation {
@@ -289,7 +299,7 @@ fn version_6_database_gains_clipboard_settle_ms() {
         conn.execute_batch(m).unwrap();
     }
     conn.pragma_update(None, "user_version", 6).unwrap();
-    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    let id = old_session(&conn);
     insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
     migrate(&mut conn).unwrap();
     let d = Dictation {
@@ -313,7 +323,7 @@ fn version_7_database_gains_the_dictionary_columns() {
         conn.execute_batch(m).unwrap();
     }
     conn.pragma_update(None, "user_version", 7).unwrap();
-    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    let id = old_session(&conn);
     insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
     migrate(&mut conn).unwrap();
     // Set at start-up, then a reload changes the size; other updates leave it alone.
@@ -361,6 +371,68 @@ fn version_7_database_gains_the_dictionary_columns() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(rows, [Some(2), None]);
+}
+
+#[test]
+fn version_8_database_gains_the_app_columns() {
+    let dir = std::env::temp_dir().join(format!("agt-db-v8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("agt.db");
+    let mut conn = Connection::open(&path).unwrap();
+    for m in &MIGRATIONS[..8] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 8).unwrap();
+    // Before the migration: nothing to read, and no column to write.
+    assert!(app_ids(&path).unwrap().is_empty());
+    let s = SessionStart {
+        stt_boost: 2.5,
+        ..Default::default()
+    };
+    insert_session(&conn, &s, 1).unwrap_err();
+    migrate(&mut conn).unwrap();
+    let id = insert_session(&conn, &s, 1).unwrap();
+    let boost: f64 = conn
+        .query_row("SELECT stt_boost FROM app_sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(boost, 2.5);
+    for (at, app, profiles, boosted) in [
+        (2000, Some("Code.exe"), Some("code,shell"), Some(12)),
+        (3000, Some("notepad.exe"), None, Some(3)),
+        (4000, None, None, None),
+    ] {
+        let d = Dictation {
+            started_at: at,
+            app_id: app.map(Into::into),
+            profiles: profiles.map(Into::into),
+            boosted_terms: boosted,
+            ..Default::default()
+        };
+        insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    }
+    let rows: Vec<(Option<String>, Option<String>, Option<i64>)> = conn
+        .prepare("SELECT app_id, profiles, boosted_terms FROM dictations ORDER BY started_at")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some("Code.exe".into()), Some("code,shell".into()), Some(12)),
+            (Some("notepad.exe".into()), None, Some(3)),
+            (None, None, None),
+        ]
+    );
+    // What `agt-bench export-history` reads, while the writer still has it open.
+    let apps = app_ids(&path).unwrap();
+    assert_eq!(apps.len(), 2);
+    assert_eq!(apps[&2000], "Code.exe");
+    assert_eq!(apps[&3000], "notepad.exe");
+    drop(conn);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

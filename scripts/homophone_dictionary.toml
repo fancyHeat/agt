@@ -1,0 +1,8 @@
+# The dictionary for the homophone test set (scripts/homophone_set.ps1); see
+# docs/benchmarks.md, "Dictionary boosting". Product names everywhere, dev words only in
+# code apps.
+terms = ["AGT", "Vexadyne", "Quillmate"]
+
+[profiles.code]
+apps = ["Code.exe", "WindowsTerminal.exe", "com.microsoft.VSCode", "com.apple.Terminal"]
+terms = ["main", "rebase", "kubectl", "PR", "Parakeet"]

@@ -3,20 +3,34 @@
 //! versions will add learned entries to it, while `config.toml` stays hand-edited.
 //!
 //! ```toml
-//! terms = ["main", "kubectl", "AGT"]
+//! terms = ["AGT"]
+//!
+//! [profiles.code]
+//! apps = ["Code.exe", "WindowsTerminal.exe", "com.microsoft.VSCode"]
+//! terms = ["main", "rebase", "kubectl"]
 //!
 //! [[replace]]
 //! from = "dot env"
 //! to = ".env"
+//! profiles = ["code"]
 //! ```
 //!
-//! - `terms`: words and names for the speech model to expect, in file order
-//!   ([`Dictionary::terms`], passed as [`crate::stt::TranscribeOpts::vocabulary`]). No engine
-//!   uses them yet (the next step biases Parakeet toward them); `agt-bench` counts how often
-//!   each one is transcribed right. Blank entries and exact duplicates are dropped.
-//! - `[[replace]]`: rewrites applied to every transcript before polish
-//!   ([`Dictionary::replace`]). An array of tables, so entries can gain optional keys later
-//!   (e.g. the apps they apply in).
+//! - `terms`: words and names for the speech model to expect, everywhere, in file order
+//!   ([`Dictionary::terms`]). Parakeet favors them (`stt.boost`, see `agt_stt::boost`);
+//!   `agt-bench` counts how often each one is transcribed right. Blank entries and exact
+//!   duplicates are dropped.
+//! - `[profiles.<name>]`: terms that only apply while one of `apps` has focus: the Windows
+//!   program's file name (`Code.exe`) or the macOS app's bundle identifier
+//!   (`com.microsoft.VSCode`), compared ignoring case. An app in several profiles gets all of
+//!   them. At most [`MAX_PROFILES`].
+//! - `[[replace]]`: rewrites applied to every transcript before polish, or with `profiles`
+//!   only in those profiles' apps ([`Scope::replace`]). A `profiles` entry no
+//!   `[profiles.<name>]` defines is an error, and so is an empty list.
+//!
+//! Each dictation resolves the dictionary once, at key-down, for the app that has focus then:
+//! a [`Scope`], whose terms go to the engine as [`crate::stt::TranscribeOpts::vocabulary`].
+//! Each profile's term list (the global terms, then its own) is built at load, so resolving
+//! is a lookup and an `Arc` clone (a merge only for an app in several profiles).
 //!
 //! A missing file is an empty dictionary, which changes nothing. Unknown keys are rejected so
 //! typos surface (as in `config.toml`), and errors say where (line and column) without
@@ -35,7 +49,8 @@
 //!   `Maine`, `maine` and `MAINE` all become `to`. That is also why a rewrite of a real word
 //!   applies everywhere, including where the word was meant.
 //! - A blank `from` or `to` is an error, and so is a `from` given twice (ignoring case and
-//!   spacing): which one applied would depend on their order.
+//!   spacing), even for different profiles: in an app in both, which one applied would
+//!   depend on their order.
 //!
 //! Edge cases, by design (speech engines write NFC text, where they hardly come up):
 //!
@@ -53,7 +68,13 @@
 
 use crate::config::{line_column, located, redact_values};
 use serde::Deserialize;
-use std::{borrow::Cow, collections::HashMap, fs, io, path::Path};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    fs, io,
+    path::Path,
+    sync::Arc,
+};
 
 /// Written by "Edit dictionary..." when there is no file yet. Kept as text so the comments
 /// explain the format; it parses to an empty dictionary.
@@ -61,25 +82,68 @@ pub const TEMPLATE: &str = r#"# AGT dictionary. AGT applies your changes as soon
 # error, AGT says so in its menu and keeps using the last version that worked since it
 # started (none, if the file already had the error when AGT started) until it's fixed.
 
-# Words and names you use, for the speech model to expect (not used yet: a later version
-# makes Parakeet favor them). For example: terms = ["main", "kubectl", "AGT"]
+# Words and names you use, for the speech model to favor (Parakeet; how much: `boost` in
+# config.toml's [stt]). Favored everywhere; for words that only make sense in some apps, use
+# a profile (below). For example: terms = ["AGT", "Kubernetes"]
 terms = []
 
+# Terms favored only while one of `apps` has focus: on Windows the program's file name, on
+# macOS the app's bundle identifier, ignoring case. AGT records the app of each dictation
+# (agt.db, `dictations.app_id`; see the README). An app can be in several profiles. Remove
+# the # signs to use this one:
+#
+# [profiles.code]
+# apps = [
+#     # Windows: VS Code, Cursor, Zed, Visual Studio, Windows Terminal, consoles, JetBrains
+#     "Code.exe", "Cursor.exe", "Zed.exe", "devenv.exe", "WindowsTerminal.exe",
+#     "powershell.exe", "pwsh.exe", "cmd.exe", "idea64.exe", "pycharm64.exe",
+#     "webstorm64.exe", "clion64.exe", "goland64.exe", "rider64.exe", "rustrover64.exe",
+#     "phpstorm64.exe",
+#     # macOS: VS Code, Cursor, Zed, Terminal, iTerm2, Ghostty, Warp, JetBrains
+#     "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "dev.zed.Zed",
+#     "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
+#     "dev.warp.Warp-Stable", "com.jetbrains.intellij", "com.jetbrains.pycharm",
+#     "com.jetbrains.WebStorm", "com.jetbrains.CLion", "com.jetbrains.goland",
+#     "com.jetbrains.rider", "com.jetbrains.rustrover", "com.jetbrains.PhpStorm",
+# ]
+# terms = ["main", "rebase", "kubectl", "PR"]
+
 # Fixed rewrites applied to every transcript before polish. Only for things that are never
-# ambiguous: a rewrite of a real word (e.g. "Maine") applies everywhere. `from` matches whole
-# words, ignoring case; `to` is pasted exactly as written. Copy these three lines for each:
+# ambiguous: a rewrite of a real word (e.g. "Maine") applies everywhere, unless you limit it
+# to profiles. `from` matches whole words, ignoring case; `to` is pasted exactly as written.
+# Copy these lines for each (`profiles` is optional):
 #
 # [[replace]]
 # from = "dot env"
 # to = ".env"
+# profiles = ["code"]
 "#;
+
+/// Profiles a dictionary may have (they're a bit mask).
+pub const MAX_PROFILES: usize = 64;
 
 /// One `[[replace]]` entry, as written (trimmed).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Replacement {
     pub from: String,
     pub to: String,
+    /// The profiles it's limited to ([`Dictionary::profiles`] indexes, as a bit mask); 0:
+    /// everywhere.
+    profiles: u64,
     pieces: Vec<Piece>,
+}
+
+/// A `[profiles.<name>]` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    /// As written (trimmed, without blanks); matched ignoring case.
+    pub apps: Vec<String>,
+    /// Its own terms, in file order.
+    pub terms: Vec<String>,
+    /// The global terms, then its own (without duplicates): what an app in this profile
+    /// alone boosts.
+    all_terms: Arc<[String]>,
 }
 
 /// A compiled `from`: what the text must have, in order.
@@ -95,7 +159,12 @@ enum Piece {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Dictionary {
-    terms: Vec<String>,
+    /// The global terms.
+    terms: Arc<[String]>,
+    /// By name.
+    profiles: Vec<Profile>,
+    /// App (lowercased) → the profiles it's in, as a bit mask of `profiles` indexes.
+    apps: HashMap<String, u64>,
     replacements: Vec<Replacement>,
     /// Indexes of `replacements` by the first character (lowercased) of their match.
     index: HashMap<char, Vec<usize>>,
@@ -130,7 +199,15 @@ impl std::error::Error for DictionaryError {}
 #[serde(default, deny_unknown_fields)]
 struct File {
     terms: Vec<String>,
+    profiles: BTreeMap<String, ProfileEntry>,
     replace: Vec<Entry>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProfileEntry {
+    apps: Vec<String>,
+    terms: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,10 +215,34 @@ struct File {
 struct Entry {
     from: toml::Spanned<String>,
     to: toml::Spanned<String>,
+    profiles: Option<toml::Spanned<Vec<toml::Spanned<String>>>>,
 }
 
 /// The file's own keys: kept in error messages, which say what was expected.
-const KEYS: &[&str] = &["terms", "replace", "from", "to"];
+const KEYS: &[&str] = &["terms", "profiles", "apps", "replace", "from", "to"];
+
+/// `list` trimmed, without blanks and exact duplicates, in order.
+fn cleaned(list: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in list {
+        let item = item.trim();
+        if !item.is_empty() && !out.iter().any(|t| t == item) {
+            out.push(item.to_owned());
+        }
+    }
+    out
+}
+
+/// `lists` joined in order, without duplicates.
+fn merged<'a>(lists: impl IntoIterator<Item = &'a [String]>) -> Arc<[String]> {
+    let mut out: Vec<String> = Vec::new();
+    for t in lists.into_iter().flatten() {
+        if !out.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    out.into()
+}
 
 /// toml's message without anything the user wrote: quoted values (as for `config.toml`) and
 /// also names in backticks, which in this file are the user's words (``unknown field
@@ -247,19 +348,56 @@ impl Dictionary {
             at: line_column(span, text),
         };
         let file: File = toml::from_str(text).map_err(|e| error(e.message(), e.span()))?;
-        let mut terms: Vec<String> = Vec::with_capacity(file.terms.len());
-        for term in file.terms {
-            let term = term.trim();
-            if !term.is_empty() && !terms.iter().any(|t| t == term) {
-                terms.push(term.to_owned());
-            }
+        if file.profiles.len() > MAX_PROFILES {
+            return Err(error(&format!("more than {MAX_PROFILES} `profiles`"), None));
         }
+        let terms: Arc<[String]> = cleaned(file.terms).into();
+        let mut apps: HashMap<String, u64> = HashMap::new();
+        let profiles: Vec<Profile> = file
+            .profiles
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, p))| {
+                let own = cleaned(p.terms);
+                let app_ids = cleaned(p.apps);
+                for app in &app_ids {
+                    *apps.entry(app.to_lowercase()).or_default() |= 1 << i;
+                }
+                Profile {
+                    name,
+                    apps: app_ids,
+                    all_terms: merged([&terms[..], &own[..]]),
+                    terms: own,
+                }
+            })
+            .collect();
         let mut dictionary = Self {
             terms,
+            apps,
             ..Self::default()
         };
         let mut seen: HashMap<Vec<Piece>, ()> = HashMap::new();
         for entry in file.replace {
+            let mut mask = 0u64;
+            if let Some(names) = &entry.profiles {
+                if names.get_ref().is_empty() {
+                    return Err(error(
+                        "`profiles` is empty (leave it out to apply everywhere)",
+                        Some(names.span()),
+                    ));
+                }
+                for name in names.get_ref() {
+                    match profiles.iter().position(|p| p.name == *name.get_ref()) {
+                        Some(i) => mask |= 1 << i,
+                        None => {
+                            return Err(error(
+                                "`profiles` names a profile that no [profiles.<name>] table defines",
+                                Some(name.span()),
+                            ));
+                        }
+                    }
+                }
+            }
             let from = entry.from.get_ref().trim();
             let to = entry.to.get_ref().trim();
             if from.is_empty() {
@@ -288,9 +426,11 @@ impl Dictionary {
             dictionary.replacements.push(Replacement {
                 from: from.to_owned(),
                 to: to.to_owned(),
+                profiles: mask,
                 pieces,
             });
         }
+        dictionary.profiles = profiles;
         Ok(dictionary)
     }
 
@@ -321,12 +461,28 @@ impl Dictionary {
 
     /// No terms and no replacements: nothing changes.
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.replacements.is_empty()
+        self.terms.is_empty()
+            && self.profiles.iter().all(|p| p.terms.is_empty())
+            && self.replacements.is_empty()
     }
 
-    /// The terms, in file order.
+    /// The global terms (not the profiles'), in file order.
     pub fn terms(&self) -> &[String] {
         &self.terms
+    }
+
+    /// Every term, global and the profiles', in file order, without duplicates.
+    pub fn all_terms(&self) -> Arc<[String]> {
+        merged(
+            [&self.terms[..]]
+                .into_iter()
+                .chain(self.profiles.iter().map(|p| &p.terms[..])),
+        )
+    }
+
+    /// The `[profiles.<name>]` tables, by name.
+    pub fn profiles(&self) -> &[Profile] {
+        &self.profiles
     }
 
     /// The `[[replace]]` entries, in file order.
@@ -334,12 +490,19 @@ impl Dictionary {
         &self.replacements
     }
 
-    /// `text` with every replacement applied (see the module docs), and how many were made.
-    /// Borrowed when nothing matched.
+    /// `text` with every replacement that applies everywhere (no `profiles`) applied: what
+    /// an app in no profile gets ([`Scope::replace`]).
     pub fn replace<'a>(&self, text: &'a str) -> (Cow<'a, str>, usize) {
+        self.replace_in(text, 0)
+    }
+
+    /// `text` with the replacements for the profiles in `profiles` (a bit mask) applied
+    /// (see the module docs), and how many were made. Borrowed when nothing matched.
+    fn replace_in<'a>(&self, text: &'a str, profiles: u64) -> (Cow<'a, str>, usize) {
         if self.replacements.is_empty() {
             return (Cow::Borrowed(text), 0);
         }
+        let applies = |r: &Replacement| r.profiles == 0 || r.profiles & profiles != 0;
         let mut out = String::new();
         let (mut copied, mut count, mut i) = (0, 0, 0);
         while let Some(c) = text[i..].chars().next() {
@@ -355,6 +518,7 @@ impl Dictionary {
             let best = self.index.get(&lower(c)).and_then(|candidates| {
                 candidates
                     .iter()
+                    .filter(|&&r| applies(&self.replacements[r]))
                     .filter_map(|&r| {
                         match_at(&self.replacements[r].pieces, text, i).map(|end| (end, r))
                     })
@@ -378,6 +542,81 @@ impl Dictionary {
         }
         out.push_str(&text[copied..]);
         (Cow::Owned(out), count)
+    }
+}
+
+/// A dictionary as it applies in one app: its terms and replacements there. Resolved once
+/// per dictation, at key-down, and carried with it ([`Scope::new`] costs a hash lookup).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Scope {
+    dictionary: Arc<Dictionary>,
+    app: Option<String>,
+    /// The app's profiles (bit mask of [`Dictionary::profiles`] indexes).
+    profiles: u64,
+    terms: Arc<[String]>,
+}
+
+impl Scope {
+    /// `dictionary` in `app` (an exe file name or a bundle identifier; `None`: unknown, so
+    /// in no profile).
+    pub fn new(dictionary: Arc<Dictionary>, app: Option<String>) -> Self {
+        let profiles = app
+            .as_deref()
+            .and_then(|a| dictionary.apps.get(&a.to_lowercase()))
+            .copied()
+            .unwrap_or(0);
+        let terms = match profiles.count_ones() {
+            0 => dictionary.terms.clone(),
+            1 => dictionary.profiles[profiles.trailing_zeros() as usize]
+                .all_terms
+                .clone(),
+            _ => merged(
+                [&dictionary.terms[..]].into_iter().chain(
+                    dictionary
+                        .profiles
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| profiles & 1 << i != 0)
+                        .map(|(_, p)| &p.terms[..]),
+                ),
+            ),
+        };
+        Self {
+            dictionary,
+            app,
+            profiles,
+            terms,
+        }
+    }
+
+    pub fn dictionary(&self) -> &Dictionary {
+        &self.dictionary
+    }
+
+    /// The focused app at key-down, if known.
+    pub fn app(&self) -> Option<&str> {
+        self.app.as_deref()
+    }
+
+    /// The names of the app's profiles, by name.
+    pub fn profile_names(&self) -> impl Iterator<Item = &str> {
+        self.dictionary
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.profiles & 1 << i != 0)
+            .map(|(_, p)| p.name.as_str())
+    }
+
+    /// The global terms, then the app's profiles' (in profile order), without duplicates.
+    pub fn terms(&self) -> &Arc<[String]> {
+        &self.terms
+    }
+
+    /// `text` with the replacements that apply here applied (see the module docs), and
+    /// how many were made. Borrowed when nothing matched.
+    pub fn replace<'a>(&self, text: &'a str) -> (Cow<'a, str>, usize) {
+        self.dictionary.replace_in(text, self.profiles)
     }
 }
 
@@ -555,8 +794,151 @@ mod tests {
         let e = Dictionary::parse("maine = \"main\"")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("expected `terms` or `replace`"), "{e}");
+        assert!(
+            e.contains("expected one of `terms`, `profiles`, `replace`"),
+            "{e}"
+        );
         assert!(!e.contains("maine"), "{e}");
+    }
+
+    const PROFILED: &str = r#"
+terms = ["AGT", "main"]
+
+[profiles.code]
+apps = ["Code.exe", " com.apple.Terminal ", "", "code.exe"]
+terms = ["main", "rebase"]
+
+[profiles.shell]
+apps = ["WindowsTerminal.exe", "CODE.EXE"]
+terms = ["kubectl", "rebase"]
+
+[profiles.empty]
+
+[[replace]]
+from = "dot env"
+to = ".env"
+profiles = ["code"]
+
+[[replace]]
+from = "agt"
+to = "AGT"
+"#;
+
+    #[test]
+    fn profiles_scope_terms_and_replacements_by_app() {
+        let d = Arc::new(dict(PROFILED));
+        let names: Vec<&str> = d.profiles().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["code", "empty", "shell"]);
+        assert_eq!(
+            d.profiles()[0].apps,
+            ["Code.exe", "com.apple.Terminal", "code.exe"]
+        );
+        assert_eq!(&d.all_terms()[..], ["AGT", "main", "rebase", "kubectl"]);
+        let scope = |app: Option<&str>| Scope::new(d.clone(), app.map(str::to_owned));
+        let replaced = |s: &Scope| s.replace("agt reads dot env").0.into_owned();
+
+        // No profile (or no app known): the global terms and rules only.
+        for app in [None, Some("notepad.exe"), Some("")] {
+            let s = scope(app);
+            assert_eq!(&s.terms()[..], ["AGT", "main"]);
+            assert!(Arc::ptr_eq(s.terms(), &d.terms));
+            assert_eq!(s.profile_names().count(), 0);
+            assert_eq!(replaced(&s), "AGT reads dot env");
+        }
+        assert_eq!(d.replace("agt reads dot env").0, "AGT reads dot env");
+        // One profile, matched ignoring case: its precompiled list.
+        let s = scope(Some("COM.APPLE.TERMINAL"));
+        assert_eq!(&s.terms()[..], ["AGT", "main", "rebase"]);
+        assert!(Arc::ptr_eq(s.terms(), &d.profiles()[0].all_terms));
+        assert_eq!(s.profile_names().collect::<Vec<_>>(), ["code"]);
+        assert_eq!(s.app(), Some("COM.APPLE.TERMINAL"));
+        assert_eq!(replaced(&s), "AGT reads .env");
+        let s = scope(Some("WindowsTerminal.exe"));
+        assert_eq!(&s.terms()[..], ["AGT", "main", "kubectl", "rebase"]);
+        assert_eq!(replaced(&s), "AGT reads dot env");
+        // An app in two profiles gets both.
+        let s = scope(Some("Code.exe"));
+        assert_eq!(s.profile_names().collect::<Vec<_>>(), ["code", "shell"]);
+        assert_eq!(&s.terms()[..], ["AGT", "main", "rebase", "kubectl"]);
+        assert_eq!(replaced(&s), "AGT reads .env");
+        // Profile terms count as terms; profile-only rules don't apply outside them.
+        assert!(!dict("[profiles.x]\nterms = [\"a\"]\n").is_empty());
+        assert!(dict("[profiles.x]\napps = [\"a.exe\"]\n").is_empty());
+    }
+
+    #[test]
+    fn bad_profiles_say_where_without_quoting() {
+        for (text, line, what) in [
+            (
+                "[profiles.code]\n\n[[replace]]\nfrom = \"x\"\nto = \"y\"\nprofiles = [\"code\", \"secretword\"]\n",
+                6,
+                "no [profiles.<name>] table defines",
+            ),
+            (
+                "[[replace]]\nfrom = \"x\"\nto = \"y\"\nprofiles = []\n",
+                4,
+                "`profiles` is empty",
+            ),
+            ("[profiles.code]\nsecretword = 1\n", 2, "unknown field"),
+            (
+                "[profiles.code]\napps = \"secretword\"\n",
+                2,
+                "invalid type",
+            ),
+            ("[profiles]\nsecretword = 1\n", 2, "invalid type"),
+            (
+                "[[replace]]\nfrom = \"x\"\nto = \"y\"\nprofiles = \"secretword\"\n",
+                4,
+                "invalid type",
+            ),
+        ] {
+            let e = Dictionary::parse(text).unwrap_err().to_string();
+            assert!(
+                e.starts_with(&format!("invalid dictionary.toml at line {line}, column ")),
+                "{text}: {e}"
+            );
+            assert!(e.contains(what), "{text}: {e}");
+            assert!(!e.to_lowercase().contains("secretword"), "{text:?}: {e}");
+        }
+        let many: String = (0..=MAX_PROFILES)
+            .map(|i| format!("[profiles.p{i}]\n"))
+            .collect();
+        let e = Dictionary::parse(&many).unwrap_err().to_string();
+        assert!(e.contains("more than 64"), "{e}");
+        let ok: String = (0..MAX_PROFILES)
+            .map(|i| format!("[profiles.p{i}]\n"))
+            .collect();
+        assert_eq!(dict(&ok).profiles().len(), MAX_PROFILES);
+    }
+
+    /// The template's commented-out examples work once uncommented.
+    #[test]
+    fn template_examples_parse() {
+        let uncommented: String = TEMPLATE
+            .lines()
+            .map(|l| {
+                let Some(rest) = l.strip_prefix("# ") else {
+                    return l;
+                };
+                let key = rest
+                    .split_once(" = ")
+                    .is_some_and(|(k, _)| k.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+                match key || rest.starts_with(['[', ']', ' ']) {
+                    true => rest,
+                    false => l,
+                }
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let d = Arc::new(dict(&uncommented));
+        assert_eq!(d.profiles().len(), 1);
+        assert_eq!(d.replacements().len(), 1);
+        for app in ["code.exe", "com.microsoft.vscode", "WindowsTerminal.exe"] {
+            let s = Scope::new(d.clone(), Some(app.into()));
+            assert!(s.terms().iter().any(|t| t == "main"), "{app}");
+            assert_eq!(s.replace("copy dot env").0, "copy .env");
+        }
+        assert_eq!(d.replace("copy dot env").0, "copy dot env");
     }
 
     #[test]

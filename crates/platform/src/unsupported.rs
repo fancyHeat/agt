@@ -44,6 +44,10 @@ pub fn foreground_window() -> Option<usize> {
     None
 }
 
+pub fn foreground_app() -> Option<String> {
+    None
+}
+
 pub fn focus_takes_text() -> Option<bool> {
     None
 }
