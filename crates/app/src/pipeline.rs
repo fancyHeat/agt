@@ -19,11 +19,17 @@
 //!   and are pasted in order (nothing is dropped). A recording's segments are transcribed
 //!   while it's still being recorded, and their texts joined at release; a dropped
 //!   (cancelled) recording's are skipped, or discarded if already being transcribed.
-//! - `polish`: with `polish.enabled`, cleans each transcript up with an LLM (`agt-polish`),
-//!   bounded by `polish.timeout_ms`; on any failure the raw transcript is pasted. Then hands
-//!   it to `paste`. A long dictation transcribed while recording is also polished while
+//! - `polish`: first applies the dictionary's replacements (`dictionary.toml`, see
+//!   [`agt_core::dictionary`]) to each transcript, polish on or off. Then, with
+//!   `polish.enabled`, cleans it up with an LLM (`agt-polish`), bounded by
+//!   `polish.timeout_ms`; on any failure the transcript (replaced) is pasted. Then hands it to
+//!   `paste`. A long dictation transcribed while recording is also polished while
 //!   recording, in pieces that end at a sentence end (`agt_polish::ahead`, local servers
-//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]).
+//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]); the
+//!   replacements are then applied to each piece. A phrase is never split across segments
+//!   (their texts are joined with a space before any replacement), only across pieces, which
+//!   end at a sentence end (or, in a run-on of over `agt_polish::ahead::MAX_HELD_WORDS`
+//!   words, at a segment boundary): a `from` spanning one of those isn't matched.
 //! - `permissions` (macOS, only while something is missing): asks for the Microphone and
 //!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
 //!   both are granted, so no restart is needed.
@@ -43,11 +49,15 @@
 //!
 //! With `[history]` on, a transcribed dictation's text and/or audio also travel with it, as an
 //! [`agt_history::Entry`], and are handed to the history writer (again a channel send) after
-//! the paste. With it off, no entry is built.
+//! the paste. With it off, no entry is built. Its `raw` text is the engine's, before the
+//! dictionary's replacements.
+//!
+//! The dictionary in use is swapped as a whole when `dictionary.toml` changes
+//! ([`Pipeline::set_dictionary`]); no restart.
 
 use agt_audio::{Level, Recorder};
 use agt_core::{
-    Config,
+    Config, Dictionary,
     config::{PolishConfig, PolishProvider},
     paths,
     polish::Polisher,
@@ -62,6 +72,7 @@ use agt_polish::{Outcome, ahead::Ahead};
 use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
+    borrow::Cow,
     fmt,
     sync::{
         Arc, Condvar, Mutex,
@@ -293,6 +304,66 @@ impl Drop for SetOnDrop {
     }
 }
 
+/// The dictionary in use, shared by the `stt` and `polish` threads and replaced as a whole
+/// ([`Pipeline::set_dictionary`]). Each use takes the current one: an `Arc` clone under a
+/// lock held for nanoseconds.
+#[derive(Clone, Default)]
+struct Words(Arc<Mutex<Arc<Dictionary>>>);
+
+impl Words {
+    fn new(dictionary: Dictionary) -> Self {
+        Self(Arc::new(Mutex::new(Arc::new(dictionary))))
+    }
+
+    fn get(&self) -> Arc<Dictionary> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn set(&self, dictionary: Dictionary) {
+        *self.0.lock().unwrap() = Arc::new(dictionary);
+    }
+}
+
+/// The engine's options for the dictionary in use: rebuilt only when it changed.
+struct Hints {
+    dictionary: Arc<Dictionary>,
+    opts: TranscribeOpts,
+}
+
+impl Hints {
+    fn new(words: &Words) -> Self {
+        let dictionary = words.get();
+        let opts = TranscribeOpts {
+            vocabulary: dictionary.terms().to_vec(),
+            ..Default::default()
+        };
+        Self { dictionary, opts }
+    }
+
+    fn get(&mut self, words: &Words) -> &TranscribeOpts {
+        let now = words.get();
+        if !Arc::ptr_eq(&now, &self.dictionary) {
+            *self = Self::new(words);
+        }
+        &self.opts
+    }
+}
+
+/// Applies `dictionary`'s replacements to `text`; returns how many it made.
+fn replace_in(dictionary: &Dictionary, text: &mut String) -> usize {
+    let replaced = match dictionary.replace(text) {
+        (Cow::Owned(out), n) => Some((out, n)),
+        (Cow::Borrowed(_), _) => None,
+    };
+    match replaced {
+        Some((out, n)) => {
+            *text = out;
+            n
+        }
+        None => 0,
+    }
+}
+
 /// Keeps the pipeline running; dropping it stops the hotkey.
 pub struct Pipeline {
     _hotkey: HotkeyHandle,
@@ -303,9 +374,16 @@ pub struct Pipeline {
     to_paste: Sender<ToPaste>,
     key_down: Arc<Mutex<Option<Instant>>>,
     ducker: Ducker,
+    words: Words,
 }
 
 impl Pipeline {
+    /// Uses `dictionary` from the next transcript on (a dictation already being polished
+    /// may finish with the old one).
+    pub fn set_dictionary(&self, dictionary: Dictionary) {
+        self.words.set(dictionary);
+    }
+
     /// Before exiting: puts the output volume back if a dictation in progress lowered it.
     pub fn shutdown(&self) {
         self.ducker.shutdown(DUCK_SHUTDOWN_WAIT);
@@ -397,8 +475,10 @@ enum ToPaste {
 /// platform without support yet); the model is then not loaded either.
 pub fn start(
     config: &Config,
+    dictionary: Dictionary,
     notify: impl Fn(Event) + Send + Sync + 'static,
 ) -> Result<Pipeline, String> {
+    let words = Words::new(dictionary);
     let hub = Hub {
         state: Arc::new(Mutex::new(HubState {
             engine: Engine::Loading("Loading model...".into()),
@@ -452,15 +532,15 @@ pub fn start(
     let (polisher, polish_info) = load_polisher(config, &hub, &stt_loaded);
     let saver = history::start(&config.history, paths::dictations_dir());
     let polishing = polisher.is_some();
-    let (h, cfg, hs) = (hub.clone(), config.clone(), saver.clone());
+    let (h, cfg, hs, w) = (hub.clone(), config.clone(), saver.clone(), words.clone());
     spawn("stt", move || {
         stt_thread(
-            cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs, stt_loaded,
+            cfg, h, stt_rx, to_polish, polishing, hs, chunk_secs, stt_loaded, w,
         )
     });
-    let (cfg, tp) = (config.clone(), to_paste.clone());
+    let (cfg, tp, w) = (config.clone(), to_paste.clone(), words.clone());
     spawn("polish", move || {
-        polish_thread(cfg, polish_rx, tp, polisher)
+        polish_thread(cfg, polish_rx, tp, polisher, w)
     });
 
     let (h, cfg) = (hub.clone(), config.clone());
@@ -474,6 +554,7 @@ pub fn start(
         to_paste,
         key_down,
         ducker,
+        words,
     })
 }
 
@@ -1324,11 +1405,12 @@ impl Partial {
 fn transcribe(
     engine: &mut dyn SttEngine,
     audio: &[f32],
+    opts: &TranscribeOpts,
     hub: &Hub,
     chunk_secs: &AtomicU32,
 ) -> Result<String, String> {
     let notice = engine.notice();
-    let result = engine.transcribe(audio, &TranscribeOpts::default());
+    let result = engine.transcribe(audio, opts);
     if engine.notice() != notice {
         let note = engine.notice();
         telemetry::global().session(telemetry::SessionUpdate {
@@ -1358,8 +1440,10 @@ fn stt_thread(
     history: Option<History>,
     chunk_secs: Arc<AtomicU32>,
     stt_loaded: SttLoaded,
+    words: Words,
 ) {
     let polish = polishing.then_some(&config.polish);
+    let mut hints = Hints::new(&words);
     let loading = SetOnDrop(stt_loaded);
     let mut engine = load_engine(&config, &hub);
     // Loaded or failed: either way S1-mini no longer competes with it for the network.
@@ -1398,7 +1482,8 @@ fn stt_thread(
                     continue;
                 };
                 let t = Instant::now();
-                let result = transcribe(engine.as_mut(), &piece.audio, &hub, &chunk_secs);
+                let opts = hints.get(&words);
+                let result = transcribe(engine.as_mut(), &piece.audio, opts, &hub, &chunk_secs);
                 engine_done = Some(Instant::now());
                 let took = ms(t.elapsed());
                 if shared.dropped.load(Relaxed) {
@@ -1447,8 +1532,9 @@ fn stt_thread(
         let stt_start = Instant::now();
         // Polished in pieces: those left to polish.
         let mut rest = None;
+        let opts = hints.get(&words);
         let result = match job.live.take() {
-            None => transcribe(engine.as_mut(), &job.audio, &hub, &chunk_secs),
+            None => transcribe(engine.as_mut(), &job.audio, opts, &hub, &chunk_secs),
             // Most of it was transcribed while recording: only the tail is left.
             Some((tail, shared)) => {
                 let mut p = partial
@@ -1460,7 +1546,7 @@ fn stt_thread(
                 d.live_idle_ms = engine_done.map(|t| ms(stt_start.saturating_duration_since(t)));
                 d.live_stt_ms = Some(p.stt_ms);
                 for piece in tail {
-                    match transcribe(engine.as_mut(), &piece.audio, &hub, &chunk_secs) {
+                    match transcribe(engine.as_mut(), &piece.audio, opts, &hub, &chunk_secs) {
                         Ok(text) => p.texts.add(text, piece.redo),
                         Err(e) => p.error = Some(e),
                     }
@@ -1548,8 +1634,10 @@ struct Pieces {
     shared: Arc<Shared>,
     texts: Vec<String>,
     outcomes: Vec<Outcome>,
-    /// Words of the pieces as transcribed.
+    /// Words of the pieces as transcribed (before the dictionary's replacements).
     raw_words: usize,
+    /// The dictionary's replacements made in the pieces.
+    replacements: usize,
     /// Time spent on the pieces polished in the background, before the transcript was ready.
     ahead_ms: f64,
     /// A request ran out of time: the rest of the pieces stay raw.
@@ -1563,17 +1651,22 @@ impl Pieces {
             texts: Vec::new(),
             outcomes: Vec::new(),
             raw_words: 0,
+            replacements: 0,
             ahead_ms: 0.0,
             timed_out: false,
         }
     }
 
-    /// Polishes the next piece, or keeps it raw once a request for this dictation failed by
+    /// Applies the dictionary's replacements to the next piece (`raw`, as transcribed) and
+    /// polishes it, or keeps it unpolished once a request for this dictation failed by
     /// running out of time: a hung server would make every piece wait out its own deadline,
     /// one after the other. A quick failure (a server restarting) doesn't stop the rest.
-    fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
+    fn polish(&mut self, p: &dyn Polisher, raw: &str, cfg: &PolishConfig, dictionary: &Dictionary) {
+        self.raw_words += raw.split_whitespace().count();
+        let (piece, replaced) = dictionary.replace(raw);
+        self.replacements += replaced;
+        let piece = piece.as_ref();
         let words = piece.split_whitespace().count();
-        self.raw_words += words;
         let (text, outcome) = if self.timed_out {
             let why = "an earlier piece timed out".to_owned();
             (piece.to_owned(), Outcome::Failed(why))
@@ -1634,6 +1727,7 @@ fn polish_thread(
     jobs: Receiver<ToPolish>,
     to_paste: Sender<ToPaste>,
     polisher: Option<Arc<dyn Polisher>>,
+    words: Words,
 ) {
     // A piece may be shorter than `polish.min_words`; the dictation it's from isn't.
     let piece_cfg = PolishConfig {
@@ -1657,7 +1751,7 @@ fn polish_thread(
                 // Dropped (cancelled): its pieces still queued are skipped.
                 if !shared.dropped.load(Relaxed) {
                     let t = Instant::now();
-                    p.polish(polisher, &text, &piece_cfg);
+                    p.polish(polisher, &text, &piece_cfg, &words.get());
                     p.ahead_ms += ms(t.elapsed());
                 }
                 continue;
@@ -1675,6 +1769,9 @@ fn polish_thread(
         } = *job;
         // Pieces sent before it are its own (or a failed dictation's).
         let earlier = pieces.take();
+        let dictionary = words.get();
+        // Polished in pieces, the replacements are made in each (see `Pieces::polish`).
+        let mut replacements = None;
         if let Some(polisher) = polisher.as_deref() {
             let start = Instant::now();
             d.polish_wait_ms = Some(ms(start.saturating_duration_since(ready)));
@@ -1696,8 +1793,9 @@ fn polish_thread(
                 Some((mut p, rest, words)) => {
                     let ahead = p.texts.len();
                     for piece in &rest {
-                        p.polish(polisher, piece, &piece_cfg);
+                        p.polish(polisher, piece, &piece_cfg, &dictionary);
                     }
+                    replacements = Some(p.replacements);
                     tracing::debug!(
                         "polished in {} pieces, {ahead} in the background ({:.0} ms); {words} words left at release",
                         ahead + rest.len(),
@@ -1712,6 +1810,7 @@ fn polish_thread(
                     outcome
                 }
                 None => {
+                    replacements = Some(replace_in(&dictionary, &mut text));
                     let (polished, outcome) =
                         agt_polish::polish_or_raw(polisher, &text, &config.polish);
                     log_outcome(&outcome, &text, "transcript");
@@ -1722,6 +1821,8 @@ fn polish_thread(
             d.polish_ms = Some(ms(start.elapsed()));
             d.polish_outcome = Some(outcome);
         }
+        let replacements = replacements.unwrap_or_else(|| replace_in(&dictionary, &mut text));
+        d.replacements = Some(replacements as i64);
         if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
             t.polish_outcome = d.polish_outcome;
             t.polished =
@@ -2380,6 +2481,19 @@ mod tests {
 
     /// Runs the polish thread over `msgs`; returns what it hands to `paste`.
     fn polish_all(msgs: Vec<ToPolish>) -> Vec<(String, Box<Dictation>)> {
+        polish_with(msgs, Some(Arc::new(Marks)), Dictionary::default())
+            .into_iter()
+            .map(|(text, d, _)| (text, d))
+            .collect()
+    }
+
+    /// [`polish_all`] with a polisher (or none: polish off) and a dictionary; also returns
+    /// the history entries.
+    fn polish_with(
+        msgs: Vec<ToPolish>,
+        polisher: Option<Arc<dyn Polisher>>,
+        dictionary: Dictionary,
+    ) -> Vec<(String, Box<Dictation>, Option<Box<history::Entry>>)> {
         let (tx, rx) = mpsc::channel();
         let (to_paste, pasted) = mpsc::channel();
         for m in msgs {
@@ -2390,16 +2504,119 @@ mod tests {
         config.paste.trailing_space = false;
         config.polish.timeout_ms = TEST_TIMEOUT.as_millis() as u64;
         config.polish.timeout_per_word_ms = 0;
-        polish_thread(config, rx, to_paste, Some(Arc::new(Marks)));
+        polish_thread(config, rx, to_paste, polisher, Words::new(dictionary));
         pasted
             .try_iter()
             .map(|m| match m {
                 ToPaste::Paste {
-                    text, dictation, ..
-                } => (text, dictation),
+                    text,
+                    dictation,
+                    saved,
+                    ..
+                } => (text, dictation, saved),
                 _ => panic!("not a paste"),
             })
             .collect()
+    }
+
+    /// `maine` -> `main`, `dot env` -> `.env` (two words to one).
+    fn test_dictionary() -> Dictionary {
+        Dictionary::parse(
+            "[[replace]]\nfrom = \"maine\"\nto = \"main\"\n\n[[replace]]\nfrom = \"dot env\"\nto = \".env\"\n",
+        )
+        .unwrap()
+    }
+
+    /// A transcript saved to the history with its raw text.
+    fn with_history(msg: ToPolish) -> ToPolish {
+        let ToPolish::Text(mut t) = msg else {
+            panic!("not a transcript")
+        };
+        t.saved = Some(Box::new(history::Entry {
+            text: Some(history::Text {
+                raw: t.text.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        ToPolish::Text(t)
+    }
+
+    #[test]
+    fn replacements_apply_before_polish_and_the_history_keeps_the_raw_text() {
+        let text = "merge it into Maine and copy the dot env file";
+        let out = polish_with(
+            vec![with_history(whole(text, None))],
+            Some(Arc::new(Marks)),
+            test_dictionary(),
+        );
+        let [(pasted, d, saved)] = &out[..] else {
+            panic!()
+        };
+        assert_eq!(pasted, "merge it into main and copy the .env file ok.");
+        assert_eq!(d.replacements, Some(2));
+        let t = saved.as_ref().unwrap().text.as_ref().unwrap();
+        assert_eq!(t.raw, text, "the engine's output, for the eval");
+        assert_eq!(t.polished.as_deref(), Some(pasted.as_str()));
+    }
+
+    #[test]
+    fn replacements_apply_with_polish_off_skipped_or_failed() {
+        let cases = [
+            // Polish off.
+            (None, "into Maine please", "into main please"),
+            // Too short to polish.
+            (Some(Arc::new(Marks) as Arc<dyn Polisher>), "Maine", "main"),
+            // Polish failed: the transcript pasted as is, replaced.
+            (
+                Some(Arc::new(Marks) as Arc<dyn Polisher>),
+                "FAIL into Maine please",
+                "FAIL into main please",
+            ),
+        ];
+        for (polisher, text, want) in cases {
+            let out = polish_with(vec![whole(text, None)], polisher, test_dictionary());
+            let [(pasted, d, _)] = &out[..] else { panic!() };
+            assert_eq!(pasted, want);
+            assert_eq!(d.replacements, Some(1), "{text}");
+        }
+        // Nothing to replace (or no dictionary): the text as it was, and a count of 0.
+        let out = polish_with(vec![whole("hi there", None)], None, Dictionary::default());
+        assert_eq!(out[0].0, "hi there");
+        assert_eq!(out[0].1.replacements, Some(0));
+    }
+
+    #[test]
+    fn replacements_apply_to_every_piece_of_a_long_dictation() {
+        let a = Arc::<Shared>::default();
+        // Each piece and the rest have a phrase to replace; "dot env" -> ".env" drops a word,
+        // which must not make the pieces look like they don't add up to the transcript.
+        let one = format!("{} Maine dot env.", sentences(25, "one"));
+        let two = format!("{} then dot env.", sentences(25, "two"));
+        let out = polish_with(
+            vec![
+                piece(&one, &a),
+                piece(&two, &a),
+                transcribed(&[&one, &two], &["into Maine"], &a),
+            ],
+            Some(Arc::new(Marks)),
+            test_dictionary(),
+        );
+        let [(text, d, _)] = &out[..] else { panic!() };
+        assert_eq!(
+            text,
+            &format!(
+                "{} main .env. ok. {} then .env. ok. into main ok.",
+                sentences(25, "one"),
+                sentences(25, "two")
+            )
+        );
+        assert_eq!(
+            d.polish_ahead_pieces,
+            Some(2),
+            "polished in pieces, not whole"
+        );
+        assert_eq!(d.replacements, Some(4));
     }
 
     /// The transcript of `ahead` (sent as pieces before) and `rest`, with `rest` left to

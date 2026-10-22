@@ -17,6 +17,11 @@ pub struct TranscribeOpts {
     /// BCP-47-ish language hint (`"en"`); `None` = engine default / auto-detect.
     /// Engines that can't use it ignore it.
     pub language: Option<String>,
+    /// Words and names the user says ([`crate::Dictionary::terms`]), in the dictionary's
+    /// order; empty without a dictionary. No engine uses them yet: the next step of the
+    /// dictionary work biases Parakeet's decoder toward them. Engines that can't use them
+    /// ignore them.
+    pub vocabulary: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

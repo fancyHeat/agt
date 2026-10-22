@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-/// Holds `config.toml`. Small, user-edited, fine to roam.
+/// Holds `config.toml` and `dictionary.toml`. Small, user-edited, fine to roam.
 pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
@@ -49,6 +49,11 @@ pub fn llama_dir() -> PathBuf {
 
 pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// The user's words and fixed rewrites (see [`crate::dictionary`]), next to `config.toml`.
+pub fn dictionary_file() -> PathBuf {
+    config_dir().join("dictionary.toml")
 }
 
 /// The telemetry database (sessions, dictation metrics, events; see `agt-telemetry`).

@@ -307,6 +307,63 @@ fn version_6_database_gains_clipboard_settle_ms() {
 }
 
 #[test]
+fn version_7_database_gains_the_dictionary_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    for m in &MIGRATIONS[..7] {
+        conn.execute_batch(m).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 7).unwrap();
+    let id = insert_session(&conn, &SessionStart::default(), 1).unwrap();
+    insert_dictation(&conn, id, &Dictation::default(), Outcome::Pasted).unwrap_err();
+    migrate(&mut conn).unwrap();
+    // Set at start-up, then a reload changes the size; other updates leave it alone.
+    let tx = conn.transaction().unwrap();
+    for u in [
+        SessionUpdate {
+            dictionary_terms: Some(3),
+            dictionary_rules: Some(1),
+            ..Default::default()
+        },
+        SessionUpdate {
+            dictionary_terms: Some(4),
+            dictionary_rules: Some(2),
+            ..Default::default()
+        },
+        SessionUpdate {
+            warmup_ms: Some(5.0),
+            ..Default::default()
+        },
+    ] {
+        update_session(&tx, id, &u).unwrap();
+    }
+    tx.commit().unwrap();
+    let size: (i64, i64) = conn
+        .query_row(
+            "SELECT dictionary_terms, dictionary_rules FROM app_sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(size, (4, 2));
+    for (at, replacements) in [(2000, Some(2)), (3000, None)] {
+        let d = Dictation {
+            started_at: at,
+            replacements,
+            ..Default::default()
+        };
+        insert_dictation(&conn, id, &d, Outcome::Pasted).unwrap();
+    }
+    let rows: Vec<Option<i64>> = conn
+        .prepare("SELECT replacements FROM dictations ORDER BY started_at")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, [Some(2), None]);
+}
+
+#[test]
 fn rtf_is_derived() {
     let conn = memory();
     dictation(&conn, now_ms(), 200.0, Outcome::Pasted);

@@ -11,6 +11,8 @@ pub mod window;
 pub enum Action {
     /// Open `config.toml` in a text editor.
     EditFile,
+    /// Open `dictionary.toml` in a text editor, created from its template if missing.
+    EditDictionary,
     /// Open the saved dictations' folder (created if needed).
     OpenHistory,
 }

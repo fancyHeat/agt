@@ -4,7 +4,7 @@
 
 use super::{Action, metrics, schema};
 use agt_core::{
-    Config,
+    Config, Dictionary,
     config::{self, SettingPath, SettingValue},
     paths,
 };
@@ -91,6 +91,7 @@ pub fn run() {
         path: paths::config_file(),
         actions: Vec::new(),
         stamp: None,
+        dictionary_stamp: None,
         metrics: metrics::Metrics::new(paths::db_file()),
         advanced: false,
     };
@@ -118,21 +119,32 @@ struct Model {
     path: PathBuf,
     /// By row id, for the pages last shown.
     actions: Vec<Act>,
-    /// The file's modification time and size when last read or written.
+    /// The file's modification time and size when last read or written, and
+    /// `dictionary.toml`'s when last read (its error is shown under "Edit dictionary...").
     stamp: Option<(Option<SystemTime>, u64)>,
+    dictionary_stamp: Option<(Option<SystemTime>, u64)>,
     metrics: metrics::Metrics,
     /// Showing every setting, not just the basic ones (until the window closes).
     advanced: bool,
 }
 
+fn stamp(path: &std::path::Path) -> Option<(Option<SystemTime>, u64)> {
+    fs::metadata(path)
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()))
+}
+
 impl Model {
     fn stamp(&self) -> Option<(Option<SystemTime>, u64)> {
-        fs::metadata(&self.path)
-            .ok()
-            .map(|m| (m.modified().ok(), m.len()))
+        stamp(&self.path)
     }
 
-    fn row(&mut self, item: schema::Item, enabled: bool) -> Row {
+    fn row(&mut self, mut item: schema::Item, enabled: bool) -> Row {
+        if let schema::Kind::Button(Action::EditDictionary) = item.kind
+            && let Err(e) = Dictionary::load(&paths::dictionary_file())
+        {
+            item.note = format!("{e}. AGT keeps using the last version that worked.");
+        }
         let id = self.actions.len();
         let (label, control, act) = match item.kind {
             schema::Kind::Check { path, on, .. } => (
@@ -227,6 +239,7 @@ impl Model {
 impl agt_settings_ui::Model for Model {
     fn pages(&mut self) -> Vec<Page> {
         self.stamp = self.stamp();
+        self.dictionary_stamp = stamp(&paths::dictionary_file());
         self.actions.clear();
         // Not `load_or_create`: a file deleted while the window is open isn't brought back
         // with defaults (which AGT would then apply).
@@ -314,6 +327,12 @@ impl agt_settings_ui::Model for Model {
             (Some(Act::Button(action)), Event::Click(_)) => {
                 match action {
                     Action::EditFile => crate::open_in_editor(&self.path),
+                    Action::EditDictionary => {
+                        let path = paths::dictionary_file();
+                        Dictionary::create_if_missing(&path)
+                            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+                        crate::open_in_editor(&path);
+                    }
                     Action::OpenHistory => crate::open_history(),
                 }
                 return Ok(());
@@ -332,7 +351,8 @@ impl agt_settings_ui::Model for Model {
     }
 
     fn changed_elsewhere(&mut self) -> bool {
-        let file = self.stamp() != self.stamp;
+        let file =
+            self.stamp() != self.stamp || stamp(&paths::dictionary_file()) != self.dictionary_stamp;
         // Always asked: it keeps the figures current.
         let figures = self.metrics.refresh();
         file || figures

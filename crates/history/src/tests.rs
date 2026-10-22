@@ -185,6 +185,56 @@ fn write_appends_lines_and_wavs() {
 }
 
 #[test]
+fn read_returns_what_was_written_in_order() {
+    let dir = temp_dir("read");
+    // Two days (fixed dates, written by hand: `write` would use this machine's zone).
+    let one = dir.join("2026-10-15");
+    let two = dir.join("2026-10-16");
+    for d in [&one, &two] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::write(
+        two.join(RECORDS_FILE),
+        "{\"started_at\":3,\"time\":\"x\",\"audio\":\"090000-003.wav\",\"audio_secs\":1.0,\"raw\":\"into Maine\",\"polished\":null,\"polish_outcome\":null,\"pasted\":\"into main \"}\n\
+         {\"started_at\":4,\"time\":\"x\",\"audio_secs\":1.0}\n",
+    )
+    .unwrap();
+    // A line cut short by a crash, then an intact one; text not saved.
+    fs::write(
+        one.join(RECORDS_FILE),
+        "{\"started_at\":1,\"ti\n{\"started_at\":2,\"time\":\"x\",\"audio\":\"235959-999.wav\",\"audio_secs\":2.0}\n",
+    )
+    .unwrap();
+    fs::write(dir.join("notes.txt"), "not a day").unwrap();
+    let saved = read(&dir);
+    assert_eq!(
+        saved,
+        [
+            Saved {
+                started_at: 2,
+                day: "2026-10-15".into(),
+                audio: Some(one.join("235959-999.wav")),
+                raw: None,
+            },
+            Saved {
+                started_at: 3,
+                day: "2026-10-16".into(),
+                audio: Some(two.join("090000-003.wav")),
+                raw: Some("into Maine".into()),
+            },
+            Saved {
+                started_at: 4,
+                day: "2026-10-16".into(),
+                audio: None,
+                raw: None,
+            },
+        ]
+    );
+    assert!(read(&dir.join("missing")).is_empty());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn a_line_cut_short_by_a_crash_does_not_swallow_the_next() {
     let dir = temp_dir("torn");
     let path = dir.join(RECORDS_FILE);

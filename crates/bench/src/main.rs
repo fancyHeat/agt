@@ -15,7 +15,16 @@
 //!                       what an idle GPU/CPU costs the next call (clock-down, wake-up)
 //!   --no-warmup         skip warmup, so the first run shows the cold-start cost
 //!   --quiet             no per-file lines, only the summary
+//!   --dictionary <file> use this dictionary.toml (default: AGT's, if there is one)
+//!   --no-dictionary     use none
 //! ```
+//!
+//! With a dictionary, its terms go to the engine and its replacements are applied to each
+//! transcript, exactly as AGT does before polish, and a per-term table (see [`terms`]) counts
+//! each term (and each replacement's `to`) in the references and transcripts, case-sensitive.
+//!
+//! `agt-bench export-history [--days n] [--out dir]` turns the dictation history into an
+//! eval set of `.wav` + `.txt` reference pairs (see [`export`]).
 //!
 //! Clips are grouped for the summary by duration (short < 6 s, medium 6-20 s, long > 20 s)
 //! and, for WER, by "set": the file name up to `-short-`/`-medium-`/`-long-` (the naming used
@@ -31,15 +40,18 @@
 //! over each non-empty line of a text file and prints latency, the guard outcome and the
 //! result (see [`polish`]).
 
+mod export;
 mod live;
 mod polish;
 
 mod mem;
+mod terms;
 mod wer;
 
 use agt_core::{
-    Config,
+    Config, Dictionary,
     config::SttConfig,
+    paths,
     stt::{SAMPLE_RATE, TranscribeOpts},
 };
 use std::{
@@ -49,7 +61,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--no-warmup] [--quiet] <dir>";
+const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--no-warmup] [--quiet] [--dictionary f | --no-dictionary] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
 
 fn main() -> ExitCode {
     match run() {
@@ -86,10 +98,13 @@ fn run() -> Result<(), String> {
     match std::env::args().nth(1).as_deref() {
         Some("polish") => return polish::run(std::env::args().skip(2)),
         Some("live") => return live::run(std::env::args().skip(2)),
+        Some("export-history") => return export::run(std::env::args().skip(2)),
         _ => {}
     }
     let mut cfg = SttConfig::default();
     let (mut runs, mut warmup, mut quiet, mut dir) = (3usize, true, false, None);
+    // `None`: AGT's own, if there is one; `Some(None)`: none.
+    let mut dictionary_file: Option<Option<PathBuf>> = None;
     let mut gap = std::time::Duration::ZERO;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -104,6 +119,8 @@ fn run() -> Result<(), String> {
             }
             "--no-warmup" => warmup = false,
             "--quiet" => quiet = true,
+            "--dictionary" => dictionary_file = Some(Some(PathBuf::from(val()?))),
+            "--no-dictionary" => dictionary_file = Some(None),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -124,6 +141,12 @@ fn run() -> Result<(), String> {
         return Err(format!("no .wav files in {}", dir.display()));
     }
     let categories = read_categories(&dir);
+    let dictionary_file =
+        dictionary_file.unwrap_or_else(|| Some(paths::dictionary_file()).filter(|p| p.is_file()));
+    let dictionary = match &dictionary_file {
+        Some(p) => Dictionary::load(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        None => Dictionary::default(),
+    };
 
     let rss_before = mem::peak_rss();
     let t = Instant::now();
@@ -145,7 +168,22 @@ fn run() -> Result<(), String> {
         println!("warmup: {:.0} ms", ms(t));
     }
 
-    let opts = TranscribeOpts::default();
+    match &dictionary_file {
+        Some(p) => println!(
+            "dictionary: {} ({} terms, {} replacements)",
+            p.display(),
+            dictionary.terms().len(),
+            dictionary.replacements().len()
+        ),
+        None => println!("dictionary: none"),
+    }
+    // As the app passes them (see the pipeline's `Hints`).
+    let opts = TranscribeOpts {
+        vocabulary: dictionary.terms().to_vec(),
+        ..Default::default()
+    };
+    let mut term_counts = terms::Terms::new(terms::of(&dictionary));
+    let mut replacements = 0;
     let mut clips = Vec::new();
     if !quiet {
         println!();
@@ -171,7 +209,15 @@ fn run() -> Result<(), String> {
         let first = times[0];
         times.sort_by(f64::total_cmp);
         let median = times[times.len() / 2];
-        let errors = read_reference(wav).map(|r| wer::word_errors(&r, &text));
+        // What AGT does before polish (the pipeline's polish thread).
+        let (replaced, n) = dictionary.replace(&text);
+        replacements += n;
+        let text = replaced.into_owned();
+        let reference = read_reference(wav);
+        if let Some(r) = &reference {
+            term_counts.add(r, &text);
+        }
+        let errors = reference.map(|r| wer::word_errors(&r, &text));
         let name = name(wav);
         if !quiet {
             println!(
@@ -270,6 +316,29 @@ fn run() -> Result<(), String> {
             }
         }
         wers.push(format!("{:.2}", pct(all.1, all.2)));
+    }
+
+    if !dictionary.replacements().is_empty() {
+        println!();
+        println!("replacements made: {replacements}");
+    }
+    if !term_counts.is_empty() && clips.iter().any(|c| c.errors.is_some()) {
+        println!();
+        println!(
+            "{:<24} {:>6} {:>6} {:>6} {:>9}",
+            "term (case-sensitive)", "in ref", "hits", "misses", "false ins"
+        );
+        let total = term_counts.total();
+        for c in term_counts.counts().iter().chain([&total]) {
+            println!(
+                "{:<24} {:>6} {:>6} {:>6} {:>9}",
+                c.term,
+                c.expected(),
+                c.hits,
+                c.misses,
+                c.false_insertions
+            );
+        }
     }
 
     println!();
