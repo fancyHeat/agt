@@ -31,8 +31,9 @@
 //! With [`TranscribeOpts::boost`] above 0, the decoder favors the terms in
 //! [`TranscribeOpts::vocabulary`] (see [`boost`]). It's all in the CPU decoder loop
 //! ([`OnnxJoint`]), so it works the same whatever device runs the encoder, for v2 and v3 (each
-//! with its own vocabulary), and for every chunk of a long recording. The trie of a term list
-//! is built on first use (about 0.3 ms for 50 terms) and kept for the next [`TRIES`] lists.
+//! with its own vocabulary), and for every chunk of a long recording. The weight is scaled
+//! per model ([`boost_scale`]). The trie of a term list is built on first use (about 0.3 ms
+//! for 50 terms) and kept for the next [`TRIES`] lists.
 
 use crate::{
     boost::{self, Cursor, Trie},
@@ -165,6 +166,8 @@ pub struct Parakeet {
     blank: usize,
     /// The vocabulary as boosting needs it ([`boost`]).
     pieces: boost::Pieces,
+    /// [`TranscribeOpts::boost`] is multiplied by this (see [`boost_scale`]).
+    boost_scale: f32,
     /// Tries of the term lists boosted lately, by a hash of the list, most recent last (see
     /// [`TRIES`]).
     tries: Vec<(u64, Arc<Trie>)>,
@@ -261,6 +264,18 @@ const PROBE_PAUSE: Duration = Duration::from_secs(3);
 /// Term lists whose tries are kept: one per app profile in use, so switching apps doesn't
 /// rebuild them (not that a build is slow: well under a millisecond for 50 terms).
 const TRIES: usize = 4;
+
+/// What one `stt.boost` weight means for each model: the same setting should give each one
+/// its tested-safe weight. v3's 8192 pieces hold longer word parts than v2's 1024 (`▁Ma`,
+/// `▁main`), so a piece the bonus picks can finish a term in one go where v2 would still need
+/// pieces the check looks at; on the homophone set (docs/benchmarks.md) v3 at 1 did what v2
+/// does at 2, and v3 at 2 changed real words.
+fn boost_scale(model: &str) -> f32 {
+    match model {
+        "parakeet-tdt-0.6b-v3" => 0.5,
+        _ => 1.0,
+    }
+}
 
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
 const ENCODER_FP32: &str = "encoder-model.onnx";
@@ -451,6 +466,7 @@ impl Parakeet {
             decoder,
             pieces: boost::Pieces::new(&vocab),
             tries: Vec::new(),
+            boost_scale: boost_scale(&cfg.model),
             vocab,
             blank,
             state_shape,
@@ -747,7 +763,7 @@ impl SttEngine for Parakeet {
             true => self.trie(&opts.vocabulary),
             false => None,
         };
-        let boost = trie.as_deref().map(|t| (t, opts.boost));
+        let boost = trie.as_deref().map(|t| (t, opts.boost * self.boost_scale));
         match self.decode(audio, boost) {
             // A GPU that worked at load can still fail later (driver reset/TDR, device
             // removed, out of VRAM): switch to the CPU for good and retry this audio once.
@@ -784,6 +800,14 @@ impl Parakeet {
                     terms.len(),
                     ms(t.elapsed())
                 );
+                // Once per term list (it's kept), and never which terms: they're the user's.
+                if trie.spelled < terms.len() {
+                    tracing::info!(
+                        "{} of {} dictionary terms have a character this model has no piece for; they aren't favored",
+                        terms.len() - trie.spelled,
+                        terms.len()
+                    );
+                }
                 if self.tries.len() >= TRIES {
                     self.tries.remove(0);
                 }
@@ -872,6 +896,7 @@ impl Parakeet {
             next_state: [vec![0.0; state_len], vec![0.0; state_len]],
             steps: 0,
             lookaheads: 0,
+            tokens: Vec::new(),
             boost: boost.map(|(trie, weight)| Cursor::new(trie, &self.pieces, weight)),
         };
         let tokens = tdt::greedy_decode(valid, self.blank, &mut joint)?;
@@ -905,6 +930,8 @@ struct OnnxJoint<'a> {
     steps: usize,
     /// Extra steps run to check a boosted piece (see [`Joint::step`]).
     lookaheads: usize,
+    /// The token logits of the step, kept for boosting (reused, so no allocation per step).
+    tokens: Vec<f32>,
     /// Boosting the dictionary's terms, if on: where the decoding is in their trie.
     boost: Option<Cursor<'a>>,
 }
@@ -912,13 +939,14 @@ struct OnnxJoint<'a> {
 impl OnnxJoint<'_> {
     /// Runs the prediction network and joint on frame `t` after `last_token`, from `state`
     /// (`next` picks [`Self::next_state`] instead of [`Self::state`]). Calls `f` with the
-    /// logits (tokens, then durations) and the new states.
+    /// logits (tokens, then durations); if it says so, keeps the new states in
+    /// [`Self::next_state`] (only worth copying for a step that emits a token).
     fn run<R>(
         &mut self,
         t: usize,
         last_token: usize,
         next: bool,
-        f: impl FnOnce(&[f32], &[f32], &[f32]) -> R,
+        f: impl FnOnce(&[f32]) -> (R, bool),
     ) -> Result<R> {
         let frame = &self.frames[t * self.dim..(t + 1) * self.dim];
         let target = [last_token as i32];
@@ -942,57 +970,56 @@ impl OnnxJoint<'_> {
             )
             .into());
         }
-        let (_, s1) = out["output_states_1"].try_extract_tensor::<f32>()?;
-        let (_, s2) = out["output_states_2"].try_extract_tensor::<f32>()?;
-        Ok(f(logits, s1, s2))
+        let (r, keep) = f(logits);
+        if keep {
+            let (_, s1) = out["output_states_1"].try_extract_tensor::<f32>()?;
+            let (_, s2) = out["output_states_2"].try_extract_tensor::<f32>()?;
+            self.next_state[0].copy_from_slice(s1);
+            self.next_state[1].copy_from_slice(s2);
+        }
+        Ok(r)
     }
 }
 
 impl Joint for OnnxJoint<'_> {
-    fn step(&mut self, t: usize, last_token: usize) -> Result<(usize, usize)> {
+    fn step(&mut self, t: usize, last_token: usize, emitted_here: usize) -> Result<(usize, usize)> {
         self.steps += 1;
         let (vocab_size, blank) = (self.vocab_size, self.blank);
-        let boost = self.boost.take();
-        let mut next_state = std::mem::take(&mut self.next_state);
-        let (best, mut token, duration) = self.run(t, last_token, false, |logits, s1, s2| {
-            let tokens = &logits[..vocab_size];
-            let best = tdt::argmax(tokens);
-            let token = boost.as_ref().map_or(best, |c| c.pick(tokens, best, blank));
-            if token != blank {
-                next_state[0].copy_from_slice(s1);
-                next_state[1].copy_from_slice(s2);
+        let boosting = self.boost.is_some();
+        let mut tokens = std::mem::take(&mut self.tokens);
+        // The states only for a token (a bonus never turns blank into one, or back).
+        let (best, duration) = self.run(t, last_token, false, |logits| {
+            let best = tdt::argmax(&logits[..vocab_size]);
+            if boosting {
+                tokens.clear();
+                tokens.extend_from_slice(&logits[..vocab_size]);
             }
-            (best, token, tdt::argmax(&logits[vocab_size..]))
+            ((best, tdt::argmax(&logits[vocab_size..])), best != blank)
         })?;
-        self.next_state = next_state;
-        self.boost = boost;
-        // A piece the bonus chose that a term must go on from: only if the model, given it,
-        // would go on with the term (the next step's logits; see `boost`). Rare: an extra
-        // decoder run only where the bonus changed the model's choice.
-        let check = (token != best)
-            .then(|| self.boost.clone())
-            .flatten()
-            .filter(|c| c.needs_check(token));
-        if let Some(check) = check {
-            let next = t + tdt::DURATIONS.get(duration).copied().unwrap_or(1);
-            let frames = self.frames.len() / self.dim;
-            let goes_on = next < frames
-                && self.run(next, token, true, |logits, _, _| {
-                    check.continues(token, &logits[..vocab_size], blank)
-                })?;
-            self.lookaheads += 1;
-            if !goes_on {
-                token = best;
+        let token = match self.boost.take() {
+            None => best,
+            Some(mut cursor) => {
+                let at = boost::At {
+                    t,
+                    duration,
+                    emitted_here,
+                    frames: self.frames.len() / self.dim,
+                };
+                // The lookahead (see `boost`): from the state after `last_token`, not yet
+                // accepted, with the candidate piece as the last token.
+                let token = cursor.step(&tokens, best, blank, at, |frame, piece| {
+                    self.lookaheads += 1;
+                    self.run(frame, piece, true, |logits| {
+                        (logits[..vocab_size].to_vec(), false)
+                    })
+                });
+                self.boost = Some(cursor);
+                token?
             }
-        }
-        if token != blank
-            && let Some(cursor) = &mut self.boost
-        {
-            cursor.advance(token);
-        }
+        };
+        self.tokens = tokens;
         Ok((token, duration))
     }
-
     fn accept(&mut self) {
         std::mem::swap(&mut self.state, &mut self.next_state);
     }

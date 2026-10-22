@@ -461,6 +461,10 @@ fn wer_by(clips: &[Clip], categories: &BTreeMap<String, String>) -> Option<Wers>
 
 /// WER by set, then by category, then overall; the replacements; the per-term table.
 fn report(pass: &Pass, categories: &BTreeMap<String, String>, no_rules: bool) {
+    if !no_rules {
+        println!();
+        println!("replacements made: {}", pass.replacements);
+    }
     let Some(w) = wer_by(&pass.clips, categories) else {
         return;
     };
@@ -476,10 +480,6 @@ fn report(pass: &Pass, categories: &BTreeMap<String, String>, no_rules: bool) {
         w.all.2,
         pct(w.all.1, w.all.2)
     );
-    if !no_rules {
-        println!();
-        println!("replacements made: {}", pass.replacements);
-    }
     if !pass.terms.is_empty() {
         println!();
         println!(

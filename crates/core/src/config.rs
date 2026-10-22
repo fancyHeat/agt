@@ -102,7 +102,8 @@ threads = 0
 # Parakeet: how strongly to favor the words in dictionary.toml (its terms, and those of the
 # focused app's profiles) where they sound like what was said. 0 = off; 1 to 4 is the useful
 # range: more fixes more homophones ("Maine" for "main") and also changes more words that
-# only sound a bit like a term. See docs/benchmarks.md.
+# only sound a bit like a term. Each model gets the same effect from a value (Parakeet v3, whose
+# pieces are longer, uses half of it). See docs/benchmarks.md.
 boost = 2.0
 # Where models are downloaded to. "" = the default: %LOCALAPPDATA%\AGT-models on Windows,
 # ~/Library/Application Support/AGT/models on macOS.

@@ -10,12 +10,27 @@ const MAX_SYMBOLS_PER_FRAME: usize = 10;
 
 /// One prediction-network + joint evaluation.
 pub trait Joint {
-    /// Scores encoder frame `t` given the last emitted token (blank at the start).
-    /// Returns `(token, duration index)`, both argmaxes.
-    fn step(&mut self, t: usize, last_token: usize) -> Result<(usize, usize)>;
+    /// Scores encoder frame `t` given the last emitted token (blank at the start), with
+    /// `emitted_here` tokens already emitted on this frame. Returns `(token, duration
+    /// index)`: the argmaxes, unless the joint boosts (see [`crate::boost`]).
+    fn step(&mut self, t: usize, last_token: usize, emitted_here: usize) -> Result<(usize, usize)>;
     /// Keep the prediction-network state produced by the last `step`
     /// (called only when that step emitted a non-blank token).
     fn accept(&mut self);
+}
+
+/// The frame the decoder goes on with after a step on frame `t` that predicted duration index
+/// `dur` and emitted a token (`emitted`, then `emitted_here` on this frame, that one included)
+/// or blank.
+pub fn next_frame(t: usize, dur: usize, emitted: bool, emitted_here: usize) -> usize {
+    let skip = DURATIONS.get(dur).copied().unwrap_or(1);
+    if skip > 0 {
+        t + skip
+    } else if !emitted || emitted_here >= MAX_SYMBOLS_PER_FRAME {
+        t + 1
+    } else {
+        t
+    }
 }
 
 /// Decodes `frames` encoder frames; returns the emitted token ids.
@@ -23,19 +38,16 @@ pub fn greedy_decode(frames: usize, blank: usize, joint: &mut impl Joint) -> Res
     let mut tokens = Vec::new();
     let (mut t, mut emitted_here) = (0, 0);
     while t < frames {
-        let (token, dur) = joint.step(t, tokens.last().copied().unwrap_or(blank))?;
+        let last = tokens.last().copied().unwrap_or(blank);
+        let (token, dur) = joint.step(t, last, emitted_here)?;
         if token != blank {
             joint.accept();
             tokens.push(token);
             emitted_here += 1;
         }
-        let skip = DURATIONS.get(dur).copied().unwrap_or(1);
-        if skip > 0 {
-            t += skip;
-            emitted_here = 0;
-        } else if token == blank || emitted_here >= MAX_SYMBOLS_PER_FRAME {
-            t += 1;
-            emitted_here = 0;
+        let next = next_frame(t, dur, token != blank, emitted_here);
+        if next != t {
+            (t, emitted_here) = (next, 0);
         }
     }
     Ok(tokens)
@@ -75,7 +87,7 @@ mod tests {
     }
 
     impl Joint for Scripted {
-        fn step(&mut self, t: usize, _last: usize) -> Result<(usize, usize)> {
+        fn step(&mut self, t: usize, _last: usize, _here: usize) -> Result<(usize, usize)> {
             let (want_t, tok, dur) = self.script.remove(0);
             assert_eq!(t, want_t, "decoder visited the wrong frame");
             Ok((tok, dur))
@@ -113,6 +125,15 @@ mod tests {
         };
         let out = greedy_decode(2, BLANK, &mut j).unwrap();
         assert_eq!(out.len(), MAX_SYMBOLS_PER_FRAME);
+    }
+
+    #[test]
+    fn next_frame_follows_duration_blank_and_the_cap() {
+        assert_eq!(next_frame(5, 2, true, 1), 7); // duration 2
+        assert_eq!(next_frame(5, 0, true, 1), 5); // a token with duration 0 stays
+        assert_eq!(next_frame(5, 0, false, 0), 6); // blank always advances
+        assert_eq!(next_frame(5, 0, true, MAX_SYMBOLS_PER_FRAME), 6); // the cap
+        assert_eq!(next_frame(5, 99, true, 1), 6); // an unknown duration: one frame
     }
 
     #[test]

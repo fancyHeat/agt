@@ -136,7 +136,8 @@ profiles = ["code"]
 - **Terms** are words and names you use. Parakeet favors them where they sound like what you
   said: with `main` a term, "push to main" comes out as "main", not "Maine". How strongly is
   `boost` in `config.toml`'s `[stt]` (**Settings... → Speech → Favor dictionary words**, an
-  advanced setting): 0 is off, 2 the default. It only picks between spellings the model
+  advanced setting): 0 is off, 2 the default (Parakeet v3 applies half of the value, which in
+  the tests had the same effect as the full value on v2). It only picks between spellings the model
   already considered: it never adds a word where you didn't say one, but a stronger boost
   also turns more words that merely sound like a term into it. Whisper ignores terms.
 - **Profiles** (`[profiles.<name>]`) hold terms that only apply while one of their `apps` has
@@ -156,17 +157,22 @@ and IDEs. If you already have the file, paste this in (and remove the apps you d
 ```toml
 [profiles.code]
 apps = [
-    # Windows: VS Code, Cursor, Zed, Visual Studio, Windows Terminal, consoles, JetBrains
-    "Code.exe", "Cursor.exe", "Zed.exe", "devenv.exe", "WindowsTerminal.exe",
+    # Windows: VS Code (+ Insiders), Cursor, Zed, Visual Studio, Windows Terminal, consoles,
+    # JetBrains IDEs, Android Studio
+    "Code.exe", "Code - Insiders.exe", "Cursor.exe", "Zed.exe", "devenv.exe",
+    "WindowsTerminal.exe",
     "powershell.exe", "pwsh.exe", "cmd.exe", "idea64.exe", "pycharm64.exe",
     "webstorm64.exe", "clion64.exe", "goland64.exe", "rider64.exe", "rustrover64.exe",
-    "phpstorm64.exe",
-    # macOS: VS Code, Cursor, Zed, Terminal, iTerm2, Ghostty, Warp, JetBrains
-    "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "dev.zed.Zed",
+    "phpstorm64.exe", "studio64.exe",
+    # macOS: VS Code (+ Insiders), Cursor, Zed, Terminal, iTerm2, Ghostty, Warp, JetBrains IDEs
+    # (Community editions too), Android Studio
+    "com.microsoft.VSCode", "com.microsoft.VSCodeInsiders", "com.todesktop.230313mzl4w4u92",
+    "dev.zed.Zed",
     "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
     "dev.warp.Warp-Stable", "com.jetbrains.intellij", "com.jetbrains.pycharm",
     "com.jetbrains.WebStorm", "com.jetbrains.CLion", "com.jetbrains.goland",
     "com.jetbrains.rider", "com.jetbrains.rustrover", "com.jetbrains.PhpStorm",
+    "com.jetbrains.intellij.ce", "com.jetbrains.pycharm.ce", "com.google.android.studio",
 ]
 terms = ["main", "rebase", "kubectl", "PR"]
 ```
@@ -183,6 +189,12 @@ FROM dictations ORDER BY started_at DESC LIMIT 5;
 With `log_level = "debug"`, the `events` table also says at each key-down which app had focus
 and which profiles it matched. A console window (PowerShell or cmd in the classic console)
 shows as the shell (`powershell.exe`); with Windows Terminal it's `WindowsTerminal.exe`.
+Store apps (Settings, Calculator, Mail and other UWP apps) all show as
+`ApplicationFrameHost.exe`: putting that in a profile would include every one of them.
+
+A term needs every character to be in the speech model's vocabulary to be favored: one with
+characters it doesn't have (`C++`, `#general`, most non-Latin scripts) is skipped, and AGT
+logs how many terms were (never which).
 
 AGT applies the file as soon as you save it, without restarting. If it has an error, AGT says
 so in its tray menu and keeps using the last version that worked since it started; if the

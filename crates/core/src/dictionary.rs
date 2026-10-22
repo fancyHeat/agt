@@ -94,17 +94,22 @@ terms = []
 #
 # [profiles.code]
 # apps = [
-#     # Windows: VS Code, Cursor, Zed, Visual Studio, Windows Terminal, consoles, JetBrains
-#     "Code.exe", "Cursor.exe", "Zed.exe", "devenv.exe", "WindowsTerminal.exe",
+#     # Windows: VS Code (+ Insiders), Cursor, Zed, Visual Studio, Windows Terminal, consoles,
+#     # JetBrains IDEs, Android Studio
+#     "Code.exe", "Code - Insiders.exe", "Cursor.exe", "Zed.exe", "devenv.exe",
+#     "WindowsTerminal.exe",
 #     "powershell.exe", "pwsh.exe", "cmd.exe", "idea64.exe", "pycharm64.exe",
 #     "webstorm64.exe", "clion64.exe", "goland64.exe", "rider64.exe", "rustrover64.exe",
-#     "phpstorm64.exe",
-#     # macOS: VS Code, Cursor, Zed, Terminal, iTerm2, Ghostty, Warp, JetBrains
-#     "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "dev.zed.Zed",
+#     "phpstorm64.exe", "studio64.exe",
+#     # macOS: VS Code (+ Insiders), Cursor, Zed, Terminal, iTerm2, Ghostty, Warp, JetBrains IDEs
+#     # (Community editions too), Android Studio
+#     "com.microsoft.VSCode", "com.microsoft.VSCodeInsiders", "com.todesktop.230313mzl4w4u92",
+#     "dev.zed.Zed",
 #     "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
 #     "dev.warp.Warp-Stable", "com.jetbrains.intellij", "com.jetbrains.pycharm",
 #     "com.jetbrains.WebStorm", "com.jetbrains.CLion", "com.jetbrains.goland",
 #     "com.jetbrains.rider", "com.jetbrains.rustrover", "com.jetbrains.PhpStorm",
+#     "com.jetbrains.intellij.ce", "com.jetbrains.pycharm.ce", "com.google.android.studio",
 # ]
 # terms = ["main", "rebase", "kubectl", "PR"]
 
@@ -199,7 +204,7 @@ impl std::error::Error for DictionaryError {}
 #[serde(default, deny_unknown_fields)]
 struct File {
     terms: Vec<String>,
-    profiles: BTreeMap<String, ProfileEntry>,
+    profiles: BTreeMap<toml::Spanned<String>, ProfileEntry>,
     replace: Vec<Entry>,
 }
 
@@ -351,6 +356,13 @@ impl Dictionary {
         if file.profiles.len() > MAX_PROFILES {
             return Err(error(&format!("more than {MAX_PROFILES} `profiles`"), None));
         }
+        // agt.db joins a dictation's profile names with commas.
+        if let Some(name) = file.profiles.keys().find(|n| n.get_ref().contains(',')) {
+            return Err(error(
+                "a profile name can't have a comma in it",
+                Some(name.span()),
+            ));
+        }
         let terms: Arc<[String]> = cleaned(file.terms).into();
         let mut apps: HashMap<String, u64> = HashMap::new();
         let profiles: Vec<Profile> = file
@@ -364,7 +376,7 @@ impl Dictionary {
                     *apps.entry(app.to_lowercase()).or_default() |= 1 << i;
                 }
                 Profile {
-                    name,
+                    name: name.into_inner(),
                     apps: app_ids,
                     all_terms: merged([&terms[..], &own[..]]),
                     terms: own,
@@ -880,6 +892,7 @@ to = "AGT"
                 "`profiles` is empty",
             ),
             ("[profiles.code]\nsecretword = 1\n", 2, "unknown field"),
+            ("terms = []\n[profiles.\"secret,word\"]\n", 2, "comma"),
             (
                 "[profiles.code]\napps = \"secretword\"\n",
                 2,

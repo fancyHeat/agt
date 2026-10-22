@@ -544,14 +544,20 @@ fn process_name(hwnd: HWND) -> Option<String> {
     if process.is_null() {
         return None;
     }
-    let mut buf = [0u16; 260];
-    let mut len = buf.len() as u32;
-    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
-    unsafe { CloseHandle(process) };
-    if ok == 0 {
-        return None;
+    // MAX_PATH is enough for nearly every program; a longer path (long-path-aware systems)
+    // fails with ERROR_INSUFFICIENT_BUFFER: once more with the longest path Windows has.
+    let mut buf = vec![0u16; 260];
+    let mut path = None;
+    for size in [260, 32_768] {
+        buf.resize(size, 0);
+        let mut len = size as u32;
+        if unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) } != 0 {
+            path = Some(String::from_utf16_lossy(&buf[..len as usize]));
+            break;
+        }
     }
-    let path = String::from_utf16_lossy(buf.get(..len as usize)?);
+    unsafe { CloseHandle(process) };
+    let path = path?;
     path.rsplit('\\').next().map(str::to_owned)
 }
 

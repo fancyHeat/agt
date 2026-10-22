@@ -1109,63 +1109,90 @@ main"; at 6, "Bangor Maine" → "Bangor main" too. With `--app notepad.exe` (no 
 Satine" / "Vixatine" → "Vexatine" (closer to `Vexadyne`); at 6, partial `Quillmate`s appear
 ("cubicuttle" → "Quicuttle").
 
-**Parakeet v3** (CPU, code app), whose 8192 pieces hold many whole words (`▁Main`,
-`▁Maine`): boosting is more forceful, because a whole-word piece needs no lookahead.
+**Parakeet v3** (CPU, code app). v3's 8192 pieces hold longer word parts than v2's: `Main` is
+`▁Ma in` and "Maine" `▁Ma ine`. At a sentence start, where `Main` is boosted, the model
+emits the shared `▁Ma` anyway, the bonus puts `in` ahead of `ine`, and a piece that finishes a
+term is never checked, so "Maine and Vermont" can become "Main and Vermont". (On v2 "Maine" is
+`▁M ain e`, `Main` is a prefix of it, and the model's `e` follows anyway.) First measured
+with the weight as given:
 
-| boost | WER `code` | WER `real` | terms: hits / misses / false ins | "Maine" kept (of 10) |
+| boost (as given) | WER `code` | WER `real` | terms: hits / misses / false ins | "Maine" kept (of 10) |
 |---|---|---|---|---|
 | 0 | 10.28 | 3.18 | 46/18/0 | 10 |
 | 1 | 8.51 | 3.18 | 50/14/0 | 10 |
 | 2 | 8.51 | 3.64 | 51/13/1 | 9 |
 | 3 | 8.16 | 5.00 | 52/12/3 | 6 |
 
-At 2, "Maine and Vermont" at a sentence start became "Main" (the capitalized form is boosted
-there) and "a parakeet" became "a Parakeet"; with v3, 1 is the safer weight.
+1 does on v3 what 2 does on v2, and 2 costs real words, so the engine scales the setting per
+model: v2 × 1, v3 × 0.5. With the scale (the setting as a user would write it):
+
+| `stt.boost` | WER `code` | WER `real` | terms: hits / misses / false ins | "Maine" kept (of 10) | words changed |
+|---|---|---|---|---|---|
+| 0 | 10.28 | 3.18 | 46/18/0 | 10 | 0 |
+| 1 | 9.93 | 3.18 | 48/16/0 | 10 | 2 |
+| **2** | **8.51** | **3.18** | **50/14/0** | **10** | **6** |
+| 3 | 8.51 | 3.18 | 50/14/0 | 10 | 6 |
+| 4 | 8.51 | 3.64 | 51/13/1 | 9 | 9 |
+
+With a non-code app nothing in the `real` set changes at 2 or 4 on v3 either. A check that a
+finishing piece's word doesn't go on (no `e` after `▁Ma in`) was tried: it changed nothing on
+either model, because given `▁Ma in` the model goes on with the next word.
 
 ### Regression: the stock eval set
 
 The 78 clips of the eval set (no dictionary words in them, but plenty of everyday words that
-are also dev terms) with `scripts/dev_terms_dictionary.toml`: 50 dev terms (`main`, `cargo`,
-`trait`, `async`, `await`, `Rust`, `PR`, `AGT`, `kubectl`, ...), all global, so boosted in
-every clip: the worst case.
+are also dev terms) with `scripts/dev_terms_dictionary.toml`: 58 dev terms (`main`, `cargo`,
+`trait`, `async`, `await`, `Rust`, `PR`, `AGT`, `kubectl`, ..., and `1Password`, `2FA`, `3D`,
+`.env`, `.NET`, `Xcode`, `Zod`, `Qdrant`, which v2 spells with the bare `▁` piece), all
+global, so boosted in every clip: the worst case.
 
-| boost | WER all (CPU / DirectML) | read | real | false ins | words changed (CPU / DirectML) |
-|---|---|---|---|---|---|
-| 0 | 4.09 / 3.99 | 2.23 / 2.09 | 5.19 / 5.10 | 0 | 0 / 0 |
-| 1 | 4.09 / 3.99 | 2.23 / 2.09 | 5.19 / 5.10 | 0 | 0 / 1 |
-| **2** | **4.09 / 3.99** | **2.23 / 2.09** | **5.19 / 5.10** | **0** | **2 / 2** |
-| 3 | 4.19 / 3.99 | 2.23 / 2.09 | 5.35 / 5.10 | 0 | 6 / 2 |
-| 4 | 4.30 / 4.09 | 2.37 / 2.23 | 5.43 / 5.19 | 0 | 9 / 4 |
-| 6 | 4.35 / 4.40 | 2.51 / 2.51 | 5.43 / 5.51 | 0 / 1 | 18 / 20 |
+| boost | WER all (CPU / DirectML) | read | real | words changed (CPU / DirectML) |
+|---|---|---|---|---|
+| 0 | 4.09 / 3.99 | 2.23 / 2.09 | 5.19 / 5.10 | 0 / 0 |
+| **2** | **4.09 / 3.99** | **2.23 / 2.09** | **5.19 / 5.10** | **2 / 2** |
+| 4 | 4.30 / 4.09 | 2.37 / 2.23 | 5.43 / 5.19 | 9 / 4 |
 
-At 2 the WER doesn't move on either device; the two words that change are capitals at the start
-of a clip ("'Cause" → "Cause", "positively" → "Positively": a term's capitalized first piece
-whose next piece fit, the one-step check's limit). From 3 on, the
-greedy partial matches show up: "That thanks very much" → "Let's go" (CPU, 3), "people" →
-"Poly", "polar opposite" → "Parliam Opposite" (4). The 12 long dictations (`eval-data/long`,
-35 min, DirectML): WER 10.71 at 0 and 2 (one word changed), 10.79 at 3, 10.95 at 4. Parakeet
-v3 on the 78 clips (CPU): 4.61 at 0, 1, 2 and 3 (one word changed at 3).
+(Without the last 8 terms, the first measurement: the same WER at 0, 2 and 4, and 3 → 4.19 /
+3.99, 6 → 4.35 / 4.40.) No term is inserted at any of these weights. At 2 the WER doesn't move on
+either device; the two words that change are capitals at the start of a clip ("'Cause" →
+"Cause", "positively" → "Positively": a term's capitalized first piece whose next piece fit,
+the one-step check's limit). At 4 the greedy partial matches show up: "That thanks very much"
+→ "Let's go", "people" → "Poly", "polar opposite" → "Parliam Opposite". The 12 long dictations
+(`eval-data/long`, 35 min, DirectML): WER 10.71 at 0 and 2 (one word changed), 10.95 at 4.
+Parakeet v3 on the 78 clips (CPU): 4.61 at 0, 2 and 4, no word changed.
+
+**The bare `▁` piece.** The first version boosted the bare `▁` at every word start for a term
+spelled with it, so the one-step check passed whenever a number followed: with `terms =
+["1Password"]` alone, "the last ten to fifteen years" (`earn-medium-01`) became "the last 10
+to 15 years" at 2 and 4 (2 words changed on the 78 clips at 2 and 4). The bare piece now never
+gets the bonus at a word start (a match still starts when the model writes it): 0 words
+changed, "ten to fifteen" stays. With the 58 terms the first version happened not to trip
+over it (other first pieces won those word starts), which is why the list alone didn't show it.
 
 ### Speed
 
 The bonus is one pass over the pieces that can continue or start a term (44 first pieces for
-the 50 terms above) per decoder step: about 65 ns, against the ~400 µs the decoder step itself
-takes on the CPU. The lookahead step runs only where the bonus changed the model's choice: 54
-times in 13,534 steps over the 78 clips (×3 runs) with the 50 terms. Decode time per clip
-(median of 234 calls, CPU, two runs each): 20.9 and 19.5 ms without terms, 20.5 and 18.0 ms
-with 50: no difference beyond noise; whole transcription 32.1 / 31.9 s vs 32.5 / 31.2 s. The
-trie is built once per term list (0.29 ms for 50 terms) and kept. Resolving the dictionary
-for the focused app at key-down (`agt_platform::foreground_app` and the profile lookup) took
-0.14-0.16 ms in the app; `foreground_app` alone is ~35 µs on Windows, ~25 µs on an M4.
+the first 50 terms above) per decoder step: about 65 ns, against the ~400 µs the decoder step
+itself takes on the CPU. When boosting, the step's token logits are copied to a reused buffer
+(1025 floats); the decoder's new states are copied only for a step that emits a token. The
+lookahead step runs only where the bonus changed the model's choice: 54 times in 13,534
+steps over the 78 clips (×3 runs). Decode time per clip (median of 234 calls, CPU, two runs
+each): without terms 20.9 and 19.5 ms, with 50 terms 20.5 and 18.0 ms; again with the final
+build and the 58 terms, 22.4 / 25.4 ms vs 26.3 / 23.3 ms (the machine was busier): no
+difference beyond run-to-run noise either time. The trie is built once per term list (0.29
+ms for 50 terms) and kept. Resolving the dictionary for the focused app at key-down
+(`agt_platform::foreground_app` and the profile lookup) took 0.14-0.16 ms in the app;
+`foreground_app` alone is ~35 µs on Windows, ~25 µs on an M4.
 
 ### The default: 2
 
 On v2 (the default model), 2 fixes every `main` in the homophone set on both devices, leaves
 every real word alone there up to 4, and changes no WER on the stock set (78 clips and the 12
-long ones) with 50 global terms. 3 fixes a little more on the synthetic set but starts to
+long ones) with 58 global terms. 3 fixes a little more on the synthetic set but starts to
 cost real speech (+0.1 WER on CPU, the partial matches above); 2 keeps a factor of two from
 where synthetic real words started to go (4-6), for real speech that is less clean than TTS.
-v3 users may prefer 1 (see above).
+On v3 the same setting gives half the weight (see above), which keeps every real word there
+too.
 
 ### Without the one-step check
 
