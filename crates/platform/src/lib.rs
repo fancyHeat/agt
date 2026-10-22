@@ -42,18 +42,18 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// What the hotkey thread reports. Delivered from the hook thread: handlers must not block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    /// The hotkey (every key of a chord) went down (auto-repeat is filtered out). Can also
-    /// arrive while a hold is still believed active, if its release was never seen (e.g. it
-    /// happened on the secure desktop): the receiver should then drop the stale hold and
-    /// start over.
-    Down(Instant),
-    /// A hotkey key was released after a `Down` (and no `Cancel`).
+    /// Hotkey `.1` (its index in [`Hotkeys::list`]) went down, every key of it (auto-repeat
+    /// is filtered out). Only one hotkey is held at a time. Can also arrive while a hold is
+    /// still believed active, if its release was never seen (e.g. it happened on the secure
+    /// desktop): the receiver should then drop the stale hold and start over.
+    Down(Instant, usize),
+    /// A key of the held hotkey was released after its `Down` (and no `Cancel`).
     Up(Instant),
     /// Another key was pressed while holding the hotkey (Esc, or a shortcut such as Ctrl+C),
     /// or the hold turned out to be stale (a chord key was pressed again long after its
     /// release was missed): the hold is not a dictation. No `Up` follows.
     Cancel,
-    /// Esc (no modifier) was pressed while the hotkey wasn't held (with it held, that's a
+    /// Esc (no modifier) was pressed while no hotkey was held (with one held, that's a
     /// `Cancel`) and [`arm_escape`] was on: ends a hands-free recording. The focused app
     /// doesn't see that Esc.
     Escape,
@@ -172,7 +172,9 @@ pub const MAX_CHORD: usize = 4;
 
 /// A configured hotkey (see [`Hotkeys`]): one key, or a chord of up to [`MAX_CHORD`] keys
 /// (e.g. `LeftCtrl+LeftWin`) that must all be held together. A dictation starts once every
-/// key is down (in any order) and ends as soon as any of them is released.
+/// key is down and ends as soon as any of them is released. A hotkey made only of modifiers
+/// starts in whatever order they go down; a combo with a key that isn't a modifier
+/// (`LeftShift+Space`) needs exactly its modifiers down first, then that key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hotkey {
     keys: Vec<Key>,
@@ -538,8 +540,9 @@ const STALE_GAP_MS: u32 = 1500;
 ///   release was missed (e.g. on the secure desktop): the stale state is dropped.
 ///
 /// The caller filters out modifiers that aren't part of the chord (they neither cancel nor
-/// disarm: they only matter together with a non-modifier key, which does). Platform-
-/// independent so it can be unit-tested.
+/// disarm: they only matter together with a non-modifier key, which does). Its `Down`s say
+/// hotkey 0: [`Detector`](hotkeys::Detector), which runs one per hotkey, puts in the right
+/// one. Platform-independent so it can be unit-tested.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct HoldDetector {
@@ -628,7 +631,7 @@ impl HoldDetector {
             self.down |= bit;
             if self.state == Hold::Idle && self.complete() {
                 self.state = Hold::Held;
-                return Some(HotkeyEvent::Down(now));
+                return Some(HotkeyEvent::Down(now, 0));
             }
             return None;
         }
@@ -646,7 +649,7 @@ impl HoldDetector {
         self.state = Hold::Idle;
         if self.complete() {
             self.state = Hold::Held;
-            Some(HotkeyEvent::Down(now))
+            Some(HotkeyEvent::Down(now, 0))
         } else {
             was_held.then_some(HotkeyEvent::Cancel)
         }
@@ -661,7 +664,8 @@ impl HoldDetector {
         self.down & (1 << i) != 0 && self.state != Hold::Idle
     }
 
-    /// What the hooks call for every key event: [`Self::on_key`], plus Esc. `esc`: the key is
+    /// What the hooks call for every key event: [`Self::on_key`], plus Esc (for one hotkey;
+    /// [`Detector::on_key`](hotkeys::Detector::on_key) does it for several). `esc`: the key is
     /// Esc; `armed`: [`arm_escape`] is on and no modifier is held. An armed Esc press with no
     /// chord key down is [`HotkeyEvent::Escape`] (with the hotkey held, Esc is a `Cancel`).
     /// Also returns whether to keep the key from the focused app: an Esc reported as `Escape`,
@@ -685,11 +689,22 @@ impl HoldDetector {
         if self.escape_down {
             return (ev, true); // its auto-repeat
         }
-        if ev.is_none() && armed && self.state == Hold::Idle && self.down == 0 {
+        if ev.is_none() && armed && self.idle() {
             self.escape_down = true;
             return (Some(HotkeyEvent::Escape), true);
         }
         (ev, false)
+    }
+
+    /// Whether no chord key is down (so there's no hold, nor a wait for one to end).
+    pub(crate) fn idle(&self) -> bool {
+        self.state == Hold::Idle && self.down == 0
+    }
+
+    /// Drops the hold that just started: another hotkey holds. Like a hold that ended, it
+    /// waits until every chord key is released.
+    pub(crate) fn rearm(&mut self) {
+        self.state = Hold::Rearm;
     }
 
     /// Forget any hold in progress.
@@ -938,13 +953,13 @@ mod tests {
     fn hold_ignores_repeat_and_reports_release() {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
-        assert_eq!(d.on_key(HOT, true, 1000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 1000, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(HOT, true, 1500, t), None); // first auto-repeat
         assert_eq!(d.on_key(HOT, true, 1533, t), None);
         assert_eq!(d.on_key(OTHER, false, 1600, t), None); // release of some other key
         assert_eq!(d.on_key(HOT, false, 9000, t), Some(HotkeyEvent::Up(t)));
         assert_eq!(d.on_key(HOT, false, 9001, t), None);
-        assert_eq!(d.on_key(HOT, true, 9100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 9100, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -952,12 +967,12 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
         assert_eq!(d.on_key(OTHER, true, 0, t), None); // typing while idle
-        assert_eq!(d.on_key(HOT, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(OTHER, true, 20, t), Some(HotkeyEvent::Cancel)); // e.g. Esc
         assert_eq!(d.on_key(OTHER, true, 30, t), None);
         assert_eq!(d.on_key(HOT, false, 40, t), None);
         // Next hold works normally.
-        assert_eq!(d.on_key(HOT, true, 50, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 50, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -978,7 +993,7 @@ mod tests {
         assert_eq!(esc(&mut d, false, true, 12), (None, true));
         assert_eq!(esc(&mut d, false, false, 15), (None, true));
         // Esc while the hotkey is held is the hold's cancel, not an Escape too.
-        assert_eq!(d.on_key(HOT, true, 20, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 20, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(
             esc(&mut d, true, true, 30),
             (Some(HotkeyEvent::Cancel), false)
@@ -1009,15 +1024,18 @@ mod tests {
     fn missed_release_does_not_turn_next_press_into_repeat() {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
-        assert_eq!(d.on_key(HOT, true, 1_000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 1_000, t), Some(HotkeyEvent::Down(t, 0)));
         // The release happened on the secure desktop; the hook never saw it. Much later:
-        assert_eq!(d.on_key(HOT, true, 60_000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(HOT, true, 60_000, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
         assert_eq!(d.on_key(HOT, false, 61_000, t), Some(HotkeyEvent::Up(t)));
         // Same after a cancelled hold whose release was missed, across tick wrap-around.
         let mut d = HoldDetector::new(1);
         d.on_key(HOT, true, u32::MAX - 10, t);
         d.on_key(OTHER, true, u32::MAX - 5, t);
-        assert_eq!(d.on_key(HOT, true, 5_000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 5_000, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -1027,7 +1045,7 @@ mod tests {
         d.on_key(HOT, true, 0, t);
         d.reset();
         assert_eq!(d.on_key(HOT, false, 100, t), None);
-        assert_eq!(d.on_key(HOT, true, 200, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 200, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     // Chords: key 0 = Ctrl, key 1 = Win.
@@ -1043,7 +1061,10 @@ mod tests {
             assert_eq!(d.on_key(first, true, 0, t0), None);
             assert_eq!(d.on_key(first, true, 500, t0), None); // auto-repeat
             // The hold (and the short-hold threshold) starts when the chord completes.
-            assert_eq!(d.on_key(second, true, 600, t1), Some(HotkeyEvent::Down(t1)));
+            assert_eq!(
+                d.on_key(second, true, 600, t1),
+                Some(HotkeyEvent::Down(t1, 0))
+            );
             assert_eq!(d.on_key(second, true, 1100, t1), None); // auto-repeat
             assert_eq!(d.on_key(first, true, 1150, t1), None); // late repeat of the first
             // Releasing either key ends it.
@@ -1051,7 +1072,10 @@ mod tests {
             assert_eq!(d.on_key(second, false, 2010, t1), None);
             // Ready again.
             assert_eq!(d.on_key(second, true, 3000, t0), None);
-            assert_eq!(d.on_key(first, true, 3010, t1), Some(HotkeyEvent::Down(t1)));
+            assert_eq!(
+                d.on_key(first, true, 3010, t1),
+                Some(HotkeyEvent::Down(t1, 0))
+            );
             assert_eq!(d.on_key(second, false, 3500, t1), Some(HotkeyEvent::Up(t1)));
         }
     }
@@ -1062,7 +1086,7 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(WIN, false, 40, t), Some(HotkeyEvent::Up(t)));
     }
 
@@ -1071,7 +1095,7 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(WIN, false, 1000, t), Some(HotkeyEvent::Up(t)));
         // Ctrl still held; Win again: no new dictation...
         assert_eq!(d.on_key(WIN, true, 1100, t), None);
@@ -1079,7 +1103,7 @@ mod tests {
         // ...until everything was released.
         assert_eq!(d.on_key(CTRL, false, 1300, t), None);
         d.on_key(WIN, true, 1400, t);
-        assert_eq!(d.on_key(CTRL, true, 1410, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(CTRL, true, 1410, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -1088,7 +1112,7 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(OTHER, true, 50, t), Some(HotkeyEvent::Cancel));
         assert_eq!(d.on_key(OTHER, false, 60, t), None);
         assert_eq!(d.on_key(OTHER, true, 70, t), None); // again: Ctrl+Win+Right twice
@@ -1097,7 +1121,7 @@ mod tests {
         assert_eq!(d.on_key(WIN, false, 95, t), None);
         assert_eq!(d.on_key(CTRL, false, 100, t), None);
         d.on_key(CTRL, true, 200, t);
-        assert_eq!(d.on_key(WIN, true, 210, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 210, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -1115,7 +1139,7 @@ mod tests {
         // Typing with nothing held doesn't disarm anything.
         assert_eq!(d.on_key(OTHER, true, 80, t), None);
         d.on_key(WIN, true, 90, t);
-        assert_eq!(d.on_key(CTRL, true, 100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(CTRL, true, 100, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -1127,7 +1151,10 @@ mod tests {
         assert_eq!(d.on_key(OTHER, true, 10, t), None); // L
         // Back at the desktop a minute later: Ctrl, then Win.
         assert_eq!(d.on_key(CTRL, true, 60_000, t), None);
-        assert_eq!(d.on_key(WIN, true, 60_100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(WIN, true, 60_100, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
         assert_eq!(d.on_key(CTRL, false, 61_000, t), Some(HotkeyEvent::Up(t)));
         assert_eq!(d.on_key(WIN, false, 61_010, t), None);
 
@@ -1135,9 +1162,12 @@ mod tests {
         // stale hold (Cancel), the other key's press then starts a new one.
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(CTRL, true, 30_000, t), Some(HotkeyEvent::Cancel));
-        assert_eq!(d.on_key(WIN, true, 30_050, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(WIN, true, 30_050, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
 
         // Only one release missed (Win), Ctrl's was seen: re-pressing completes the chord.
         let mut d = HoldDetector::new(2);
@@ -1146,7 +1176,7 @@ mod tests {
         assert_eq!(d.on_key(OTHER, true, 20, t), Some(HotkeyEvent::Cancel));
         assert_eq!(d.on_key(CTRL, false, 5_000, t), None);
         assert_eq!(d.on_key(CTRL, true, 9_000, t), None); // Win still believed down
-        assert_eq!(d.on_key(WIN, true, 9_100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 9_100, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -1155,14 +1185,20 @@ mod tests {
         let mut d = HoldDetector::new(3);
         assert_eq!(d.on_key(Some(2), true, 0, t), None);
         assert_eq!(d.on_key(Some(0), true, 10, t), None);
-        assert_eq!(d.on_key(Some(1), true, 20, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(Some(1), true, 20, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
         assert_eq!(d.on_key(Some(0), false, 500, t), Some(HotkeyEvent::Up(t)));
         assert_eq!(d.on_key(Some(0), true, 600, t), None);
         d.reset();
         // After a reset (hook re-installed), keys must be pressed again.
         assert_eq!(d.on_key(Some(0), true, 700, t), None);
         assert_eq!(d.on_key(Some(1), true, 710, t), None);
-        assert_eq!(d.on_key(Some(2), true, 720, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(Some(2), true, 720, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
     }
 
     #[test]
@@ -1181,7 +1217,7 @@ mod tests {
         // The chord held: Win repeats are in the chord.
         d.on_key(CTRL, true, 1000, t);
         assert!(!d.repeat_in_chord(1)); // the press completing the chord isn't a repeat
-        assert_eq!(d.on_key(WIN, true, 1010, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 1010, t), Some(HotkeyEvent::Down(t, 0)));
         assert!(d.repeat_in_chord(1));
         // Being released: Ctrl let go first, Win lingers and repeats.
         assert_eq!(d.on_key(CTRL, false, 2000, t), Some(HotkeyEvent::Up(t)));

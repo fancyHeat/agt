@@ -986,7 +986,7 @@ impl AudioThread {
                 }
             };
             match ev {
-                HotkeyEvent::Down(t) => {
+                HotkeyEvent::Down(t, _) => {
                     *self.key_down.lock().unwrap() = Some(t);
                     if matches!(latch, Latch::On | Latch::Ending) && holding.is_some() {
                         // Ends the hands-free recording on its release, like a hold: every
@@ -1150,7 +1150,7 @@ impl AudioThread {
             self.key
         );
         self.reset.reset();
-        Some((HotkeyEvent::Down(Instant::now()), true))
+        Some((HotkeyEvent::Down(Instant::now(), 0), true))
     }
 
     /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded

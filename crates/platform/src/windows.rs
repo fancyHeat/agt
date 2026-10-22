@@ -329,7 +329,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     );
                     swallow |= swallow_esc;
                     if let Some(ev) = ev {
-                        if let (HotkeyEvent::Down(_), Some(mask)) = (ev, &s.mask) {
+                        if let (HotkeyEvent::Down(..), Some(mask)) = (ev, &s.mask) {
                             // Covers both a dictation and a hold later cancelled by another
                             // key (Ctrl+Win+D, ...). Non-blocking.
                             s.masked_at_paste = crate::paste_count();
@@ -1053,7 +1053,7 @@ mod tests {
         ];
         let got = run("LeftCtrl+LeftWin", &real);
         assert!(
-            matches!(got[..], [HotkeyEvent::Down(_), HotkeyEvent::Up(_)]),
+            matches!(got[..], [HotkeyEvent::Down(..), HotkeyEvent::Up(_)]),
             "{got:?}"
         );
     }
@@ -1072,14 +1072,14 @@ mod tests {
         ];
         let got = run("LeftCtrl+LeftWin", &events);
         assert!(
-            matches!(got[..], [HotkeyEvent::Down(_), HotkeyEvent::Up(_)]),
+            matches!(got[..], [HotkeyEvent::Down(..), HotkeyEvent::Up(_)]),
             "{got:?}"
         );
         // Ctrl+Win+Right (switch virtual desktop) cancels.
         let events = [(0xA2, 0x1D, true, 0), LWIN_DOWN, (0x27, 0x4D, true, 1100)];
         let got = run("LeftCtrl+LeftWin", &events);
         assert!(
-            matches!(got[..], [HotkeyEvent::Down(_), HotkeyEvent::Cancel]),
+            matches!(got[..], [HotkeyEvent::Down(..), HotkeyEvent::Cancel]),
             "{got:?}"
         );
     }
