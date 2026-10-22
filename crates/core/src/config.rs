@@ -40,16 +40,27 @@ log_level = "info"
 launch_at_login = true
 
 [hotkey]
-# Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
-# LeftShift (still work normally in apps), or F13-F24 (e.g. a remapped mouse button; AGT
-# takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
-# Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (the default on
-# Windows); LeftWin/RightWin only work in a chord with Ctrl or Shift. A chord starts once
-# all its keys are down and ends when any of them is released.
-# macOS keys: Fn (the Globe key, the default; on its own, tapping it no longer also opens
-# the emoji picker), RightOption, RightCommand, or F13-F20.
-# With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
-# keys are up: if you already hold the hotkey for the next dictation, the previous text
+# Hold the hotkey to dictate, let go to paste. Nearly any key can be one (not Esc, nor Caps
+# Lock on macOS), by its name in one word: F13, A, Space, Slash, LeftShift, RightOption or
+# LeftCommand (macOS), RightCtrl, RightAlt or LeftWin (Windows)... Pressing a key that isn't a
+# modifier while holding the hotkey (e.g. Esc) cancels.
+# Or a combo of up to 4 keys held together, at most one of them not a modifier, e.g.
+# "LeftCtrl+LeftWin" (the default on Windows) or "LeftControl+Space" (macOS). A combo of only
+# modifiers starts once all are down, in any order. With a key that isn't a modifier, it
+# starts only when exactly its modifiers are held, pressed before that key, and only then is
+# that key kept from the app. A combo ends when any of its keys is released.
+# Several hotkeys can be listed, and any of them dictates: key = ["Fn", "LeftControl+Space"]
+# on macOS, or ["LeftCtrl+LeftWin", "F13"] on Windows. They can share keys, but one can't
+# contain another (LeftShift and LeftShift+Space).
+# Alone, a key that isn't a modifier is taken over: it won't type in other apps while AGT runs
+# (F13-F24 cost nothing: they're usually spare mouse or keyboard buttons). Alone, a modifier
+# you use in shortcuts and typing (either Shift; macOS: either Control, LeftOption,
+# LeftCommand; Windows: LeftCtrl, LeftAlt, either Win) starts AGT listening each time you
+# hold it.
+# macOS: Fn is the Globe key (the default; as a hotkey on its own, tapping it no longer also
+# opens the emoji picker).
+# Windows: with LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once
+# those keys are up: if you already hold the hotkey for the next dictation, the previous text
 # lands when you release it (after 10 s it's pasted anyway).
 key = ""#,
     default_hotkey!(),
@@ -274,8 +285,10 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeyConfig {
-    /// Key name or `+`-separated chord; parsed (and rejected if invalid) by `agt-platform`.
-    pub key: String,
+    /// `key`: one hotkey, or a list of them. Each is a key name or a `+`-separated chord;
+    /// parsed (and rejected if invalid) by `agt-platform`.
+    #[serde(rename = "key", deserialize_with = "one_or_more")]
+    pub keys: Vec<String>,
     pub min_hold_ms: u64,
     /// Max gap between a tap's release and the next press for a double tap; 0 = off.
     pub double_tap_ms: u64,
@@ -664,11 +677,39 @@ impl Default for Config {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            key: DEFAULT_HOTKEY.into(),
+            keys: vec![DEFAULT_HOTKEY.into()],
             min_hold_ms: 150,
             double_tap_ms: 400,
         }
     }
+}
+
+/// `key = "Fn"` or `key = ["Fn", "LeftControl+Space"]`.
+fn one_or_more<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    struct Keys;
+    impl<'de> serde::de::Visitor<'de> for Keys {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a hotkey or a list of hotkeys")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_owned()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut keys = Vec::new();
+            while let Some(key) = seq.next_element()? {
+                keys.push(key);
+            }
+            Ok(keys)
+        }
+    }
+    d.deserialize_any(Keys)
 }
 
 impl Default for SttConfig {
@@ -911,8 +952,21 @@ impl Config {
     }
 }
 
-/// A value to write with [`set`] (a string, integer or bool).
+/// A value to write with [`set`] (a string, integer, bool or list).
 pub use toml_edit::Value as SettingValue;
+
+/// `hotkey.key` as [`set`] writes it: a string for one hotkey (a single-key file looks as it
+/// always has), a list for more.
+pub fn hotkey_value(keys: &[String]) -> SettingValue {
+    match keys {
+        [one] => one.as_str().into(),
+        _ => keys
+            .iter()
+            .map(String::as_str)
+            .collect::<toml_edit::Array>()
+            .into(),
+    }
+}
 
 /// A setting's place in the file, e.g. `&["polish", "s1-mini", "styling"]`.
 pub type SettingPath = &'static [&'static str];
@@ -1166,7 +1220,8 @@ mod tests {
             err.contains("[polish]") && !err.contains("something-unknown"),
             "{err}"
         );
-        assert_eq!((c.hotkey.key.as_str(), c.hotkey.min_hold_ms), ("F13", 300));
+        assert_eq!(c.hotkey.keys, ["F13"]);
+        assert_eq!(c.hotkey.min_hold_ms, 300);
         assert_eq!(c.stt.device, Device::Cpu);
         assert_eq!(c.overlay.position, OverlayPosition::Top);
         assert!(!c.update.enabled);
@@ -1203,6 +1258,33 @@ mod tests {
                 .polish_notices
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hotkey_list() {
+        let c = Config::parse("[hotkey]\nkey = [\"Fn\", \"LeftControl+Space\"]\n").unwrap();
+        assert_eq!(c.hotkey.keys, ["Fn", "LeftControl+Space"]);
+        let one = with_settings(
+            DEFAULT_CONFIG,
+            &[(&["hotkey", "key"], hotkey_value(&["F13".into()]))],
+        )
+        .unwrap();
+        assert!(one.contains("key = \"F13\""));
+        let two = with_settings(
+            DEFAULT_CONFIG,
+            &[(
+                &["hotkey", "key"],
+                hotkey_value(&["F13".into(), "F14".into()]),
+            )],
+        )
+        .unwrap();
+        assert_eq!(Config::parse(&two).unwrap().hotkey.keys, ["F13", "F14"]);
+        assert!(two.contains("\nkey = [\"F13\", \"F14\"]\n"), "{two}");
+        assert!(Config::parse("[hotkey]\nkey = 3\n").is_err());
+        assert!(Config::parse("[hotkey]\nkey = [\"F13\", 3]\n").is_err());
+        assert_eq!(Config::default().hotkey.keys, [DEFAULT_HOTKEY]);
+        let no_key = Config::parse("[hotkey]\nmin_hold_ms = 300\n").unwrap();
+        assert_eq!(no_key.hotkey.keys, [DEFAULT_HOTKEY]);
     }
 
     #[test]

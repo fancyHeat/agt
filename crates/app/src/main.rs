@@ -278,7 +278,7 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
     let s1 = on && polish.provider == agt_core::config::PolishProvider::S1Mini;
     agt_telemetry::SessionStart {
         app_version: VERSION.into(),
-        hotkey: config.hotkey.key.clone(),
+        hotkey: config.hotkey.keys.join(", "),
         min_hold_ms: config.hotkey.min_hold_ms as i64,
         keep_mic_open: config.audio.keep_mic_open,
         duck: config.audio.duck,

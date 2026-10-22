@@ -34,6 +34,9 @@ use unsupported as imp;
 mod duck;
 pub use duck::{Ducked, Ducker};
 
+mod hotkeys;
+pub use hotkeys::Hotkeys;
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// What the hotkey thread reports. Delivered from the hook thread: handlers must not block.
@@ -62,7 +65,7 @@ use keys::CAPS_LOCK_CODE;
 pub use keys::KEYS;
 use keys::{CHORD_EXAMPLE, ESC_CODE, EVERYDAY_MODIFIERS, is_spare_f_key, key_names};
 
-/// A single key, by name. See [`KEYS`]. The configured hotkey is a [`Hotkey`]: one key or a
+/// A single key, by name. See [`KEYS`]. Each configured hotkey is a [`Hotkey`]: one key or a
 /// chord of several.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
@@ -167,9 +170,9 @@ fn unusable_key(code: u16) -> &'static str {
 /// The most keys a chord may have (e.g. Left Control + Left Option + Left Command + Space).
 pub const MAX_CHORD: usize = 4;
 
-/// The configured hotkey: one key, or a chord of up to [`MAX_CHORD`] keys (e.g.
-/// `LeftCtrl+LeftWin`) that must all be held together. A dictation starts once every key is
-/// down (in any order) and ends as soon as any of them is released.
+/// A configured hotkey (see [`Hotkeys`]): one key, or a chord of up to [`MAX_CHORD`] keys
+/// (e.g. `LeftCtrl+LeftWin`) that must all be held together. A dictation starts once every
+/// key is down (in any order) and ends as soon as any of them is released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hotkey {
     keys: Vec<Key>,

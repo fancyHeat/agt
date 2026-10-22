@@ -66,8 +66,8 @@ use agt_core::{
 };
 use agt_history::{self as history, History};
 use agt_platform::{
-    ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key,
-    MAX_CHORD, PasteToken, Permission,
+    ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Hotkeys,
+    Key, MAX_CHORD, PasteToken, Permission,
 };
 use agt_polish::{Outcome, ahead::Ahead};
 use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
@@ -469,8 +469,8 @@ enum ToPaste {
     CopyLast,
 }
 
-/// Starts all pipeline threads. Fails if the hotkey can't be installed (bad key name, or a
-/// platform without support yet); the model is then not loaded either.
+/// Starts all pipeline threads. Fails if the hotkey can't be installed (a bad key name or list
+/// of hotkeys, or a platform without support yet); the model is then not loaded either.
 pub fn start(
     config: &Config,
     dictionary: Dictionary,
@@ -492,7 +492,8 @@ pub fn start(
     };
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     let ducker = Ducker::start(paths::ducked_volume_file());
-    let key = Hotkey::parse(&config.hotkey.key)?;
+    // Every hotkey is checked, but only the first one dictates for now.
+    let key = Hotkeys::parse(&config.hotkey.keys)?.list()[0].clone();
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);
 

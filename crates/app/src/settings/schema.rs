@@ -143,7 +143,12 @@ fn general(c: &Config) -> Page {
     let hotkey = section(
         "Hotkey",
         vec![
-            Item::choice("Key", hotkey_choices(&c.hotkey.key)).note(
+            // The first hotkey only, until rows for each replace this menu.
+            Item::choice(
+                "Key",
+                hotkey_choices(c.hotkey.keys.first().map_or("", String::as_str)),
+            )
+            .note(
                 "Hold it to dictate, let go to paste. A chord written in config.toml is \
                  kept and shown as is.",
             ),
@@ -998,7 +1003,7 @@ mod tests {
         // Each preset written into the default file gives a config that parses.
         let c = Config::default();
         let mut all = Vec::new();
-        all.extend(hotkey_choices(&c.hotkey.key));
+        all.extend(hotkey_choices(&c.hotkey.keys[0]));
         all.extend(enums(
             &["stt", "device"],
             Device::ALL,
