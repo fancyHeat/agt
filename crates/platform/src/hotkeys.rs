@@ -76,13 +76,14 @@ impl fmt::Display for Hotkeys {
 ///
 /// - A modifier that isn't in a hotkey never reaches its detector: it neither cancels nor
 ///   blocks that hotkey's hold (Shift + Fn still dictates).
-/// - A combo's key that isn't a modifier counts for it only if its press completes the
-///   combo: the combo is armed (not waiting for its keys to be released after a hold or a
-///   shortcut), its modifiers went down first, and no other modifier is down. Its auto-repeat
-///   and release count only if its press did. Otherwise it's just another key: Space alone,
-///   Space then Left Control, Left Control + Left Shift + Space, and a Space typed after
-///   Left Control + A with Left Control still held all reach apps. A key that is a whole
-///   hotkey on its own always counts.
+/// - A combo's key that isn't a modifier counts for it only if its press starts the combo's
+///   hold: no other hotkey holds, the combo is armed (not waiting for its keys to be
+///   released after a hold or a shortcut), its modifiers went down first, and no other
+///   modifier is down. Its auto-repeat and release count only if its press did. Otherwise
+///   it's just another key: Space alone, Space then Left Control, Left Control + Left Shift +
+///   Space, a Space typed after Left Control + A with Left Control still held, and one
+///   pressed while another hotkey holds all reach apps. A key that is a whole hotkey on its
+///   own always counts.
 /// - One hold at a time, judged by the state before each event: while one hotkey is held,
 ///   another one completing starts nothing, and waits until all its keys are up (as after a
 ///   hold of its own). Of two completing on the same key, the first in the list holds.
@@ -119,10 +120,13 @@ struct Watch {
 
 impl Watch {
     /// Whether a fresh press of its key that isn't a modifier (chord key `j`), with
-    /// `modifiers` down, counts for it: always for a lone key; for a combo, if it completes
-    /// the combo with no other modifier down.
-    fn counts(&self, j: usize, modifiers: u64) -> bool {
-        self.modifiers == 0 || (self.modifiers == modifiers && self.hold.would_complete(j))
+    /// `modifiers` down, counts for it: always for a lone key; for a combo, if it starts the
+    /// combo's hold: it completes the combo with no other modifier down, and no other hotkey
+    /// holds (`other_holds`: the combo can't start then, and a key that starts nothing isn't
+    /// kept from apps).
+    fn counts(&self, j: usize, modifiers: u64, other_holds: bool) -> bool {
+        self.modifiers == 0
+            || (!other_holds && self.modifiers == modifiers && self.hold.would_complete(j))
     }
 }
 
@@ -212,7 +216,8 @@ impl Detector {
             let chord_key = match hotkey.index_of(code.into()) {
                 Some(j) if Some(j) == w.other => {
                     if down && w.press == Press::Up {
-                        w.press = if w.counts(j, self.modifiers) {
+                        let other_holds = held.is_some_and(|h| h != i);
+                        w.press = if w.counts(j, self.modifiers, other_holds) {
                             Press::Counted
                         } else {
                             Press::Ignored
@@ -259,24 +264,27 @@ impl Detector {
         (ev, false)
     }
 
-    /// Whether a press of `code` (call before [`Self::on_key`]) would complete a combo but for
-    /// another modifier believed down: that may be a release the hook missed, so the hook
+    /// Whether a press of `code` (call before [`Self::on_key`]) would count for a combo but
+    /// for another modifier believed down: that may be a release the hook missed, so the hook
     /// should [`Self::resync_modifiers`] first. Only for a fresh press (not its auto-repeat),
-    /// and not when the OS's answer can't make it count (the combo is waiting for its keys to
-    /// be released, or one of its own modifiers isn't down): the OS is asked at most once per
-    /// press, and only on this rare path.
+    /// and not when the OS's answer can't make it count (another hotkey holds, the combo is
+    /// waiting for its keys to be released, or one of its own modifiers isn't down): the OS is
+    /// asked at most once per press, and only on this rare path.
     pub(crate) fn press_needs_resync(&self, code: u16) -> bool {
         self.hotkeys
             .list()
             .iter()
             .zip(&self.watches)
-            .any(|(hotkey, w)| {
+            .enumerate()
+            .any(|(i, (hotkey, w))| {
+                let other_holds = self.held.is_some_and(|h| h != i);
                 w.press == Press::Up
                     && w.modifiers != 0
                     && w.modifiers != self.modifiers
-                    && hotkey
-                        .index_of(code.into())
-                        .is_some_and(|j| Some(j) == w.other && w.hold.would_complete(j))
+                    && hotkey.index_of(code.into()).is_some_and(|j| {
+                        // It would, with exactly its own modifiers down.
+                        Some(j) == w.other && w.counts(j, w.modifiers, other_holds)
+                    })
             })
     }
 
@@ -584,6 +592,27 @@ mod tests {
         assert_eq!(press(&mut d, "LeftShift", false), (None, false));
         assert_eq!(press(&mut d, "LeftShift", true), (None, false));
         assert_eq!(press(&mut d, "F14", true), (Some(Down(*T, 1)), true));
+    }
+
+    #[test]
+    fn combo_key_during_another_hold_reaches_apps() {
+        let space = code("Space");
+        let mut d = detector(&["F13", "LeftShift+Space"]);
+        assert_eq!(press(&mut d, "F13", true), (Some(Down(*T, 0)), true));
+        assert_eq!(press(&mut d, "LeftShift", true), (None, false));
+        // The combo can't start while F13 holds: its Space cancels that hold, and types.
+        press(&mut d, "RightShift", true);
+        assert!(!d.press_needs_resync(space), "no point asking the OS");
+        press(&mut d, "RightShift", false);
+        assert_eq!(press(&mut d, "Space", true), (Some(Cancel), false));
+        assert_eq!(press(&mut d, "Space", false), (None, false));
+        assert_eq!(press(&mut d, "F13", false), (None, true));
+        assert_eq!(press(&mut d, "LeftShift", false), (None, false));
+        // A key that is a whole hotkey on its own is kept even while another hotkey holds.
+        assert_eq!(press(&mut d, "LeftShift", true), (None, false));
+        assert_eq!(press(&mut d, "Space", true), (Some(Down(*T, 1)), true));
+        assert_eq!(press(&mut d, "F13", true), (Some(Cancel), true));
+        assert_eq!(press(&mut d, "F13", false), (None, true));
     }
 
     #[test]
