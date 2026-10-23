@@ -86,9 +86,10 @@ removes it (there's always at least one).
     AGT runs. F13 to F24 cost nothing, as nothing types them (they're usually spare mouse or
     keyboard buttons).
   - A combo with a regular key (F13 to F24 aside) is taken over in every app while AGT runs.
-    With only Shift or Option (Windows: Right Alt, which is AltGr on many keyboard layouts)
-    it types a character, so that character is gone (**Left Shift + A**); with any other
-    modifier it's a shortcut your apps won't see (**Left Control + Space**).
+    When that key types (a letter, digit, Space, punctuation, or a keypad digit or sign) and
+    the only modifiers are Shift or Option (Windows: Right Alt, which is AltGr on many keyboard
+    layouts), it types a character, so that character is gone (**Left Shift + A**); otherwise
+    it's a shortcut your apps won't see (**Left Control + Space**, **Left Shift + Tab**).
   - A modifier you use in shortcuts and typing, on its own (either Shift; macOS: either
     Control, Left Option or Left Command; Windows: Left Ctrl, either Alt or either Win), starts
     AGT listening each time you hold it.

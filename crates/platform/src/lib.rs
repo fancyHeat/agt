@@ -70,7 +70,7 @@ use keys::CAPS_LOCK_CODE;
 pub use keys::KEYS;
 use keys::{
     CHARACTER_MODIFIERS, CHORD_EXAMPLE, ESC_CODE, EVERYDAY_MODIFIERS, MENU_KEYS, START_KEYS,
-    is_spare_f_key, key_names,
+    is_spare_f_key, key_names, types_character,
 };
 
 /// A single key, by name. See [`KEYS`]. Each configured hotkey is a [`Hotkey`]: one key or a
@@ -267,8 +267,8 @@ impl Hotkey {
     ///
     /// - A key that isn't a modifier is kept from apps (F13-F24 cost nothing: nothing types
     ///   them): alone, always; in a combo, whenever the combo is held. In a combo that takes
-    ///   over a character when its modifiers only pick which one a key types (Shift, Option,
-    ///   AltGr), and an app's shortcut otherwise.
+    ///   over a character when the key types one and its modifiers only pick which (Shift,
+    ///   Option, AltGr), and an app's shortcut otherwise (Shift + Tab, Option + Left Arrow).
     /// - Alone, a Windows Win or Alt key no longer opens its menu when tapped (AGT masks the
     ///   tap), and a modifier used in everyday shortcuts and typing starts AGT listening every
     ///   time it's held.
@@ -292,11 +292,12 @@ impl Hotkey {
             None
         } else if self.keys.len() == 1 {
             Some("AGT takes this key over: it won't type in other apps while AGT runs.")
-        } else if self
-            .keys
-            .iter()
-            .filter(|k| k.is_modifier())
-            .all(|k| CHARACTER_MODIFIERS.contains(&k.name))
+        } else if types_character(key.name)
+            && self
+                .keys
+                .iter()
+                .filter(|k| k.is_modifier())
+                .all(|k| CHARACTER_MODIFIERS.contains(&k.name))
         {
             Some("This types a character, so AGT takes it over in every app while AGT runs.")
         } else {
@@ -844,7 +845,13 @@ mod tests {
             ("LeftShift+A", TYPES),
             ("A+LeftShift", TYPES),
             ("LeftShift+RightShift+Space", TYPES),
-            ("LeftShift+F5", TYPES),
+            ("LeftShift+Slash", TYPES),
+            ("RightShift+KeypadMinus", TYPES),
+            // Keys that type nothing: a shortcut whatever the modifiers.
+            ("LeftShift+F5", SHORTCUT),
+            ("LeftShift+Tab", SHORTCUT),
+            ("RightShift+UpArrow", SHORTCUT),
+            ("LeftShift+Backspace", SHORTCUT),
             ("LeftShift+F13", None),
             ("LeftShift+RightShift", None),
             ("LeftShift", EVERYDAY),
@@ -863,6 +870,13 @@ mod tests {
                 ("LeftShift+LeftControl+A", SHORTCUT),
                 ("RightOption+E", TYPES),
                 ("LeftOption+LeftShift+2", TYPES),
+                ("LeftOption+KeypadEquals", TYPES),
+                ("LeftShift+Section", TYPES),
+                ("RightOption+LeftArrow", SHORTCUT),
+                ("LeftOption+Return", SHORTCUT),
+                ("LeftShift+KeypadEnter", SHORTCUT),
+                ("RightOption+Help", SHORTCUT),
+                ("LeftShift+ForwardDelete", SHORTCUT),
                 ("RightCommand+F20", None),
                 ("LeftControl+LeftOption", None),
                 ("Fn", None),
@@ -891,6 +905,27 @@ mod tests {
             .chain(MENU_KEYS)
         {
             assert!(Key::parse(name).unwrap().is_modifier(), "{name}");
+        }
+    }
+
+    /// Every key [`NON_CHARACTER_KEYS`] names is in [`KEYS`], not as a modifier, and a key
+    /// labelled with the one character it types (A, 5, /) is never among them.
+    #[test]
+    fn keys_that_type_a_character() {
+        for name in keys::NON_CHARACTER_KEYS {
+            assert!(!Key::parse(name).unwrap().is_modifier(), "{name}");
+            assert!(!types_character(name), "{name}");
+        }
+        for &(name, label, _, kind) in KEYS {
+            if kind == Swallowed && label.chars().count() == 1 {
+                assert!(types_character(name), "{name}");
+            }
+        }
+        for name in ["Space", "Keypad5", "KeypadPlus", "KeypadDecimal", "F"] {
+            assert!(types_character(name), "{name}");
+        }
+        for name in ["F1", "F5", "F12", "F13", "LeftArrow", "Tab"] {
+            assert!(!types_character(name), "{name}");
         }
     }
 
@@ -1026,6 +1061,12 @@ mod tests {
             ("RightAlt+Q", TYPES),
             ("RightAlt+LeftShift+2", TYPES),
             ("RightShift+Keypad5", TYPES),
+            ("RightAlt+IsoKey", TYPES),
+            ("LeftShift+KeypadDecimal", TYPES),
+            ("RightAlt+LeftArrow", SHORTCUT),
+            ("LeftShift+Enter", SHORTCUT),
+            ("RightAlt+Insert", SHORTCUT),
+            ("LeftShift+Delete", SHORTCUT),
             ("CapsLock", TAKEN),
             ("F12", TAKEN),
             ("Keypad5", TAKEN),

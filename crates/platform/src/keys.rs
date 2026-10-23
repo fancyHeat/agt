@@ -174,6 +174,29 @@ pub(crate) const START_KEYS: &[&str] = &["LeftWin", "RightWin"];
 #[cfg(not(target_os = "macos"))]
 pub(crate) const MENU_KEYS: &[&str] = &["LeftAlt", "RightAlt"];
 
+/// The keys that aren't modifiers but type no character, F1-F24 aside (goes with [`KEYS`]):
+/// see [`types_character`].
+#[cfg(not(target_os = "macos"))]
+pub(crate) const NON_CHARACTER_KEYS: &[&str] = &[
+    "CapsLock",
+    "Tab",
+    "Enter",
+    "Backspace",
+    "Delete",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+    "LeftArrow",
+    "RightArrow",
+    "UpArrow",
+    "DownArrow",
+    "Insert",
+    "Pause",
+    "ScrollLock",
+    "Menu",
+];
+
 /// Every key a hotkey can use on macOS: its name in the config file (case-insensitive, one
 /// word), its label in plain words (what the settings window shows), its macOS virtual key
 /// code (Carbon `kVK_*`) and its kind.
@@ -344,12 +367,44 @@ pub(crate) const START_KEYS: &[&str] = &[];
 #[cfg(target_os = "macos")]
 pub(crate) const MENU_KEYS: &[&str] = &[];
 
+/// The keys that aren't modifiers but type no character, F1-F20 aside (goes with [`KEYS`]):
+/// see [`types_character`].
+#[cfg(target_os = "macos")]
+pub(crate) const NON_CHARACTER_KEYS: &[&str] = &[
+    "Tab",
+    "Return",
+    "Backspace",
+    "ForwardDelete",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+    "LeftArrow",
+    "RightArrow",
+    "UpArrow",
+    "DownArrow",
+    "KeypadClear",
+    "KeypadEnter",
+    "Help",
+];
+
+/// Which function key the key named `name` is (5 for F5), if it's one.
+fn f_key_number(name: &str) -> Option<u8> {
+    name.strip_prefix('F').and_then(|n| n.parse().ok())
+}
+
 /// Whether the key named `name` is one of F13-F24: on no keyboard's typing keys (typically
 /// mapped to spare mouse or keyboard buttons), so a hotkey can take it over for free.
 pub(crate) fn is_spare_f_key(name: &str) -> bool {
-    name.strip_prefix('F')
-        .and_then(|n| n.parse::<u8>().ok())
-        .is_some_and(|n| (13..=24).contains(&n))
+    f_key_number(name).is_some_and(|n| (13..=24).contains(&n))
+}
+
+/// Whether the key named `name` (not a modifier) types a character: a letter, digit, Space,
+/// punctuation, or a keypad digit or operator. Then Shift or Option (AltGr) with it only picks
+/// which character, rather than making a shortcut. The function keys and
+/// [`NON_CHARACTER_KEYS`] (Tab, Return or Enter, the arrows...) type none.
+pub(crate) fn types_character(name: &str) -> bool {
+    f_key_number(name).is_none() && !NON_CHARACTER_KEYS.contains(&name)
 }
 
 /// The names in [`KEYS`], for error messages.

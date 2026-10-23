@@ -56,7 +56,8 @@ launch_at_login = true
 # Alone, a key that isn't a modifier is taken over: it won't type in other apps while AGT runs
 # (F13-F24 cost nothing: they're usually spare mouse or keyboard buttons). A combo with one is
 # taken over in every app too: with only Shift or Option (Windows: RightAlt, AltGr on many
-# layouts) it types a character, with other modifiers it's a shortcut apps won't see.
+# layouts) and a key that types (a letter, digit, Space, punctuation), it types a character;
+# otherwise (other modifiers, or Tab, Enter, an arrow...) it's a shortcut apps won't see.
 # Alone, a modifier you use in shortcuts and typing (either Shift; macOS: either Control,
 # LeftOption, LeftCommand; Windows: LeftCtrl, either Alt, either Win) starts AGT listening
 # each time you hold it, and a tap of Win or Alt alone no longer opens Start or an app's menu.
