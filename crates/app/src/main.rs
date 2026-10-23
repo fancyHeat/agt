@@ -82,7 +82,8 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("stats") {
         return print_stats();
     }
-    // `agt settings`: the settings window (see `settings::window`); doesn't start the app.
+    // `agt settings`: the settings window (see `settings::window`); doesn't start the app. It
+    // records its own events.
     if std::env::args().nth(1).as_deref() == Some("settings") {
         return settings::window::run();
     }

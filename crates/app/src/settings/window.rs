@@ -87,6 +87,12 @@ pub fn run() {
     if fs::write(&tmp, std::process::id().to_string()).is_ok() {
         let _ = fs::rename(&tmp, &pid_file);
     }
+    // The window's events (the key recorder's: which tap it has, ...) go to the app's database
+    // too, with no session (see `agt_telemetry::Sink::start_events`).
+    let log_level =
+        Config::load(&paths::config_file()).map_or_else(|_| "info".into(), |c| c.log_level);
+    crate::logging::init(&log_level);
+    agt_telemetry::global().start_events(paths::db_file());
 
     let model = Model {
         path: paths::config_file(),
@@ -100,8 +106,11 @@ pub fn run() {
     };
     let icon = crate::tray::color_icon;
     if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page), Some(icon)) {
-        eprintln!("agt settings: {e}");
+        tracing::error!("settings window: {e}");
     }
+    // On macOS, closing the window ends the process before this; events are written as they
+    // come, so only those of its last moment can be lost there.
+    agt_telemetry::global().flush(crate::TELEMETRY_FLUSH);
 }
 
 /// What a row of the window does.

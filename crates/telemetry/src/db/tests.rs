@@ -745,6 +745,93 @@ fn unusable_database_turns_telemetry_off() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The settings window's process records its events beside the running app: with no session,
+/// in the app's database only, and both writers keep going while the other writes.
+#[test]
+fn a_process_beside_the_app_records_only_its_events() {
+    let dir = temp_dir();
+    let path = dir.join("agt.db");
+    // Before the app made the database: nothing is created.
+    let early = Sink::default();
+    assert!(early.start_events(path.clone()));
+    early.event("INFO", "t", "too early".into());
+    assert!(!early.flush(Duration::from_secs(5)), "writer gave up");
+    assert!(!path.exists());
+    // There, but not set up by the app yet.
+    drop(Connection::open(&path).unwrap());
+    let early = Sink::default();
+    assert!(early.start_events(path.clone()));
+    assert!(!early.flush(Duration::from_secs(5)), "writer gave up");
+
+    let app = Sink::default();
+    assert!(app.start(path.clone(), SessionStart::default()));
+    assert!(app.flush(Duration::from_secs(10)));
+    let beside = Sink::default();
+    assert!(beside.start_events(path.clone()));
+    for i in 0..500 {
+        app.event("INFO", "t", format!("app {i}"));
+        beside.event("INFO", "t", format!("beside {i}"));
+    }
+    beside.event("INFO", "agt_platform::macos", "key recorder: tap".into());
+    // Only the app records these.
+    beside.dictation(Dictation::default(), Outcome::Pasted);
+    beside.session(SessionUpdate::default());
+    beside.update(Update {
+        kind: "check",
+        from_version: "0.0.1".into(),
+        to_version: None,
+        result: "none",
+        error: None,
+        duration_ms: 1.0,
+    });
+    assert!(beside.flush(Duration::from_secs(10)));
+    assert!(app.flush(Duration::from_secs(10)));
+
+    let conn = open_read_only(&path).unwrap();
+    let events = |sql: &str| count(&conn, &format!("SELECT count(*) FROM events WHERE {sql}"));
+    assert_eq!(events("message GLOB 'app *' AND session_id = 1"), 500);
+    assert_eq!(
+        events("message GLOB 'beside *' AND session_id IS NULL"),
+        500
+    );
+    assert_eq!(
+        events("message = 'key recorder: tap' AND session_id IS NULL"),
+        1
+    );
+    assert_eq!(events("message = 'too early'"), 0);
+    assert_eq!(count(&conn, "SELECT count(*) FROM dictations"), 0);
+    assert_eq!(count(&conn, "SELECT count(*) FROM updates"), 0);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM app_sessions WHERE id = 1 AND ended_at IS NULL"
+        ),
+        1,
+        "the app's session, still open, is the only one"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM app_sessions"), 1);
+    drop(conn);
+    // A session closed as stale ends at its own last event, not the other process's.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE events SET ts = ts + 60000 WHERE session_id IS NULL",
+        [],
+    )
+    .unwrap();
+    close_stale_sessions(&conn).unwrap();
+    let (ended, last): (i64, i64) = conn
+        .query_row(
+            "SELECT ended_at, (SELECT max(ts) FROM events WHERE session_id = 1)
+            FROM app_sessions WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(ended, last);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn senders_never_wait_for_the_disk() {
     let dir = temp_dir();

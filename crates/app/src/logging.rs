@@ -1,5 +1,7 @@
 //! Events (what used to be the log file) go to the `events` table of the telemetry database
 //! (see `agt-telemetry`), filtered by `log_level`. Debug builds also print them to stderr.
+//! The settings window, a process of its own, records its events there too, with no session
+//! (see `settings::window::run`).
 //!
 //! Events must never contain dictated text, clipboard contents or secrets: they are kept
 //! for 30 days.
