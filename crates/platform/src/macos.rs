@@ -25,8 +25,8 @@ use objc2_app_kit::{
     NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
 };
 use objc2_core_foundation::{
-    CFGetTypeID, CFMachPort, CFRetained, CFRunLoop, CFString, CFType, CFTypeID, kCFBooleanTrue,
-    kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    CFGetTypeID, CFMachPort, CFRetained, CFRunLoop, CFRunLoopRunResult, CFString, CFType, CFTypeID,
+    kCFBooleanTrue, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
@@ -544,11 +544,18 @@ fn run_capture_thread(shared: Arc<CaptureShared>, ready: mpsc::SyncSender<Result
             continue;
         }
         made = Instant::now();
-        // The new tap first, then the old one goes: no key gets past both.
+        // The new tap first, then the old one goes: no key gets past both. Disabled, the old
+        // one gets no more events; any it was already sent (one may have come in since the run
+        // loop last ran) are handled before it's invalidated, or a kept key's release would be
+        // lost and the key taken as still down. A run of 0 s handles one at most.
         match capture_tap(&shared, &run_loop, CGEventTapLocation::SessionEventTap) {
             Some(new) => {
                 shared.state.lock().unwrap().tap = Some(Cf(new.clone()));
                 let old = std::mem::replace(&mut tap, new);
+                CGEvent::tap_enable(&old, false);
+                while CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.0, true)
+                    == CFRunLoopRunResult::HandledSource
+                {}
                 CFMachPort::invalidate(&old);
             }
             None if !renew_failed => {
@@ -609,10 +616,14 @@ unsafe extern "C-unwind" fn capture_callback(
         return pass;
     };
     if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
-        if let Some(tap) = &st.tap {
+        // The current tap still enabled: this was about one being made afresh, disabled on
+        // purpose (see `run_capture_thread`).
+        if let Some(tap) = &st.tap
+            && !CGEvent::tap_is_enabled(&tap.0)
+        {
             CGEvent::tap_enable(&tap.0, true);
+            tracing::warn!("key recorder's event tap was disabled; re-enabled it");
         }
-        tracing::warn!("key recorder's event tap was disabled; re-enabled it");
         return pass;
     }
     if CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUserData) == INJECTED_MARK {
