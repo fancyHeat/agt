@@ -1,17 +1,19 @@
 //! The dictation pipeline: hotkey → microphone → speech-to-text → paste.
 //!
 //! Threads (none of them is the UI thread, and nothing blocks the hook thread):
-//! - `hotkey` (agt-platform): low-level keyboard hook; forwards hold events to `audio`.
-//! - `audio`: owns the microphone. Starts recording on key down, and on release hands the
-//!   samples to `stt`. Short taps and cancelled holds are dropped here. While recording it
-//!   also polls the key, in case the hook missed the release (see [`RELEASE_POLL`]), and
-//!   takes the new audio: a long recording is cut into segments as it comes in
-//!   (`agt_stt::chunk::Live`, cheap), and each finished one goes to `stt` right away, so at
-//!   release only the last few seconds are left to transcribe (see [`Feed`]). A double tap
-//!   (`hotkey.double_tap_ms`) records hands-free instead: the release doesn't end that
-//!   recording, the next press and release does (Esc cancels it, and so does
-//!   [`HANDS_FREE_MAX`]). After a tap the status stays "recording" for `double_tap_ms`, so
-//!   the bar doesn't flicker between the two taps.
+//! - `hotkey` (agt-platform): low-level keyboard hook watching every configured hotkey, one
+//!   hold at a time; forwards hold events (with which hotkey went down) to `audio`.
+//! - `audio`: owns the microphone. Starts recording when any hotkey goes down, and on its
+//!   release hands the samples to `stt`. Short taps and cancelled holds are dropped here.
+//!   While recording it also polls the held hotkey's keys, in case the hook missed the
+//!   release (see [`RELEASE_POLL`]), and takes the new audio: a long recording is cut into
+//!   segments as it comes in (`agt_stt::chunk::Live`, cheap), and each finished one goes to
+//!   `stt` right away, so at release only the last few seconds are left to transcribe (see
+//!   [`Feed`]). A double tap (`hotkey.double_tap_ms`; the two taps may be on different
+//!   hotkeys) records hands-free instead: the release doesn't end that recording, the next
+//!   press and release of any hotkey does (Esc cancels it, and so does [`HANDS_FREE_MAX`]).
+//!   After a tap the status stays "recording" for `double_tap_ms`, so the bar doesn't flicker
+//!   between the two taps.
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
 //!   system output volume down until the recording ends, however it ends.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
@@ -36,9 +38,9 @@
 //! - `paste`: saves the clipboard when a recording starts (on a helper thread, with a
 //!   deadline, so a hung clipboard owner can't block pasting), pastes, and restores the
 //!   clipboard `paste.restore_clipboard_ms` later. If that save is what keeps the clipboard
-//!   busy, the paste waits for it (up to [`BUSY_SAVE_WAIT`]). It also waits while a hotkey key
-//!   the paste would disturb is still held (see [`HOTKEY_RELEASE_POLL`]). It keeps the last
-//!   transcript in memory for the tray's "Copy last transcript".
+//!   busy, the paste waits for it (up to [`BUSY_SAVE_WAIT`]). It also waits while a key of any
+//!   hotkey that the paste would disturb is still held (see [`HOTKEY_RELEASE_POLL`]). It keeps
+//!   the last transcript in memory for the tray's "Copy last transcript".
 //!
 //! Status changes are reported through a callback (the app forwards them to the tray and the
 //! overlay).
@@ -88,7 +90,7 @@ use std::{
 /// of the microphone recording (the mic is still opened and recorded as usual).
 pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 
-/// While recording, how often the audio thread checks that the hotkey is really still down.
+/// While recording, how often the audio thread checks the held hotkey is really still down.
 /// The hook can miss a release: it happens on the secure desktop (UAC prompt, Ctrl+Alt+Del)
 /// or Windows dropped a hook that was too slow once. A missed release is treated as a normal
 /// release at the moment it's noticed: the user did let go, and what they said up to then is
@@ -116,12 +118,14 @@ const SNAPSHOT_WAIT: Duration = Duration::from_millis(100);
 /// before trying again (issue #3).
 const BUSY_SAVE_WAIT: Duration = Duration::from_secs(2);
 
-/// A paste waits while a hotkey key that pasting would have to release in software (Shift,
-/// Left Ctrl, Win) is still held: a Win key held a moment longer than the chord's other key,
-/// or the hotkey already held for the next dictation. Releasing them in software would leave
-/// them logically up while physically down: a still-held Win then auto-repeats as a fresh
-/// press and its release opens the Start menu, and the release watchdog can't trust its polls.
-/// After [`HOTKEY_RELEASE_MAX`] it pastes anyway (releasing them, as before).
+/// A paste waits while a key of any hotkey that pasting would have to release in software
+/// (Windows: Shift, Left Ctrl, Alt, Win; macOS: Left Command and V, see
+/// [`agt_platform::paste_may_release`]) is still held: a Win key held a moment longer than
+/// the chord's other key, or a hotkey (any of them) already held for the next dictation.
+/// Releasing them in software would leave them logically up while physically down: a
+/// still-held Win then auto-repeats as a fresh press and its release opens the Start menu,
+/// and the release watchdog can't trust its polls. After [`HOTKEY_RELEASE_MAX`] it pastes
+/// anyway (releasing them, as before).
 const HOTKEY_RELEASE_POLL: Duration = Duration::from_millis(15);
 const HOTKEY_RELEASE_MAX: Duration = Duration::from_secs(10);
 
@@ -164,10 +168,10 @@ pub enum Event {
     /// The status line changed. With the number of failures (microphone, transcription,
     /// paste) so far: a `Status::Error` is a new failure only if that went up since.
     Status(Status, u64),
-    /// The hotkey was pressed but no recording started (the model failed to load, or no
+    /// A hotkey was pressed but no recording started (the model failed to load, or no
     /// microphone); the status line says why.
     Rejected,
-    /// The hotkey was pressed while the model is still loading (or downloading): no
+    /// A hotkey was pressed while the model is still loading (or downloading): no
     /// recording.
     NotReady,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
@@ -242,7 +246,7 @@ impl Hub {
         }
     }
 
-    /// The hotkey was pressed but no recording started.
+    /// A hotkey was pressed but no recording started.
     fn reject(&self) {
         (self.notify)(Event::Rejected);
     }
@@ -387,7 +391,7 @@ impl Pipeline {
         let _ = self.to_paste.send(ToPaste::CopyLast);
     }
 
-    /// When the hotkey last went down (for latency logging).
+    /// When a hotkey last went down (for latency logging).
     pub fn last_key_down(&self) -> Option<Instant> {
         *self.key_down.lock().unwrap()
     }
@@ -427,7 +431,7 @@ enum ToStt {
     /// The recording those segments were from was dropped: recorded as `Ended` once they
     /// are out of the way.
     Dropped(Box<Dictation>, Ended),
-    /// The model failed to load and the user pressed the hotkey: try again.
+    /// The model failed to load and the user pressed a hotkey: try again.
     RetryLoad,
 }
 
@@ -493,9 +497,6 @@ pub fn start(
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     let ducker = Ducker::start(paths::ducked_volume_file());
     let hotkeys = Hotkeys::parse(&config.hotkey.keys)?;
-    // The hook watches every hotkey; the audio and paste threads still go by the first one's
-    // keys (for a missed release, and the paste wait).
-    let key = hotkeys.list()[0].clone();
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);
 
@@ -515,7 +516,8 @@ pub fn start(
     let chunk_secs = Arc::new(AtomicU32::new(agt_stt::CHUNK_SECS.to_bits()));
     let audio = AudioThread {
         config: config.clone(),
-        key: key.clone(),
+        keys: hotkeys.clone(),
+        held: 0,
         reset: hotkey.resetter(),
         hub: hub.clone(),
         to_stt,
@@ -546,7 +548,9 @@ pub fn start(
     });
 
     let (h, cfg) = (hub.clone(), config.clone());
-    spawn("paste", move || paste_thread(cfg, h, paste_rx, key, saver));
+    spawn("paste", move || {
+        paste_thread(cfg, h, paste_rx, hotkeys, saver)
+    });
 
     hub.update(|_| {});
     Ok(Pipeline {
@@ -722,16 +726,18 @@ fn load_test_wav() -> Option<Vec<f32>> {
 
 /// Decides whether a key-state poll that says "up" really means the hook missed a release.
 ///
-/// Every key of the hotkey (all keys of a chord) is polled; any one of them up means the hold
-/// ended.
+/// Every key of the held hotkey (all keys of a chord) is polled; any one of them up means the
+/// hold ended.
 ///
-/// The poll sees the *logical* key state, which our own paste can change: pasting releases
-/// held Shift and Win keys, and its Ctrl-up maps to Left Ctrl. A paste normally waits until
-/// those hotkey keys are up ([`HOTKEY_RELEASE_MAX`]), but if it gave up waiting and released
-/// them in software ([`agt_platform::paste_count`] went up since this recording started), a
-/// poll for such a key is not trusted (the chord's other keys still are): a genuinely missed
-/// release is then caught on the next press instead (the stale recording is discarded).
-/// Right Ctrl (the default) is never touched by a paste.
+/// The poll sees the *logical* key state, which our own paste can change (see
+/// [`agt_platform::paste_may_release`]): on Windows pasting releases held Shift, Alt and Win
+/// keys, and its Ctrl-up maps to Left Ctrl; on macOS Cmd+V posts Left Command and V key-ups
+/// where the poll reads them. A paste normally waits until those hotkey keys are up
+/// ([`HOTKEY_RELEASE_MAX`]), but if it gave up waiting and released them in software
+/// ([`agt_platform::paste_count`] went up since this recording started), a poll for such a
+/// key is not trusted (the chord's other keys still are): a genuinely missed release is then
+/// caught on the next press instead (the stale recording is discarded). Right Ctrl is never
+/// touched by a paste.
 #[derive(Debug, Clone, Copy)]
 struct ReleaseWatch {
     /// Bit `i`: a paste can make chord key `i` look released.
@@ -778,7 +784,7 @@ enum Latch {
     /// The double tap's second press is still down: if it's a tap, its release doesn't end
     /// it (if it's held, it was a hold after all).
     Pressed,
-    /// Recording with the hotkey up: the next press's release ends it.
+    /// Recording with no hotkey held: the next press's release (any hotkey's) ends it.
     On,
     /// That press is down: its release ends it. Another press meanwhile (an auto-repeat after
     /// a missed press re-installed the hook) changes nothing; another key (a shortcut with the
@@ -794,7 +800,10 @@ fn is_double_tap(last_tap: Option<Instant>, now: Instant, gap: Duration) -> bool
 
 struct AudioThread {
     config: Config,
-    key: Hotkey,
+    keys: Hotkeys,
+    /// The hotkey of the last press (its index in `keys`): the one whose release ends the
+    /// recording, and that the logs name.
+    held: usize,
     reset: HotkeyReset,
     hub: Hub,
     to_stt: Sender<ToStt>,
@@ -890,7 +899,12 @@ fn live_stats(d: &mut Dictation, stats: &LiveStats, max_queue: usize) {
 }
 
 impl AudioThread {
-    fn run(self, events: Receiver<HotkeyEvent>, level: Level) {
+    /// The hotkey of the last press (see [`Self::held`]).
+    fn hotkey(&self) -> &Hotkey {
+        &self.keys.list()[self.held]
+    }
+
+    fn run(mut self, events: Receiver<HotkeyEvent>, level: Level) {
         let mut recorder = Recorder::new(
             self.config.audio.keep_mic_open,
             self.config.audio.device.clone(),
@@ -907,7 +921,7 @@ impl AudioThread {
         // output volume, and its audio. Dropping that guard puts the volume back, however the
         // hold ends (including this thread exiting or panicking).
         let mut holding: Option<(Instant, Box<Dictation>, Option<Ducked>, Feed)> = None;
-        let mut watch = ReleaseWatch::new(&self.key, 0);
+        let mut watch = ReleaseWatch::new(self.hotkey(), 0);
         let mut latch = Latch::Off;
         // When the last tap was let go: maybe the first half of a double tap.
         let mut last_tap: Option<Instant> = None;
@@ -927,8 +941,8 @@ impl AudioThread {
             agt_platform::arm_escape(hands_free);
             // `missed`: a release synthesized after the hook missed the real one.
             let (ev, missed) = if let Some((down, .., feed)) = &mut holding {
-                // Hands-free, the hotkey is up: no release to watch for, but a press the hook
-                // missed, and the time limit.
+                // Hands-free, no hotkey is held: no release to watch for, but a press the hook
+                // missed (of any hotkey), and the time limit.
                 let until = *down + HANDS_FREE_MAX;
                 let wait = match hands_free {
                     true => until.saturating_duration_since(Instant::now()),
@@ -988,13 +1002,20 @@ impl AudioThread {
                 }
             };
             match ev {
-                HotkeyEvent::Down(t, _) => {
+                HotkeyEvent::Down(t, i) => {
                     *self.key_down.lock().unwrap() = Some(t);
+                    self.held = i;
                     if matches!(latch, Latch::On | Latch::Ending) && holding.is_some() {
                         // Ends the hands-free recording on its release, like a hold: every
-                        // paste comes after the hotkey is let go.
+                        // paste comes after the hotkey is let go. Any hotkey's press does:
+                        // its keys are the ones polled from here on (pastes still counted
+                        // from the recording's start).
+                        watch = ReleaseWatch::new(self.hotkey(), watch.pastes_at_start);
                         if latch == Latch::On {
-                            tracing::debug!("hands-free recording ending: {} pressed", self.key);
+                            tracing::debug!(
+                                "hands-free recording ending: {} pressed",
+                                self.hotkey()
+                            );
                         }
                         latch = Latch::Ending;
                         continue;
@@ -1009,7 +1030,7 @@ impl AudioThread {
                         self.abort_recording(&mut recorder, down, t, d, feed, outcome);
                     }
                     // Before starting: any paste from here on counts as "during this recording".
-                    watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
+                    watch = ReleaseWatch::new(self.hotkey(), agt_platform::paste_count());
                     let double = is_double_tap(last_tap.take(), t, double_tap);
                     holding = self.start_recording(&mut recorder, t).map(|mut d| {
                         // Only once the microphone runs: never delays it (a channel send).
@@ -1029,8 +1050,8 @@ impl AudioThread {
                     if double && holding.is_some() {
                         latch = Latch::Pressed;
                         tracing::info!(
-                            "double tap: recording hands-free until {} is pressed again",
-                            self.key
+                            "double tap: recording hands-free until a hotkey ({}) is pressed again",
+                            self.keys
                         );
                     }
                 }
@@ -1062,7 +1083,7 @@ impl AudioThread {
                 }
                 HotkeyEvent::Cancel if latch == Latch::Ending && holding.is_some() => {
                     // A shortcut with the hotkey while hands-free: not the end of it.
-                    tracing::debug!("{} was part of a shortcut; still hands-free", self.key);
+                    tracing::debug!("{} was part of a shortcut; still hands-free", self.hotkey());
                     latch = Latch::On;
                 }
                 HotkeyEvent::Cancel => {
@@ -1092,15 +1113,15 @@ impl AudioThread {
     }
 
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
-    /// release (with `true`) if the key turns out not to be down any more. `press_missed`:
-    /// the press being held was synthesized by [`Self::missed_press`].
+    /// release (with `true`) if the held hotkey turns out not to be down any more.
+    /// `press_missed`: the press being held was synthesized by [`Self::missed_press`].
     fn missed_release(
         &self,
         events: &Receiver<HotkeyEvent>,
         watch: &ReleaseWatch,
         press_missed: bool,
     ) -> Option<(HotkeyEvent, bool)> {
-        let keys = self.key.keys();
+        let keys = self.hotkey().keys();
         let mut keys_down = [None; MAX_CHORD];
         for (down, &k) in keys_down.iter_mut().zip(keys) {
             *down = match press_missed {
@@ -1122,37 +1143,38 @@ impl AudioThread {
         }
         tracing::warn!(
             "{} is no longer down but no release was seen; finishing the dictation and re-installing the keyboard hook",
-            self.key
+            self.hotkey()
         );
         self.reset.reset();
         Some((HotkeyEvent::Up(Instant::now()), true))
     }
 
     /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
-    /// synthesized press if the hotkey turns out to be down without the hook having said so
-    /// (macOS disabled the event tap after a timeout, Windows dropped the hook), so the
-    /// recording can still be ended; with `true` if synthesized. A tap shorter than the poll
-    /// is caught only if a poll falls within it (a 100 ms tap: 40% of the time); the next
-    /// tap then gets another chance. (`GetAsyncKeyState`'s "pressed since the last call" bit
-    /// would catch it, but Windows documents it as unreliable.)
+    /// synthesized press if a hotkey (the first whose keys are all down) turns out to be down
+    /// without the hook having said so (macOS disabled the event tap after a timeout, Windows
+    /// dropped the hook), so the recording can still be ended; with `true` if synthesized. A
+    /// tap shorter than the poll is caught only if a poll falls within it (a 100 ms tap: 40%
+    /// of the time); the next tap then gets another chance. (`GetAsyncKeyState`'s "pressed
+    /// since the last call" bit would catch it, but Windows documents it as unreliable.)
     fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<(HotkeyEvent, bool)> {
-        let keys = self.key.keys();
-        if !keys
-            .iter()
-            .all(|&k| agt_platform::key_down(k) == Some(true))
-        {
-            return None; // up, or can't tell
-        }
+        let down = self.keys.list().iter().enumerate().find(|(_, hotkey)| {
+            hotkey
+                .keys()
+                .iter()
+                .all(|&k| agt_platform::key_down(k) == Some(true))
+        });
+        let Some((i, hotkey)) = down else {
+            return None; // all up, or can't tell
+        };
         // As in `missed_release`: a real press would normally be queued already.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
             return Some((ev, false));
         }
         tracing::warn!(
-            "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
-            self.key
+            "{hotkey} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook"
         );
         self.reset.reset();
-        Some((HotkeyEvent::Down(Instant::now(), 0), true))
+        Some((HotkeyEvent::Down(Instant::now(), i), true))
     }
 
     /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded
@@ -1208,7 +1230,10 @@ impl AudioThread {
             ..Default::default()
         });
         if !self.hub.engine_ready() {
-            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
+            tracing::info!(
+                "{} pressed but the model isn't ready; ignoring",
+                self.hotkey()
+            );
             if self.hub.engine_failed() {
                 let _ = self.to_stt.send(ToStt::RetryLoad);
                 self.hub.reject();
@@ -1222,7 +1247,7 @@ impl AudioThread {
             // macOS would record silence. The status line already says what to do.
             tracing::info!(
                 "{} pressed but the Microphone permission isn't granted; ignoring",
-                self.key
+                self.hotkey()
             );
             self.hub.reject();
             return None;
@@ -1981,14 +2006,16 @@ fn may_paste(at_release: Option<usize>, now: Option<usize>) -> bool {
     at_release.is_none() || at_release == now
 }
 
-/// The hotkey keys a paste would have to release in software if they were held.
-fn paste_sensitive_keys(hotkey: &Hotkey) -> Vec<Key> {
-    hotkey
-        .keys()
-        .iter()
-        .copied()
-        .filter(|&k| agt_platform::paste_may_release(k))
-        .collect()
+/// The hotkey keys a paste would have to release in software if they were held: every
+/// hotkey's (the one held for the next dictation may be any of them), each once.
+fn paste_sensitive_keys(hotkeys: &Hotkeys) -> Vec<Key> {
+    let mut keys = Vec::new();
+    for &k in hotkeys.list().iter().flat_map(Hotkey::keys) {
+        if agt_platform::paste_may_release(k) && !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
 }
 
 /// Waits while `held()` says a paste-sensitive hotkey key is down, polling every `poll`, for
@@ -2073,7 +2100,7 @@ fn paste_thread(
     config: Config,
     hub: Hub,
     rx: Receiver<ToPaste>,
-    hotkey: Hotkey,
+    hotkeys: Hotkeys,
     history: Option<History>,
 ) {
     let restore_after = Duration::from_millis(config.paste.restore_clipboard_ms);
@@ -2084,7 +2111,7 @@ fn paste_thread(
     // Our paste that still has to be undone, and when.
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
     let mut last = LastTranscript::default();
-    let sensitive = paste_sensitive_keys(&hotkey);
+    let sensitive = paste_sensitive_keys(&hotkeys);
     // The clipboard save started for the next paste (its time is credited to that one).
     let mut save_for_paste: Option<u64> = None;
 
@@ -2131,12 +2158,12 @@ fn paste_thread(
                     d.hotkey_wait_ms = Some(ms(waited));
                     if released {
                         tracing::debug!(
-                            "paste waited {:.0} ms for {hotkey} to be released",
+                            "paste waited {:.0} ms for the hotkey ({hotkeys}) to be released",
                             ms(waited)
                         );
                     } else {
                         tracing::warn!(
-                            "{hotkey} still held after {} s; pasting anyway",
+                            "hotkey ({hotkeys}) still held after {} s; pasting anyway",
                             waited.as_secs()
                         );
                     }
@@ -2903,11 +2930,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn release_watch_trusts_the_hardware_state_on_macos() {
-        // The poll reads the HID state, which our injected Cmd+V never changes.
+        // The poll reads the HID state, which our injected Cmd+V changes only for its own keys
+        // (Left Command and V).
         for name in ["Fn", "RightOption", "RightCommand+F13", "Fn+RightOption"] {
             let w = ReleaseWatch::new(&Hotkey::parse(name).unwrap(), 5);
             assert_eq!(w.paste_may_release, 0, "{name}");
-            assert!(paste_sensitive_keys(&Hotkey::parse(name).unwrap()).is_empty());
+            assert!(paste_sensitive_keys(&Hotkeys::parse(&[name.into()]).unwrap()).is_empty());
         }
     }
 
@@ -2955,14 +2983,44 @@ mod tests {
         let k = |n| Hotkey::parse(n).unwrap();
         let w = ReleaseWatch::new(&k("RightCtrl+RightWin"), 5);
         assert_eq!(w.paste_may_release, 0b10);
+        let one = |n: &str| Hotkeys::parse(&[n.into()]).unwrap();
         assert_eq!(
-            paste_sensitive_keys(&k("LeftCtrl+RightCtrl+LeftWin"))
+            paste_sensitive_keys(&one("LeftCtrl+RightCtrl+LeftWin"))
                 .iter()
                 .map(|k| k.name)
                 .collect::<Vec<_>>(),
             ["LeftCtrl", "LeftWin"]
         );
-        assert!(paste_sensitive_keys(&k("RightCtrl")).is_empty());
+        assert!(paste_sensitive_keys(&one("RightCtrl")).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paste_waits_for_every_hotkeys_sensitive_keys() {
+        let hk = Hotkeys::parse(&[
+            "LeftShift+F13".into(),
+            "RightCtrl".into(),
+            "RightShift".into(),
+            "F14+LeftShift".into(),
+        ])
+        .unwrap();
+        let names: Vec<_> = paste_sensitive_keys(&hk).iter().map(|k| k.name).collect();
+        assert_eq!(names, ["LeftShift", "RightShift"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paste_waits_for_every_hotkeys_sensitive_keys_on_macos() {
+        // Cmd+V's own keys: once each, in the order the hotkeys first have them.
+        let hk = Hotkeys::parse(&[
+            "LeftCommand+F13".into(),
+            "RightOption".into(),
+            "F14+LeftCommand".into(),
+            "V".into(),
+        ])
+        .unwrap();
+        let names: Vec<_> = paste_sensitive_keys(&hk).iter().map(|k| k.name).collect();
+        assert_eq!(names, ["LeftCommand", "V"]);
     }
 
     /// A fake key-state source: held for the first `n` polls.
