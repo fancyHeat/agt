@@ -10,8 +10,13 @@
 //! Every control's `tag` is its row's id. Changes are sent to the model as they happen; the
 //! page is then rebuilt from the model on the next run-loop turn (never inside the control's
 //! own action or a text field's end-of-editing), with the focused control focused again.
+//!
+//! A hotkey row listens for a press through the key recorder (`agt_platform::capture_keys`),
+//! which keeps the keys from every app (this window too) while it runs. A timer picks up what
+//! it reports and shows the keys held; anything else done in the window cancels listening.
 
 use crate::{Control, Error, Event, Model, Page, Stat};
+use agt_platform::{Capture, CaptureHandle, Key, capture_keys};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
@@ -22,17 +27,23 @@ use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBorderType,
     NSButton, NSColor, NSControl, NSControlSize, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSGridCellPlacement,
-    NSGridRowAlignment, NSGridView, NSImage, NSLayoutConstraint, NSMenu, NSMenuItem, NSPopUpButton,
-    NSResponder, NSRunningApplication, NSScreen, NSScrollView, NSScroller, NSScrollerStyle,
-    NSSecureTextField, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSTextViewDelegate, NSToolbar, NSToolbarDelegate, NSToolbarItem, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowToolbarStyle,
+    NSGridRowAlignment, NSGridView, NSImage, NSLayoutAttribute, NSLayoutConstraint,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSPopUpButton, NSResponder, NSRunningApplication,
+    NSScreen, NSScrollView, NSScroller, NSScrollerStyle, NSSecureTextField, NSStackView,
+    NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSToolbar,
+    NSToolbarDelegate, NSToolbarItem, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowToolbarStyle,
 };
 use objc2_foundation::{
     NSArray, NSDistributedNotificationCenter, NSNotification, NSNotificationSuspensionBehavior,
-    NSPoint, NSRange, NSRect, NSSize, NSString, NSTimer,
+    NSPoint, NSRange, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// Width of the label and control columns, in points: the same on every page, so the
 /// window keeps its width.
@@ -48,6 +59,16 @@ const TABLE_COLUMN_WIDTH: f64 = 70.0;
 const RAISE: &str = "io.notics.agt.settings.raise";
 /// How often [`Model::changed_elsewhere`] is asked.
 const POLL_SECONDS: f64 = 2.0;
+/// How often a listening hotkey row shows what the key recorder reported, and a recorder done
+/// listening is checked for its keys being up.
+const CAPTURE_SECONDS: f64 = 0.05;
+/// The longest a recorder done listening waits for the keys it kept from apps to be released.
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
+/// A hotkey row's text while it listens, until a key is held.
+const LISTENING: &str = "Press a key or combo... (Esc cancels)";
+/// A hotkey row's key button: the control column but for the minus button beside it, the
+/// same with or without one.
+const HOTKEY_WIDTH: f64 = CONTROL_WIDTH - 40.0;
 
 struct State {
     model: Box<dyn Model>,
@@ -62,6 +83,26 @@ struct State {
     rebuild_pending: bool,
     /// The file changed while a text field was being edited: rebuild once editing ends.
     stale: bool,
+    /// Hotkey rows' key buttons, by row id.
+    hotkey_buttons: HashMap<usize, Retained<NSButton>>,
+    listening: Option<Listening>,
+    /// Recorders done listening, each kept (since when) until the keys it kept from apps are
+    /// up: dropped while one is held (the Esc that cancelled), its auto-repeat and release
+    /// would reach this window and AGT.
+    releasing: Vec<(CaptureHandle, Instant)>,
+    /// Runs `capture:` while a row listens or a recorder waits for its keys.
+    capture_timer: Option<Retained<NSTimer>>,
+}
+
+/// The hotkey row listening for a press.
+struct Listening {
+    id: usize,
+    capture: CaptureHandle,
+    /// What the recorder reported last: set on its thread (which must never wait for this
+    /// one), taken by `capture:`.
+    latest: Arc<Mutex<Option<Capture>>>,
+    /// The row's text: [`LISTENING`], or the keys held.
+    title: String,
 }
 
 struct Ivars {
@@ -98,9 +139,42 @@ define_class!(
             self.send(Event::Click(tag(sender)));
         }
 
+        /// A hotkey row's key button: listens for a press (already listening: goes on).
+        #[unsafe(method(recordHotkey:))]
+        fn record_hotkey(&self, sender: &NSButton) {
+            self.end_editing();
+            let id = tag(sender);
+            if self.with(|s| s.listening.as_ref().is_some_and(|l| l.id == id)) == Some(false) {
+                // Another row listening is cancelled first.
+                self.end_listening(None);
+                self.listen(id);
+            }
+        }
+
+        /// Lets go of recorders done listening whose keys are up, and shows what the listening
+        /// one reported.
+        #[unsafe(method(capture:))]
+        fn capture_tick(&self, _timer: &NSTimer) {
+            self.with(|s| {
+                s.releasing
+                    .retain(|(capture, since)| !capture.keys_up() && since.elapsed() < RELEASE_WAIT)
+            });
+            let latest = self
+                .with(|s| s.listening.as_ref()?.latest.lock().ok()?.take())
+                .flatten();
+            match latest {
+                Some(Capture::Held(codes)) => self.show_held(&codes),
+                Some(Capture::Done(codes)) => self.end_listening(Some(codes)),
+                Some(Capture::Cancelled) => self.end_listening(None),
+                None => {}
+            }
+            self.run_capture_timer(false);
+        }
+
         #[unsafe(method(selectPage:))]
         fn select_page(&self, sender: &NSToolbarItem) {
             self.end_editing();
+            self.end_listening(None);
             let id = sender.itemIdentifier().to_string();
             let index = self.with(|s| s.pages.iter().position(|p| p.title == id));
             if let Some(index) = index.flatten() {
@@ -133,6 +207,7 @@ define_class!(
                 .flatten();
             if let Some(index) = index {
                 self.end_editing();
+                self.end_listening(None);
                 self.with(|s| s.current = index);
                 self.rebuild(true);
             }
@@ -214,6 +289,7 @@ define_class!(
             if let Some(window) = self.with(|s| s.window.clone()).flatten() {
                 window.makeFirstResponder(None);
             }
+            self.end_listening(None);
             NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
     }
@@ -294,6 +370,10 @@ impl Controller {
     }
 
     fn send(&self, event: Event) {
+        // Any other change cancels listening first.
+        if !matches!(event, Event::Hotkey(..)) {
+            self.end_listening(None);
+        }
         let Some(result) = self.with(|s| {
             crate::note(&mut s.pages, &event);
             s.model.handle(event)
@@ -301,13 +381,166 @@ impl Controller {
             return;
         };
         if let Err(message) = result {
-            let alert = NSAlert::new(self.mtm());
-            alert.setMessageText(&NSString::from_str("The setting wasn't changed"));
-            alert.setInformativeText(&NSString::from_str(&message));
-            alert.runModal();
+            self.alert(&message);
         }
         // Shows the file's state: the change, a failed change undone, rows it adds or removes.
         self.schedule_rebuild();
+    }
+
+    fn alert(&self, message: &str) {
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str("The setting wasn't changed"));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.runModal();
+    }
+
+    /// Listens for a press for hotkey row `id`. False if the key recorder can't start (macOS:
+    /// no Accessibility), after saying why: the row stays as it is.
+    fn listen(&self, id: usize) -> bool {
+        let latest = Arc::new(Mutex::new(None));
+        let on = latest.clone();
+        let capture = match capture_keys(move |c| {
+            if let Ok(mut latest) = on.lock() {
+                *latest = Some(c);
+            }
+        }) {
+            Ok(capture) => capture,
+            Err(e) => {
+                self.alert(&e.to_string());
+                return false;
+            }
+        };
+        self.with(|s| {
+            if let Some(button) = s.hotkey_buttons.get(&id) {
+                button.setTitle(&NSString::from_str(LISTENING));
+            }
+            s.listening = Some(Listening {
+                id,
+                capture,
+                latest,
+                title: LISTENING.into(),
+            });
+        });
+        self.run_capture_timer(false);
+        true
+    }
+
+    /// Shows the keys held so far on the listening row.
+    fn show_held(&self, codes: &[u16]) {
+        let title = codes
+            .iter()
+            .map(|&c| Key::from_code(c).map_or_else(|| format!("Key {c}"), |k| k.label().into()))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        self.with(|s| {
+            let Some(listening) = s.listening.as_mut() else {
+                return;
+            };
+            if let Some(button) = s.hotkey_buttons.get(&listening.id) {
+                button.setTitle(&NSString::from_str(&title));
+            }
+            listening.title = title;
+        });
+    }
+
+    /// Ends listening, if a row listens: shows its hotkey again, lets the recorder go once the
+    /// keys it kept are up, and reports `keys` (`None`: cancelled). The page shows what the
+    /// model makes of them once it's rebuilt.
+    fn end_listening(&self, keys: Option<Vec<u16>>) {
+        let listening = self
+            .with(|s| {
+                let listening = s.listening.take()?;
+                let label = s
+                    .pages
+                    .get(s.current)
+                    .and_then(|p| hotkey_label(p, listening.id));
+                if let (Some(button), Some(label)) = (s.hotkey_buttons.get(&listening.id), label) {
+                    button.setTitle(&NSString::from_str(label));
+                }
+                Some(listening)
+            })
+            .flatten();
+        let Some(Listening { id, capture, .. }) = listening else {
+            return;
+        };
+        // Before the event, which may bring up an alert: keys must reach it.
+        if capture.keys_up() {
+            drop(capture);
+        } else {
+            self.with(|s| s.releasing.push((capture, Instant::now())));
+            // A fresh timer: AppKit doesn't fire one again while its own action runs (this may
+            // be `capture:`), and the alert's modal loop mustn't hold up the wait for the keys.
+            self.run_capture_timer(true);
+        }
+        self.send(Event::Hotkey(id, keys));
+    }
+
+    /// Runs the capture timer while a row listens or a recorder waits for its keys, and stops
+    /// it after. `fresh`: replaces a running one.
+    fn run_capture_timer(&self, fresh: bool) {
+        self.with(|s| {
+            let needed = s.listening.is_some() || !s.releasing.is_empty();
+            if (fresh || !needed)
+                && let Some(timer) = s.capture_timer.take()
+            {
+                timer.invalidate();
+            }
+            if needed && s.capture_timer.is_none() {
+                let timer = unsafe {
+                    NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                        CAPTURE_SECONDS,
+                        self,
+                        sel!(capture:),
+                        None,
+                        true,
+                    )
+                };
+                // Also while a pop-up's menu is open or an alert is up.
+                unsafe {
+                    NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes)
+                };
+                s.capture_timer = Some(timer);
+            }
+        });
+    }
+
+    /// After the page is shown afresh: listening goes on while the page has its row, and a row
+    /// that asks to listen starts.
+    fn listen_as_shown(&self) {
+        let Some((gone, wanted)) = self.with(|s| {
+            let rows: Vec<_> = s
+                .pages
+                .get(s.current)
+                .into_iter()
+                .flat_map(|p| &p.sections)
+                .flat_map(|section| &section.rows)
+                .filter(|r| r.enabled)
+                .filter_map(|r| match r.control {
+                    Control::Hotkey { listening, .. } => Some((r.id, listening)),
+                    _ => None,
+                })
+                .collect();
+            let listening = s.listening.as_ref().map(|l| l.id);
+            let gone = listening.is_some_and(|id| !rows.iter().any(|&(r, _)| r == id));
+            let wanted = rows
+                .iter()
+                .find(|&&(_, wants)| wants)
+                .map(|&(id, _)| id)
+                .filter(|&id| listening != Some(id));
+            (gone, wanted)
+        }) else {
+            return;
+        };
+        if gone {
+            self.end_listening(None);
+        }
+        if let Some(id) = wanted {
+            self.end_listening(None);
+            if !self.listen(id) {
+                // The model has the row listening: that's over.
+                self.send(Event::Hotkey(id, None));
+            }
+        }
     }
 
     fn schedule_rebuild(&self) {
@@ -362,6 +595,7 @@ impl Controller {
             s.current = s.current.min(s.pages.len().saturating_sub(1));
             s.shown_text.clear();
             s.text_views.clear();
+            s.hotkey_buttons.clear();
             let page = s.pages.get(s.current).cloned()?;
             Some((page_view(mtm, self, &page, s), page.title))
         }) else {
@@ -418,7 +652,20 @@ impl Controller {
         if let Some(id) = focused {
             refocus(&window, &view, id, self);
         }
+        self.listen_as_shown();
     }
+}
+
+/// The keys of hotkey row `id` on `page`, as the model gave them.
+fn hotkey_label(page: &Page, id: usize) -> Option<&str> {
+    page.sections
+        .iter()
+        .flat_map(|s| &s.rows)
+        .find(|r| r.id == id)
+        .and_then(|r| match &r.control {
+            Control::Hotkey { label, .. } => Some(label.as_str()),
+            _ => None,
+        })
 }
 
 /// A control's row id. Tags are ids + 1: 0 is every view's default.
@@ -794,6 +1041,52 @@ fn control_view(
             };
             Retained::into_super(b)
         }
+        Control::Hotkey {
+            label, removable, ..
+        } => {
+            // Rebuilt while listening: still shows the keys held.
+            let title = match &state.listening {
+                Some(l) if l.id == id => l.title.as_str(),
+                _ => label.as_str(),
+            };
+            let key = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(title),
+                    target,
+                    Some(sel!(recordHotkey:)),
+                    mtm,
+                )
+            };
+            key.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            key.setTranslatesAutoresizingMaskIntoConstraints(false);
+            key.widthAnchor()
+                .constraintEqualToConstant(HOTKEY_WIDTH)
+                .setActive(true);
+            let mut buttons = vec![key.clone()];
+            if *removable {
+                buttons.push(unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        // A minus sign.
+                        &NSString::from_str("\u{2212}"),
+                        target,
+                        Some(sel!(clicked:)),
+                        mtm,
+                    )
+                });
+            }
+            state.hotkey_buttons.insert(id, key);
+            let views: Vec<Retained<NSView>> = buttons
+                .into_iter()
+                .map(|b| {
+                    b.setTag(id as isize + 1);
+                    b.setEnabled(enabled);
+                    Retained::into_super(Retained::into_super(b))
+                })
+                .collect();
+            let stack = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&views), mtm);
+            stack.setAlignment(NSLayoutAttribute::FirstBaseline);
+            return Retained::into_super(stack);
+        }
         // Shown by `full_width_view`.
         Control::Stats(_) | Control::Table { .. } => {
             return unsafe { NSGridCell_emptyContentView(mtm) };
@@ -877,6 +1170,10 @@ pub fn run(
             text_views: Vec::new(),
             rebuild_pending: false,
             stale: false,
+            hotkey_buttons: HashMap::new(),
+            listening: None,
+            releasing: Vec::new(),
+            capture_timer: None,
         },
     );
 

@@ -22,6 +22,12 @@ impl HotkeyReset {
     pub fn reset(&self) {}
 }
 
+impl CaptureHandle {
+    pub fn keys_up(&self) -> bool {
+        true
+    }
+}
+
 pub fn start_hotkey(
     _hotkeys: Hotkeys,
     _on_event: Box<dyn Fn(HotkeyEvent) + Send>,

@@ -420,12 +420,20 @@ struct CaptureState {
 
 struct CaptureShared {
     stop: AtomicBool,
+    /// [`KeyCapture::keys_up`], after each key event: read without taking `state`'s lock.
+    keys_up: AtomicBool,
     state: Mutex<CaptureState>,
 }
 
 pub struct CaptureHandle {
     shared: Arc<CaptureShared>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CaptureHandle {
+    pub fn keys_up(&self) -> bool {
+        self.shared.keys_up.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for CaptureHandle {
@@ -454,6 +462,7 @@ pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Er
     }
     let shared = Arc::new(CaptureShared {
         stop: AtomicBool::new(false),
+        keys_up: AtomicBool::new(true),
         state: Mutex::new(CaptureState {
             capture: KeyCapture::default(),
             on,
@@ -549,6 +558,7 @@ unsafe extern "C-unwind" fn capture_callback(
     let st = &mut *st;
     let mut key = |down, repeat| {
         let (c, keep) = st.capture.on_key(code, down, repeat);
+        shared.keys_up.store(st.capture.keys_up(), Ordering::SeqCst);
         if let Some(c) = c {
             (st.on)(c);
         }

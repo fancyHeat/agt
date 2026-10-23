@@ -73,6 +73,15 @@ pub enum Control {
     Value(String),
     /// A push button with this title.
     Button(String),
+    /// A hotkey, set by pressing it: a button showing `label` (its keys in plain words) that
+    /// listens for a press when clicked, reported as [`Event::Hotkey`]. `listening`: listens
+    /// as soon as the row is shown (a row "Add hotkey" just added). `removable`: a minus
+    /// button beside it, reported as [`Event::Click`].
+    Hotkey {
+        label: String,
+        listening: bool,
+        removable: bool,
+    },
     /// Read-only figures in a row, each a large value over a small caption, across the
     /// whole width (the row's label is ignored).
     Stats(Vec<Stat>),
@@ -97,6 +106,10 @@ pub enum Event {
     Choose(usize, usize),
     Text(usize, String),
     Click(usize),
+    /// Row, the keys pressed (platform key codes, in the order they went down), or `None`:
+    /// listening was cancelled (Esc, anything else done in the window) or, for a row that
+    /// asked to listen, couldn't start.
+    Hotkey(usize, Option<Vec<u16>>),
 }
 
 pub trait Model {
@@ -111,10 +124,15 @@ pub trait Model {
 
 /// Records in `pages` what `event` changed, which its control already shows: pages the
 /// model gives afterwards that equal these need no rebuild (and the focus, caret and open
-/// lists stay as they are).
+/// lists stay as they are). Not a hotkey: the model may refuse the keys, so its row shows what
+/// the model gives.
 pub(crate) fn note(pages: &mut [Page], event: &Event) {
     let id = match event {
-        Event::Toggle(id, _) | Event::Choose(id, _) | Event::Text(id, _) | Event::Click(id) => *id,
+        Event::Toggle(id, _)
+        | Event::Choose(id, _)
+        | Event::Text(id, _)
+        | Event::Click(id)
+        | Event::Hotkey(id, _) => *id,
     };
     let row = pages
         .iter_mut()
@@ -158,4 +176,34 @@ pub fn activate(pid: u32, page: Option<&str>) -> bool {
 pub(crate) fn page_index(pages: &[Page], title: Option<&str>) -> Option<usize> {
     let title = title?;
     Some(pages.iter().position(|p| p.title == title).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_ignores_hotkey_events() {
+        let row = Row {
+            id: 0,
+            label: "Hotkey".into(),
+            note: String::new(),
+            enabled: true,
+            control: Control::Hotkey {
+                label: "Fn".into(),
+                listening: false,
+                removable: true,
+            },
+        };
+        let mut pages = vec![Page {
+            title: "Settings".into(),
+            symbol: "",
+            sections: vec![Section {
+                title: String::new(),
+                rows: vec![row.clone()],
+            }],
+        }];
+        note(&mut pages, &Event::Hotkey(0, Some(vec![1])));
+        assert_eq!(pages[0].sections[0].rows[0], row);
+    }
 }

@@ -20,8 +20,16 @@ pub enum Capture {
 
 /// Keeps the key recorder running; dropping it removes its keyboard tap or hook and waits for
 /// its thread to end.
-#[allow(dead_code)] // held for its `Drop`
 pub struct CaptureHandle(imp::CaptureHandle);
+
+impl CaptureHandle {
+    /// Whether every key the recorder kept from apps is up again. Until then, dropping the
+    /// handle would let a held key's auto-repeat and release (the Esc that cancelled) reach
+    /// apps and AGT's listener without its press.
+    pub fn keys_up(&self) -> bool {
+        self.0.keys_up()
+    }
+}
 
 /// Starts recording a key press on a dedicated thread, ahead of every other app's view of the
 /// keyboard: macOS an active event tap at the HID level, which comes before AGT's own (at the
@@ -34,8 +42,8 @@ pub struct CaptureHandle(imp::CaptureHandle);
 /// `on` runs on that thread for each change ([`Capture`]) and must return quickly (every
 /// keystroke on the system waits for it); it must not drop the handle. Nothing is reported
 /// after [`Capture::Done`] or [`Capture::Cancelled`], but keys stay kept from apps until the
-/// handle is dropped (so that, say, Esc's auto-repeat doesn't reach the window): drop it right
-/// after either.
+/// handle is dropped (so that, say, Esc's auto-repeat doesn't reach the window): drop it after
+/// either, once [`CaptureHandle::keys_up`].
 ///
 /// macOS: needs Accessibility (an active tap takes it); without it this fails at once.
 pub fn capture_keys(on: impl Fn(Capture) + Send + 'static) -> Result<CaptureHandle, Error> {
@@ -105,6 +113,12 @@ impl KeyCapture {
                 }
             }
         }
+    }
+
+    /// Whether every key it kept from apps has been released (keys down before the capture
+    /// started pass, so they don't count).
+    pub(crate) fn keys_up(&self) -> bool {
+        self.down.is_empty()
     }
 }
 
@@ -227,6 +241,34 @@ mod tests {
         assert_eq!(repeat(&mut c, 3), (None, PASS));
         assert_eq!(release(&mut c, 3), (None, PASS));
         assert_eq!(release(&mut c, 1), (None, KEEP));
+    }
+
+    #[test]
+    fn keys_up_once_every_kept_key_is_released() {
+        let mut c = KeyCapture::default();
+        assert!(c.keys_up());
+        press(&mut c, 1);
+        assert!(!c.keys_up());
+        // Cancelled with Esc and 1 still held: both are kept until they're released.
+        press(&mut c, ESC_CODE);
+        release(&mut c, 1);
+        assert!(!c.keys_up());
+        release(&mut c, ESC_CODE);
+        assert!(c.keys_up());
+        // A key pressed after it finished is kept too.
+        press(&mut c, 2);
+        assert!(!c.keys_up());
+        release(&mut c, 2);
+        assert!(c.keys_up());
+        // Done comes with the last release.
+        let mut c = KeyCapture::default();
+        press(&mut c, 1);
+        release(&mut c, 1);
+        assert!(c.keys_up());
+        // A key down before the capture passes, so it doesn't count.
+        let mut c = KeyCapture::default();
+        repeat(&mut c, 3);
+        assert!(c.keys_up());
     }
 
     /// Takes over the keyboard for a moment (macOS: needs Accessibility for the process

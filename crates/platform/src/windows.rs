@@ -11,7 +11,11 @@ use std::{
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::Path,
     ptr::{null, null_mut},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -363,6 +367,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 struct CaptureState {
     capture: KeyCapture,
     on: Box<dyn Fn(Capture) + Send>,
+    /// [`KeyCapture::keys_up`], after each key event, for the handle (the state is this
+    /// thread's).
+    keys_up: Arc<AtomicBool>,
 }
 
 thread_local! {
@@ -372,6 +379,13 @@ thread_local! {
 pub struct CaptureHandle {
     thread_id: u32,
     thread: Option<thread::JoinHandle<()>>,
+    keys_up: Arc<AtomicBool>,
+}
+
+impl CaptureHandle {
+    pub fn keys_up(&self) -> bool {
+        self.keys_up.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for CaptureHandle {
@@ -395,6 +409,8 @@ impl Drop for CaptureHandle {
 /// calls the newest one first, so it runs before AGT's (installed when AGT started).
 pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
     let (tx, rx) = mpsc::sync_channel(1);
+    let keys_up = Arc::new(AtomicBool::new(true));
+    let thread_keys_up = keys_up.clone();
     let thread = thread::Builder::new()
         .name("key-capture".into())
         .spawn(move || {
@@ -404,6 +420,7 @@ pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Er
                 *c.borrow_mut() = Some(CaptureState {
                     capture: KeyCapture::default(),
                     on,
+                    keys_up: thread_keys_up,
                 })
             });
             let hook = unsafe {
@@ -438,6 +455,7 @@ pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Er
     Ok(CaptureHandle {
         thread_id,
         thread: Some(thread),
+        keys_up,
     })
 }
 
@@ -461,6 +479,7 @@ unsafe extern "system" fn capture_proc(code: i32, wparam: WPARAM, lparam: LPARAM
                             return true;
                         };
                         let (capture, keep) = s.capture.on_key(key, down, down && was_down);
+                        s.keys_up.store(s.capture.keys_up(), Ordering::SeqCst);
                         if let Some(capture) = capture {
                             (s.on)(capture);
                         }

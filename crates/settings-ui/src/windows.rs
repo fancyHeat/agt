@@ -1645,6 +1645,8 @@ unsafe fn create(
                 Control::Value(_) | Control::Stats(_) | Control::Table { .. } => {
                     return null_mut();
                 }
+                // Not shown on Windows yet: `card` places no control for it.
+                Control::Hotkey { .. } => return null_mut(),
                 Control::Button(title) => {
                     let look = if row.label.is_empty() {
                         Look::Card(row.note.clone())

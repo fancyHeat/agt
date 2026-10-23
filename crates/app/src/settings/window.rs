@@ -305,9 +305,11 @@ impl agt_settings_ui::Model for Model {
 
     fn handle(&mut self, event: Event) -> Result<(), String> {
         let id = match &event {
-            Event::Toggle(id, _) | Event::Choose(id, _) | Event::Text(id, _) | Event::Click(id) => {
-                *id
-            }
+            Event::Toggle(id, _)
+            | Event::Choose(id, _)
+            | Event::Text(id, _)
+            | Event::Click(id)
+            | Event::Hotkey(id, _) => *id,
         };
         let changes = match (self.actions.get(id), event) {
             (Some(Act::Check(path)), Event::Toggle(_, on)) => vec![(*path, on.into())],
