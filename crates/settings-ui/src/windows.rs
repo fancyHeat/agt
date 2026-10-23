@@ -15,7 +15,8 @@
 //!
 //! A hotkey row listens for a press through the key recorder (`agt_platform::capture_keys`),
 //! which keeps the keys from every app (this window too) while it runs. A timer picks up what
-//! it reports and shows the keys held; anything else done in the window cancels listening.
+//! it reports and shows the keys held; anything else done in the window cancels listening, and
+//! so do another app becoming active and [`crate::LISTEN_IDLE`] with no key held.
 
 use crate::{Control, Error, Event, Icon, Model, Page, Row, Stat};
 use agt_platform::{Capture, CaptureHandle, capture_keys};
@@ -79,7 +80,7 @@ use windows_sys::Win32::{
         },
         Input::KeyboardAndMouse::{
             EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, SetFocus, TME_LEAVE,
-            TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_SHIFT, VK_TAB,
+            TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_LBUTTON, VK_RETURN, VK_SHIFT, VK_TAB,
         },
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -219,6 +220,7 @@ struct Listening {
     latest: Arc<Mutex<Option<Capture>>>,
     /// The row's text: [`crate::LISTENING`], or the keys held.
     title: String,
+    idle: crate::Idle,
 }
 
 thread_local! {
@@ -810,6 +812,16 @@ pub fn run(
                     }
                     reveal(next);
                 }
+                continue;
+            }
+            // Holding Enter on a button clicks it once: its auto-repeat (lParam bit 30, the key
+            // was down already) would click the button focused after (the next row's minus,
+            // once a minus has removed its row).
+            if msg.message == WM_KEYDOWN
+                && msg.wParam == VK_RETURN as WPARAM
+                && msg.lParam & (1 << 30) != 0
+                && pushed(msg.hwnd)
+            {
                 continue;
             }
             // Tab between controls (scrolled into view), Enter as IDOK.
@@ -1727,7 +1739,7 @@ unsafe fn create(
                     .unwrap_or_else(|| label.clone());
                     (
                         "BUTTON",
-                        key_name(&row.label, &shown),
+                        crate::hotkey_name(&row.label, &shown),
                         BS_PUSHBUTTON as u32 | WS_TABSTOP,
                         Some(Look::Button(Some(shown))),
                     )
@@ -2010,6 +2022,7 @@ fn listen(id: usize) -> Result<(), String> {
             capture,
             latest,
             title: crate::LISTENING.into(),
+            idle: crate::Idle::new(Instant::now()),
         })
     });
     show_on_key(id, crate::LISTENING);
@@ -2030,6 +2043,13 @@ fn capture_tick() {
         Some(Capture::Done(codes)) => end_listening(Some(codes)),
         Some(Capture::Cancelled) => end_listening(None),
         None => {}
+    }
+    let idle = with(|s| {
+        let l = s.listening.as_mut()?;
+        Some(l.idle.over(!l.capture.keys_up(), Instant::now()))
+    });
+    if idle.flatten() == Some(true) {
+        end_listening(None);
     }
     run_capture_timer();
 }
@@ -2144,16 +2164,9 @@ fn show_on_key(id: usize, text: &str) {
                 *shown = Some(text.to_owned());
             }
         });
-        SetWindowTextW(button, wide(&key_name(&label, text)).as_ptr());
+        SetWindowTextW(button, wide(&crate::hotkey_name(&label, text)).as_ptr());
         InvalidateRect(button, null(), 0);
     }
-}
-
-/// A hotkey row's key button's name for screen readers, showing `shown`: the row's label (a
-/// row without one: "Hotkey"), then what it shows.
-fn key_name(label: &str, shown: &str) -> String {
-    let label = if label.is_empty() { "Hotkey" } else { label };
-    format!("{label}: {shown}")
 }
 
 fn window_text(hwnd: HWND) -> String {
@@ -2698,8 +2711,14 @@ fn draw_button(cd: &NMCUSTOMDRAW) -> bool {
             let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
             let text = shown.clone().unwrap_or_else(|| window_text(hwnd));
             // Clear of the box's edges (as a pop-up's), where a long one (a hotkey's) ends in
-            // "...".
-            let inner = inset(&b, d(CHOICE_TEXT), 0);
+            // "...". Not on a hotkey's minus button: its square is too small for the inset, and
+            // a lone sign never runs long.
+            let pad = if unsafe { GetDlgCtrlID(hwnd) } >= REMOVE_ID {
+                0
+            } else {
+                d(CHOICE_TEXT)
+            };
+            let inner = inset(&b, pad, 0);
             c.text(&text, &inner, Font::Body, ink, flags);
             if focused {
                 focus_ring(c, &r, radius());
@@ -2864,6 +2883,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     draw_nav_item(item);
                 }
                 1
+            }
+            // Another app became active (not another window of this one, such as a message
+            // box): listening ends, or the keys typed there next would be recorded.
+            WM_ACTIVATEAPP => {
+                if wp == 0 {
+                    end_listening(None);
+                }
+                0
             }
             WM_ACTIVATE => {
                 // Like a dialog: the focus goes back to the control that had it (at first, the

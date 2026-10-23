@@ -13,9 +13,10 @@
 //!
 //! A hotkey row listens for a press through the key recorder (`agt_platform::capture_keys`),
 //! which keeps the keys from every app (this window too) while it runs. A timer picks up what
-//! it reports and shows the keys held; anything else done in the window cancels listening.
+//! it reports and shows the keys held; anything else done in the window cancels listening, and
+//! so do another app becoming active and [`crate::LISTEN_IDLE`] with no key held.
 
-use crate::{Control, Error, Event, Model, Page, Stat};
+use crate::{Control, Error, Event, Model, Page, Row, Stat};
 use agt_platform::{Capture, CaptureHandle, capture_keys};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -24,8 +25,9 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBorderType,
-    NSButton, NSColor, NSControl, NSControlSize, NSControlStateValueOff, NSControlStateValueOn,
+    NSAccessibility, NSAlert, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDidResignActiveNotification, NSBackingStoreType, NSBorderType, NSButton, NSColor,
+    NSControl, NSControlSize, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSGridCellPlacement,
     NSGridRowAlignment, NSGridView, NSImage, NSLayoutAttribute, NSLayoutConstraint,
     NSLineBreakMode, NSMenu, NSMenuItem, NSPopUpButton, NSResponder, NSRunningApplication,
@@ -35,8 +37,9 @@ use objc2_app_kit::{
     NSWindowToolbarStyle,
 };
 use objc2_foundation::{
-    NSArray, NSDistributedNotificationCenter, NSNotification, NSNotificationSuspensionBehavior,
-    NSPoint, NSRange, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
+    NSArray, NSDistributedNotificationCenter, NSNotification, NSNotificationCenter,
+    NSNotificationSuspensionBehavior, NSPoint, NSRange, NSRect, NSRunLoop, NSRunLoopCommonModes,
+    NSSize, NSString, NSTimer,
 };
 use std::{
     cell::RefCell,
@@ -79,8 +82,8 @@ struct State {
     rebuild_pending: bool,
     /// The file changed while a text field was being edited: rebuild once editing ends.
     stale: bool,
-    /// Hotkey rows' key buttons, by row id.
-    hotkey_buttons: HashMap<usize, Retained<NSButton>>,
+    /// Hotkey rows' key buttons and the rows' labels, by row id.
+    hotkey_buttons: HashMap<usize, (Retained<NSButton>, String)>,
     listening: Option<Listening>,
     /// Recorders done listening, each kept (since when) until the keys it kept from apps are
     /// up: dropped while one is held (the Esc that cancelled), its auto-repeat and release
@@ -99,6 +102,7 @@ struct Listening {
     latest: Arc<Mutex<Option<Capture>>>,
     /// The row's text: [`crate::LISTENING`], or the keys held.
     title: String,
+    idle: crate::Idle,
 }
 
 struct Ivars {
@@ -166,7 +170,21 @@ define_class!(
                 Some(Capture::Cancelled) => self.end_listening(None),
                 None => {}
             }
+            let idle = self.with(|s| {
+                let l = s.listening.as_mut()?;
+                Some(l.idle.over(!l.capture.keys_up(), Instant::now()))
+            });
+            if idle.flatten() == Some(true) {
+                self.end_listening(None);
+            }
             self.run_capture_timer(false);
+        }
+
+        /// Another app became active (not another window of this one, such as an alert):
+        /// listening ends, or the keys typed there next would be recorded.
+        #[unsafe(method(resignedActive:))]
+        fn resigned_active(&self, _notification: &NSNotification) {
+            self.end_listening(None);
         }
 
         #[unsafe(method(selectPage:))]
@@ -409,14 +427,15 @@ impl Controller {
             }
         };
         self.with(|s| {
-            if let Some(button) = s.hotkey_buttons.get(&id) {
-                button.setTitle(&NSString::from_str(crate::LISTENING));
+            if let Some((button, label)) = s.hotkey_buttons.get(&id) {
+                show_on_key(button, label, crate::LISTENING);
             }
             s.listening = Some(Listening {
                 id,
                 capture,
                 latest,
                 title: crate::LISTENING.into(),
+                idle: crate::Idle::new(Instant::now()),
             });
         });
         self.run_capture_timer(false);
@@ -430,8 +449,8 @@ impl Controller {
             let Some(listening) = s.listening.as_mut() else {
                 return;
             };
-            if let Some(button) = s.hotkey_buttons.get(&listening.id) {
-                button.setTitle(&NSString::from_str(&title));
+            if let Some((button, label)) = s.hotkey_buttons.get(&listening.id) {
+                show_on_key(button, label, &title);
             }
             listening.title = title;
         });
@@ -448,8 +467,10 @@ impl Controller {
                     .pages
                     .get(s.current)
                     .and_then(|p| crate::hotkey_label(p, listening.id));
-                if let (Some(button), Some(label)) = (s.hotkey_buttons.get(&listening.id), label) {
-                    button.setTitle(&NSString::from_str(label));
+                if let (Some((button, row)), Some(label)) =
+                    (s.hotkey_buttons.get(&listening.id), label)
+                {
+                    show_on_key(button, row, label);
                 }
                 Some(listening)
             })
@@ -631,6 +652,13 @@ impl Controller {
     }
 }
 
+/// Shows `title` on a hotkey row's key button, named for VoiceOver after its row (labelled
+/// `label`) and what it shows (see [`crate::hotkey_name`]).
+fn show_on_key(button: &NSButton, label: &str, title: &str) {
+    button.setTitle(&NSString::from_str(title));
+    button.setAccessibilityLabel(Some(&NSString::from_str(&crate::hotkey_name(label, title))));
+}
+
 /// A control's row id. Tags are ids + 1: 0 is every view's default.
 fn tag(control: &NSView) -> usize {
     (control.tag() - 1).max(0) as usize
@@ -734,7 +762,7 @@ fn page_view(
                 }
                 Retained::into_super(Retained::into_super(label))
             };
-            let control = control_view(mtm, controller, r.id, &r.control, r.enabled, state);
+            let control = control_view(mtm, controller, r, state);
             let row = grid.addRowWithViews(&NSArray::from_retained_slice(&[label, control]));
             if section_top {
                 row.setTopPadding(14.0);
@@ -880,11 +908,10 @@ unsafe fn NSGridCell_emptyContentView(mtm: MainThreadMarker) -> Retained<NSView>
 fn control_view(
     mtm: MainThreadMarker,
     controller: &Controller,
-    id: usize,
-    control: &Control,
-    enabled: bool,
+    row: &Row,
     state: &mut State,
 ) -> Retained<NSView> {
+    let (id, control, enabled) = (row.id, &row.control, row.enabled);
     let target: Option<&AnyObject> = Some(controller);
     let view: Retained<NSControl> = match control {
         Control::Toggle { text, on } => {
@@ -1020,6 +1047,7 @@ fn control_view(
                     mtm,
                 )
             };
+            show_on_key(&key, &row.label, title);
             key.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             key.setTranslatesAutoresizingMaskIntoConstraints(false);
             key.widthAnchor()
@@ -1027,7 +1055,7 @@ fn control_view(
                 .setActive(true);
             let mut buttons = vec![key.clone()];
             if *removable {
-                buttons.push(unsafe {
+                let minus = unsafe {
                     NSButton::buttonWithTitle_target_action(
                         // A minus sign.
                         &NSString::from_str("\u{2212}"),
@@ -1035,9 +1063,11 @@ fn control_view(
                         Some(sel!(clicked:)),
                         mtm,
                     )
-                });
+                };
+                minus.setAccessibilityLabel(Some(&NSString::from_str("Remove hotkey")));
+                buttons.push(minus);
             }
-            state.hotkey_buttons.insert(id, key);
+            state.hotkey_buttons.insert(id, (key, row.label.clone()));
             let views: Vec<Retained<NSView>> = buttons
                 .into_iter()
                 .map(|b| {
@@ -1176,6 +1206,12 @@ pub fn run(
                 None,
                 NSNotificationSuspensionBehavior::DeliverImmediately,
             );
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &controller,
+            sel!(resignedActive:),
+            Some(NSApplicationDidResignActiveNotification),
+            None,
+        );
     }
 
     let _timer = unsafe {

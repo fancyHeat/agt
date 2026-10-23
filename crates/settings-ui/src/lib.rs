@@ -21,7 +21,7 @@ use unsupported as platform;
 use windows as platform;
 
 use agt_platform::Key;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type Error = Box<dyn std::error::Error>;
 
@@ -188,6 +188,48 @@ pub(crate) const LISTENING: &str = "Press a key or combo... (Esc cancels)";
 /// released (see [`agt_platform::CaptureHandle::keys_up`]).
 pub(crate) const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
+/// How long a hotkey row listens with no key held before it gives up, as Esc would: the key
+/// recorder keeps every key on the system from apps while it listens.
+pub(crate) const LISTEN_IDLE: Duration = Duration::from_secs(30);
+
+/// When a listening hotkey row gives up: once it's listened [`LISTEN_IDLE`] with no key held.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Idle {
+    /// Since when no key has been held (`None`: one is).
+    since: Option<Instant>,
+}
+
+impl Idle {
+    /// Listening started at `now`.
+    pub(crate) fn new(now: Instant) -> Self {
+        Idle { since: Some(now) }
+    }
+
+    /// Checked as listening goes on: whether to give up. `held`: whether a key the recorder
+    /// keeps from apps is down now (the opposite of [`agt_platform::CaptureHandle::keys_up`]).
+    pub(crate) fn over(&mut self, held: bool, now: Instant) -> bool {
+        match self.since {
+            _ if held => {
+                self.since = None;
+                false
+            }
+            None => {
+                self.since = Some(now);
+                false
+            }
+            Some(since) => now.saturating_duration_since(since) >= LISTEN_IDLE,
+        }
+    }
+}
+
+/// A hotkey row's key button's name for screen readers, while it shows `shown` (its keys, the
+/// listening text or the keys held): the row's label ("Hotkey" for a row without one), then
+/// what it shows.
+pub(crate) fn hotkey_name(label: &str, shown: &str) -> String {
+    let label = if label.is_empty() { "Hotkey" } else { label };
+    format!("{label}: {shown}")
+}
+
 /// A listening hotkey row's text for the keys held so far (platform key codes, in the order
 /// they went down): their labels joined with " + ", a key AGT doesn't know as `Key {code}`.
 pub(crate) fn held_label(codes: &[u16]) -> String {
@@ -301,6 +343,35 @@ mod tests {
         assert_eq!(held_label(&[shift, space]), "Left Shift + Space");
         assert_eq!(Key::from_code(0xFFFF), None);
         assert_eq!(held_label(&[shift, 0xFFFF]), "Left Shift + Key 65535");
+    }
+
+    #[test]
+    fn listening_gives_up_when_idle() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut idle = Idle::new(t0);
+        assert!(!idle.over(false, at(29)));
+        assert!(idle.over(false, at(30)));
+        // A key held puts it off, for as long as one is held and 30 s after.
+        let mut idle = Idle::new(t0);
+        assert!(!idle.over(true, at(20)));
+        assert!(!idle.over(true, at(60)));
+        assert!(!idle.over(false, at(61)));
+        assert!(!idle.over(false, at(90)));
+        assert!(idle.over(false, at(91)));
+    }
+
+    #[test]
+    fn key_buttons_are_named_after_their_row() {
+        assert_eq!(hotkey_name("Hotkey", "Fn"), "Hotkey: Fn");
+        assert_eq!(
+            hotkey_name("", "Left Control + Space"),
+            "Hotkey: Left Control + Space"
+        );
+        assert_eq!(
+            hotkey_name("Hotkey", LISTENING),
+            "Hotkey: Press a key or combo... (Esc cancels)"
+        );
     }
 
     #[test]
