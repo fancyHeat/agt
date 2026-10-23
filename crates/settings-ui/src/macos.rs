@@ -16,7 +16,7 @@
 //! it reports and shows the keys held; anything else done in the window cancels listening.
 
 use crate::{Control, Error, Event, Model, Page, Stat};
-use agt_platform::{Capture, CaptureHandle, Key, capture_keys};
+use agt_platform::{Capture, CaptureHandle, capture_keys};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
@@ -42,7 +42,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// Width of the label and control columns, in points: the same on every page, so the
@@ -62,10 +62,6 @@ const POLL_SECONDS: f64 = 2.0;
 /// How often a listening hotkey row shows what the key recorder reported, and a recorder done
 /// listening is checked for its keys being up.
 const CAPTURE_SECONDS: f64 = 0.05;
-/// The longest a recorder done listening waits for the keys it kept from apps to be released.
-const RELEASE_WAIT: Duration = Duration::from_secs(2);
-/// A hotkey row's text while it listens, until a key is held.
-const LISTENING: &str = "Press a key or combo... (Esc cancels)";
 /// A hotkey row's key button: the control column but for the minus button beside it, the
 /// same with or without one.
 const HOTKEY_WIDTH: f64 = CONTROL_WIDTH - 40.0;
@@ -101,7 +97,7 @@ struct Listening {
     /// What the recorder reported last: set on its thread (which must never wait for this
     /// one), taken by `capture:`.
     latest: Arc<Mutex<Option<Capture>>>,
-    /// The row's text: [`LISTENING`], or the keys held.
+    /// The row's text: [`crate::LISTENING`], or the keys held.
     title: String,
 }
 
@@ -157,7 +153,9 @@ define_class!(
         fn capture_tick(&self, _timer: &NSTimer) {
             self.with(|s| {
                 s.releasing
-                    .retain(|(capture, since)| !capture.keys_up() && since.elapsed() < RELEASE_WAIT)
+                    .retain(|(capture, since)| {
+                        !capture.keys_up() && since.elapsed() < crate::RELEASE_WAIT
+                    })
             });
             let latest = self
                 .with(|s| s.listening.as_ref()?.latest.lock().ok()?.take())
@@ -412,13 +410,13 @@ impl Controller {
         };
         self.with(|s| {
             if let Some(button) = s.hotkey_buttons.get(&id) {
-                button.setTitle(&NSString::from_str(LISTENING));
+                button.setTitle(&NSString::from_str(crate::LISTENING));
             }
             s.listening = Some(Listening {
                 id,
                 capture,
                 latest,
-                title: LISTENING.into(),
+                title: crate::LISTENING.into(),
             });
         });
         self.run_capture_timer(false);
@@ -427,11 +425,7 @@ impl Controller {
 
     /// Shows the keys held so far on the listening row.
     fn show_held(&self, codes: &[u16]) {
-        let title = codes
-            .iter()
-            .map(|&c| Key::from_code(c).map_or_else(|| format!("Key {c}"), |k| k.label().into()))
-            .collect::<Vec<_>>()
-            .join(" + ");
+        let title = crate::held_label(codes);
         self.with(|s| {
             let Some(listening) = s.listening.as_mut() else {
                 return;
@@ -453,7 +447,7 @@ impl Controller {
                 let label = s
                     .pages
                     .get(s.current)
-                    .and_then(|p| hotkey_label(p, listening.id));
+                    .and_then(|p| crate::hotkey_label(p, listening.id));
                 if let (Some(button), Some(label)) = (s.hotkey_buttons.get(&listening.id), label) {
                     button.setTitle(&NSString::from_str(label));
                 }
@@ -508,26 +502,7 @@ impl Controller {
     /// that asks to listen starts.
     fn listen_as_shown(&self) {
         let Some((gone, wanted)) = self.with(|s| {
-            let rows: Vec<_> = s
-                .pages
-                .get(s.current)
-                .into_iter()
-                .flat_map(|p| &p.sections)
-                .flat_map(|section| &section.rows)
-                .filter(|r| r.enabled)
-                .filter_map(|r| match r.control {
-                    Control::Hotkey { listening, .. } => Some((r.id, listening)),
-                    _ => None,
-                })
-                .collect();
-            let listening = s.listening.as_ref().map(|l| l.id);
-            let gone = listening.is_some_and(|id| !rows.iter().any(|&(r, _)| r == id));
-            let wanted = rows
-                .iter()
-                .find(|&&(_, wants)| wants)
-                .map(|&(id, _)| id)
-                .filter(|&id| listening != Some(id));
-            (gone, wanted)
+            crate::listening_as_shown(s.pages.get(s.current), s.listening.as_ref().map(|l| l.id))
         }) else {
             return;
         };
@@ -654,18 +629,6 @@ impl Controller {
         }
         self.listen_as_shown();
     }
-}
-
-/// The keys of hotkey row `id` on `page`, as the model gave them.
-fn hotkey_label(page: &Page, id: usize) -> Option<&str> {
-    page.sections
-        .iter()
-        .flat_map(|s| &s.rows)
-        .find(|r| r.id == id)
-        .and_then(|r| match &r.control {
-            Control::Hotkey { label, .. } => Some(label.as_str()),
-            _ => None,
-        })
 }
 
 /// A control's row id. Tags are ids + 1: 0 is every view's default.

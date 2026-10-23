@@ -20,6 +20,9 @@ use unsupported as platform;
 #[cfg(windows)]
 use windows as platform;
 
+use agt_platform::Key;
+use std::time::Duration;
+
 pub type Error = Box<dyn std::error::Error>;
 
 /// One page of the window (a toolbar tab on macOS, a sidebar entry on Windows).
@@ -178,6 +181,64 @@ pub(crate) fn page_index(pages: &[Page], title: Option<&str>) -> Option<usize> {
     Some(pages.iter().position(|p| p.title == title).unwrap_or(0))
 }
 
+/// A hotkey row's text while it listens, until a key is held.
+pub(crate) const LISTENING: &str = "Press a key or combo... (Esc cancels)";
+
+/// The longest a key recorder done listening waits for the keys it kept from apps to be
+/// released (see [`agt_platform::CaptureHandle::keys_up`]).
+pub(crate) const RELEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// A listening hotkey row's text for the keys held so far (platform key codes, in the order
+/// they went down): their labels joined with " + ", a key AGT doesn't know as `Key {code}`.
+pub(crate) fn held_label(codes: &[u16]) -> String {
+    codes
+        .iter()
+        .map(|&c| Key::from_code(c).map_or_else(|| format!("Key {c}"), |k| k.label().into()))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// The keys of hotkey row `id` on `page`, as the model gave them.
+pub(crate) fn hotkey_label(page: &Page, id: usize) -> Option<&str> {
+    page.sections
+        .iter()
+        .flat_map(|s| &s.rows)
+        .find(|r| r.id == id)
+        .and_then(|r| match &r.control {
+            Control::Hotkey { label, .. } => Some(label.as_str()),
+            _ => None,
+        })
+}
+
+/// What `page` (the page shown afresh, if any) means for listening while row `listening`
+/// listens (if one does): whether that row is gone (the page has no enabled hotkey row with
+/// its id), and the row to start listening on (the first enabled one that asks to, unless
+/// it's that one).
+pub(crate) fn listening_as_shown(
+    page: Option<&Page>,
+    listening: Option<usize>,
+) -> (bool, Option<usize>) {
+    let rows: Vec<_> = page
+        .into_iter()
+        .flat_map(|p| &p.sections)
+        .flat_map(|section| &section.rows)
+        .filter(|r| r.enabled)
+        .filter_map(|r| match r.control {
+            Control::Hotkey {
+                listening: wants, ..
+            } => Some((r.id, wants)),
+            _ => None,
+        })
+        .collect();
+    let gone = listening.is_some_and(|id| !rows.iter().any(|&(r, _)| r == id));
+    let wanted = rows
+        .iter()
+        .find(|&&(_, wants)| wants)
+        .map(|&(id, _)| id)
+        .filter(|&id| listening != Some(id));
+    (gone, wanted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +266,77 @@ mod tests {
         }];
         note(&mut pages, &Event::Hotkey(0, Some(vec![1])));
         assert_eq!(pages[0].sections[0].rows[0], row);
+    }
+
+    fn hotkey(id: usize, listening: bool, enabled: bool) -> Row {
+        Row {
+            id,
+            label: String::new(),
+            note: String::new(),
+            enabled,
+            control: Control::Hotkey {
+                label: format!("F{}", 13 + id),
+                listening,
+                removable: false,
+            },
+        }
+    }
+
+    fn page(rows: Vec<Row>) -> Page {
+        Page {
+            title: "Settings".into(),
+            symbol: "",
+            sections: vec![Section {
+                title: String::new(),
+                rows,
+            }],
+        }
+    }
+
+    #[test]
+    fn held_keys_in_plain_words() {
+        let code = |name| Key::parse(name).unwrap().code();
+        let (shift, space) = (code("LeftShift"), code("Space"));
+        assert_eq!(held_label(&[shift]), "Left Shift");
+        assert_eq!(held_label(&[shift, space]), "Left Shift + Space");
+        assert_eq!(Key::from_code(0xFFFF), None);
+        assert_eq!(held_label(&[shift, 0xFFFF]), "Left Shift + Key 65535");
+    }
+
+    #[test]
+    fn hotkey_label_is_the_models() {
+        let mut button = hotkey(1, false, true);
+        button.control = Control::Button("Add hotkey".into());
+        let p = page(vec![hotkey(0, false, true), button]);
+        assert_eq!(hotkey_label(&p, 0), Some("F13"));
+        assert_eq!(hotkey_label(&p, 1), None);
+        assert_eq!(hotkey_label(&p, 2), None);
+    }
+
+    #[test]
+    fn listening_follows_the_page_shown() {
+        let one = page(vec![hotkey(0, false, true)]);
+        assert_eq!(listening_as_shown(Some(&one), None), (false, None));
+        // The listening row is still there: listening goes on.
+        assert_eq!(listening_as_shown(Some(&one), Some(0)), (false, None));
+        // A row that asks to listen starts, unless it listens already.
+        let asks = page(vec![hotkey(0, false, true), hotkey(1, true, true)]);
+        assert_eq!(listening_as_shown(Some(&asks), None), (false, Some(1)));
+        assert_eq!(listening_as_shown(Some(&asks), Some(1)), (false, None));
+        assert_eq!(listening_as_shown(Some(&asks), Some(0)), (false, Some(1)));
+        // Gone: no such row, a disabled one, a row that isn't a hotkey, no page.
+        assert_eq!(listening_as_shown(Some(&one), Some(5)), (true, None));
+        let disabled = page(vec![hotkey(0, true, false)]);
+        assert_eq!(listening_as_shown(Some(&disabled), Some(0)), (true, None));
+        let mut button = hotkey(0, false, true);
+        button.control = Control::Button("Add hotkey".into());
+        assert_eq!(
+            listening_as_shown(Some(&page(vec![button])), Some(0)),
+            (true, None)
+        );
+        assert_eq!(listening_as_shown(None, Some(0)), (true, None));
+        assert_eq!(listening_as_shown(None, None), (false, None));
+        // A disabled row doesn't start listening.
+        assert_eq!(listening_as_shown(Some(&disabled), None), (false, None));
     }
 }

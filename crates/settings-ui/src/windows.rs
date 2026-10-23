@@ -7,17 +7,25 @@
 //! which then replace every color here. Per-monitor DPI aware: sizes are in DIPs, scaled by
 //! the window's DPI.
 //!
-//! Each control's id is its row's id + [`FIRST_ID`]. Changes are sent to the model as they
-//! happen (a pop-up's once chosen). If the model's pages then differ, the page is rebuilt on a
-//! zero-length timer, whose message comes after any input still queued (so a click that moved
-//! focus out of an edit field, which reported its text, still reaches the control it was on).
+//! Each control's id is its row's id + [`FIRST_ID`] (a hotkey row's minus button: +
+//! [`REMOVE_ID`]). Changes are sent to the model as they happen (a pop-up's once chosen). If
+//! the model's pages then differ, the page is rebuilt on a zero-length timer, whose message
+//! comes after any input still queued (so a click that moved focus out of an edit field, which
+//! reported its text, still reaches the control it was on).
+//!
+//! A hotkey row listens for a press through the key recorder (`agt_platform::capture_keys`),
+//! which keeps the keys from every app (this window too) while it runs. A timer picks up what
+//! it reports and shows the keys held; anything else done in the window cancels listening.
 
 use crate::{Control, Error, Event, Icon, Model, Page, Row, Stat};
+use agt_platform::{Capture, CaptureHandle, capture_keys};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 use windows_sys::Win32::{
     Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -81,13 +89,19 @@ use windows_sys::Win32::{
 const CLASS: &str = "AGT.Settings";
 const PANE_CLASS: &str = "AGT.SettingsPane";
 
-/// The page list's control id; rows start at [`FIRST_ID`] (clear of IDOK and IDCANCEL).
+/// The page list's control id; rows start at [`FIRST_ID`] (clear of IDOK and IDCANCEL), and
+/// hotkey rows' minus buttons at [`REMOVE_ID`] (clear of the rows).
 const LIST_ID: i32 = 10;
 const FIRST_ID: i32 = 100;
+const REMOVE_ID: i32 = 0x4000;
 
 const REBUILD_TIMER: usize = 1;
 const POLL_TIMER: usize = 2;
 const POLL_MS: u32 = 2000;
+/// Runs while a hotkey row listens or a recorder done listening waits for its keys: shows what
+/// the key recorder reported, and checks the waiting one's keys.
+const CAPTURE_TIMER: usize = 3;
+const CAPTURE_MS: u32 = 50;
 
 // Sizes in DIPs, after Windows 11's Settings.
 const NAV_WIDTH: i32 = 200;
@@ -129,6 +143,10 @@ const DROP_TEXT: i32 = 16;
 const DROP_HEIGHT: i32 = 300;
 const BUTTON_MIN: i32 = 120;
 const BUTTON_PADDING: i32 = 12;
+/// A hotkey row's key button, at least (wider if the listening text needs it), the same on
+/// every row. Then, if the row can be removed, the gap and its minus button (a square).
+const HOTKEY_WIDTH: i32 = 260;
+const HOTKEY_GAP: i32 = 8;
 /// A value wider than this goes under its title.
 const VALUE_WIDTH: i32 = 260;
 const SWITCH_WIDTH: i32 = 40;
@@ -185,6 +203,22 @@ struct State {
     moving: Option<bool>,
     /// The page changed size while the window was minimized: [`place`] it once restored.
     place_owed: bool,
+    listening: Option<Listening>,
+    /// Recorders done listening, each kept (since when) until the keys it kept from apps are
+    /// up: dropped while one is held (the Esc that cancelled), its auto-repeat and release
+    /// would reach this window and AGT.
+    releasing: Vec<(CaptureHandle, Instant)>,
+}
+
+/// The hotkey row listening for a press.
+struct Listening {
+    id: usize,
+    capture: CaptureHandle,
+    /// What the recorder reported last: set on its thread (which must never wait for this
+    /// one: its hook would hold up every keystroke), taken by [`CAPTURE_TIMER`].
+    latest: Arc<Mutex<Option<Capture>>>,
+    /// The row's text: [`crate::LISTENING`], or the keys held.
+    title: String,
 }
 
 thread_local! {
@@ -247,8 +281,9 @@ enum Look {
     Text(Ink, bool),
     /// A checkbox drawn as a switch.
     Switch,
-    /// A push button, on a card.
-    Button,
+    /// A push button, on a card: it shows its text, or this one (its text then names it for
+    /// screen readers).
+    Button(Option<String>),
     /// A button that's a whole card: its note under its title.
     Card(String),
 }
@@ -739,6 +774,8 @@ pub fn run(
                 last_focus: 0,
                 moving: None,
                 place_owed: false,
+                listening: None,
+                releasing: Vec::new(),
             })
         });
         rebuild(true);
@@ -1185,8 +1222,10 @@ enum Placed {
         align: u32,
     },
     /// The row's control. An edit field: its box (see [`Decor::fields`]); a button that's a
-    /// whole card: the card, and room for its focus ring.
+    /// whole card: the card, and room for its focus ring; a hotkey: its key button.
     Row(Row),
+    /// A hotkey row's minus button.
+    Remove { id: usize, enabled: bool },
 }
 
 impl Layout {
@@ -1323,6 +1362,13 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
     };
     let control = d(CONTROL_HEIGHT);
     let (with_ring, line) = (control + 2 * focus, line_height(Font::Body));
+    // A hotkey row's minus button and the gap before it.
+    let minus = match row.control {
+        Control::Hotkey {
+            removable: true, ..
+        } => d(HOTKEY_GAP) + control,
+        _ => 0,
+    };
     // The control on the right: its window's size, and the margin in it (its focus ring's).
     let right = match &row.control {
         Control::Toggle { .. } => Some((switch_width() + 2 * focus, with_ring, focus)),
@@ -1341,6 +1387,7 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
             let w = (text_width(Font::Body, title) + d(2 * BUTTON_PADDING)).max(d(BUTTON_MIN));
             Some((w + 2 * focus, with_ring, focus))
         }
+        Control::Hotkey { .. } => Some((hotkey_width() + minus + 2 * focus, with_ring, focus)),
         Control::Value(text) if !row.label.is_empty() => {
             let w = text_width(Font::Body, text);
             (w <= d(VALUE_WIDTH)).then_some((w, line, 0))
@@ -1381,6 +1428,23 @@ fn card(row: &Row, x: i32, y: i32, width: i32, dpi: u32, out: &mut Layout) -> i3
         let r = rect(x + width - pad + m - w, y + (h - ch) / 2, w, ch);
         match &row.control {
             Control::Value(text) => out.text(text, Font::Body, Ink::Secondary, true, SS_RIGHT, r),
+            // The key button, then the minus button at the right (each with its focus ring's
+            // room).
+            Control::Hotkey { .. } => {
+                let key = RECT {
+                    right: r.right - minus,
+                    ..r
+                };
+                out.items.push((Placed::Row(row.clone()), key));
+                if minus > 0 {
+                    let r = RECT {
+                        left: r.right - control - 2 * m,
+                        ..r
+                    };
+                    let (id, enabled) = (row.id, row.enabled);
+                    out.items.push((Placed::Remove { id, enabled }, r));
+                }
+            }
             _ => {
                 if matches!(row.control, Control::Text { .. }) {
                     out.decor.fields.push((r, FIRST_ID + row.id as i32));
@@ -1436,6 +1500,12 @@ fn button_card_height(title: &str, note: &str, width: i32, dpi: u32) -> i32 {
     };
     let h = text_height(Font::Body, title, w) + note_h + 2 * dip(CARD_PADDING_Y, dpi);
     h.max(dip(CARD_MIN, dpi))
+}
+
+/// A hotkey row's key button, without its focus ring's room: the same with or without a minus
+/// button beside it, with room for the listening text.
+fn hotkey_width() -> i32 {
+    (text_width(Font::Body, crate::LISTENING) + d(2 * BUTTON_PADDING)).max(d(HOTKEY_WIDTH))
 }
 
 /// A switch's window: "Off" (the wider), the gap, the switch.
@@ -1582,6 +1652,7 @@ fn rebuild(force: bool) -> bool {
         }
     }
     update_scrollbar();
+    listen_as_shown();
     true
 }
 
@@ -1645,13 +1716,27 @@ unsafe fn create(
                 Control::Value(_) | Control::Stats(_) | Control::Table { .. } => {
                     return null_mut();
                 }
-                // Not shown on Windows yet: `card` places no control for it.
-                Control::Hotkey { .. } => return null_mut(),
+                // The key button (see `Placed::Remove` for the minus).
+                Control::Hotkey { label, .. } => {
+                    // Rebuilt while listening: still shows the keys held.
+                    let shown = with(|s| match &s.listening {
+                        Some(l) if l.id == row.id => Some(l.title.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| label.clone());
+                    (
+                        "BUTTON",
+                        key_name(&row.label, &shown),
+                        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                        Some(Look::Button(Some(shown))),
+                    )
+                }
                 Control::Button(title) => {
                     let look = if row.label.is_empty() {
                         Look::Card(row.note.clone())
                     } else {
-                        Look::Button
+                        Look::Button(None)
                     };
                     // A command link: its note (`BCM_SETNOTE`) is its description for
                     // screen readers. Drawn here all the same.
@@ -1666,6 +1751,16 @@ unsafe fn create(
             };
             (class, text, style, id, row.enabled, Font::Body, look)
         }
+        // Its text for screen readers; it shows a minus sign.
+        Placed::Remove { id, enabled } => (
+            "BUTTON",
+            "Remove hotkey".to_owned(),
+            BS_PUSHBUTTON as u32 | WS_TABSTOP,
+            REMOVE_ID + *id as i32,
+            *enabled,
+            Font::Body,
+            Some(Look::Button(Some("\u{2212}".into()))),
+        ),
     };
     let (mut x, mut y, mut w, mut h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
     let multiline = style & ES_MULTILINE as u32 != 0;
@@ -1837,6 +1932,7 @@ fn scroll_to(pos: i32) {
 
 /// Shows page `index` (the user chose it), from its top.
 fn show(index: usize) {
+    end_listening(None);
     let Some(Some(window)) = with(|s| {
         s.page = s.pages.get(index)?.title.clone();
         s.current = index;
@@ -1857,6 +1953,10 @@ fn schedule_rebuild() {
 }
 
 fn send(event: Event) {
+    // Any other change cancels listening first.
+    if !matches!(event, Event::Hotkey(..)) {
+        end_listening(None);
+    }
     let Some(result) = with(|s| {
         crate::note(&mut s.pages, &event);
         s.model.handle(event)
@@ -1864,17 +1964,196 @@ fn send(event: Event) {
         return;
     };
     if let Err(message) = result {
-        let window = with(|s| s.window).unwrap_or(null_mut());
-        unsafe {
-            MessageBoxW(
-                window,
-                wide(&message).as_ptr(),
-                wide("The setting wasn't changed").as_ptr(),
-                MB_ICONWARNING | MB_OK,
-            );
-        }
+        alert(&message);
     }
     schedule_rebuild();
+}
+
+fn alert(message: &str) {
+    let window = with(|s| s.window).unwrap_or(null_mut());
+    unsafe {
+        MessageBoxW(
+            window,
+            wide(message).as_ptr(),
+            wide("The setting wasn't changed").as_ptr(),
+            MB_ICONWARNING | MB_OK,
+        );
+    }
+}
+
+/// Hotkey row `id`'s key button was clicked: it listens for a press (already listening: goes
+/// on).
+fn record(id: usize) {
+    if with(|s| s.listening.as_ref().is_some_and(|l| l.id == id)) == Some(false) {
+        // Another row listening is cancelled first.
+        end_listening(None);
+        if let Err(e) = listen(id) {
+            alert(&e);
+        }
+    }
+}
+
+/// Listens for a press for hotkey row `id`. `Err`: the key recorder can't start, and why (the
+/// row stays as it is).
+fn listen(id: usize) -> Result<(), String> {
+    let latest = Arc::new(Mutex::new(None));
+    let on = latest.clone();
+    let capture = capture_keys(move |c| {
+        if let Ok(mut latest) = on.lock() {
+            *latest = Some(c);
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    with(|s| {
+        s.listening = Some(Listening {
+            id,
+            capture,
+            latest,
+            title: crate::LISTENING.into(),
+        })
+    });
+    show_on_key(id, crate::LISTENING);
+    run_capture_timer();
+    Ok(())
+}
+
+/// The capture timer: lets go of recorders done listening whose keys are up, and shows what
+/// the listening one reported.
+fn capture_tick() {
+    with(|s| {
+        s.releasing
+            .retain(|(capture, since)| !capture.keys_up() && since.elapsed() < crate::RELEASE_WAIT)
+    });
+    let latest = with(|s| s.listening.as_ref()?.latest.lock().ok()?.take()).flatten();
+    match latest {
+        Some(Capture::Held(codes)) => show_held(&codes),
+        Some(Capture::Done(codes)) => end_listening(Some(codes)),
+        Some(Capture::Cancelled) => end_listening(None),
+        None => {}
+    }
+    run_capture_timer();
+}
+
+/// Shows the keys held so far on the listening row.
+fn show_held(codes: &[u16]) {
+    let title = crate::held_label(codes);
+    let id = with(|s| {
+        let listening = s.listening.as_mut()?;
+        listening.title = title.clone();
+        Some(listening.id)
+    });
+    if let Some(id) = id.flatten() {
+        show_on_key(id, &title);
+    }
+}
+
+/// Ends listening, if a row listens: shows its hotkey again, lets the recorder go once the keys
+/// it kept are up, and reports `keys` (`None`: cancelled). The page shows what the model makes
+/// of them once it's rebuilt.
+fn end_listening(keys: Option<Vec<u16>>) {
+    let Some(Some((Listening { id, capture, .. }, label))) = with(|s| {
+        let listening = s.listening.take()?;
+        let label = s
+            .pages
+            .get(s.current)
+            .and_then(|p| crate::hotkey_label(p, listening.id))
+            .map(str::to_owned);
+        Some((listening, label))
+    }) else {
+        return;
+    };
+    if let Some(label) = label {
+        show_on_key(id, &label);
+    }
+    // Before the event, which may bring up a message box: keys must reach it.
+    if capture.keys_up() {
+        drop(capture);
+    } else {
+        with(|s| s.releasing.push((capture, Instant::now())));
+        // It goes on in a message box's own loop too.
+        run_capture_timer();
+    }
+    send(Event::Hotkey(id, keys));
+}
+
+/// Runs the capture timer while a row listens or a recorder waits for its keys, and stops it
+/// after.
+fn run_capture_timer() {
+    let Some((window, needed)) =
+        with(|s| (s.window, s.listening.is_some() || !s.releasing.is_empty()))
+    else {
+        return;
+    };
+    unsafe {
+        if needed {
+            SetTimer(window, CAPTURE_TIMER, CAPTURE_MS, None);
+        } else {
+            KillTimer(window, CAPTURE_TIMER);
+        }
+    }
+}
+
+/// After the page is shown afresh: listening goes on while the page has its row, and a row
+/// that asks to listen starts.
+fn listen_as_shown() {
+    let Some((gone, wanted)) = with(|s| {
+        crate::listening_as_shown(s.pages.get(s.current), s.listening.as_ref().map(|l| l.id))
+    }) else {
+        return;
+    };
+    if gone {
+        end_listening(None);
+    }
+    if let Some(id) = wanted {
+        end_listening(None);
+        if let Err(e) = listen(id) {
+            // The model has the row listening: that's over (first: a rebuild while the message
+            // is up, as its loop runs the timers, would try again).
+            send(Event::Hotkey(id, None));
+            alert(&e);
+        }
+    }
+}
+
+/// Shows `text` on hotkey row `id`'s key button.
+fn show_on_key(id: usize, text: &str) {
+    let Some((pane, label)) = with(|s| {
+        let label = s
+            .pages
+            .get(s.current)
+            .and_then(|p| {
+                p.sections
+                    .iter()
+                    .flat_map(|sec| &sec.rows)
+                    .find(|r| r.id == id)
+            })
+            .map_or(String::new(), |r| r.label.clone());
+        (s.pane, label)
+    }) else {
+        return;
+    };
+    unsafe {
+        let button = GetDlgItem(pane, FIRST_ID + id as i32);
+        if button.is_null() {
+            return;
+        }
+        LOOKS.with(|l| {
+            if let Ok(mut l) = l.try_borrow_mut()
+                && let Some(Look::Button(shown)) = l.get_mut(&button)
+            {
+                *shown = Some(text.to_owned());
+            }
+        });
+        SetWindowTextW(button, wide(&key_name(&label, text)).as_ptr());
+        InvalidateRect(button, null(), 0);
+    }
+}
+
+/// A hotkey row's key button's name for screen readers, showing `shown`: the row's label (a
+/// row without one: "Hotkey"), then what it shows.
+fn key_name(label: &str, shown: &str) -> String {
+    let label = if label.is_empty() { "Hotkey" } else { label };
+    format!("{label}: {shown}")
 }
 
 fn window_text(hwnd: HWND) -> String {
@@ -2346,7 +2625,7 @@ fn draw_button(cd: &NMCUSTOMDRAW) -> bool {
         let l = l.try_borrow().ok()?;
         match l.get(&hwnd)? {
             Look::Switch => Some(Look::Switch),
-            Look::Button => Some(Look::Button),
+            Look::Button(shown) => Some(Look::Button(shown.clone())),
             Look::Card(note) => Some(Look::Card(note.clone())),
             Look::Text(..) => None,
         }
@@ -2408,7 +2687,7 @@ fn draw_button(cd: &NMCUSTOMDRAW) -> bool {
                 );
             }
         }
-        Look::Button => {
+        Look::Button(shown) => {
             c.rect(&r, Argb::solid(p.card));
             control_box(c, &b, control_fill(enabled, pressed, hot));
             let ink = match () {
@@ -2417,7 +2696,11 @@ fn draw_button(cd: &NMCUSTOMDRAW) -> bool {
                 _ => p.control_text,
             };
             let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-            c.text(&window_text(hwnd), &b, Font::Body, ink, flags);
+            let text = shown.clone().unwrap_or_else(|| window_text(hwnd));
+            // Clear of the box's edges (as a pop-up's), where a long one (a hotkey's) ends in
+            // "...".
+            let inner = inset(&b, d(CHOICE_TEXT), 0);
+            c.text(&text, &inner, Font::Body, ink, flags);
             if focused {
                 focus_ring(c, &r, radius());
             }
@@ -2630,6 +2913,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 0
             }
+            WM_TIMER if wp == CAPTURE_TIMER => {
+                capture_tick();
+                0
+            }
             WM_TIMER if wp == POLL_TIMER => {
                 let changed = with(|s| s.model.changed_elsewhere()).unwrap_or(false);
                 if changed || with(|s| s.stale).unwrap_or(false) {
@@ -2730,6 +3017,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_CLOSE => {
                 // Moving the focus off an edit field reports its last change.
                 SetFocus(hwnd);
+                end_listening(None);
                 DestroyWindow(hwnd);
                 0
             }
@@ -2746,7 +3034,13 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     unsafe {
         match msg {
             WM_COMMAND => {
-                let row = (wp & 0xFFFF) as i32 - FIRST_ID;
+                let id = (wp & 0xFFFF) as i32;
+                // A hotkey row's minus button, else the row's control.
+                let (row, minus) = if id >= REMOVE_ID {
+                    (id - REMOVE_ID, true)
+                } else {
+                    (id - FIRST_ID, false)
+                };
                 let code = ((wp >> 16) & 0xFFFF) as u32;
                 let control = lp as HWND;
                 if row < 0 || control.is_null() {
@@ -2788,6 +3082,8 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         send(Event::Toggle(row, on));
                     }
                     (Some(Control::Button(_)), BN_CLICKED) => send(Event::Click(row)),
+                    (Some(Control::Hotkey { .. }), BN_CLICKED) if minus => send(Event::Click(row)),
+                    (Some(Control::Hotkey { .. }), BN_CLICKED) => record(row),
                     // Once the choice is made (the list closes on it, or the focus moves on
                     // after arrowing through it), not on every step through the list: a closed
                     // one reports `CBN_SELENDOK` for each arrow key too.
