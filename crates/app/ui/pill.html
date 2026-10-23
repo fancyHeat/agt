@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>AGT meeting pill</title>
+<script>
+  // Rust delivers messages with window.agt.receive(msg). Defined before anything else; messages
+  // that arrive before the page script has started are queued and replayed in order.
+  (function () {
+    var queue = [];
+    window.agt = {
+      receive: function (msg) {
+        if (window.agt._handle) window.agt._handle(msg);
+        else queue.push(msg);
+      },
+      _queue: queue,
+      _handle: null
+    };
+  })();
+</script>
+<style>
+  :root {
+    --capsule: #2b2b2b;
+    --edge: rgba(255, 255, 255, 0.10);
+    --red: #ff3b30;
+    --green: #7ac70c;
+    --grey: #8e8e93;
+    --fg: #ffffff;
+    --fg-70: rgba(255, 255, 255, 0.70);
+    --fg-60: rgba(255, 255, 255, 0.60);
+    --btn: rgba(255, 255, 255, 0.10);
+    --btn-hover: rgba(255, 255, 255, 0.18);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --red: #ff453a; --edge: rgba(255, 255, 255, 0.14); }
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    background: transparent;
+  }
+  body {
+    font: 13px/1.25 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: var(--fg);
+    -webkit-font-smoothing: antialiased;
+    -webkit-user-select: none; user-select: none;
+    cursor: default;
+  }
+  button { font: inherit; color: inherit; cursor: default; margin: 0; }
+  button:focus { outline: none; }
+  button:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.6); outline-offset: 1px; }
+
+  /* The frame is the window: in the app it fills the webview, whatever size Rust gives it. */
+  #frame {
+    position: fixed; inset: 0; color: var(--fg);
+    font: 13px/1.25 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+
+  /* Capsule (recording, paused, finishing) */
+  .capsule {
+    position: absolute; inset: 0; border-radius: 999px; background: var(--capsule);
+    box-shadow: inset 0 0 0 1px var(--edge);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  /* Collapsed, the right 8 px sit off-screen: center the content in the visible part. */
+  #frame[data-expanded="false"] .capsule { padding-right: 8px; }
+  #frame[data-expanded="true"] .capsule { justify-content: flex-start; padding: 17px 0 7px; }
+
+  .cluster { display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 2px 0; }
+  #frame[data-expanded="true"] .cluster { gap: 8px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--red);
+    animation: breathe 1.8s ease-in-out infinite;
+  }
+  #frame[data-state="paused"] .dot,
+  #frame[data-state="finishing"] .dot { background: var(--grey); animation: none; }
+  @keyframes breathe { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.78); } }
+
+  .bars { display: flex; align-items: center; gap: 2.5px; height: 18px; }
+  .bars i {
+    display: block; width: 3px; height: 18px; border-radius: 2px; background: var(--green);
+    transform: scaleY(0.17); transform-origin: 50% 50%;
+    transition: transform 80ms linear, background-color 150ms ease;
+  }
+  #frame[data-state="paused"] .bars i { background: var(--grey); transform: scaleY(0.17) !important; }
+  #frame[data-state="finishing"] .bars i {
+    transform: scaleY(0.25); transition: none;
+    animation: sweep 1.6s ease-in-out infinite;
+  }
+  #frame[data-state="finishing"] .bars i:nth-child(2) { animation-delay: 0.2s; }
+  #frame[data-state="finishing"] .bars i:nth-child(3) { animation-delay: 0.4s; }
+  #frame[data-state="finishing"] .bars i:nth-child(4) { animation-delay: 0.6s; }
+  @keyframes sweep { 0%, 60%, 100% { transform: scaleY(0.25); opacity: 0.55; } 30% { transform: scaleY(0.9); opacity: 1; } }
+
+  .time {
+    font-size: 10px; line-height: 12px; font-weight: 500; color: var(--fg-70);
+    font-variant-numeric: tabular-nums; white-space: nowrap; letter-spacing: 0;
+  }
+  /* h:mm:ss past an hour: a touch tighter so it fits the 36 px that show when collapsed. */
+  .time.long { font-size: 9px; letter-spacing: -0.3px; }
+
+  .controls { display: none; flex-direction: column; align-items: center; gap: 5px; margin-top: 10px; }
+  .grip { display: none; }
+  #frame[data-expanded="true"] .controls,
+  #frame[data-expanded="true"] .grip { display: flex; animation: appear 140ms ease-out; }
+  @keyframes appear { from { opacity: 0; } to { opacity: 1; } }
+
+  .rb {
+    width: 28px; height: 28px; border-radius: 50%; border: 0; padding: 0;
+    background: var(--btn); color: var(--fg);
+    display: flex; align-items: center; justify-content: center;
+    transition: background-color 120ms ease, transform 120ms ease;
+  }
+  .rb:hover { background: var(--btn-hover); }
+  .rb:active { transform: scale(0.94); }
+  .rb.stop { background: var(--red); }
+  .rb.stop:hover { background: var(--red); filter: brightness(1.08); }
+  .rb svg { display: block; }
+
+  .grip {
+    margin-top: auto; width: 28px; height: 18px; align-items: center; justify-content: center;
+    cursor: grab;
+  }
+  .grip svg { display: block; }
+
+  /* Prompt card */
+  .card {
+    position: absolute; inset: 0; border-radius: 16px; background: var(--capsule);
+    box-shadow: inset 0 0 0 1px var(--edge);
+    display: flex; align-items: center; gap: 12px; padding: 0 16px;
+  }
+  .c-text { flex: 1; min-width: 0; padding-right: 4px; }
+  .c-title { font-size: 13px; font-weight: 700; line-height: 1.3; }
+  .c-sub {
+    font-size: 12px; line-height: 1.35; color: var(--fg-60); margin-top: 2px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .take {
+    flex: none; height: 30px; padding: 0 14px; border: 0; border-radius: 15px;
+    background: #ffffff; color: #1d1d1f; font-size: 13px; font-weight: 600; white-space: nowrap;
+    transition: background-color 120ms ease, transform 120ms ease;
+  }
+  .take:hover { background: #ebebeb; }
+  .take:active { transform: scale(0.97); }
+  .x {
+    position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; border-radius: 50%;
+    border: 0; padding: 0; background: transparent; color: var(--fg-60);
+    display: flex; align-items: center; justify-content: center;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+  .x:hover { background: var(--btn); color: var(--fg); }
+
+  /* Something went wrong (the notes window says what): a red ring that pulses a few times. */
+  #frame.alert .capsule, #frame.alert .card { animation: alert 0.7s ease-in-out 4; }
+  @keyframes alert { 50% { box-shadow: inset 0 0 0 2px var(--red); } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition-duration: 0ms !important; }
+    .dot { animation: none !important; }
+    #frame.alert .capsule, #frame.alert .card { animation: none; box-shadow: inset 0 0 0 2px var(--red); }
+    #frame[data-expanded="true"] .controls, #frame[data-expanded="true"] .grip { animation: none; }
+    #frame[data-state="finishing"] .bars i { animation: none; transform: scaleY(0.45); opacity: 0.7; }
+  }
+
+  /* Mock only (plain browser with ?mock): a pretend screen edge and a control panel. */
+  .mock-stage {
+    position: fixed; inset: 0; display: flex; gap: 0;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: #1d1d1f; background: #f2f2f0;
+  }
+  .mock-panel { width: 250px; flex: none; padding: 14px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+  .mock-panel h1 { font-size: 14px; margin: 0; }
+  .mock-panel p { margin: 0; color: #5a5a5f; font-size: 12px; }
+  .mock-panel .row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .mock-panel button {
+    height: 26px; padding: 0 10px; border-radius: 6px; border: 1px solid rgba(0, 0, 0, 0.18);
+    background: #fff; color: #1d1d1f; font-size: 12px;
+  }
+  .mock-panel button[aria-pressed="true"] { background: #1d1d1f; color: #fff; border-color: #1d1d1f; }
+  .mock-panel kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid rgba(0,0,0,0.2); border-radius: 4px; padding: 0 4px; }
+  .mock-log { font: 11px/1.45 ui-monospace, Menlo, monospace; color: #3a3a3f; white-space: pre-wrap; word-break: break-all; }
+  .mock-screen {
+    flex: 1; position: relative; overflow: hidden; margin: 12px 0 12px 0;
+    background: linear-gradient(135deg, #cfd6dd, #e9e4dc);
+    border-radius: 10px 0 0 10px;
+  }
+  .mock-screen::after {
+    content: "screen edge"; position: absolute; right: 6px; bottom: 6px; font-size: 11px; color: rgba(0, 0, 0, 0.4);
+  }
+  .mock-screen .mock-hidden { position: absolute; right: 16px; top: 40%; font-size: 12px; color: rgba(0, 0, 0, 0.45); }
+  .mock-screen #frame { position: absolute; inset: auto; transition: none; }
+  @media (prefers-color-scheme: dark) {
+    .mock-stage { background: #1c1c1e; color: #f2f2f4; }
+    .mock-panel p, .mock-log { color: #a8a8ad; }
+    .mock-panel button { background: #2c2c2e; color: #f2f2f4; border-color: rgba(255, 255, 255, 0.18); }
+    .mock-panel button[aria-pressed="true"] { background: #f2f2f4; color: #1d1d1f; }
+    .mock-panel kbd { border-color: rgba(255,255,255,0.25); }
+    .mock-screen { background: linear-gradient(135deg, #2f3740, #3d3933); }
+    .mock-screen::after, .mock-screen .mock-hidden { color: rgba(255, 255, 255, 0.45); }
+  }
+</style>
+</head>
+<body>
+<div id="frame" data-state="recording" data-expanded="false">
+  <div class="capsule" id="capsule">
+    <div class="cluster" id="cluster" title="Open meeting notes">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span class="time" id="time">00:00</span>
+    </div>
+    <div class="controls">
+      <button class="rb" id="b-notes" aria-label="Open notes" title="Notes">
+        <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><rect x="2.5" y="1.5" width="9" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 5h4M5 7.5h4M5 10h2.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </button>
+      <button class="rb" id="b-pause" aria-label="Pause" title="Pause">
+        <svg id="i-pause" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="2.2" y="1.5" width="2.6" height="9" rx="1" fill="currentColor"/><rect x="7.2" y="1.5" width="2.6" height="9" rx="1" fill="currentColor"/></svg>
+        <svg id="i-play" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" hidden><path d="M3.5 1.8v8.4c0 .5.5.8 1 .5l6.3-4.2c.4-.3.4-.8 0-1.1L4.5 1.3c-.5-.3-1 0-1 .5z" fill="currentColor"/></svg>
+      </button>
+      <button class="rb stop" id="b-stop" aria-label="Stop" title="Stop">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" rx="2" fill="#ffffff"/></svg>
+      </button>
+    </div>
+    <div class="grip" id="grip" title="Drag to move" aria-hidden="true">
+      <svg width="10" height="14" viewBox="0 0 10 14"><g fill="rgba(255,255,255,0.4)"><circle cx="2.5" cy="2.5" r="1.3"/><circle cx="7.5" cy="2.5" r="1.3"/><circle cx="2.5" cy="7" r="1.3"/><circle cx="7.5" cy="7" r="1.3"/><circle cx="2.5" cy="11.5" r="1.3"/><circle cx="7.5" cy="11.5" r="1.3"/></g></svg>
+    </div>
+  </div>
+  <div class="card" id="card" hidden>
+    <div class="c-text">
+      <div class="c-title">Meeting detected</div>
+      <div class="c-sub" id="c-sub">An app is using your mic</div>
+    </div>
+    <button class="take" id="b-take">Take notes</button>
+    <button class="x" id="b-dismiss" aria-label="Dismiss" title="Dismiss">
+      <svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2 2 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  function $(id) { return document.getElementById(id); }
+
+  // ------------------------------------------------------------------ IPC
+  var params = new URLSearchParams(location.search);
+  var mock = null;
+  if (!window.ipc) {
+    var sent = [];
+    window.__agtSent = sent;
+    window.ipc = {
+      postMessage: function (s) {
+        var msg;
+        try { msg = JSON.parse(s); } catch (e) { msg = s; }
+        sent.push(msg);
+        console.log('[agt ipc]', msg);
+        if (mock) setTimeout(function () { mock.handle(msg); }, 0);
+      }
+    };
+  }
+  function send(msg) {
+    try { window.ipc.postMessage(JSON.stringify(msg)); } catch (e) { console.error('[agt ipc] send failed', e); }
+  }
+
+  // ------------------------------------------------------------------ state and rendering
+  var frame = $('frame'), timeEl = $('time'), bars = Array.prototype.slice.call(document.querySelectorAll('.bars i'));
+  var S = { state: 'recording', expanded: null, elapsed: 0, at: Date.now(), app: '', levelAt: 0 };
+  var MULT = [0.62, 1, 0.84, 0.5];
+
+  function pad(n) { return n < 10 ? '0' + n : '' + n; }
+  function clock(ms) {
+    var t = Math.max(0, Math.floor((+ms || 0) / 1000));
+    var h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+    return h ? h + ':' + pad(m) + ':' + pad(s) : pad(m) + ':' + pad(s);
+  }
+  function elapsed() { return S.elapsed + (S.state === 'recording' ? Date.now() - S.at : 0); }
+  function isExpanded() {
+    if (S.state === 'prompt') return false;
+    if (S.state === 'finishing') return false;
+    if (typeof S.expanded === 'boolean') return S.expanded;
+    // Rust did not say: read it off the window size (expanded is 52 x 212, collapsed 44 x 120).
+    return frame.clientHeight >= 160 && frame.clientWidth <= 120;
+  }
+
+  function render() {
+    var st = S.state;
+    frame.dataset.state = st;
+    frame.dataset.expanded = isExpanded() ? 'true' : 'false';
+    $('capsule').hidden = st === 'prompt';
+    $('card').hidden = st !== 'prompt';
+    if (st === 'prompt') {
+      $('c-sub').textContent = (S.app ? S.app : 'An app') + ' is using your mic';
+    }
+    var paused = st === 'paused';
+    $('b-pause').setAttribute('aria-label', paused ? 'Resume' : 'Pause');
+    $('b-pause').title = paused ? 'Resume' : 'Pause';
+    // SVG elements have no .hidden property: toggle the attribute itself.
+    $('i-pause').toggleAttribute('hidden', paused);
+    $('i-play').toggleAttribute('hidden', !paused);
+    tick();
+    if (st !== 'recording') bars.forEach(function (b) { b.style.transform = ''; });
+  }
+  function tick() {
+    var t = S.state === 'finishing' ? '...' : clock(elapsed());
+    timeEl.textContent = t;
+    timeEl.classList.toggle('long', t.length > 5);
+    if (S.state === 'recording' && Date.now() - S.levelAt > 400) bars.forEach(function (b) { b.style.transform = 'scaleY(0.17)'; });
+  }
+
+  function onPill(msg) {
+    var st = msg.state;
+    if (st !== 'recording' && st !== 'paused' && st !== 'prompt' && st !== 'finishing') return;
+    S.state = st;
+    S.expanded = typeof msg.expanded === 'boolean' ? msg.expanded : null;
+    if (typeof msg.elapsed_ms === 'number' && isFinite(msg.elapsed_ms)) { S.elapsed = msg.elapsed_ms; S.at = Date.now(); }
+    S.app = msg.app ? String(msg.app) : '';
+    render();
+  }
+  function onLevels(me, them) {
+    if (S.state !== 'recording') return;
+    var v = Math.max(0, Math.min(1, Math.max(+me || 0, +them || 0)));
+    v = Math.min(1, Math.sqrt(v) * 1.15);
+    S.levelAt = Date.now();
+    bars.forEach(function (b, i) {
+      var k = 0.17 + 0.83 * Math.min(1, v * MULT[i] * (0.82 + 0.36 * Math.random()));
+      b.style.transform = 'scaleY(' + k.toFixed(3) + ')';
+    });
+  }
+
+  // A notice: flash, and keep the text as the tooltip for a while.
+  var alertTimer = null;
+  function onNotice(text) {
+    frame.classList.remove('alert');
+    void frame.offsetWidth; // restart the animation
+    frame.classList.add('alert');
+    frame.title = text ? String(text) : '';
+    clearTimeout(alertTimer);
+    alertTimer = setTimeout(function () { frame.classList.remove('alert'); frame.title = ''; }, 8000);
+  }
+
+  window.agt._handle = function (msg) {
+    if (typeof msg === 'string') { try { msg = JSON.parse(msg); } catch (e) { return; } }
+    if (!msg || typeof msg !== 'object') return;
+    try {
+      if (msg.type === 'pill') onPill(msg);
+      else if (msg.type === 'levels') onLevels(msg.me, msg.them);
+      else if (msg.type === 'notice') onNotice(msg.text);
+    } catch (e) {
+      console.error('[agt] could not handle', msg.type, e);
+    }
+  };
+
+  // ------------------------------------------------------------------ input
+  // Mouse down on the grip or on empty capsule or card space starts a native window drag.
+  // The dot, bars and time are not empty space: a click there opens the notes window.
+  frame.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    var t = e.target;
+    if (t.closest('button')) return;
+    var expanded = frame.dataset.expanded === 'true';
+    if (S.state !== 'prompt' && !expanded) return;          // collapsed: a click opens notes
+    if (t.closest('#cluster') && !t.closest('#grip')) return;
+    e.preventDefault();
+    send({ type: 'drag' });
+  });
+  $('capsule').addEventListener('click', function (e) {
+    if (e.target.closest('button') || e.target.closest('#grip')) return;
+    var expanded = frame.dataset.expanded === 'true';
+    if (!expanded || e.target.closest('#cluster')) send({ type: 'open_notes' });
+  });
+  $('b-notes').addEventListener('click', function () { send({ type: 'open_notes' }); });
+  $('b-pause').addEventListener('click', function () { send({ type: S.state === 'paused' ? 'resume' : 'pause' }); });
+  $('b-stop').addEventListener('click', function () { send({ type: 'stop' }); });
+  $('b-take').addEventListener('click', function () { send({ type: 'start' }); });
+  $('b-dismiss').addEventListener('click', function () { send({ type: 'dismiss' }); });
+  window.addEventListener('resize', function () { if (S.expanded === null) render(); });
+
+  setInterval(tick, 250);
+
+  // ------------------------------------------------------------------ mock (plain browser with ?mock)
+  if (window.__agtSent && params.has('mock')) mock = makeMock();
+
+  // Hover: Rust grows the window on enter and shrinks it back 600 ms after leave.
+  var hoverTarget = mock && mock.stage ? frame : document.documentElement;
+  hoverTarget.addEventListener('mouseenter', function () { send({ type: 'hover', on: true }); });
+  hoverTarget.addEventListener('mouseleave', function () { send({ type: 'hover', on: false }); });
+
+  function makeMock() {
+    var bare = params.has('bare');
+    var deliver = function (msg) { window.agt.receive(JSON.parse(JSON.stringify(msg))); };
+    var M = {
+      stage: !bare,
+      state: params.get('state') || 'recording',
+      expanded: params.has('expanded'),
+      hidden: false,
+      elapsed: 754000,
+      last: Date.now(),
+      app: params.get('app') || 'Google Chrome',
+      hover: false,
+      leaveTimer: null,
+      tour: params.has('tour'),
+      tourStep: 0
+    };
+    if (['recording', 'paused', 'prompt', 'finishing'].indexOf(M.state) < 0) M.state = 'recording';
+    var screen = null, hiddenNote = null, logEl = null, buttons = {};
+
+    function sizeFor() {
+      if (M.state === 'prompt') return { w: 300, h: 88, right: 8 };
+      if (M.state === 'finishing' || !M.expanded) return { w: 44, h: 120, right: -8 };
+      return { w: 52, h: 212, right: 8 };
+    }
+    function place() {
+      if (!screen) return;
+      var s = sizeFor();
+      frame.hidden = M.hidden;
+      hiddenNote.hidden = !M.hidden;
+      frame.style.width = s.w + 'px';
+      frame.style.height = s.h + 'px';
+      frame.style.right = s.right + 'px';
+      frame.style.top = Math.round(screen.clientHeight * 0.4 - s.h / 2) + 'px';
+    }
+    function push() {
+      var t = Date.now();
+      if (M.state === 'recording') M.elapsed += t - M.last;
+      M.last = t;
+      place();
+      var msg = { type: 'pill', state: M.state, expanded: M.expanded, elapsed_ms: M.elapsed };
+      if (M.state === 'prompt') msg.app = M.app;
+      deliver(msg);
+      syncButtons();
+    }
+    function setState(st, expanded) {
+      if (M.state === 'recording') { M.elapsed += Date.now() - M.last; }
+      M.last = Date.now();
+      M.state = st;
+      if (typeof expanded === 'boolean') M.expanded = expanded;
+      if (st === 'prompt' || st === 'finishing') M.expanded = false;
+      M.hidden = false;
+      push();
+    }
+    function hide() { M.hidden = true; place(); syncButtons(); }
+
+    // Fake levels at about 15 Hz while recording.
+    setInterval(function () {
+      if (M.state !== 'recording' || M.hidden) return;
+      var t = Date.now() / 1000;
+      var talking = Math.sin(t * 0.9) > -0.3;
+      var lv = talking ? 0.2 + 0.6 * Math.abs(Math.sin(t * 5.1)) * (0.6 + 0.4 * Math.random()) : 0.02 + 0.03 * Math.random();
+      deliver({ type: 'levels', me: lv * 0.6, them: lv });
+    }, 66);
+    // Rust pushes the state about once a second.
+    setInterval(function () { if (!M.hidden) push(); }, 1000);
+
+    // Optional automatic tour through every state.
+    var TOUR = [
+      ['prompt', false, 4000], ['recording', false, 3500], ['recording', true, 3500], ['paused', true, 2500],
+      ['recording', false, 2500], ['finishing', false, 3000], ['hidden', false, 1200]
+    ];
+    function tourNext() {
+      if (!M.tour) return;
+      var step = TOUR[M.tourStep % TOUR.length];
+      M.tourStep++;
+      if (step[0] === 'hidden') hide(); else setState(step[0], step[1]);
+      M.tourTimer = setTimeout(tourNext, step[2]);
+    }
+
+    function log(msg) {
+      if (!logEl) return;
+      logEl.textContent = (JSON.stringify(msg) + '\n' + logEl.textContent).slice(0, 1600);
+    }
+    function syncButtons() {
+      Object.keys(buttons).forEach(function (k) {
+        var on = k === 'expanded' ? M.expanded : k === 'tour' ? M.tour : k === 'hidden' ? M.hidden : (!M.hidden && M.state === k);
+        buttons[k].setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+    }
+    function buildStage() {
+      var stage = document.createElement('div');
+      stage.className = 'mock-stage';
+      var panel = document.createElement('div');
+      panel.className = 'mock-panel';
+      panel.innerHTML = '<h1>Pill mock</h1><p>Rust sizes the window per state; this page plays Rust. Hover the pill to expand it.</p>' +
+        '<div class="row" id="m-states"></div><div class="row" id="m-opts"></div>' +
+        '<p>Keys: <kbd>1</kbd> recording <kbd>2</kbd> paused <kbd>3</kbd> prompt <kbd>4</kbd> finishing <kbd>e</kbd> expand <kbd>t</kbd> tour <kbd>n</kbd> notice</p>' +
+        '<p>Sent to Rust:</p><div class="mock-log" id="m-log"></div>';
+      screen = document.createElement('div');
+      screen.className = 'mock-screen';
+      hiddenNote = document.createElement('div');
+      hiddenNote.className = 'mock-hidden';
+      hiddenNote.textContent = 'Pill hidden';
+      hiddenNote.hidden = true;
+      stage.appendChild(panel);
+      stage.appendChild(screen);
+      document.body.insertBefore(stage, frame);
+      screen.appendChild(hiddenNote);
+      screen.appendChild(frame);
+      logEl = panel.querySelector('#m-log');
+      function mk(row, key, label, fn) {
+        var b = document.createElement('button');
+        b.textContent = label;
+        b.addEventListener('click', fn);
+        panel.querySelector(row).appendChild(b);
+        buttons[key] = b;
+      }
+      ['recording', 'paused', 'prompt', 'finishing'].forEach(function (st) {
+        mk('#m-states', st, st.charAt(0).toUpperCase() + st.slice(1), function () { M.tour = false; setState(st); });
+      });
+      mk('#m-opts', 'expanded', 'Expanded', function () { M.tour = false; M.expanded = !M.expanded; if (M.state === 'prompt' || M.state === 'finishing') M.state = 'recording'; push(); });
+      mk('#m-opts', 'hidden', 'Hide', function () { M.tour = false; if (M.hidden) { M.hidden = false; push(); } else hide(); });
+      mk('#m-opts', 'tour', 'Tour', function () { M.tour = !M.tour; clearTimeout(M.tourTimer); if (M.tour) { M.tourStep = 0; tourNext(); } syncButtons(); });
+      mk('#m-opts', 'notice', 'Notice', sendNotice);
+      window.addEventListener('resize', place);
+    }
+    function sendNotice() { deliver({ type: 'notice', text: 'The microphone stopped: the device was unplugged' }); }
+    document.addEventListener('keydown', function (e) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 'n') { sendNotice(); return; }
+      var map = { '1': 'recording', '2': 'paused', '3': 'prompt', '4': 'finishing' };
+      if (map[e.key]) { M.tour = false; setState(map[e.key]); }
+      else if (e.key === 'e') { M.tour = false; if (M.state === 'prompt' || M.state === 'finishing') M.state = 'recording'; M.expanded = !M.expanded; push(); }
+      else if (e.key === 't') { M.tour = !M.tour; clearTimeout(M.tourTimer); if (M.tour) { M.tourStep = 0; tourNext(); } syncButtons(); }
+    });
+
+    if (M.stage) buildStage();
+    setTimeout(function () { push(); if (M.tour) tourNext(); }, 0);
+    // &notice=S: a notice S seconds after load.
+    if (params.has('notice')) setTimeout(sendNotice, Math.max(0, +params.get('notice') || 2) * 1000);
+
+    return {
+      stage: M.stage,
+      handle: function (msg) {
+        log(msg);
+        switch (msg && msg.type) {
+          case 'hover':
+            // What Rust does: expand at once on hover, collapse 600 ms after the mouse leaves.
+            M.hover = !!msg.on;
+            clearTimeout(M.leaveTimer);
+            if (M.state !== 'recording' && M.state !== 'paused') break;
+            if (M.hover) { if (!M.expanded) { M.expanded = true; push(); } }
+            else M.leaveTimer = setTimeout(function () { if (!M.hover && M.expanded) { M.expanded = false; push(); } }, 600);
+            break;
+          case 'pause': setState('paused'); break;
+          case 'resume': setState('recording'); break;
+          case 'stop':
+            setState('finishing');
+            setTimeout(function () { if (M.state === 'finishing') hide(); }, 2500);
+            break;
+          case 'start': M.elapsed = 0; setState('recording', false); break;
+          case 'dismiss': hide(); break;
+          case 'open_notes': console.log('[agt mock] would open the notes window'); break;
+          case 'drag': console.log('[agt mock] would start a window drag'); break;
+        }
+      }
+    };
+  }
+
+  // ------------------------------------------------------------------ start
+  render();
+  window.agt._queue.splice(0).forEach(function (msg) { window.agt._handle(msg); });
+})();
+</script>
+</body>
+</html>

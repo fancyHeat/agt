@@ -8,6 +8,9 @@
 //!   every other app and from AGT's own hotkey listener.
 //! - Ducking other audio while dictating ([`Ducker`]): the default output device's volume
 //!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL).
+//! - Meeting notes: the system audio recording permission ([`system_audio_permission`]) and
+//!   which apps are using the microphone ([`mic_users`], [`meeting_app_name`]), to offer notes
+//!   when a call starts.
 //! - Starting AGT at login ([`set_launch_at_login`]; Windows: the `Run` key; macOS:
 //!   `SMAppService`).
 //! - Anything else returns [`Error`]s saying it's unsupported.
@@ -377,6 +380,72 @@ pub fn open_permission_settings(permission: Permission) {
     imp::open_permission_settings(permission)
 }
 
+// Meeting notes: recording the other side of a call, and noticing that a call started. Kept
+// apart from `Permission`: dictation never needs these, so they must not show up in its
+// permission checks.
+
+/// Whether AGT may record other apps' audio (meeting notes' "Them" track). macOS: the "System
+/// Audio Recording Only" permission (TCC's `kTCCServiceAudioCapture`); without it the capture
+/// runs but delivers silence. `None`: not known, either not asked yet (macOS shows its prompt
+/// the first time a capture starts) or the check isn't available (it's a private macOS API).
+/// Windows and others: always `Some(true)`, loopback capture needs no permission. Cheap: fine
+/// to poll.
+pub fn system_audio_permission() -> Option<bool> {
+    imp::system_audio_permission()
+}
+
+/// Opens the system settings page where system audio recording is allowed (Windows: the
+/// microphone privacy page, the closest there is).
+pub fn open_system_audio_settings() {
+    imp::open_system_audio_settings()
+}
+
+/// A process that is recording from an input device right now (see [`mic_users`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicUser {
+    pub pid: i32,
+    /// Empty for processes without a bundle (command-line tools).
+    pub bundle_id: String,
+    /// A name to show the user: [`meeting_app_name`] if it's a known meeting app (so Chrome's
+    /// helper process reads "Google Chrome"), else the app's own name, else the process name,
+    /// its bundle ID or "pid N". Never empty.
+    pub app: String,
+}
+
+/// The other processes recording from a microphone (any input device) right now, to notice a
+/// call starting. AGT itself is never listed. macOS 14.2+ (Core Audio process objects); empty
+/// on older macOS, on Windows and on error. A few HAL queries per process: poll every second
+/// or two, not per frame.
+pub fn mic_users() -> Vec<MicUser> {
+    imp::mic_users()
+}
+
+/// Apps people take calls in, by bundle ID prefix (a prefix so helper processes and variants
+/// match: `com.google.Chrome.helper`, `com.microsoft.teams2`).
+const MEETING_APPS: &[(&str, &str)] = &[
+    ("com.google.Chrome", "Google Chrome"),
+    ("com.apple.Safari", "Safari"),
+    ("com.microsoft.edgemac", "Microsoft Edge"),
+    ("company.thebrowser.Browser", "Arc"),
+    ("com.brave.Browser", "Brave"),
+    ("org.mozilla.firefox", "Firefox"),
+    ("com.microsoft.teams", "Microsoft Teams"),
+    ("us.zoom.xos", "Zoom"),
+    ("com.tinyspeck.slackmacgap", "Slack"),
+    ("com.cisco.webex", "Webex"),
+    ("com.apple.FaceTime", "FaceTime"),
+    ("com.hnc.Discord", "Discord"),
+];
+
+/// The display name of the meeting app (or browser, for web calls) `bundle_id` belongs to;
+/// `None` if it isn't one (a voice memo, a dictation app: no "Take notes?" for those).
+pub fn meeting_app_name(bundle_id: &str) -> Option<&'static str> {
+    MEETING_APPS
+        .iter()
+        .find(|(prefix, _)| bundle_id.starts_with(prefix))
+        .map(|&(_, name)| name)
+}
+
 /// What [`set_launch_at_login`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginItem {
@@ -512,6 +581,14 @@ pub fn snapshot_clipboard() -> Result<ClipboardSnapshot, Error> {
 /// Puts `text` on the clipboard (excluded from clipboard history).
 pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     imp::set_clipboard_text(text).map(PasteToken)
+}
+
+/// Puts `text` on the clipboard the way any app's Copy does: unlike [`set_clipboard_text`],
+/// which is for a paste and keeps its text out of clipboard history, managers and other
+/// devices, this is a copy the user asked for to keep and paste elsewhere (the meeting notes
+/// window's Copy). Nothing is restored afterwards.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    imp::copy_text(text)
 }
 
 /// Call between [`set_clipboard_text`] and [`send_paste`]. Windows: clipboard listeners
@@ -1361,5 +1438,56 @@ mod tests {
         eprintln!("foreground app: {app:?}, {each:?} per call");
         assert!(app.as_deref() != Some(""));
         assert!(each < std::time::Duration::from_millis(5), "{each:?}");
+    }
+
+    #[test]
+    fn meeting_app_names() {
+        // Chrome captures the mic in a helper process, which has its own bundle ID.
+        assert_eq!(
+            meeting_app_name("com.google.Chrome.helper"),
+            Some("Google Chrome")
+        );
+        assert_eq!(meeting_app_name("com.google.Chrome"), Some("Google Chrome"));
+        // The new Teams client is `teams2`.
+        assert_eq!(
+            meeting_app_name("com.microsoft.teams2"),
+            Some("Microsoft Teams")
+        );
+        assert_eq!(meeting_app_name("us.zoom.xos"), Some("Zoom"));
+        assert_eq!(meeting_app_name("com.example"), None);
+        assert_eq!(meeting_app_name(""), None);
+    }
+
+    #[test]
+    fn mic_users_excludes_self() {
+        let me = std::process::id() as i32;
+        let users = mic_users();
+        assert!(users.iter().all(|u| u.pid != me), "{users:?}");
+        assert!(
+            users.iter().all(|u| u.pid > 0 && !u.app.is_empty()),
+            "{users:?}"
+        );
+    }
+
+    #[test]
+    fn system_audio_permission_does_not_panic() {
+        let p = system_audio_permission();
+        if cfg!(not(target_os = "macos")) {
+            assert_eq!(p, Some(true));
+        }
+    }
+
+    /// What this machine reports right now: `cargo test -p agt-platform -- --ignored
+    /// --nocapture print_meeting_state`.
+    #[test]
+    #[ignore = "prints this machine's state"]
+    fn print_meeting_state() {
+        // The first call also connects to the HAL; the second is what a poll costs.
+        for _ in 0..2 {
+            let t = Instant::now();
+            let users = mic_users();
+            println!("mic_users ({:?}): {users:#?}", t.elapsed());
+        }
+        println!("system_audio_permission: {:?}", system_audio_permission());
     }
 }

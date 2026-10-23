@@ -1,0 +1,1713 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>AGT Meeting notes</title>
+<script>
+  // Rust delivers messages with window.agt.receive(msg). Defined before anything else; messages
+  // that arrive before the page script has started are queued and replayed in order.
+  (function () {
+    var queue = [];
+    window.agt = {
+      receive: function (msg) {
+        if (window.agt._handle) window.agt._handle(msg);
+        else queue.push(msg);
+      },
+      _queue: queue,
+      _handle: null,
+      // Rust calls window.agt.flush() right before it hides the window (replaced below).
+      flush: function () {}
+    };
+  })();
+</script>
+<style>
+  :root {
+    --bg: #f7f7f3;
+    --bg-elev: #efefea;
+    --fill: #e9e9e4;
+    --fill-hover: #e1e1db;
+    --me: #d9eeeb;
+    --text: #1d1d1f;
+    --text-2: #56565b;
+    --text-3: #6b6b70;
+    --line: rgba(0, 0, 0, 0.09);
+    --line-strong: rgba(0, 0, 0, 0.16);
+    --primary-bg: #1d1d1f;
+    --primary-fg: #ffffff;
+    --primary-hover: #000000;
+    --btn-bg: #ffffff;
+    --btn-hover: #f2f2ee;
+    --seg-on: #ffffff;
+    --red: #ff3b30;
+    --focus: rgba(0, 122, 255, 0.5);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 4px 14px rgba(0, 0, 0, 0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1e1e1d;
+      --bg-elev: #272726;
+      --fill: #2e2e2c;
+      --fill-hover: #383836;
+      --me: #173a37;
+      --text: #f2f2f0;
+      --text-2: #b0b0ab;
+      --text-3: #9a9a95;
+      --line: rgba(255, 255, 255, 0.10);
+      --line-strong: rgba(255, 255, 255, 0.18);
+      --primary-bg: #f2f2f0;
+      --primary-fg: #1d1d1f;
+      --primary-hover: #ffffff;
+      --btn-bg: #2a2a29;
+      --btn-hover: #333331;
+      --seg-on: #484845;
+      --red: #ff453a;
+      --focus: rgba(10, 132, 255, 0.6);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.4);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+  }
+  button { font: inherit; color: inherit; cursor: default; }
+  button:focus { outline: none; }
+  button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
+  }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .view { position: absolute; inset: 0; display: flex; flex-direction: column; }
+  .wrap { width: 100%; max-width: 760px; margin: 0 auto; padding-left: 20px; padding-right: 20px; }
+  @media (max-width: 420px) { .wrap { padding-left: 16px; padding-right: 16px; } }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    height: 28px; padding: 0 12px; border-radius: 7px;
+    border: 1px solid var(--line-strong); background: var(--btn-bg);
+    font-size: 13px; font-weight: 500; white-space: nowrap;
+    transition: background-color 120ms ease, opacity 120ms ease;
+  }
+  .btn:hover:not(:disabled) { background: var(--btn-hover); }
+  .btn:disabled { opacity: 0.45; }
+  .btn.sm { height: 26px; padding: 0 10px; font-size: 12.5px; }
+  .btn.primary {
+    background: var(--primary-bg); color: var(--primary-fg); border-color: transparent;
+    font-weight: 600; height: 30px; padding: 0 14px;
+  }
+  .btn.primary:hover:not(:disabled) { background: var(--primary-hover); }
+  .btn.primary.busy:disabled { opacity: 1; }
+  .btn.block { width: 100%; height: 34px; font-size: 13.5px; }
+  .sq { width: 9px; height: 9px; border-radius: 2px; background: var(--red); flex: none; }
+  .icon-btn {
+    width: 28px; height: 28px; border-radius: 7px; border: 0; background: transparent;
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+    color: var(--text-2); transition: background-color 120ms ease;
+  }
+  .icon-btn:hover { background: var(--fill); color: var(--text); }
+  .icon-btn.xs { width: 20px; height: 20px; border-radius: 5px; }
+  .link-btn {
+    border: 0; background: none; padding: 0; font-size: 13px; font-weight: 600;
+    color: var(--text); text-decoration: underline; text-underline-offset: 2px;
+    text-decoration-color: var(--line-strong); white-space: nowrap;
+  }
+  .link-btn:hover { text-decoration-color: currentColor; }
+
+  .spin {
+    width: 12px; height: 12px; border-radius: 50%; flex: none;
+    border: 2px solid currentColor; border-right-color: transparent;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .rec-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex: none;
+    animation: breathe 1.8s ease-in-out infinite;
+  }
+  .rec-dot.paused { background: var(--text-3); animation: none; }
+  @keyframes breathe { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.45; transform: scale(0.8); } }
+
+  /* List view */
+  .list-head { padding-top: 20px; padding-bottom: 6px; flex: none; }
+  .list-head .wrap { display: flex; flex-direction: column; gap: 14px; }
+  .vt { margin: 0; font-size: 20px; line-height: 1.25; font-weight: 600; letter-spacing: -0.01em; }
+  .live-card {
+    display: flex; align-items: center; gap: 8px; padding: 8px 8px 8px 12px;
+    border-radius: 10px; background: var(--bg-elev); border: 1px solid var(--line);
+  }
+  .live-card .lc-label { font-size: 13px; font-weight: 600; }
+  .live-card .lc-title { font-size: 13px; color: var(--text-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .list-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 24px; }
+  .day { margin: 18px 0 4px; font-size: 12.5px; font-weight: 600; color: var(--text-2); padding-left: 10px; }
+  .row {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    border: 0; background: transparent; border-radius: 8px; padding: 8px 10px;
+    transition: background-color 120ms ease;
+  }
+  .row:hover { background: var(--fill); }
+  .row .r-main { flex: 1; min-width: 0; }
+  .row .r-title { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .r-title.is-new, .live-card .lc-title.is-new { color: var(--text-3); }
+  .row .r-sub { font-size: 12.5px; color: var(--text-2); display: flex; align-items: center; gap: 6px; }
+  .tag {
+    flex: none; font-size: 11.5px; font-weight: 600; color: var(--text-2);
+    border: 1px solid var(--line-strong); border-radius: 5px; padding: 1px 6px; line-height: 1.4;
+  }
+  .empty { color: var(--text-2); font-size: 13.5px; text-align: center; padding: 40px 12px; line-height: 1.55; }
+  .empty strong { display: block; color: var(--text); font-size: 14px; margin-bottom: 4px; }
+
+  /* Meeting view header */
+  .m-head { flex: none; padding-top: 12px; }
+  .m-head .wrap { display: flex; flex-direction: column; gap: 6px; }
+  .titlerow { display: flex; align-items: center; gap: 4px; margin-left: -6px; }
+  .title-input {
+    flex: 1; min-width: 0; font: inherit; font-size: 20px; line-height: 1.25; font-weight: 600;
+    letter-spacing: -0.01em; color: var(--text); background: transparent;
+    border: 0; border-radius: 6px; padding: 3px 6px; margin: 0;
+    transition: background-color 120ms ease;
+    -webkit-user-select: text; user-select: text;
+  }
+  .title-input:hover { background: var(--fill); }
+  .title-input:focus { outline: none; background: var(--fill); }
+  /* Untitled: the date title reads like a title; "New meeting..." (and any hint being typed over) is grey. */
+  .title-input::placeholder { color: var(--text); opacity: 1; }
+  .title-input.is-new::placeholder, .title-input:focus::placeholder { color: var(--text-3); }
+  .indent { padding-left: 32px; }
+  .meta { font-size: 13px; color: var(--text-2); }
+  .live-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 11px 0 10px;
+    border-radius: 13px; background: var(--fill); font-size: 13px; font-weight: 500; margin-right: 2px;
+  }
+  .notice {
+    display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2);
+    background: var(--bg-elev); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 6px 6px 10px; margin-top: 4px; line-height: 1.4;
+  }
+  .notice .n-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .notice .link-btn { margin-right: 4px; }
+  /* Something went wrong: the text in full strength, a red dot before it. */
+  .notice.alert { color: var(--text); }
+  .notice.alert::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--red); flex: none;
+  }
+
+  /* Tabs */
+  .tabs-wrap { flex: none; padding-top: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  .tabs {
+    display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--fill);
+  }
+  .tab {
+    border: 0; background: transparent; border-radius: 7px; padding: 4px 12px;
+    font-size: 13px; font-weight: 500; color: var(--text-2);
+    display: inline-flex; align-items: center; gap: 7px;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+  .tab:hover { color: var(--text); }
+  .tab[aria-selected="true"] { background: var(--seg-on); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12); }
+  .lv { display: inline-flex; gap: 3px; align-items: center; }
+  .lv i {
+    display: block; width: 6px; height: 6px; border-radius: 50%; background: var(--text-2);
+    opacity: 0.25; transform: scale(0.85); transition: opacity 90ms linear, transform 90ms linear;
+  }
+  .lv i.me { background: #0d9488; }
+
+  /* Panels */
+  .panels { flex: 1; min-height: 0; position: relative; }
+  .panel { position: absolute; inset: 0; overflow-y: auto; overflow-anchor: none; }
+  .panel.notes-panel { overflow: hidden; }
+  .notes-panel .wrap { height: 100%; padding-left: 0; padding-right: 0; }
+  #notes {
+    display: block; width: 100%; height: 100%; margin: 0; border: 0; outline: none; resize: none;
+    background: transparent; color: var(--text);
+    font: inherit; font-size: 15px; line-height: 1.65;
+    padding: 16px 20px 48px;
+    -webkit-user-select: text; user-select: text;
+  }
+  @media (max-width: 420px) { #notes { padding-left: 16px; padding-right: 16px; } }
+  #notes::placeholder { color: var(--text-3); }
+
+  /* AI notes */
+  .ai-wrap { padding-top: 16px; padding-bottom: 32px; }
+  .state-box {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+    padding: 18px; border-radius: 10px; background: var(--bg-elev); border: 1px solid var(--line);
+    color: var(--text-2); font-size: 13.5px; line-height: 1.55;
+  }
+  .state-box strong { color: var(--text); font-size: 14px; }
+  .state-row { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 500; }
+  .state-box .err { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .by { margin-top: 20px; font-size: 12px; color: var(--text-3); }
+  .dim { opacity: 0.45; }
+
+  .md { font-size: 14px; line-height: 1.6; -webkit-user-select: text; user-select: text; cursor: auto; overflow-wrap: anywhere; }
+  .md > :first-child { margin-top: 0; }
+  .md h1 { font-size: 17px; line-height: 1.3; margin: 22px 0 8px; font-weight: 650; }
+  .md h2 { font-size: 15px; line-height: 1.35; margin: 20px 0 6px; font-weight: 650; }
+  .md h3 { font-size: 14px; line-height: 1.4; margin: 16px 0 4px; font-weight: 650; color: var(--text-2); }
+  .md p { margin: 0 0 10px; }
+  .md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+  .md li { margin: 3px 0; }
+  .md li > ul, .md li > ol { margin: 3px 0 0; }
+  .md ul ul { list-style-type: circle; }
+  .md li.task { list-style: none; }
+  .md li.task::marker { content: ""; }
+  .md .cb {
+    display: inline-block; width: 14px; height: 14px; margin: 0 7px 0 -21px; vertical-align: -2px;
+    border: 1.5px solid var(--text-3); border-radius: 4px; position: relative;
+  }
+  .md .cb.on { background: var(--text); border-color: var(--text); }
+  .md .cb.on::after {
+    content: ""; position: absolute; left: 3.5px; top: 0.5px; width: 3.5px; height: 7px;
+    border: solid var(--bg); border-width: 0 2px 2px 0; transform: rotate(45deg);
+  }
+  .md li.task.done .tt { color: var(--text-2); text-decoration: line-through; text-decoration-color: var(--line-strong); }
+  .md code {
+    font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--fill); border-radius: 4px; padding: 1px 5px;
+  }
+  .md pre { background: var(--fill); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 0 0 10px; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { margin: 0 0 10px; padding-left: 12px; border-left: 3px solid var(--line-strong); color: var(--text-2); }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+  .md strong { font-weight: 650; }
+
+  /* Transcript */
+  .t-wrap { padding-top: 10px; padding-bottom: 64px; }
+  .ln { display: flex; flex-direction: column; margin-top: 12px; }
+  .ln.cont { margin-top: 5px; }
+  .ln.me { align-items: flex-end; }
+  .ln.them { align-items: flex-start; }
+  .ln-meta { font-size: 12px; color: var(--text-3); margin: 0 6px 3px; font-variant-numeric: tabular-nums; }
+  .ln-meta b { font-weight: 600; color: var(--text-2); margin-right: 6px; }
+  .bubble {
+    max-width: 84%; padding: 7px 11px; border-radius: 14px; font-size: 14px; line-height: 1.42;
+    white-space: pre-wrap; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; cursor: auto;
+  }
+  .me .bubble { background: var(--me); border-bottom-right-radius: 5px; }
+  .them .bubble { background: var(--fill); border-bottom-left-radius: 5px; }
+  .jump {
+    position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+    display: inline-flex; align-items: center; gap: 6px;
+    border: 0; border-radius: 14px; padding: 6px 12px 6px 10px;
+    background: var(--primary-bg); color: var(--primary-fg);
+    font-size: 12.5px; font-weight: 600; box-shadow: var(--shadow);
+  }
+  .jump:hover { background: var(--primary-hover); }
+
+  /* Footer */
+  .foot { flex: none; border-top: 1px solid var(--line); padding-top: 10px; padding-bottom: 12px; background: var(--bg); }
+  .foot-row { display: flex; align-items: center; gap: 8px; }
+  .foot-row .grow { flex: 1; }
+  .foot-error {
+    font-size: 12.5px; color: var(--text); margin-bottom: 8px; line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+  .foot-error::before { content: "Couldn't write notes: "; font-weight: 600; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition-duration: 0ms !important; }
+    .rec-dot, .spin { animation: none !important; }
+    .spin { border-right-color: currentColor; opacity: 0.6; }
+  }
+</style>
+</head>
+<body>
+
+<section class="view" id="list-view">
+  <header class="list-head">
+    <div class="wrap">
+      <h1 class="vt">Meetings</h1>
+      <div id="list-action"></div>
+      <div class="notice alert" id="l-notice" role="alert" hidden>
+        <span class="n-text" id="l-notice-text"></span>
+        <button class="icon-btn xs" id="l-notice-x" aria-label="Dismiss" title="Dismiss">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2 2 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+  <div class="list-scroll" id="list-scroll">
+    <div class="wrap" id="list"></div>
+  </div>
+</section>
+
+<section class="view" id="meeting-view" hidden>
+  <header class="m-head">
+    <div class="wrap">
+      <div class="titlerow">
+        <button class="icon-btn" id="back" aria-label="All meetings" title="All meetings">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <input id="title" class="title-input" aria-label="Meeting title" maxlength="200" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="meta indent" id="meta"></div>
+      <div class="live-row indent" id="live-row" hidden>
+        <span class="chip" id="chip"><span class="rec-dot" id="chip-dot"></span><span id="chip-label">Recording</span><span class="tnum" id="chip-time">00:00</span></span>
+        <button class="btn sm" id="pause">Pause</button>
+        <button class="btn sm" id="stop"><span class="sq" aria-hidden="true"></span>Stop</button>
+      </div>
+      <div class="notice" id="consent" role="note" hidden>
+        <span class="n-text">Recording on this computer. Let people know you're taking notes.</span>
+        <button class="icon-btn xs" id="consent-x" aria-label="Dismiss" title="Dismiss">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2 2 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="notice" id="sys" role="status" hidden>
+        <span class="n-text" id="sys-text"></span>
+        <button class="link-btn" id="open-settings" hidden>Open settings</button>
+        <button class="icon-btn xs" id="sys-x" aria-label="Dismiss" title="Dismiss" hidden>
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2 2 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="notice alert" id="m-notice" role="alert" hidden>
+        <span class="n-text" id="m-notice-text"></span>
+        <button class="icon-btn xs" id="m-notice-x" aria-label="Dismiss" title="Dismiss">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2 2 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+  <div class="tabs-wrap">
+    <div class="wrap">
+      <div class="tabs" role="tablist" aria-label="Meeting">
+        <button class="tab" role="tab" id="tab-notes" data-tab="notes" aria-controls="panel-notes">Notes</button>
+        <button class="tab" role="tab" id="tab-ai" data-tab="ai" aria-controls="panel-ai">AI notes</button>
+        <button class="tab" role="tab" id="tab-transcript" data-tab="transcript" aria-controls="panel-transcript">Transcript<span class="lv" id="lv" aria-hidden="true" title="Me and Them levels" hidden><i class="me" id="lv-me"></i><i class="them" id="lv-them"></i></span></button>
+      </div>
+    </div>
+  </div>
+  <main class="panels">
+    <div class="panel notes-panel" role="tabpanel" id="panel-notes" aria-labelledby="tab-notes">
+      <div class="wrap"><textarea id="notes" aria-label="My notes" spellcheck="true"></textarea></div>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-ai" aria-labelledby="tab-ai" hidden>
+      <div class="wrap ai-wrap" id="ai" aria-live="polite"></div>
+    </div>
+    <div class="panel" role="tabpanel" id="panel-transcript" aria-labelledby="tab-transcript" hidden>
+      <div class="wrap t-wrap" id="t-list"></div>
+    </div>
+    <button class="jump" id="jump" hidden>
+      <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M5 1.5v7M1.8 5.4 5 8.5l3.2-3.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Jump to latest</span>
+    </button>
+  </main>
+  <footer class="foot">
+    <div class="wrap">
+      <div class="foot-error" id="foot-error" role="alert" hidden></div>
+      <div class="foot-row">
+        <button class="btn primary" id="gen"><span class="spin" id="gen-spin" hidden></span><span id="gen-label">Generate notes</span></button>
+        <span class="grow"></span>
+        <button class="btn" id="copy">Copy</button>
+        <button class="btn" id="folder">Folder</button>
+      </div>
+    </div>
+  </footer>
+</section>
+
+<script>
+(function () {
+  'use strict';
+
+  function $(id) { return document.getElementById(id); }
+
+  // ------------------------------------------------------------------ IPC
+  var params = new URLSearchParams(location.search);
+  var mock = null;
+  if (!window.ipc) {
+    var sent = [];
+    window.__agtSent = sent;
+    window.ipc = {
+      postMessage: function (s) {
+        var msg;
+        try { msg = JSON.parse(s); } catch (e) { msg = s; }
+        sent.push(msg);
+        console.log('[agt ipc]', msg);
+        if (mock) setTimeout(function () { mock.handle(msg); }, 0);
+      }
+    };
+  }
+  function send(msg) {
+    try { window.ipc.postMessage(JSON.stringify(msg)); } catch (e) { console.error('[agt ipc] send failed', e); }
+  }
+
+  // ------------------------------------------------------------------ formatting
+  function pad(n) { return n < 10 ? '0' + n : '' + n; }
+  function clock(ms) {
+    var t = Math.max(0, Math.floor((+ms || 0) / 1000));
+    var h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+    return h ? h + ':' + pad(m) + ':' + pad(s) : pad(m) + ':' + pad(s);
+  }
+  function dur(ms) {
+    if (!(ms >= 0)) return '';
+    if (ms < 60000) return 'under 1 min';
+    var min = Math.round(ms / 60000);
+    if (min < 60) return min + ' min';
+    var h = Math.floor(min / 60), m = min % 60;
+    return h + ' h' + (m ? ' ' + m + ' min' : '');
+  }
+  var fDay = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  var fDayYear = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  var fTime = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+  function validTs(ts) { return typeof ts === 'number' && isFinite(ts) && ts > 0; }
+  function dayText(ts) {
+    var d = new Date(ts);
+    return d.getFullYear() === new Date().getFullYear() ? fDay.format(d) : fDayYear.format(d);
+  }
+  function startOfDay(ts) { var d = new Date(ts); d.setHours(0, 0, 0, 0); return d.getTime(); }
+  function dayLabel(ts) {
+    var today = startOfDay(Date.now());
+    var day = startOfDay(ts);
+    if (day === today) return 'Today';
+    var y = new Date(today); y.setDate(y.getDate() - 1);
+    if (day === y.getTime()) return 'Yesterday';
+    return dayText(ts);
+  }
+
+  // ------------------------------------------------------------------ Markdown (escape first, then our own tags only)
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function inline(text) {
+    var codes = [];
+    var s = esc(text).replace(/`([^`]+)`/g, function (_, c) {
+      codes.push(c);
+      return '\u0000' + (codes.length - 1) + '\u0000';
+    });
+    // Links render as their text only: no href, nothing to navigate to.
+    s = s.replace(/\[([^\]]+)\]\((?:[^()\s]|\([^()]*\))*\)/g, '<span class="md-link">$1</span>');
+    s = s.replace(/\*\*(?=\S)([^*]*?\S)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*\w])\*(?=[^*\s])([^*]*?[^*\s])\*(?![*\w])/g, '$1<em>$2</em>');
+    s = s.replace(/\u0000(\d+)\u0000/g, function (_, i) { return '<code>' + codes[+i] + '</code>'; });
+    return s;
+  }
+  function renderMarkdown(src) {
+    var lines = String(src || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n');
+    var out = [], para = [], root = null, inFence = false, fence = [];
+    function flushPara() {
+      if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; }
+    }
+    function listHtml(list) {
+      var tag = list.ordered ? 'ol' : 'ul';
+      var start = list.ordered && list.start !== 1 ? ' start="' + list.start + '"' : '';
+      return '<' + tag + start + '>' + list.items.map(function (it) {
+        var body = it.task
+          ? '<span class="cb' + (it.done ? ' on' : '') + '" role="img" aria-label="' + (it.done ? 'Done' : 'Not done') + '"></span><span class="tt">' + inline(it.text) + '</span>'
+          : inline(it.text);
+        var cls = it.task ? ' class="task' + (it.done ? ' done' : '') + '"' : '';
+        return '<li' + cls + '>' + body + it.children.map(listHtml).join('') + '</li>';
+      }).join('') + '</' + tag + '>';
+    }
+    function flushList() { if (root) { out.push(listHtml(root)); root = null; } }
+    function lastItem() {
+      var it = root.items[root.items.length - 1];
+      var sub = it.children[it.children.length - 1];
+      return sub ? sub.items[sub.items.length - 1] : it;
+    }
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i], m;
+      if (inFence) {
+        if (/^\s*```/.test(line)) { out.push('<pre><code>' + esc(fence.join('\n')) + '</code></pre>'); fence = []; inFence = false; }
+        else fence.push(line);
+        continue;
+      }
+      if (/^\s*```/.test(line)) { flushPara(); flushList(); inFence = true; continue; }
+      if (/^\s*$/.test(line)) { flushPara(); continue; }
+      if ((m = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line))) {
+        flushPara(); flushList();
+        var lv = Math.min(m[1].length, 3);
+        out.push('<h' + lv + '>' + inline(m[2]) + '</h' + lv + '>');
+        continue;
+      }
+      if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) { flushPara(); flushList(); out.push('<hr>'); continue; }
+      if ((m = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/.exec(line))) {
+        flushPara();
+        var indent = m[1].replace(/\t/g, '    ').length;
+        var ordered = /\d/.test(m[2]);
+        var t = /^\[([ xX])\](?:\s+(.*))?$/.exec(m[3]);
+        var item = { text: t ? (t[2] || '') : m[3], task: !!t, done: !!t && t[1] !== ' ', children: [] };
+        if (indent >= 2 && root) {
+          var parent = root.items[root.items.length - 1];
+          var sub = parent.children[parent.children.length - 1];
+          if (!sub || sub.ordered !== ordered) {
+            sub = { ordered: ordered, start: ordered ? parseInt(m[2], 10) : 1, items: [] };
+            parent.children.push(sub);
+          }
+          sub.items.push(item);
+        } else {
+          if (root && root.ordered !== ordered) flushList();
+          if (!root) root = { ordered: ordered, start: ordered ? parseInt(m[2], 10) : 1, items: [] };
+          root.items.push(item);
+        }
+        continue;
+      }
+      if ((m = /^\s{0,3}>\s?(.*)$/.exec(line))) { flushPara(); flushList(); out.push('<blockquote>' + inline(m[1]) + '</blockquote>'); continue; }
+      if (root && para.length === 0 && /^\s{2,}\S/.test(line)) { lastItem().text += ' ' + line.trim(); continue; }
+      flushList();
+      para.push(line.trim());
+    }
+    if (inFence) out.push('<pre><code>' + esc(fence.join('\n')) + '</code></pre>');
+    flushPara(); flushList();
+    return out.join('');
+  }
+
+  // ------------------------------------------------------------------ DOM helper
+  function h(tag, props, kids) {
+    var el = document.createElement(tag);
+    if (props) {
+      for (var k in props) {
+        var v = props[k];
+        if (v == null || v === false) continue;
+        if (k === 'class') el.className = v;
+        else if (k === 'text') el.textContent = v;
+        else if (k.slice(0, 2) === 'on') el.addEventListener(k.slice(2), v);
+        else el.setAttribute(k, v === true ? '' : v);
+      }
+    }
+    (kids || []).forEach(function (c) {
+      if (c == null || c === false) return;
+      el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    });
+    return el;
+  }
+
+  // ------------------------------------------------------------------ state
+  var S = {
+    view: 'list',
+    meetings: [],
+    liveId: null,
+    lives: {},          // id -> { live, at }
+    m: null,            // the open meeting
+    tab: 'notes',
+    tabs: {},           // id -> last tab
+    sum: {},            // id -> { state, error }
+    consentHidden: {},  // id -> true
+    sysHidden: {},      // id -> the system value whose notice was dismissed
+    notices: {},        // id ('' for none) -> { text, seq }: the last notice about it, until dismissed
+    stopping: {},       // id -> true after Stop until live is null
+    starting: false,
+    levels: { me: 0, them: 0, at: 0 }
+  };
+  var follow = true;
+  var tFresh = false;
+  var noticeSeq = 0;
+  var pending = { notes: null, title: null };
+  var lastSentTitle = {};
+
+  function liveOf(id) { var x = id && S.lives[id]; return x ? x.live : null; }
+  function elapsedOf(id) {
+    var x = id && S.lives[id];
+    if (!x) return 0;
+    var e = +x.live.elapsed_ms || 0;
+    if (x.live.recording && !x.live.paused) e += Date.now() - x.at;
+    return e;
+  }
+  function setLive(id, live) {
+    if (live && typeof live === 'object') {
+      S.lives[id] = { live: live, at: Date.now() };
+      S.liveId = id;
+    } else {
+      delete S.lives[id];
+      delete S.stopping[id];
+      if (S.liveId === id) S.liveId = null;
+    }
+  }
+  function byStart(a, b) { return (a.start_ms - b.start_ms) || (a.id - b.id); }
+  function wordCount() {
+    var n = 0;
+    if (S.m) S.m.lines.forEach(function (l) { n += String(l.text || '').split(/\s+/).filter(Boolean).length; });
+    return n;
+  }
+  function hasContent() { return !!S.m && (S.m.lines.length > 0 || !!(S.m.notes || '').trim()); }
+  // An untitled meeting reads "New meeting..." (greyed) while it records and while Claude writes
+  // its notes, which name it; otherwise its date title (default_title). Typing names it.
+  var NEW_TITLE = 'New meeting\u2026';
+  function naming(id) { var st = S.sum[id]; return !!liveOf(id) || !!(st && st.state === 'running'); }
+  function untitledText(x) { return naming(x.id) ? NEW_TITLE : (x.default_title || 'Untitled meeting'); }
+
+  // ------------------------------------------------------------------ elements
+  var el = {
+    listView: $('list-view'), meetingView: $('meeting-view'), list: $('list'), listAction: $('list-action'),
+    back: $('back'), title: $('title'), meta: $('meta'), liveRow: $('live-row'), chipDot: $('chip-dot'),
+    chipLabel: $('chip-label'), chipTime: $('chip-time'), pause: $('pause'), stop: $('stop'),
+    consent: $('consent'), consentX: $('consent-x'), sys: $('sys'), sysText: $('sys-text'),
+    openSettings: $('open-settings'), sysX: $('sys-x'),
+    tabNotes: $('tab-notes'), tabAi: $('tab-ai'), tabTranscript: $('tab-transcript'),
+    lv: $('lv'), lvMe: $('lv-me'), lvThem: $('lv-them'),
+    panelNotes: $('panel-notes'), panelAi: $('panel-ai'), panelTranscript: $('panel-transcript'),
+    notes: $('notes'), ai: $('ai'), tList: $('t-list'), jump: $('jump'),
+    footError: $('foot-error'), gen: $('gen'), genSpin: $('gen-spin'), genLabel: $('gen-label'),
+    copy: $('copy'), folder: $('folder'),
+    lNotice: $('l-notice'), lNoticeText: $('l-notice-text'), lNoticeX: $('l-notice-x'),
+    mNotice: $('m-notice'), mNoticeText: $('m-notice-text'), mNoticeX: $('m-notice-x')
+  };
+  var listTimeEl = null;
+
+  // ------------------------------------------------------------------ saving notes and title
+  function scheduleNotes() {
+    if (!S.m) return;
+    if (pending.notes) clearTimeout(pending.notes.timer);
+    var p = { id: S.m.id, value: el.notes.value };
+    p.timer = setTimeout(flushNotes, 600);
+    pending.notes = p;
+  }
+  function flushNotes() {
+    var p = pending.notes;
+    if (!p) return;
+    clearTimeout(p.timer);
+    pending.notes = null;
+    send({ type: 'notes', id: p.id, notes: p.value });
+  }
+  function scheduleTitle() {
+    if (!S.m) return;
+    if (pending.title) clearTimeout(pending.title.timer);
+    var p = { id: S.m.id, value: el.title.value };
+    p.timer = setTimeout(flushTitle, 600);
+    pending.title = p;
+  }
+  function flushTitle() {
+    var p = pending.title;
+    if (!p) return;
+    clearTimeout(p.timer);
+    pending.title = null;
+    var t = p.value.trim();
+    if (!t || lastSentTitle[p.id] === t) return;
+    lastSentTitle[p.id] = t;
+    send({ type: 'title', id: p.id, title: t });
+    S.meetings.forEach(function (x) { if (x.id === p.id) x.title = t; });
+  }
+  function flushAll() { flushNotes(); flushTitle(); }
+
+  // ------------------------------------------------------------------ incoming messages
+  function onMeeting(m, live) {
+    if (!m || m.id == null) return;
+    var prev = S.m && S.m.id === m.id ? S.m : null;
+    if (S.m && !prev) {
+      // Another meeting is taking over the view. Let a focused field finish (its blur handler
+      // saves under the old meeting's id), then send anything still pending, before S.m changes.
+      var ae = document.activeElement;
+      if (ae === el.notes || ae === el.title) ae.blur();
+      flushAll();
+    }
+    var lines = Array.isArray(m.lines) ? m.lines.filter(Boolean).slice() : [];
+    if (prev) {
+      var seen = {};
+      lines.forEach(function (l) { seen[l.id] = true; });
+      prev.lines.forEach(function (l) { if (!seen[l.id]) lines.push(l); });
+    }
+    lines.sort(byStart);
+    // Keep what the user is typing only when Rust re-sends the meeting already on screen.
+    var keepNotes = !!prev && ((pending.notes && pending.notes.id === m.id) || document.activeElement === el.notes);
+    var keepTitle = !!prev && ((pending.title && pending.title.id === m.id) || document.activeElement === el.title);
+    var wasLive = !!liveOf(m.id);
+    S.m = {
+      id: m.id,
+      title: keepTitle ? prev.title : (m.title || ''),
+      default_title: m.default_title || '',
+      started_at: m.started_at,
+      ended_at: m.ended_at,
+      notes: keepNotes ? prev.notes : (m.notes || ''),
+      summary: m.summary || null,
+      summary_by: m.summary_by || null,
+      lines: lines,
+      ids: {}
+    };
+    lines.forEach(function (l) { S.m.ids[l.id] = true; });
+    // A meeting runs again: a failed start's notice is old news.
+    if (live) delete S.notices[''];
+    // What Rust has. While an edit is kept, leave it alone so the edit still counts as unsent.
+    if (!keepTitle) lastSentTitle[m.id] = m.title || '';
+    setLive(m.id, live || null);
+    var cur = S.sum[m.id];
+    if (m.summary && !(cur && cur.state === 'running')) S.sum[m.id] = { state: 'done' };
+    if (!prev) {
+      S.tab = S.tabs[m.id] || (live ? 'notes' : 'ai');
+      follow = !!live;
+    } else if (wasLive && !live) {
+      S.tab = 'ai';
+    }
+    S.view = 'meeting';
+    render(true);
+    if (!keepNotes) el.notes.value = S.m.notes;
+    if (!keepTitle) el.title.value = S.m.title;
+    if (!prev) {
+      el.notes.scrollTop = 0;
+      el.panelAi.scrollTop = 0;
+      // A past meeting's transcript starts at the top the first time it shows.
+      tFresh = !live;
+      if (S.tab === 'transcript' && !live) { el.panelTranscript.scrollTop = 0; tFresh = false; }
+    }
+  }
+
+  // The transcript DOM always mirrors S.m.lines, one .ln per line in the same order, whether or
+  // not the tab is showing. Lines arrive out of start_ms order (Me lines wait for the echo check
+  // while later Them lines go out), so each one is placed by binary search, not by re-sorting.
+  // Lines live in .chunk groups of about CHUNK: WebKit lays out a flat list of 3000 lines in
+  // about 35 ms per change and a chunked one in under 1 ms.
+  var CHUNK = 100;
+  function locate(i) {
+    // The chunk and offset of line i; i may be the line count (the end).
+    var cs = el.tList.children;
+    for (var c = 0; c < cs.length; c++) {
+      var n = cs[c].children.length;
+      if (i < n) return { chunk: cs[c], at: i };
+      i -= n;
+    }
+    var last = cs[cs.length - 1];
+    return last ? { chunk: last, at: last.children.length } : null;
+  }
+  function nodeAt(i) { var p = locate(i); return p ? p.chunk.children[p.at] || null : null; }
+  function newChunk(before) { return el.tList.insertBefore(h('div', { class: 'chunk' }), before || null); }
+  function insertNodeAt(i, node) {
+    var p = locate(i);
+    if (!p) { newChunk().appendChild(node); return; }
+    var c = p.chunk;
+    if (p.at === c.children.length && c.children.length >= CHUNK && !c.nextSibling) {
+      newChunk().appendChild(node);   // appending past a full last chunk starts the next one
+      return;
+    }
+    c.insertBefore(node, c.children[p.at] || null);
+    if (c.children.length > 2 * CHUNK) {
+      // Late lines landed here often: split it in two.
+      var half = newChunk(c.nextSibling);
+      while (c.children.length > CHUNK) half.insertBefore(c.lastChild, half.firstChild);
+    }
+  }
+  function removeNodeAt(i) {
+    var p = locate(i);
+    var node = p && p.chunk.children[p.at];
+    if (!node) return;
+    p.chunk.removeChild(node);
+    if (!p.chunk.children.length) el.tList.removeChild(p.chunk);
+  }
+  function insertIndex(lines, line) {
+    var lo = 0, hi = lines.length;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (byStart(lines[mid], line) <= 0) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+  function refreshLineAt(i) {
+    // Speaker label and spacing depend on the line before, so redraw a neighbour after a change.
+    var lines = S.m.lines, node = nodeAt(i);
+    if (node && lines[i]) node.parentNode.replaceChild(lineEl(lines[i], lines[i - 1]), node);
+  }
+  function removeLineAt(i) {
+    S.m.lines.splice(i, 1);
+    removeNodeAt(i);
+    refreshLineAt(i);
+  }
+  function onLine(id, line) {
+    if (!S.m || S.m.id !== id || !line || line.id == null) return;
+    var lines = S.m.lines, list = el.tList, panel = el.panelTranscript;
+    var visible = S.view === 'meeting' && S.tab === 'transcript';
+    var stick = visible && follow;
+    if (S.m.ids[line.id]) {
+      for (var i = 0; i < lines.length; i++) if (lines[i].id === line.id) { removeLineAt(i); break; }
+    }
+    if (!lines.length) list.textContent = '';   // drop the empty state
+    var idx = insertIndex(lines, line);
+    // Scrolled up and the line lands above the view: remember where the next line sits so the
+    // reading place can be kept. Only then is layout read twice; following reads it once.
+    var ref = visible && !stick ? nodeAt(idx) : null;
+    var refTop = ref ? ref.offsetTop : 0;
+    if (ref && refTop > panel.scrollTop) ref = null;
+    lines.splice(idx, 0, line);
+    S.m.ids[line.id] = true;
+    insertNodeAt(idx, lineEl(line, lines[idx - 1]));
+    refreshLineAt(idx + 1);
+    if (stick) scrollBottom();
+    else if (ref) {
+      var moved = nodeAt(idx + 1);
+      if (moved) panel.scrollTop += moved.offsetTop - refTop;
+    }
+    updateJump();
+    renderFooter();
+  }
+
+  function onLive(id, live) {
+    if (id == null) return;
+    var was = !!liveOf(id);
+    setLive(id, live || null);
+    if (S.m && S.m.id === id) {
+      if (was && !live) {
+        if (!S.m.ended_at) S.m.ended_at = Date.now();
+        setTab('ai');
+      }
+      if (!S.m.lines.length && was !== !!live) renderTranscript();
+      renderHeader();
+      renderTabs();
+      renderFooter();
+    }
+    if (!live) S.meetings.forEach(function (x) { if (x.id === id && !x.ended_at) x.ended_at = Date.now(); });
+    if (S.view === 'list') { if (was !== !!live) renderList(); else renderListAction(); }
+  }
+
+  function onLevels(me, them) {
+    S.levels.me = Math.max(0, Math.min(1, +me || 0));
+    S.levels.them = Math.max(0, Math.min(1, +them || 0));
+    S.levels.at = Date.now();
+    paintLevels();
+  }
+  function paintLevels() {
+    if (el.lv.hidden) return;
+    var on = Date.now() - S.levels.at < 600;
+    [[el.lvMe, on ? S.levels.me : 0], [el.lvThem, on ? S.levels.them : 0]].forEach(function (p) {
+      var v = Math.min(1, Math.sqrt(p[1]) * 1.15);
+      p[0].style.opacity = (0.25 + 0.75 * v).toFixed(2);
+      p[0].style.transform = 'scale(' + (0.85 + 0.45 * v).toFixed(2) + ')';
+    });
+  }
+
+  function onSummary(msg) {
+    var id = msg.id;
+    if (id == null) return;
+    var state = msg.state;
+    if (state === 'running') S.sum[id] = { state: 'running' };
+    else if (state === 'error') S.sum[id] = { state: 'error', error: msg.error ? String(msg.error) : 'Something went wrong.' };
+    else if (state === 'done') {
+      S.sum[id] = { state: 'done' };
+      if (S.m && S.m.id === id && typeof msg.markdown === 'string') {
+        S.m.summary = msg.markdown;
+        S.m.summary_by = msg.by || null;
+      }
+      S.meetings.forEach(function (x) { if (x.id === id) x.has_summary = true; });
+      if (typeof msg.title === 'string' && msg.title) onNamed(id, msg.title);
+    } else return;
+    if (S.m && S.m.id === id) { renderTitleHint(); renderAi(); renderFooter(); }
+    if (S.view === 'list') renderList();
+  }
+
+  // The AI notes named untitled meeting `id`. Rust has the title now; a title the user is
+  // typing still wins (it is sent and saved after this one).
+  function onNamed(id, title) {
+    S.meetings.forEach(function (x) { if (x.id === id && !(x.title || '').trim()) x.title = title; });
+    if (!S.m || S.m.id !== id) return;
+    lastSentTitle[id] = title;
+    var typing = (pending.title && pending.title.id === id) || (document.activeElement === el.title && el.title.value.trim());
+    if (!typing) { S.m.title = title; el.title.value = title; }
+  }
+
+  // One line under the header: a session error, a start that failed, the model still loading.
+  // The last one about each meeting (and about none) is kept until dismissed or taken back.
+  function noticeKey(id) { return id == null ? '' : String(id); }
+  function onNotice(id, text) {
+    if (!text) return;
+    S.notices[noticeKey(id)] = { text: String(text), seq: ++noticeSeq };
+    // A start that failed answers the Start button.
+    if (id == null && S.starting) { S.starting = false; renderListAction(); }
+    renderNotice();
+  }
+  // Rust takes a notice back once it no longer holds (the speech model has loaded), unless a
+  // newer one took its place.
+  function onClearNotice(id, text) {
+    var k = noticeKey(id), n = S.notices[k];
+    if (n && n.text === String(text)) { delete S.notices[k]; renderNotice(); }
+  }
+  // The key of the newest notice among `keys` (null ones skipped), or null.
+  function newestNotice(keys) {
+    var best = null;
+    keys.forEach(function (k) {
+      var n = k == null ? null : S.notices[k];
+      if (n && (best == null || n.seq > S.notices[best].seq)) best = k;
+    });
+    return best;
+  }
+  // The list shows a failed start's notice and the live meeting's; a meeting its own and a
+  // failed start's. The newest of the two.
+  function shownNotice(view) {
+    if (view === 'list') return newestNotice(['', S.liveId]);
+    return S.m ? newestNotice(['', S.m.id]) : null;
+  }
+  function renderNotice() {
+    var lk = S.view === 'list' ? shownNotice('list') : null;
+    var mk = S.view === 'meeting' ? shownNotice('meeting') : null;
+    el.lNotice.hidden = lk == null;
+    el.mNotice.hidden = mk == null;
+    el.lNoticeText.textContent = lk == null ? '' : S.notices[lk].text;
+    el.mNoticeText.textContent = mk == null ? '' : S.notices[mk].text;
+  }
+  function dismissNotice(view) {
+    var k = shownNotice(view);
+    if (k != null) delete S.notices[k];
+    renderNotice();
+  }
+
+  function onMeetings(list) {
+    S.meetings = (Array.isArray(list) ? list.filter(Boolean) : []).slice().sort(function (a, b) {
+      return (b.started_at || 0) - (a.started_at || 0);
+    });
+    if (S.view === 'list') renderList();
+  }
+
+  window.agt._handle = function (msg) {
+    if (typeof msg === 'string') { try { msg = JSON.parse(msg); } catch (e) { return; } }
+    if (!msg || typeof msg !== 'object') return;
+    try {
+      switch (msg.type) {
+        case 'meeting': S.starting = false; onMeeting(msg.meeting, msg.live); break;
+        case 'line': onLine(msg.id, msg.line); break;
+        case 'live': onLive(msg.id, msg.live); break;
+        case 'levels': onLevels(msg.me, msg.them); break;
+        case 'summary': onSummary(msg); break;
+        case 'meetings': onMeetings(msg.list); break;
+        case 'notice': onNotice(msg.id, msg.text); break;
+        case 'clear_notice': onClearNotice(msg.id, msg.text); break;
+      }
+    } catch (e) {
+      console.error('[agt] could not handle', msg && msg.type, e);
+    }
+  };
+
+  // ------------------------------------------------------------------ rendering
+  function render(full) {
+    el.listView.hidden = S.view !== 'list';
+    el.meetingView.hidden = S.view !== 'meeting';
+    document.title = 'AGT Meeting notes';
+    renderNotice();
+    if (S.view === 'list') { renderList(); return; }
+    renderHeader();
+    renderTabs();
+    if (full) renderTranscript();
+    renderAi();
+    renderFooter();
+    if (full && S.tab === 'transcript' && follow) scrollBottom();
+  }
+
+  function metaText(m, live) {
+    if (!m || !validTs(m.started_at)) return '';
+    var parts = [dayText(m.started_at), fTime.format(new Date(m.started_at))];
+    var ms = live ? elapsedOf(m.id) : (validTs(m.ended_at) ? m.ended_at - m.started_at : null);
+    if (ms != null) parts.push(dur(ms));
+    return parts.join(' · ');
+  }
+
+  function renderTitleHint() {
+    if (!S.m) return;
+    el.title.placeholder = untitledText(S.m);
+    el.title.classList.toggle('is-new', naming(S.m.id));
+  }
+
+  function renderHeader() {
+    var m = S.m, live = liveOf(m.id);
+    renderTitleHint();
+    el.meta.textContent = metaText(m, live);
+    el.liveRow.hidden = !live;
+    if (live) {
+      var finishing = !live.recording || !!S.stopping[m.id];
+      el.chipDot.classList.toggle('paused', !!(live.paused || finishing));
+      el.chipLabel.textContent = finishing ? 'Finishing...' : (live.paused ? 'Paused' : 'Recording');
+      el.chipTime.hidden = !!finishing;
+      el.chipTime.textContent = clock(elapsedOf(m.id));
+      el.pause.hidden = !!finishing;
+      el.stop.hidden = !!finishing;
+      el.pause.textContent = live.paused ? 'Resume' : 'Pause';
+    }
+    el.consent.hidden = !live || !!S.consentHidden[m.id];
+    var sys = live ? live.system : 'ok';
+    if (live && sys === 'no-permission') {
+      // The permission is missing (or not known): the settings are the way out.
+      el.sys.hidden = false;
+      el.sysText.textContent = "AGT can't hear the other side yet.";
+      el.openSettings.hidden = false;
+      el.sysX.hidden = true;
+    } else if (live && sys === 'silent' && S.sysHidden[m.id] !== sys) {
+      // Allowed, but nothing comes (nothing plays yet, or the capture is stuck).
+      el.sys.hidden = false;
+      el.sysText.textContent = "AGT doesn't hear anything from the other side yet.";
+      el.openSettings.hidden = true;
+      el.sysX.hidden = false;
+    } else if (live && sys === 'unsupported' && S.sysHidden[m.id] !== sys) {
+      var why = String(live.system_reason || '').trim().replace(/[\s.]+$/, '');
+      el.sys.hidden = false;
+      el.sysText.textContent = 'AGT records your microphone only' + (why ? ': ' + why : '') + '.';
+      el.openSettings.hidden = true;
+      el.sysX.hidden = false;
+    } else {
+      el.sys.hidden = true;
+    }
+    el.notes.placeholder = live
+      ? 'Write notes here. AGT is transcribing; Generate notes uses both.'
+      : 'Write notes here.';
+  }
+
+  function setTab(tab) {
+    if (tab !== 'notes' && tab !== 'ai' && tab !== 'transcript') return;
+    var was = S.tab;
+    S.tab = tab;
+    if (S.m) S.tabs[S.m.id] = tab;
+    renderTabs();
+    if (tab === 'transcript' && was !== 'transcript') {
+      // The list is already up to date. Live: go to the latest. Past: keep the reading place.
+      if (liveOf(S.m && S.m.id)) scrollBottom();
+      else {
+        if (tFresh) { el.panelTranscript.scrollTop = 0; tFresh = false; }
+        follow = nearBottom();
+      }
+      updateJump();
+    }
+    if (tab === 'ai') renderAi();
+    renderFooter();
+  }
+
+  function renderTabs() {
+    var tabs = [[el.tabNotes, el.panelNotes, 'notes'], [el.tabAi, el.panelAi, 'ai'], [el.tabTranscript, el.panelTranscript, 'transcript']];
+    tabs.forEach(function (t) {
+      var on = S.tab === t[2];
+      t[0].setAttribute('aria-selected', on ? 'true' : 'false');
+      t[0].tabIndex = on ? 0 : -1;
+      t[1].hidden = !on;
+    });
+    var live = S.m && liveOf(S.m.id);
+    el.lv.hidden = !(live && live.recording && !live.paused);
+    paintLevels();
+    updateJump();
+  }
+
+  function lineEl(line, prev) {
+    var me = line.speaker === 'me';
+    var cont = prev && prev.speaker === line.speaker;
+    var meta = h('div', { class: 'ln-meta' }, [
+      cont ? null : h('b', { text: me ? 'Me' : 'Them' }),
+      clock(line.start_ms)
+    ]);
+    return h('div', { class: 'ln ' + (me ? 'me' : 'them') + (cont ? ' cont' : ''), 'data-id': String(line.id) }, [
+      meta,
+      h('div', { class: 'bubble', text: String(line.text || '') })
+    ]);
+  }
+
+  function renderTranscript() {
+    if (!S.m) return;
+    var lines = S.m.lines;
+    el.tList.textContent = '';
+    if (!lines.length) {
+      el.tList.appendChild(liveOf(S.m.id)
+        ? h('div', { class: 'empty' }, [h('strong', { text: 'Listening' }), 'Lines show up a few seconds after each pause.'])
+        : h('div', { class: 'empty', text: 'No transcript for this meeting.' }));
+      return;
+    }
+    var frag = document.createDocumentFragment(), chunk = null;
+    for (var i = 0; i < lines.length; i++) {
+      if (i % CHUNK === 0) chunk = frag.appendChild(h('div', { class: 'chunk' }));
+      chunk.appendChild(lineEl(lines[i], lines[i - 1]));
+    }
+    el.tList.appendChild(frag);
+  }
+
+  function nearBottom() {
+    var p = el.panelTranscript;
+    return p.scrollHeight - p.scrollTop - p.clientHeight < 32;
+  }
+  function scrollBottom() {
+    var p = el.panelTranscript;
+    p.scrollTop = p.scrollHeight;
+    follow = true;
+    updateJump();
+  }
+  function updateJump() {
+    var live = S.m && liveOf(S.m.id);
+    el.jump.hidden = !(S.view === 'meeting' && S.tab === 'transcript' && live && !follow && S.m.lines.length);
+  }
+
+  function renderAi() {
+    if (!S.m) return;
+    var m = S.m, st = S.sum[m.id] || { state: m.summary ? 'done' : 'idle' };
+    var box = el.ai;
+    box.textContent = '';
+    if (st.state === 'running') {
+      box.appendChild(h('div', { class: 'state-box' }, [
+        h('div', { class: 'state-row' }, [h('span', { class: 'spin' }), 'Writing notes with Claude...']),
+        'This usually takes under a minute. You can keep typing in Notes.'
+      ]));
+      if (m.summary) {
+        var old = h('div', { class: 'md dim' });
+        old.style.marginTop = '18px';
+        old.innerHTML = renderMarkdown(m.summary);
+        box.appendChild(old);
+      }
+      return;
+    }
+    if (st.state === 'error') {
+      box.appendChild(h('div', { class: 'state-box' }, [
+        h('strong', { text: "Couldn't write notes" }),
+        h('div', { class: 'err', text: st.error || 'Something went wrong.' }),
+        h('button', { class: 'btn primary', onclick: summarize, disabled: !hasContent() }, ['Try again'])
+      ]));
+      return;
+    }
+    if (m.summary && String(m.summary).trim()) {
+      var md = h('div', { class: 'md' });
+      md.innerHTML = renderMarkdown(m.summary);
+      box.appendChild(md);
+      if (m.summary_by) box.appendChild(h('div', { class: 'by', text: 'Written by ' + m.summary_by }));
+      return;
+    }
+    var live = liveOf(m.id);
+    box.appendChild(h('div', { class: 'state-box' }, [
+      h('strong', { text: 'No AI notes yet' }),
+      h('span', {
+        text: live
+          ? 'When you click Generate notes, your notes and the transcript go to your Claude account, which writes a summary, key points, decisions and action items. You can do it now or after the meeting.'
+          : 'Generate notes sends your notes and the transcript to your Claude account, which writes a summary, key points, decisions and action items. Audio never leaves this computer.'
+      }),
+      hasContent()
+        ? h('button', { class: 'btn primary', onclick: summarize }, ['Generate notes'])
+        : h('span', { text: 'There is nothing to work from yet. Write some notes or record a meeting first.' })
+    ]));
+  }
+
+  function renderFooter() {
+    if (!S.m) return;
+    var st = S.sum[S.m.id] || { state: S.m.summary ? 'done' : 'idle' };
+    var running = st.state === 'running';
+    el.genSpin.hidden = !running;
+    el.gen.classList.toggle('busy', running);
+    el.gen.disabled = running || !hasContent();
+    el.gen.title = hasContent() ? '' : 'Write notes or record some of the meeting first.';
+    el.genLabel.textContent = running ? 'Writing notes with Claude...'
+      : st.state === 'error' ? 'Try again'
+      : (S.m.summary ? 'Regenerate' : 'Generate notes');
+    // On the AI notes tab the panel already shows the full error next to Try again.
+    el.footError.hidden = st.state !== 'error' || S.tab === 'ai';
+    el.footError.textContent = st.state === 'error' ? (st.error || 'Something went wrong.') : '';
+    el.footError.title = el.footError.textContent;
+  }
+
+  var listActionKey = null;
+  function renderListAction() {
+    var box = el.listAction;
+    var live = S.liveId ? liveOf(S.liveId) : null;
+    var title = '';
+    if (live) S.meetings.forEach(function (x) { if (x.id === S.liveId) title = x.title || ''; });
+    var finishing = !!live && (!live.recording || !!S.stopping[S.liveId]);
+    // Rebuild only when something visible changes, so a click is never lost to a re-render.
+    var key = JSON.stringify([S.liveId, live && !!live.paused, finishing, title, S.starting]);
+    if (key === listActionKey && box.firstChild) {
+      if (listTimeEl && S.liveId) listTimeEl.textContent = clock(elapsedOf(S.liveId));
+      return;
+    }
+    listActionKey = key;
+    box.textContent = '';
+    listTimeEl = null;
+    if (S.liveId) {
+      listTimeEl = h('span', { class: 'tnum', text: clock(elapsedOf(S.liveId)) });
+      box.appendChild(h('div', { class: 'live-card' }, [
+        h('span', { class: 'rec-dot' + (live.paused || finishing ? ' paused' : '') }),
+        h('span', { class: 'lc-label' }, [finishing ? 'Finishing...' : (live.paused ? 'Paused ' : 'Recording '), finishing ? null : listTimeEl]),
+        h('span', { class: 'lc-title' + (title ? '' : ' is-new'), text: title || NEW_TITLE }),
+        h('button', { class: 'btn sm', onclick: function () { send({ type: 'open', id: S.liveId }); } }, ['Open']),
+        finishing ? null : h('button', { class: 'btn sm', onclick: stopMeeting }, [h('span', { class: 'sq', 'aria-hidden': 'true' }), 'Stop'])
+      ]));
+    } else {
+      box.appendChild(h('button', {
+        class: 'btn primary block', id: 'start', disabled: S.starting,
+        onclick: function () {
+          S.starting = true;
+          renderListAction();
+          send({ type: 'start' });
+          // Rust answers with the meeting, or a notice saying why not. In case neither comes,
+          // the button comes back after as long as the command line waits for a start.
+          setTimeout(function () { if (S.starting) { S.starting = false; renderListAction(); } }, 30000);
+        }
+      }, [S.starting ? 'Starting...' : 'Start meeting notes']));
+    }
+  }
+
+  function renderList() {
+    renderListAction();
+    var box = el.list;
+    box.textContent = '';
+    if (!S.meetings.length) {
+      box.appendChild(h('div', { class: 'empty' }, [
+        h('strong', { text: 'No meetings yet' }),
+        'Start meeting notes when a call begins. AGT writes down both sides of the call on this computer, with no bot in the meeting.'
+      ]));
+      return;
+    }
+    var lastDay = null;
+    S.meetings.forEach(function (x) {
+      if (validTs(x.started_at)) {
+        var d = startOfDay(x.started_at);
+        if (d !== lastDay) { lastDay = d; box.appendChild(h('div', { class: 'day', text: dayLabel(x.started_at) })); }
+      }
+      var isLive = x.id === S.liveId;
+      var sub = [];
+      if (validTs(x.started_at)) sub.push(fTime.format(new Date(x.started_at)));
+      if (!isLive && validTs(x.ended_at) && validTs(x.started_at)) sub.push(dur(x.ended_at - x.started_at));
+      box.appendChild(h('button', {
+        class: 'row',
+        onclick: function () { flushAll(); send({ type: 'open', id: x.id }); }
+      }, [
+        h('div', { class: 'r-main' }, [
+          (x.title || '').trim()
+            ? h('div', { class: 'r-title', text: x.title })
+            : h('div', { class: 'r-title' + (naming(x.id) ? ' is-new' : ''), text: untitledText(x) }),
+          h('div', { class: 'r-sub' }, [
+            isLive ? h('span', { class: 'rec-dot' }) : null,
+            isLive ? 'Recording' : null,
+            isLive && sub.length ? ' · ' : null,
+            sub.join(' · ')
+          ])
+        ]),
+        x.has_summary ? h('span', { class: 'tag', text: 'AI notes' }) : null
+      ]));
+    });
+  }
+
+  // ------------------------------------------------------------------ actions
+  function summarize() {
+    if (!S.m || !hasContent()) return;
+    flushAll();
+    S.sum[S.m.id] = { state: 'running' };
+    send({ type: 'summarize', id: S.m.id });
+    setTab('ai');
+    renderTitleHint();
+    renderAi();
+    renderFooter();
+  }
+  function stopMeeting() {
+    var id = S.liveId;
+    if (!id) return;
+    S.stopping[id] = true;
+    send({ type: 'stop' });
+    if (S.m && S.m.id === id) renderHeader();
+    if (S.view === 'list') renderListAction();
+  }
+  function meetingMarkdown(m) {
+    var out = ['# ' + ((m.title || '').trim() || m.default_title || 'Meeting')];
+    var meta = metaText(m, liveOf(m.id));
+    if (meta) out.push('', meta);
+    // The same headings as meeting.md, Claude's own a level under "## Notes".
+    if (m.summary && String(m.summary).trim()) out.push('', '## Notes', '', nestHeadings(String(m.summary).trim()));
+    if ((m.notes || '').trim()) out.push('', '## My notes', '', m.notes.trim());
+    if (m.lines.length) {
+      out.push('', '## Transcript', '');
+      m.lines.forEach(function (l) {
+        out.push('[' + clock(l.start_ms) + '] ' + (l.speaker === 'me' ? 'Me' : 'Them') + ': ' + String(l.text || '').replace(/\s*\n\s*/g, ' '));
+      });
+    }
+    return out.join('\n') + '\n';
+  }
+
+  // The AI notes' headings moved down so the highest is ### (Claude writes ## sections), as
+  // meeting.md has them (store::nested_headings in Rust): every heading moves the same, none
+  // goes past ######, and fenced code blocks are left alone.
+  function nestHeadings(md) {
+    var lines = md.split('\n'), fence = null;
+    function indentOf(line) { return line.length - line.replace(/^ +/, '').length; }
+    var levels = lines.map(function (line) {
+      var indent = indentOf(line), text = line.slice(indent);
+      var marker = indent <= 3 && /^(```|~~~)/.test(text) ? text.slice(0, 3) : null;
+      if (fence) { if (marker === fence) fence = null; return 0; }
+      if (marker) { fence = marker; return 0; }
+      var h = indent <= 3 ? /^(#{1,6})(?:[ \t\r]|$)/.exec(text) : null;
+      return h ? h[1].length : 0;
+    });
+    var top = levels.reduce(function (a, l) { return l && l < a ? l : a; }, 7);
+    var down = top <= 6 ? Math.max(0, 3 - top) : 0;
+    if (!down) return md;
+    return lines.map(function (line, i) {
+      var l = levels[i];
+      if (!l) return line;
+      var indent = indentOf(line);
+      return line.slice(0, indent) + '#'.repeat(Math.min(6, l + down) - l) + line.slice(indent);
+    }).join('\n');
+  }
+
+  el.back.addEventListener('click', function () {
+    flushAll();
+    S.view = 'list';
+    render(false);
+    send({ type: 'list' });
+  });
+  el.title.addEventListener('input', function () { if (S.m) { S.m.title = el.title.value; scheduleTitle(); } });
+  el.title.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); el.title.blur(); }
+    else if (e.key === 'Escape' && S.m) {
+      if (pending.title) { clearTimeout(pending.title.timer); pending.title = null; }
+      // Back to what Rust has, untitled included.
+      if (lastSentTitle[S.m.id] != null) S.m.title = lastSentTitle[S.m.id];
+      el.title.value = S.m.title;
+      el.title.blur();
+    }
+  });
+  el.title.addEventListener('blur', function () {
+    if (!S.m) return;
+    if (!el.title.value.trim()) {
+      if (pending.title) { clearTimeout(pending.title.timer); pending.title = null; }
+      S.m.title = lastSentTitle[S.m.id] || '';
+      el.title.value = S.m.title;
+      return;
+    }
+    if (!pending.title && el.title.value.trim() !== lastSentTitle[S.m.id]) scheduleTitle();
+    flushTitle();
+  });
+  el.notes.addEventListener('input', function () {
+    if (!S.m) return;
+    var had = hasContent();
+    S.m.notes = el.notes.value;
+    scheduleNotes();
+    if (had !== hasContent()) { renderFooter(); if (S.tab === 'ai') renderAi(); }
+  });
+  el.notes.addEventListener('blur', flushNotes);
+  el.pause.addEventListener('click', function () {
+    var live = S.m && liveOf(S.m.id);
+    if (!live) return;
+    send({ type: live.paused ? 'resume' : 'pause' });
+  });
+  el.stop.addEventListener('click', stopMeeting);
+  el.consentX.addEventListener('click', function () { if (S.m) { S.consentHidden[S.m.id] = true; renderHeader(); } });
+  el.sysX.addEventListener('click', function () {
+    var live = S.m && liveOf(S.m.id);
+    if (live) { S.sysHidden[S.m.id] = live.system; renderHeader(); }
+  });
+  el.lNoticeX.addEventListener('click', function () { dismissNotice('list'); });
+  el.mNoticeX.addEventListener('click', function () { dismissNotice('meeting'); });
+  el.openSettings.addEventListener('click', function () { send({ type: 'open_settings' }); });
+  [el.tabNotes, el.tabAi, el.tabTranscript].forEach(function (t, i, all) {
+    t.addEventListener('click', function () { setTab(t.dataset.tab); });
+    t.addEventListener('keydown', function (e) {
+      var d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      var n = all[(i + d + all.length) % all.length];
+      setTab(n.dataset.tab);
+      n.focus();
+    });
+  });
+  el.panelTranscript.addEventListener('scroll', function () {
+    follow = nearBottom();
+    updateJump();
+  }, { passive: true });
+  el.jump.addEventListener('click', scrollBottom);
+  el.gen.addEventListener('click', summarize);
+  el.copy.addEventListener('click', function () {
+    if (!S.m) return;
+    flushAll();
+    send({ type: 'copy', text: meetingMarkdown(S.m) });
+    el.copy.textContent = 'Copied';
+    clearTimeout(el.copy._t);
+    el.copy._t = setTimeout(function () { el.copy.textContent = 'Copy'; }, 1400);
+  });
+  el.folder.addEventListener('click', function () { if (S.m) send({ type: 'open_folder', id: S.m.id }); });
+  document.addEventListener('keydown', function (e) {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || S.view !== 'meeting') return;
+    var map = { '1': 'notes', '2': 'ai', '3': 'transcript' };
+    if (map[e.key]) { e.preventDefault(); setTab(map[e.key]); }
+  });
+  window.addEventListener('pagehide', flushAll);
+  window.addEventListener('beforeunload', flushAll);
+  // Rust hides the window on close instead of destroying it, so blur and pagehide may never come.
+  document.addEventListener('visibilitychange', function () { if (document.hidden) flushAll(); });
+  window.agt.flush = flushAll;
+
+  setInterval(function () {
+    if (S.view === 'meeting' && S.m && liveOf(S.m.id)) {
+      el.chipTime.textContent = clock(elapsedOf(S.m.id));
+      el.meta.textContent = metaText(S.m, true);
+      paintLevels();
+    } else if (S.view === 'list' && listTimeEl && S.liveId) {
+      listTimeEl.textContent = clock(elapsedOf(S.liveId));
+    }
+  }, 250);
+
+  // ------------------------------------------------------------------ mock (plain browser with ?mock)
+  if (window.__agtSent && params.has('mock')) mock = makeMock();
+
+  function makeMock() {
+    var deliver = function (msg) { window.agt.receive(JSON.parse(JSON.stringify(msg))); };
+    var fast = params.has('fast');
+    var LINE_MS = fast ? 220 : 1500;
+    // Test knobs: &big=N starts the demo with N lines already in it; &late=K makes every Kth line
+    // arrive late (default 7, 0 for never); &tray=S starts a meeting S seconds after load even if
+    // another meeting is open (a tray or pill start); &resend=S re-sends the meeting on screen
+    // every S seconds (the pill's Notes button or an open of the current meeting);
+    // &system=ok|no-permission|silent|unsupported sets the Them track's state (unsupported comes
+    // with its reason); &auto writes the AI notes by themselves after a stop (auto_summary);
+    // &fail=model|mic refuses or fails every start with a notice; &loading says the speech model
+    // is still loading when a meeting starts (taken back at its first line); &notice=S sends a
+    // meeting error S seconds in.
+    var BIG = Math.max(0, parseInt(params.get('big') || '0', 10) || 0);
+    var LATE = params.has('late') ? Math.max(0, parseInt(params.get('late'), 10) || 0) : 7;
+    var sysParam = params.get('system');
+    var REASON = 'system audio needs macOS 14.2 or later';
+    var LOADING = "Speech model still loading; transcription starts when it's ready";
+    var FAIL = {
+      model: 'Speech model failed to load: model unavailable, see log (press the hotkey to retry)',
+      mic: "Couldn't start the microphone: no input device"
+    }[params.get('fail')] || null;
+    var now = Date.now();
+    function at(daysAgo, hh, mm) { var d = new Date(now); d.setDate(d.getDate() - daysAgo); d.setHours(hh, mm, 0, 0); return d.getTime(); }
+    function dateTitle(ts) {
+      var d = new Date(ts);
+      return 'Meeting ' + new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(d) + ', ' + new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(d);
+    }
+    function idFor(ts) {
+      var d = new Date(ts);
+      return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+    }
+    var SCRIPT = [
+      ['them', 'Hi, can you hear me okay? I think my audio is working now.'],
+      ['me', 'Yes, you sound good. Thanks for making time today.'],
+      ['them', 'Of course. The main thing I want to cover is the rollout plan for next month.'],
+      ['me', "Sure. We're aiming for the twenty eighth, as long as the installer signing is done."],
+      ['them', 'Who owns the signing work right now?'],
+      ['me', "That's on me. I'll have the certificate request in by Friday."],
+      ['them', 'Great. And the pricing page, is that still waiting on legal?'],
+      ['me', "It is. Dana said she'd send comments by Wednesday."],
+      ['them', "Okay. Let's make the pilot group fifty seats instead of a hundred."],
+      ['me', 'That works. Smaller is easier to support in the first week.'],
+      ['them', 'Agreed. Can you send me the onboarding checklist after this?'],
+      ['me', "Yes, I'll send it this afternoon along with the timeline."],
+      ['them', 'One more thing. Support wants a short guide for the meeting notes feature.'],
+      ['me', 'I can write that. A one page guide with a few screenshots should do it.'],
+      ['them', "Perfect. Let's check in again next Tuesday at ten."],
+      ['me', "Sounds good. I'll put it on the calendar."],
+      ['them', 'While we have a minute, how did the beta feedback look?'],
+      ['me', 'Mostly good. People liked that nothing joins the call and it all stays on their computer.'],
+      ['them', 'Any complaints?'],
+      ['me', 'A few people on speakers saw their own words twice, so we added echo handling.'],
+      ['them', 'Nice. Does dictation still work during a meeting?'],
+      ['me', 'Yes. Holding the hotkey keeps working, and that dictation stays out of the meeting transcript.']
+    ];
+    var SUMMARY = [
+      '## Summary',
+      'The launch stays on the **28th** if installer signing is finished in time, and the pilot gets *smaller* so support can keep up.',
+      '',
+      '## Key points',
+      '- Launch target is the 28th',
+      '  - Depends on installer signing finishing first',
+      '  - The pricing page is still waiting on legal review',
+      '- The pilot group drops from 100 to **50 seats**',
+      '- Beta feedback is mostly positive; echo on speakers is now handled',
+      '',
+      '## Decisions',
+      '1. Pilot with 50 seats instead of 100',
+      '2. Weekly check-in moves to Tuesday at 10',
+      '',
+      '## Action items',
+      '- [ ] Me: send the certificate request by Friday',
+      '- [ ] Me: send the onboarding checklist and timeline this afternoon',
+      '- [x] Dana: share legal comments on the pricing page',
+      '- [ ] Me: write a one page guide for `meeting notes`, see [the draft](https://example.com/guide)'
+    ].join('\n');
+    function pastLines(n, seed) {
+      var out = [];
+      for (var i = 0; i < n; i++) {
+        var s = SCRIPT[(i + seed) % SCRIPT.length];
+        out.push({ id: i + 1, speaker: s[0], start_ms: i * 9000 + 1200, end_ms: i * 9000 + 6400, text: s[1] });
+      }
+      return out;
+    }
+    var store = {};
+    function add(m) { store[m.id] = m; return m; }
+    [
+      { started: at(0, 9, 5), mins: 15, title: 'Standup', summary: '## Summary\nShort standup. Everyone is on track for the release.\n\n## Action items\n- [ ] Me: review the installer changes\n- [x] Sam: fix the tray icon in dark mode' },
+      { started: at(1, 15, 0), mins: 28, title: 'Customer call: Acme rollout', summary: SUMMARY },
+      { started: at(1, 10, 30), mins: 46, title: 'Design review', summary: null },
+      { started: at(3, 13, 0), mins: 72, title: 'Vendor call', summary: null, failOnce: true },
+      { started: at(7, 11, 15), mins: 55, title: 'Weekly planning', summary: '### Notes\n* Planning for the next two weeks\n* Hiring update: *two* interviews booked\n\nRaw HTML stays as text: <img src=x onerror="alert(1)"> and <b>not bold</b>. A [link](javascript:alert(1)) is only text.' },
+      { started: at(16, 16, 45), mins: 31, title: 'Interview: support lead', summary: null },
+      { started: new Date(new Date(now).getFullYear() - 1, 11, 12, 10, 0).getTime(), mins: 40, title: 'Year end review', summary: '## Summary\nA calm year end review.' },
+      // Never named: its notes were never written.
+      { started: at(2, 14, 0), mins: 20, title: '', summary: null }
+    ].forEach(function (x, i) {
+      add({
+        id: idFor(x.started), title: x.title, started_at: x.started, ended_at: x.started + x.mins * 60000,
+        notes: i === 1 ? 'Ask about pilot size\nConfirm launch date\n- signing\n- pricing page' : '',
+        summary: x.summary, summary_by: x.summary ? 'Claude (sonnet)' : null,
+        lines: pastLines(8 + i * 2, i * 3), failOnce: !!x.failOnce
+      });
+    });
+
+    var live = null; // { id, elapsed, paused, system, lineTimer, levelTimer, tickTimer, next, talker }
+    function list() {
+      return Object.keys(store).map(function (k) {
+        var m = store[k];
+        return { id: m.id, title: m.title, default_title: dateTitle(m.started_at), started_at: m.started_at, ended_at: m.ended_at, has_summary: !!m.summary };
+      });
+    }
+    function sendList() { deliver({ type: 'meetings', list: list() }); }
+    function liveObj() {
+      if (!live) return null;
+      var o = { recording: !live.stopping, paused: live.paused, elapsed_ms: live.elapsed, system: live.system };
+      if (live.system === 'unsupported') o.system_reason = REASON;
+      return o;
+    }
+    function notice(text, id) {
+      var msg = { type: 'notice', text: text };
+      if (id != null) msg.id = id;
+      deliver(msg);
+    }
+    function meetingMsg(id) {
+      var m = store[id];
+      if (!m) return null;
+      return {
+        type: 'meeting',
+        meeting: { id: m.id, title: m.title, default_title: dateTitle(m.started_at), started_at: m.started_at, ended_at: m.ended_at, notes: m.notes, summary: m.summary, summary_by: m.summary_by, lines: m.lines },
+        live: live && live.id === id ? liveObj() : null
+      };
+    }
+    function start() {
+      if (live) return;
+      if (FAIL) { setTimeout(function () { notice(FAIL); }, 300); return; }
+      var ts = Date.now();
+      var m = add({
+        id: idFor(ts), title: '',
+        started_at: ts, ended_at: null, notes: '', summary: null, summary_by: null, lines: []
+      });
+      live = { id: m.id, elapsed: 0, paused: false, stopping: false, system: sysParam || 'ok', next: 0, talker: 'them', last: Date.now() };
+      for (var b = 0; b < BIG; b++) {
+        var sb = SCRIPT[b % SCRIPT.length];
+        m.lines.push({ id: b + 1, speaker: sb[0], start_ms: b * 4200, end_ms: b * 4200 + 2400, text: sb[1] });
+      }
+      if (BIG) { live.next = BIG; live.elapsed = BIG * 4200 + 2000; }
+      deliver(meetingMsg(m.id));
+      if (params.has('loading')) notice(LOADING, m.id);
+      if (params.has('notice')) {
+        var nid = m.id;
+        setTimeout(function () {
+          if (live && live.id === nid) notice('The microphone stopped: the device was unplugged', nid);
+        }, Math.max(0, +params.get('notice') || 6) * 1000);
+      }
+      live.tickTimer = setInterval(function () {
+        if (!live) return;
+        var t = Date.now();
+        if (!live.paused && !live.stopping) live.elapsed += t - live.last;
+        live.last = t;
+        deliver({ type: 'live', id: live.id, live: liveObj() });
+      }, 1000);
+      live.lineTimer = setInterval(function () {
+        if (!live || live.paused || live.stopping) return;
+        var s = SCRIPT[live.next % SCRIPT.length];
+        var n = live.next++;
+        live.talker = SCRIPT[live.next % SCRIPT.length][0];
+        // Fast mode runs a pretend clock so timestamps still spread out like a real call.
+        var startMs = fast ? n * 4200 + Math.floor(Math.random() * 900)
+          : Math.max(0, live.elapsed + (Date.now() - live.last) - 2600 - Math.floor(Math.random() * 600));
+        // Every Kth line arrives late (an echo hold), so it lands a few lines up.
+        if (LATE && n % LATE === LATE - 1) startMs = Math.max(0, startMs - (fast ? 3 * 4200 : 3 * LINE_MS + 800));
+        var line = { id: n + 1, speaker: s[0], start_ms: startMs, end_ms: startMs + 2400, text: s[1] };
+        store[live.id].lines.push(line);
+        deliver({ type: 'line', id: live.id, line: line });
+        // The first line: the model has loaded, so its notice is taken back.
+        if (params.has('loading') && n === BIG) deliver({ type: 'clear_notice', id: live.id, text: LOADING });
+      }, LINE_MS);
+      live.levelTimer = setInterval(function () {
+        if (!live) return;
+        if (live.paused || live.stopping) { deliver({ type: 'levels', me: 0, them: 0 }); return; }
+        var t = Date.now() / 1000;
+        var talk = 0.25 + 0.55 * Math.abs(Math.sin(t * 5.3)) * (0.6 + 0.4 * Math.random());
+        var quiet = 0.02 + Math.random() * 0.04;
+        var them = live.system === 'ok' ? (live.talker === 'them' ? talk : quiet) : 0;
+        deliver({ type: 'levels', me: live.talker === 'me' ? talk : quiet, them: them });
+      }, 66);
+      sendList();
+    }
+    function stop() {
+      if (!live || live.stopping) return;
+      live.stopping = true;
+      deliver({ type: 'live', id: live.id, live: liveObj() });
+      var id = live.id;
+      setTimeout(function () {
+        clearInterval(live.tickTimer); clearInterval(live.lineTimer); clearInterval(live.levelTimer);
+        store[id].ended_at = Date.now();
+        live = null;
+        // With auto_summary off (the default) the page shows Generate notes instead. On, the
+        // page hears "running" before the stop, as from Rust.
+        var words = store[id].lines.reduce(function (n, l) { return n + l.text.split(/\s+/).length; }, 0);
+        if (params.has('auto') && words >= 30) summarize(id);
+        deliver({ type: 'live', id: id, live: null });
+        sendList();
+      }, 1200);
+    }
+    function summarize(id) {
+      var m = store[id];
+      if (!m) return;
+      deliver({ type: 'summary', id: id, state: 'running' });
+      setTimeout(function () {
+        if (m.failOnce) {
+          m.failOnce = false;
+          deliver({ type: 'summary', id: id, state: 'error', error: "Claude didn't answer within 3 minutes. Check that Claude Code is signed in, then try again." });
+          return;
+        }
+        m.summary = m.summary && m.title !== 'Vendor call' ? m.summary : SUMMARY + (m.title === 'Vendor call' ? '\n\nRaw HTML stays as text: <script>alert(1)<\/script>' : '');
+        m.summary_by = 'Claude (sonnet)';
+        var done = { type: 'summary', id: id, state: 'done', markdown: m.summary, by: m.summary_by };
+        // An untitled meeting is named by its notes.
+        if (!(m.title || '').trim()) m.title = done.title = 'Rollout plan and pilot size';
+        deliver(done);
+        sendList();
+      }, fast ? 600 : 2600);
+    }
+    function resend() {
+      if (S.view === 'meeting' && S.m && store[S.m.id]) deliver(meetingMsg(S.m.id));
+    }
+    function lateLine(atMs) {
+      // A Me line released late, as the echo hold does. atMs places it anywhere; by default it
+      // starts 20 s before the newest line.
+      if (!live) return null;
+      var lines = store[live.id].lines;
+      var last = lines.reduce(function (mx, l) { return Math.max(mx, l.start_ms); }, 0);
+      var n = live.next++;
+      var st = typeof atMs === 'number' ? Math.max(0, atMs) : Math.max(0, last - 20000);
+      var line = { id: n + 1, speaker: 'me', start_ms: st, end_ms: st + 2400, text: 'A late line (held for the echo check), placed by its start time.' };
+      lines.push(line);
+      deliver({ type: 'line', id: live.id, line: line });
+      return line;
+    }
+    window.agtMock = { trayStart: start, resend: resend, lateLine: lateLine, stop: stop, notice: notice };
+    if (params.has('resend')) setInterval(resend, Math.max(1, +params.get('resend') || 3) * 1000);
+    return {
+      handle: function (msg) {
+        switch (msg && msg.type) {
+          case 'ready':
+            sendList();
+            if (!params.has('idle')) setTimeout(start, 900);
+            if (params.has('tray')) setTimeout(start, Math.max(0, +params.get('tray') || 8) * 1000);
+            break;
+          case 'start': start(); break;
+          case 'stop': stop(); break;
+          case 'pause': if (live) { live.paused = true; deliver({ type: 'live', id: live.id, live: liveObj() }); } break;
+          case 'resume': if (live) { live.paused = false; live.last = Date.now(); deliver({ type: 'live', id: live.id, live: liveObj() }); } break;
+          case 'notes': if (store[msg.id]) store[msg.id].notes = msg.notes; break;
+          case 'title': if (store[msg.id]) { store[msg.id].title = msg.title; } break;
+          case 'summarize': summarize(msg.id); break;
+          case 'list': sendList(); break;
+          case 'open': var mm = meetingMsg(msg.id); if (mm) setTimeout(function () { deliver(mm); }, 40); break;
+          case 'open_settings':
+            if (live && live.system !== 'ok') setTimeout(function () { if (live) { live.system = 'ok'; deliver({ type: 'live', id: live.id, live: liveObj() }); } }, 1000);
+            break;
+          case 'copy': console.log('[agt mock] copied ' + msg.text.length + ' characters'); break;
+          case 'open_folder': console.log('[agt mock] would open folder for ' + msg.id); break;
+        }
+      }
+    };
+  }
+
+  // ------------------------------------------------------------------ start
+  render(false);
+  var q = window.agt._queue.splice(0);
+  q.forEach(function (msg) { window.agt._handle(msg); });
+  send({ type: 'ready' });
+})();
+</script>
+</body>
+</html>

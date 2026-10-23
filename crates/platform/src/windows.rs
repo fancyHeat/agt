@@ -2,8 +2,8 @@
 //! Win32 clipboard, SendInput.
 
 use crate::{
-    Capture, Error, HotkeyEvent, Hotkeys, Key, KeyKind, LoginItem, Permission, capture::KeyCapture,
-    hotkeys::Detector, needs_masker,
+    Capture, Error, HotkeyEvent, Hotkeys, Key, KeyKind, LoginItem, MicUser, Permission,
+    capture::KeyCapture, hotkeys::Detector, needs_masker,
 };
 use std::{
     cell::RefCell,
@@ -672,6 +672,19 @@ fn mark_transient() {
 }
 
 pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
+    put_text(text, true)?;
+    Ok(PasteToken {
+        sequence: unsafe { GetClipboardSequenceNumber() },
+    })
+}
+
+/// Not marked: a copy to keep, which Win+V history and clipboard managers may see.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    put_text(text, false)
+}
+
+/// Replaces the clipboard's contents with `text` (`transient`: kept out of clipboard history).
+fn put_text(text: &str, transient: bool) -> Result<(), Error> {
     let utf16: Vec<u8> = text
         .encode_utf16()
         .chain([0])
@@ -685,11 +698,10 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
         .into());
     }
     set_data(CF_UNICODETEXT as u32, &utf16)?;
-    mark_transient();
-    drop(_open);
-    Ok(PasteToken {
-        sequence: unsafe { GetClipboardSequenceNumber() },
-    })
+    if transient {
+        mark_transient();
+    }
+    Ok(())
 }
 
 /// Clipboard listeners open the clipboard within ~2 ms of every change (measured: Logi
@@ -856,6 +868,27 @@ pub fn missing_permissions() -> Vec<Permission> {
 pub fn request_permissions(_missing: &[Permission]) {}
 
 pub fn open_permission_settings(_permission: Permission) {}
+
+/// WASAPI loopback capture needs no permission.
+pub fn system_audio_permission() -> Option<bool> {
+    Some(true)
+}
+
+/// The microphone privacy page: Windows has no system audio permission, and that page is where
+/// a blocked recording is unblocked.
+pub fn open_system_audio_settings() {
+    let url = "ms-settings:privacy-microphone";
+    // Explorer hands `ms-settings:` URIs to Settings, without the console window `cmd /c
+    // start` would flash.
+    if let Err(e) = std::process::Command::new("explorer").arg(url).spawn() {
+        tracing::error!("cannot open {url}: {e}");
+    }
+}
+
+/// Not implemented on Windows yet (meeting detection is macOS-only in v1).
+pub fn mic_users() -> Vec<MicUser> {
+    Vec::new()
+}
 
 // ---------------------------------------------------------------------------------------
 // Launch at login: a value in HKCU's Run key. Task Manager's Startup apps on/off switch is

@@ -15,12 +15,19 @@
 //!   After a tap the status stays "recording" for `double_tap_ms`, so the bar doesn't flicker
 //!   between the two taps.
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
-//!   system output volume down until the recording ends, however it ends.
+//!   system output volume down until the recording ends, however it ends. Not while a meeting
+//!   records ([`Pipeline::set_meeting_active`]): that would turn the call down.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
 //!   recording may start while the previous one is still being transcribed: jobs queue up
 //!   and are pasted in order (nothing is dropped). A recording's segments are transcribed
 //!   while it's still being recorded, and their texts joined at release; a dropped
 //!   (cancelled) recording's are skipped, or discarded if already being transcribed.
+//!   It also transcribes a recording meeting's segments ([`Pipeline::transcriber`]) on the same
+//!   engine, at low priority: each time it takes everything queued, and whatever dictation sent
+//!   (segments cut while recording, the job at release, a dropped recording's record, a
+//!   reload) goes first, in the order sent ([`SttQueue`]). So a meeting delays a dictation by
+//!   at most the one meeting segment already being transcribed when the dictation's work came
+//!   in. Meeting segments never reach polish, the paste, history or the status line.
 //! - `polish`: first applies the dictionary's replacements (`dictionary.toml`, see
 //!   [`agt_core::dictionary`]) to each transcript, polish on or off. Then, with
 //!   `polish.enabled`, cleans it up with an LLM (`agt-polish`), bounded by
@@ -47,7 +54,8 @@
 //!
 //! Each dictation's measurements travel with it as an [`agt_telemetry::Dictation`] and are
 //! recorded (a channel send, never a disk write) wherever it ends: after the paste, or at the
-//! stage that dropped it. Only counts and timings: never the audio or the text.
+//! stage that dropped it. Only counts and timings: never the audio or the text. Meeting
+//! segments get no such record.
 //!
 //! With `[history]` on, a transcribed dictation's text and/or audio also travel with it, as an
 //! [`agt_history::Entry`], and are handed to the history writer (again a channel send) after
@@ -76,6 +84,7 @@ use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     fmt,
     sync::{
         Arc, Condvar, Mutex,
@@ -220,12 +229,33 @@ impl HubState {
 struct Hub {
     state: Arc<Mutex<HubState>>,
     notify: Arc<dyn Fn(Event) + Send + Sync>,
+    /// `HubState::recording`, readable without the lock ([`Pipeline::dictating`]). Not
+    /// `lingering`: between the two taps of a double tap nothing records.
+    dictating: Arc<AtomicBool>,
 }
 
 impl Hub {
+    fn new(notify: impl Fn(Event) + Send + Sync + 'static) -> Self {
+        Hub {
+            state: Arc::new(Mutex::new(HubState {
+                engine: Engine::Loading("Loading model...".into()),
+                recording: false,
+                lingering: false,
+                pending: 0,
+                error: None,
+                missing: Vec::new(),
+                failures: 0,
+                last: None,
+            })),
+            notify: Arc::new(notify),
+            dictating: Arc::default(),
+        }
+    }
+
     fn update(&self, f: impl FnOnce(&mut HubState)) {
         let mut s = self.state.lock().unwrap();
         f(&mut s);
+        self.dictating.store(s.recording, Relaxed);
         let status = if s.recording || s.lingering {
             Status::Recording
         } else if s.pending > 0 {
@@ -366,9 +396,26 @@ pub struct Pipeline {
     /// One line for the tray about LLM polish, e.g. "Polish: off".
     pub polish_info: String,
     to_paste: Sender<ToPaste>,
+    /// For meeting segments ([`Pipeline::transcriber`]).
+    to_stt: Sender<ToStt>,
     key_down: Arc<Mutex<Option<Instant>>>,
     ducker: Ducker,
     words: Words,
+    dictating: Arc<AtomicBool>,
+    /// A meeting is recording: dictations don't duck ([`Pipeline::set_meeting_active`]).
+    meeting: Arc<AtomicBool>,
+    /// For [`Pipeline::speech_model`].
+    hub: Hub,
+}
+
+/// How the speech model is doing ([`Pipeline::speech_model`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpeechModel {
+    /// Downloading or loading: what is sent to the `stt` thread waits for it.
+    Loading,
+    Ready,
+    /// It didn't load, and why (as the tray says it). Nothing is transcribed until a retry.
+    Failed(String),
 }
 
 impl Pipeline {
@@ -394,6 +441,44 @@ impl Pipeline {
     /// When a hotkey last went down (for latency logging).
     pub fn last_key_down(&self) -> Option<Instant> {
         *self.key_down.lock().unwrap()
+    }
+}
+
+/// For meeting notes (`agt-meeting`).
+impl Pipeline {
+    /// Speech to text for a meeting's segments: the dictation engine on the `stt` thread,
+    /// behind everything dictation sends it (see the module docs). Only queues: `done` runs on
+    /// that thread, so it must be quick (a channel send): a dictation may be waiting. Once the
+    /// pipeline is gone, segments are answered "transcription stopped".
+    pub fn transcriber(&self) -> Arc<dyn agt_meeting::Transcriber> {
+        Arc::new(MeetingTranscriber {
+            to_stt: self.to_stt.clone(),
+            words: self.words.clone(),
+        })
+    }
+
+    /// True while a dictation records: from the microphone starting to the recording ending
+    /// (a hold released, a hands-free one ended by the next press, cancelled, too short,
+    /// timed out or discarded). A meeting blanks its mic track meanwhile: the dictation isn't
+    /// part of the meeting.
+    pub fn dictating(&self) -> Arc<AtomicBool> {
+        self.dictating.clone()
+    }
+
+    /// While on (a meeting records), dictations don't turn the output volume down: that would
+    /// turn the call down. A dictation already ducked stays so until its recording ends.
+    pub fn set_meeting_active(&self, on: bool) {
+        self.meeting.store(on, Relaxed);
+    }
+
+    /// The speech model now: a meeting can't be transcribed if it failed, and its segments
+    /// wait while it loads.
+    pub fn speech_model(&self) -> SpeechModel {
+        match &self.hub.state.lock().unwrap().engine {
+            Engine::Loading(_) => SpeechModel::Loading,
+            Engine::Ready(_) => SpeechModel::Ready,
+            Engine::Failed(e) => SpeechModel::Failed(e.clone()),
+        }
     }
 }
 
@@ -433,6 +518,70 @@ enum ToStt {
     Dropped(Box<Dictation>, Ended),
     /// The model failed to load and the user pressed a hotkey: try again.
     RetryLoad,
+    /// A meeting's segment (16 kHz mono), run when nothing from dictation waits. `done` gets
+    /// its text ("" for no speech) or why not, on the `stt` thread. `scope` is the dictionary
+    /// when it was sent, in no app's profile: a meeting isn't typed into an app.
+    Meeting {
+        audio: Vec<f32>,
+        scope: Arc<Scope>,
+        done: Done,
+    },
+}
+
+/// Where a meeting segment's text goes ([`agt_meeting::Transcriber`]).
+type Done = Box<dyn FnOnce(Result<String, String>) + Send>;
+
+/// [`Pipeline::transcriber`]: meeting segments into the `stt` thread's queue.
+struct MeetingTranscriber {
+    to_stt: Sender<ToStt>,
+    words: Words,
+}
+
+impl agt_meeting::Transcriber for MeetingTranscriber {
+    fn transcribe(&self, audio: Vec<f32>, done: Done) {
+        let scope = Arc::new(Scope::new(self.words.get(), None));
+        // The `stt` thread is gone (shutting down): answer now rather than never.
+        if let Err(mpsc::SendError(ToStt::Meeting { done, .. })) =
+            self.to_stt.send(ToStt::Meeting { audio, scope, done })
+        {
+            done(Err("transcription stopped".into()));
+        }
+    }
+}
+
+/// The `stt` thread's work, by kind: [`SttQueue::next`] picks from it.
+#[derive(Default)]
+struct SttQueue {
+    /// Everything but meeting segments: what dictation sends (segments cut while recording,
+    /// the job at release, a dropped recording's record) and reloads, in the order sent,
+    /// which they depend on (a recording's segments before its job or its `Dropped`).
+    dictation: VecDeque<ToStt>,
+    /// [`ToStt::Meeting`]s, in order.
+    meeting: VecDeque<ToStt>,
+}
+
+impl SttQueue {
+    fn push(&mut self, msg: ToStt) {
+        match msg {
+            ToStt::Meeting { .. } => self.meeting.push_back(msg),
+            msg => self.dictation.push_back(msg),
+        }
+    }
+
+    /// The next message to handle: waits for one if nothing is queued, then takes every other
+    /// one already sent, without waiting, so dictation's work sent behind meeting segments is
+    /// seen, and run, before them. `None` once every sender is gone and nothing is left.
+    fn next(&mut self, rx: &Receiver<ToStt>) -> Option<ToStt> {
+        if self.dictation.is_empty() && self.meeting.is_empty() {
+            self.push(rx.recv().ok()?);
+        }
+        while let Ok(msg) = rx.try_recv() {
+            self.push(msg);
+        }
+        self.dictation
+            .pop_front()
+            .or_else(|| self.meeting.pop_front())
+    }
 }
 
 enum ToPolish {
@@ -481,19 +630,7 @@ pub fn start(
     notify: impl Fn(Event) + Send + Sync + 'static,
 ) -> Result<Pipeline, String> {
     let words = Words::new(dictionary);
-    let hub = Hub {
-        state: Arc::new(Mutex::new(HubState {
-            engine: Engine::Loading("Loading model...".into()),
-            recording: false,
-            lingering: false,
-            pending: 0,
-            error: None,
-            missing: Vec::new(),
-            failures: 0,
-            last: None,
-        })),
-        notify: Arc::new(notify),
-    };
+    let hub = Hub::new(notify);
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     let ducker = Ducker::start(paths::ducked_volume_file());
     let hotkeys = Hotkeys::parse(&config.hotkey.keys).map_err(|e| format!("[hotkey] key: {e}"))?;
@@ -511,6 +648,7 @@ pub fn start(
     let (to_paste, paste_rx) = mpsc::channel::<ToPaste>();
     let level = Level::default();
     let key_down = Arc::new(Mutex::new(None));
+    let meeting = Arc::new(AtomicBool::new(false));
 
     let test_wav = load_test_wav();
     let chunk_secs = Arc::new(AtomicU32::new(agt_stt::CHUNK_SECS.to_bits()));
@@ -520,13 +658,14 @@ pub fn start(
         held: 0,
         reset: hotkey.resetter(),
         hub: hub.clone(),
-        to_stt,
+        to_stt: to_stt.clone(),
         to_paste: to_paste.clone(),
         test_wav,
         key_down: key_down.clone(),
         ducker: config.audio.duck.then(|| ducker.clone()),
         chunk_secs: chunk_secs.clone(),
         words: words.clone(),
+        meeting: meeting.clone(),
     };
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
@@ -558,9 +697,13 @@ pub fn start(
         level,
         polish_info,
         to_paste,
+        to_stt,
         key_down,
         ducker,
         words,
+        dictating: hub.dictating.clone(),
+        meeting,
+        hub,
     })
 }
 
@@ -858,6 +1001,8 @@ struct AudioThread {
     chunk_secs: Arc<AtomicU32>,
     /// Each recording takes the dictionary in use at key-down (see [`Words`]).
     words: Words,
+    /// A meeting is recording ([`Pipeline::set_meeting_active`]).
+    meeting: Arc<AtomicBool>,
 }
 
 /// A recording in progress: taken from the recorder every [`RELEASE_POLL`] and cut as it
@@ -1086,10 +1231,7 @@ impl AudioThread {
                     let double = is_double_tap(last_tap.take(), t, double_tap);
                     holding = self.start_recording(&mut recorder, t).map(|mut d| {
                         // Only once the microphone runs: never delays it (a channel send).
-                        let ducked = self
-                            .ducker
-                            .as_ref()
-                            .map(|k| k.duck(self.config.audio.duck_level()));
+                        let ducked = self.duck();
                         let secs = f32::from_bits(self.chunk_secs.load(Relaxed));
                         let scope = self.scope(&mut d);
                         (t, d, ducked, Feed::new(secs, scope))
@@ -1162,6 +1304,17 @@ impl AudioThread {
                 }
             }
         }
+    }
+
+    /// Turns other audio down for the recording that just started: with `audio.duck`, and not
+    /// while a meeting records (it would turn the call down).
+    fn duck(&self) -> Option<Ducked> {
+        let ducker = self.ducker.as_ref()?;
+        if self.meeting.load(Relaxed) {
+            tracing::debug!("a meeting is recording; not ducking");
+            return None;
+        }
+        Some(ducker.duck(self.config.audio.duck_level()))
     }
 
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
@@ -1548,6 +1701,45 @@ fn set_chunk_secs(engine: &dyn SttEngine, chunk_secs: &AtomicU32) {
     chunk_secs.store(secs.to_bits(), Relaxed);
 }
 
+/// A meeting segment's text, made like a dictation's raw text (whitespace collapsed, no
+/// trailing space, "" for no speech), with `scope`'s terms favored (by `boost`) and its
+/// replacements made. Never polished (polish is for pasted text), and it leaves no trace in
+/// the dictation records or history; the status line only learns of a change in how the
+/// engine runs, as from any call ([`transcribe`]). The log gets timings only, never the text.
+fn transcribe_segment(
+    engine: Option<&mut Box<dyn SttEngine>>,
+    audio: &[f32],
+    scope: &Scope,
+    boost: f32,
+    hub: &Hub,
+    chunk_secs: &AtomicU32,
+) -> Result<String, String> {
+    let Some(engine) = engine else {
+        // At debug: a meeting sends one every few seconds, and the load failure is logged.
+        tracing::debug!("meeting segment not transcribed: the model isn't loaded");
+        return Err("model not ready".into());
+    };
+    let start = Instant::now();
+    match transcribe(engine.as_mut(), audio, &opts(scope, boost), hub, chunk_secs) {
+        Ok(text) => {
+            let mut text = finish_text(&text, false);
+            let replaced = replace_in(scope, &mut text);
+            tracing::debug!(
+                "meeting segment: {:.1} s of audio, stt {:.0} ms, {replaced} replacement(s)",
+                secs(audio),
+                ms(start.elapsed())
+            );
+            Ok(text)
+        }
+        Err(e) => {
+            tracing::error!("meeting segment transcription failed: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Transcribes dictations and meeting segments, one at a time, dictation first (see the
+/// module docs).
 #[allow(clippy::too_many_arguments)]
 fn stt_thread(
     config: Config,
@@ -1569,12 +1761,14 @@ fn stt_thread(
         set_chunk_secs(e.as_ref(), &chunk_secs);
     }
     let mut partial: Option<Partial> = None;
-    // When the engine's last call ended (it's been idle since: a GPU wakes up slowly).
+    // When the engine's last call ended (it's been idle since: a GPU wakes up slowly). A
+    // meeting segment's call counts: the engine was busy with it.
     let mut engine_done: Option<Instant> = None;
+    let mut queue = SttQueue::default();
     loop {
-        // Free from here on, until the next message.
+        // Free from here on, until the next message (none if one is queued already).
         let free_at = Instant::now();
-        let Ok(msg) = jobs.recv() else { return };
+        let Some(msg) = queue.next(&jobs) else { return };
         let mut job = match msg {
             ToStt::RetryLoad => {
                 if engine.is_none() {
@@ -1636,6 +1830,20 @@ fn stt_thread(
                     d.live_discarded_ms = (p.discarded_ms > 0.0).then_some(p.discarded_ms);
                 }
                 telemetry::global().dictation(d, outcome);
+                continue;
+            }
+            ToStt::Meeting { audio, scope, done } => {
+                done(transcribe_segment(
+                    engine.as_mut(),
+                    &audio,
+                    &scope,
+                    boost,
+                    &hub,
+                    &chunk_secs,
+                ));
+                if engine.is_some() {
+                    engine_done = Some(Instant::now());
+                }
                 continue;
             }
             ToStt::Transcribe(job) => job,
@@ -3325,6 +3533,220 @@ mod tests {
         assert!(is_paste_error(COPY_FAILED));
         assert!(!is_paste_error("microphone unavailable (see log)"));
         assert!(!is_paste_error("transcription failed (see log)"));
+    }
+
+    fn job(audio: Vec<f32>) -> Job {
+        Job {
+            audio,
+            released: Instant::now(),
+            target: None,
+            dictation: Box::default(),
+            live: None,
+            scope: Arc::default(),
+        }
+    }
+
+    fn meeting_segment(audio: Vec<f32>) -> ToStt {
+        ToStt::Meeting {
+            audio,
+            scope: Arc::default(),
+            done: Box::new(|_| {}),
+        }
+    }
+
+    /// What a message is, to check the order they're handled in (audio by its first sample).
+    fn label(msg: &ToStt) -> String {
+        match msg {
+            ToStt::Transcribe(j) => format!("job {}", j.audio[0]),
+            ToStt::Segment(p, _) => format!("segment {}", p.audio[0]),
+            ToStt::Dropped(..) => "dropped".into(),
+            ToStt::RetryLoad => "reload".into(),
+            ToStt::Meeting { audio, .. } => format!("meeting {}", audio[0]),
+        }
+    }
+
+    #[test]
+    fn dictation_goes_first_in_the_order_sent() {
+        // Two meeting segments are waiting when a held dictation's segment, then its job at
+        // release, come in behind them.
+        let (tx, rx) = mpsc::channel();
+        let piece = Piece {
+            audio: vec![7.0],
+            cut: Cut::Pause,
+            redo: false,
+        };
+        for msg in [
+            meeting_segment(vec![1.0]),
+            meeting_segment(vec![2.0]),
+            ToStt::Segment(piece, Arc::default()),
+            ToStt::Transcribe(job(vec![9.0])),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        let mut queue = SttQueue::default();
+        // All four taken in one go, without blocking.
+        let first = queue.next(&rx).map(|m| label(&m));
+        assert_eq!(first.as_deref(), Some("segment 7"));
+        // A dropped recording's record and a reload come in while the meeting waits.
+        tx.send(ToStt::Dropped(Box::default(), Ended::Cancelled))
+            .unwrap();
+        tx.send(ToStt::RetryLoad).unwrap();
+        // Every sender gone: what's queued is still handed out, then the thread ends.
+        drop(tx);
+        let rest: Vec<String> = std::iter::from_fn(|| queue.next(&rx))
+            .map(|m| label(&m))
+            .collect();
+        assert_eq!(
+            rest,
+            ["job 9", "dropped", "reload", "meeting 1", "meeting 2"],
+            "dictation's work in the order sent, then the meeting's"
+        );
+    }
+
+    /// An engine that answers from a script.
+    struct Scripted(VecDeque<Result<&'static str, &'static str>>);
+
+    impl SttEngine for Scripted {
+        fn name(&self) -> String {
+            "scripted".into()
+        }
+        fn warmup(&mut self) -> agt_core::stt::Result<()> {
+            Ok(())
+        }
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            _: &TranscribeOpts,
+        ) -> agt_core::stt::Result<agt_core::stt::Transcript> {
+            match self.0.pop_front().expect("scripted") {
+                Ok(text) => Ok(agt_core::stt::Transcript { text: text.into() }),
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn meeting_segments_get_plain_text_or_an_error() {
+        let hub = Hub::new(|_| {});
+        let chunk_secs = AtomicU32::new(agt_stt::CHUNK_SECS.to_bits());
+        let mut engine: Box<dyn SttEngine> = Box::new(Scripted(VecDeque::from([
+            Ok("  Hello,\n world. "),
+            Ok("   "),
+            Err("engine fell over"),
+        ])));
+        let run = |e: Option<&mut Box<dyn SttEngine>>| {
+            transcribe_segment(e, &[0.0; 16], &Scope::default(), 0.0, &hub, &chunk_secs)
+        };
+        assert_eq!(
+            run(Some(&mut engine)),
+            Ok("Hello, world.".into()),
+            "no trailing space"
+        );
+        assert_eq!(run(Some(&mut engine)), Ok(String::new()), "no speech");
+        assert_eq!(run(Some(&mut engine)), Err("engine fell over".into()));
+        assert_eq!(run(None), Err("model not ready".into()));
+        // The status line knows nothing of it: no job pending, no failure shown.
+        let s = hub.state.lock().unwrap();
+        assert_eq!((s.pending, s.failures, s.error.as_deref()), (0, 0, None));
+    }
+
+    /// Says `text` and keeps the terms it was asked to favor, and how much.
+    struct Hears(&'static str, Arc<Mutex<Vec<(Vec<String>, f32)>>>);
+
+    impl SttEngine for Hears {
+        fn name(&self) -> String {
+            "hears".into()
+        }
+        fn warmup(&mut self) -> agt_core::stt::Result<()> {
+            Ok(())
+        }
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            opts: &TranscribeOpts,
+        ) -> agt_core::stt::Result<agt_core::stt::Transcript> {
+            let terms = opts.vocabulary.to_vec();
+            self.1.lock().unwrap().push((terms, opts.boost));
+            Ok(agt_core::stt::Transcript {
+                text: self.0.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn meeting_segments_use_the_dictionary_outside_profiles() {
+        // The global terms and replacements apply, as everywhere; a profile's don't: a
+        // meeting isn't typed into an app.
+        let d = Dictionary::parse(
+            "terms = [\"AGT\"]\n\
+             [profiles.code]\napps = [\"Code.exe\"]\nterms = [\"main\"]\n\
+             [[replace]]\nfrom = \"dot env\"\nto = \".env\"\n\
+             [[replace]]\nfrom = \"Maine\"\nto = \"main\"\nprofiles = [\"code\"]\n",
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let t = MeetingTranscriber {
+            to_stt: tx,
+            words: Words::new(d),
+        };
+        agt_meeting::Transcriber::transcribe(&t, vec![0.0; 16], Box::new(|_| {}));
+        let Ok(ToStt::Meeting { audio, scope, .. }) = rx.try_recv() else {
+            panic!("expected a meeting segment");
+        };
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let mut engine: Box<dyn SttEngine> =
+            Box::new(Hears("Push dot env to Maine.", heard.clone()));
+        let hub = Hub::new(|_| {});
+        let chunk_secs = AtomicU32::new(agt_stt::CHUNK_SECS.to_bits());
+        assert_eq!(
+            transcribe_segment(Some(&mut engine), &audio, &scope, 2.0, &hub, &chunk_secs),
+            Ok("Push .env to Maine.".into())
+        );
+        assert_eq!(*heard.lock().unwrap(), [(vec!["AGT".to_owned()], 2.0)]);
+    }
+
+    #[test]
+    fn meeting_transcriber_queues_segments_and_answers_once_stopped() {
+        let (tx, rx) = mpsc::channel();
+        let t: Arc<dyn agt_meeting::Transcriber> = Arc::new(MeetingTranscriber {
+            to_stt: tx,
+            words: Words::new(Dictionary::default()),
+        });
+        let (answers, answer) = mpsc::channel();
+        let a = answers.clone();
+        t.transcribe(vec![0.5], Box::new(move |r| a.send(r).unwrap()));
+        match rx.try_recv() {
+            Ok(ToStt::Meeting { audio, done, .. }) => {
+                assert_eq!(audio, [0.5]);
+                done(Ok("hi".into()));
+            }
+            _ => panic!("expected a meeting segment"),
+        }
+        assert_eq!(answer.try_recv(), Ok(Ok("hi".into())));
+        // The stt thread is gone: the segment is answered at once, not lost.
+        drop(rx);
+        t.transcribe(vec![0.5], Box::new(move |r| answers.send(r).unwrap()));
+        assert_eq!(answer.try_recv(), Ok(Err("transcription stopped".into())));
+    }
+
+    #[test]
+    fn dictating_follows_the_recording_state() {
+        let hub = Hub::new(|_| {});
+        let dictating = hub.dictating.clone();
+        assert!(!dictating.load(Relaxed));
+        hub.update(|s| s.recording = true);
+        assert!(dictating.load(Relaxed));
+        // Between the two taps of a double tap: shown as recording, but nothing records.
+        hub.update(|s| {
+            s.recording = false;
+            s.lingering = true;
+        });
+        assert!(!dictating.load(Relaxed), "lingering is not dictating");
+        hub.update(|s| {
+            s.lingering = false;
+            s.pending += 1;
+        });
+        assert!(!dictating.load(Relaxed), "transcribing is not dictating");
     }
 
     #[test]
