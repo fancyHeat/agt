@@ -69,7 +69,7 @@ use agt_core::{
 use agt_history::{self as history, History};
 use agt_platform::{
     ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Hotkeys,
-    Key, MAX_CHORD, PasteToken, Permission,
+    KEYS, Key, MAX_CHORD, PasteToken, Permission,
 };
 use agt_polish::{Outcome, ahead::Ahead};
 use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
@@ -358,7 +358,7 @@ fn replace_in(scope: &Scope, text: &mut String) -> usize {
     }
 }
 
-/// Keeps the pipeline running; dropping it stops the hotkey.
+/// Keeps the pipeline running; dropping it stops the hotkeys.
 pub struct Pipeline {
     _hotkey: HotkeyHandle,
     /// Live microphone level (RMS, 0..1) while recording, for the overlay.
@@ -787,8 +787,9 @@ enum Latch {
     /// Recording with no hotkey held: the next press's release (any hotkey's) ends it.
     On,
     /// That press is down: its release ends it. Another press meanwhile (an auto-repeat after
-    /// a missed press re-installed the hook) changes nothing; another key (a shortcut with the
-    /// hotkey, or Esc) goes back to `On`.
+    /// a missed press re-installed the hook, or another hotkey's) only makes its hotkey the one
+    /// whose release is watched; another key (a shortcut with the hotkey, or Esc) goes back to
+    /// `On`.
     Ending,
 }
 
@@ -796,6 +797,46 @@ enum Latch {
 /// let go at most `gap` before (`last_tap`). A zero `gap` turns it off.
 fn is_double_tap(last_tap: Option<Instant>, now: Instant, gap: Duration) -> bool {
     !gap.is_zero() && last_tap.is_some_and(|up| now.saturating_duration_since(up) <= gap)
+}
+
+/// Which hotkey a hands-free poll finds pressed without the hook having said so (see
+/// [`AudioThread::missed_press`]), if any: the first in the list whose keys all read down
+/// now (`key_down`; `None`, can't tell, never counts) and none of them at the previous poll
+/// (`was_up`). A hotkey held since before that poll isn't a new press (a shortcut that
+/// cancelled the press ending a hands-free recording leaves it held). One with a key that
+/// isn't a modifier also needs no other modifier down, as the hook does: Ctrl+Option+Space
+/// is a shortcut, not Left Control + Space (a modifier that can't be read doesn't count).
+/// Sets `was_up` for the next poll: no key read down (a key that can't be read counts as
+/// up: Windows can't read one its hook swallows while it's up).
+fn missed_press_of(
+    hotkeys: &Hotkeys,
+    was_up: &mut [bool],
+    key_down: impl Fn(Key) -> Option<bool>,
+) -> Option<usize> {
+    let mut pressed = None;
+    for ((i, hotkey), up) in hotkeys.list().iter().enumerate().zip(was_up.iter_mut()) {
+        let keys = hotkey.keys();
+        let mut down = [None; MAX_CHORD];
+        for (d, &k) in down.iter_mut().zip(keys) {
+            *d = key_down(k);
+        }
+        let down = &down[..keys.len()];
+        let other_modifier = || {
+            KEYS.iter()
+                .filter_map(|&(.., code, _)| Key::from_code(code))
+                .any(|k| k.is_modifier() && !keys.contains(&k) && key_down(k) == Some(true))
+        };
+        let combo = keys.iter().any(|k| !k.is_modifier());
+        if pressed.is_none()
+            && *up
+            && down.iter().all(|&d| d == Some(true))
+            && !(combo && other_modifier())
+        {
+            pressed = Some(i);
+        }
+        *up = !down.contains(&Some(true));
+    }
+    pressed
 }
 
 struct AudioThread {
@@ -933,10 +974,17 @@ impl AudioThread {
         // The press ending a hands-free recording was synthesized by `missed_press`: its
         // release is polled with `key_down_past_hook`.
         let mut press_missed = false;
+        // Per hotkey, whether the last hands-free poll saw it up (see `missed_press_of`).
+        let mut was_up = vec![false; self.keys.list().len()];
 
         loop {
             press_missed &= latch == Latch::Ending;
             let hands_free = latch == Latch::On && holding.is_some();
+            // Each time hands-free starts (or resumes after a shortcut), a hotkey has to be
+            // seen up first: it may still be held.
+            if !hands_free {
+                was_up.fill(false);
+            }
             // Esc is ours only while it can end something.
             agt_platform::arm_escape(hands_free);
             // `missed`: a release synthesized after the hook missed the real one.
@@ -972,10 +1020,13 @@ impl AudioThread {
                     Err(RecvTimeoutError::Timeout) => {
                         feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
                         let missed = match hands_free {
-                            true => self.missed_press(&events).map(|(ev, synthesized)| {
-                                press_missed = synthesized;
-                                (ev, false)
-                            }),
+                            true => {
+                                self.missed_press(&events, &mut was_up)
+                                    .map(|(ev, synthesized)| {
+                                        press_missed = synthesized;
+                                        (ev, false)
+                                    })
+                            }
                             false => self.missed_release(&events, &watch, press_missed),
                         };
                         match missed {
@@ -1150,28 +1201,28 @@ impl AudioThread {
     }
 
     /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
-    /// synthesized press if a hotkey (the first whose keys are all down) turns out to be down
-    /// without the hook having said so (macOS disabled the event tap after a timeout, Windows
-    /// dropped the hook), so the recording can still be ended; with `true` if synthesized. A
-    /// tap shorter than the poll is caught only if a poll falls within it (a 100 ms tap: 40%
-    /// of the time); the next tap then gets another chance. (`GetAsyncKeyState`'s "pressed
-    /// since the last call" bit would catch it, but Windows documents it as unreliable.)
-    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<(HotkeyEvent, bool)> {
-        let down = self.keys.list().iter().enumerate().find(|(_, hotkey)| {
-            hotkey
-                .keys()
-                .iter()
-                .all(|&k| agt_platform::key_down(k) == Some(true))
-        });
-        let Some((i, hotkey)) = down else {
-            return None; // all up, or can't tell
-        };
+    /// synthesized press if a hotkey turns out to have gone down since the last poll without
+    /// the hook having said so (macOS disabled the event tap after a timeout, Windows dropped
+    /// the hook), so the recording can still be ended; with `true` if synthesized. Which
+    /// presses count, and `was_up`: [`missed_press_of`]. A tap shorter than the poll is caught
+    /// only if a poll falls within it (a 100 ms tap: 40% of the time), and a chord only if no
+    /// poll falls between its keys; the next press then gets another chance.
+    /// (`GetAsyncKeyState`'s "pressed since the last call" bit would catch it, but Windows
+    /// documents it as unreliable.)
+    fn missed_press(
+        &self,
+        events: &Receiver<HotkeyEvent>,
+        was_up: &mut [bool],
+    ) -> Option<(HotkeyEvent, bool)> {
+        // Up, held since before, can't tell, or part of a shortcut.
+        let i = missed_press_of(&self.keys, was_up, agt_platform::key_down)?;
         // As in `missed_release`: a real press would normally be queued already.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
             return Some((ev, false));
         }
         tracing::warn!(
-            "{hotkey} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook"
+            "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
+            self.keys.list()[i]
         );
         self.reset.reset();
         Some((HotkeyEvent::Down(Instant::now(), i), true))
@@ -1400,7 +1451,7 @@ fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
             tracing::error!("cannot load speech model: {e}");
             hub.update(|s| {
                 s.engine =
-                    Engine::Failed("model unavailable, see log (press the hotkey to retry)".into())
+                    Engine::Failed("model unavailable, see log (press a hotkey to retry)".into())
             });
             None
         }
@@ -3021,6 +3072,80 @@ mod tests {
         .unwrap();
         let names: Vec<_> = paste_sensitive_keys(&hk).iter().map(|k| k.name).collect();
         assert_eq!(names, ["LeftCommand", "V"]);
+    }
+
+    /// A key-state source for [`missed_press_of`]: the keys named `down` are down, the rest up.
+    fn down_keys(down: &'static [&'static str]) -> impl Fn(Key) -> Option<bool> {
+        move |k| Some(down.contains(&k.name))
+    }
+
+    #[test]
+    fn a_missed_press_is_a_hotkey_going_down_between_polls() {
+        let hk = Hotkeys::parse(&["LeftShift+F13".into(), "F14".into(), "V".into()]).unwrap();
+        // A hands-free stretch's first poll: F14 may have been held since before (a shortcut
+        // cancelled the press that was ending the recording).
+        let mut was_up = [false; 3];
+        assert_eq!(missed_press_of(&hk, &mut was_up, down_keys(&["F14"])), None);
+        assert_eq!(was_up, [true, false, true]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, down_keys(&["F14"])), None);
+        // Let go, then pressed again.
+        assert_eq!(missed_press_of(&hk, &mut was_up, down_keys(&[])), None);
+        assert_eq!(was_up, [true; 3]);
+        assert_eq!(
+            missed_press_of(&hk, &mut was_up, down_keys(&["F14"])),
+            Some(1)
+        );
+        // Half a chord down at the poll before: not seen up, so not a press yet.
+        let mut was_up = [true; 3];
+        assert_eq!(
+            missed_press_of(&hk, &mut was_up, down_keys(&["LeftShift"])),
+            None
+        );
+        assert_eq!(was_up, [false, true, true]);
+        let both = down_keys(&["LeftShift", "F13"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, both), None);
+        // Two going down at once: the first in the list.
+        let mut was_up = [true; 3];
+        assert_eq!(
+            missed_press_of(&hk, &mut was_up, down_keys(&["V", "F14"])),
+            Some(1)
+        );
+        assert_eq!(was_up, [true, false, false]);
+    }
+
+    #[test]
+    fn a_key_that_cant_be_read_down_never_makes_a_missed_press() {
+        let hk = Hotkeys::parse(&["LeftShift+F13".into()]).unwrap();
+        // F13 reads `None` (Windows: a key the hook swallows, while it's up).
+        let f13_unread = |shift: bool| move |k: Key| (k.name != "F13").then_some(shift);
+        let mut was_up = [true];
+        assert_eq!(missed_press_of(&hk, &mut was_up, f13_unread(true)), None);
+        // Not read down counts as up for the next poll, so a press that got past the hook
+        // (F13 then reads down) is caught.
+        assert_eq!(missed_press_of(&hk, &mut was_up, f13_unread(false)), None);
+        assert_eq!(was_up, [true]);
+        let both = down_keys(&["LeftShift", "F13"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, both), Some(0));
+    }
+
+    #[test]
+    fn a_shortcut_with_another_modifier_is_not_a_missed_press() {
+        // The hook lets LeftShift+F13 with Right Shift also down through to apps.
+        let hk = Hotkeys::parse(&["LeftShift+F13".into()]).unwrap();
+        let mut was_up = [true];
+        let shortcut = down_keys(&["LeftShift", "F13", "RightShift"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, shortcut), None);
+        assert_eq!(was_up, [false]);
+        // A modifier that can't be read doesn't count as down.
+        let mut was_up = [true];
+        let rest_unread = |k: Key| ["LeftShift", "F13"].contains(&k.name).then_some(true);
+        assert_eq!(missed_press_of(&hk, &mut was_up, rest_unread), Some(0));
+        // A hotkey of modifiers only dictates with other modifiers down too (Shift + Fn
+        // still does).
+        let hk = Hotkeys::parse(&["LeftShift".into()]).unwrap();
+        let mut was_up = [true];
+        let with_other = down_keys(&["LeftShift", "RightShift"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, with_other), Some(0));
     }
 
     /// A fake key-state source: held for the first `n` polls.
