@@ -1,51 +1,58 @@
 //! The dictation pipeline: hotkey → microphone → speech-to-text → paste.
 //!
 //! Threads (none of them is the UI thread, and nothing blocks the hook thread):
-//! - `hotkey` (agt-platform): low-level keyboard hook; forwards hold events to `audio`.
-//! - `audio`: owns the microphone. Starts recording on key down, and on release hands the
-//!   samples to `stt`. Short taps and cancelled holds are dropped here. While recording it
-//!   also polls the key, in case the hook missed the release (see [`RELEASE_POLL`]), and
-//!   takes the new audio: a long recording is cut into segments as it comes in
-//!   (`agt_stt::chunk::Live`, cheap), and each finished one goes to `stt` right away, so at
-//!   release only the last few seconds are left to transcribe (see [`Feed`]). A double tap
-//!   (`hotkey.double_tap_ms`) records hands-free instead: the release doesn't end that
-//!   recording, the next press and release does (Esc cancels it, and so does
-//!   [`HANDS_FREE_MAX`]). After a tap the status stays "recording" for `double_tap_ms`, so
-//!   the bar doesn't flicker between the two taps.
+//! - `hotkey` (agt-platform): low-level keyboard hook watching every configured hotkey, one
+//!   hold at a time; forwards hold events (with which hotkey went down) to `audio`.
+//! - `audio`: owns the microphone. Starts recording when any hotkey goes down, and on its
+//!   release hands the samples to `stt`. Short taps and cancelled holds are dropped here.
+//!   While recording it also polls the held hotkey's keys, in case the hook missed the
+//!   release (see [`RELEASE_POLL`]), and takes the new audio: a long recording is cut into
+//!   segments as it comes in (`agt_stt::chunk::Live`, cheap), and each finished one goes to
+//!   `stt` right away, so at release only the last few seconds are left to transcribe (see
+//!   [`Feed`]). A double tap (`hotkey.double_tap_ms`; the two taps may be on different
+//!   hotkeys) records hands-free instead: the release doesn't end that recording, the next
+//!   press and release of any hotkey does (Esc cancels it, and so does [`HANDS_FREE_MAX`]).
+//!   After a tap the status stays "recording" for `double_tap_ms`, so the bar doesn't flicker
+//!   between the two taps.
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
-//!   system output volume down until the recording ends, however it ends.
+//!   system output volume down until the recording ends, however it ends. Not while a meeting
+//!   records ([`Pipeline::set_meeting_active`]): that would turn the call down.
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
 //!   recording may start while the previous one is still being transcribed: jobs queue up
 //!   and are pasted in order (nothing is dropped). A recording's segments are transcribed
 //!   while it's still being recorded, and their texts joined at release; a dropped
 //!   (cancelled) recording's are skipped, or discarded if already being transcribed.
-//! - `polish`: first applies the dictionary's replacements (`dictionary.toml`, see
-//!   [`agt_core::dictionary`]) to each transcript, polish on or off. Then, with
-//!   `polish.enabled`, cleans it up with an LLM (`agt-polish`), bounded by
-//!   `polish.timeout_ms`; on any failure the transcript (replaced) is pasted. Then hands it to
-//!   `paste`. A long dictation transcribed while recording is also polished while
-//!   recording, in pieces that end at a sentence end (`agt_polish::ahead`, local servers
-//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]); the
-//!   replacements are then applied to each piece. A phrase is never split across segments
-//!   (their texts are joined with a space before any replacement), only across pieces, which
-//!   end at a sentence end (or, in a run-on of over `agt_polish::ahead::MAX_HELD_WORDS`
-//!   words, at a segment boundary): a `from` spanning one of those isn't matched.
+//!   It also transcribes a recording meeting's segments ([`Pipeline::transcriber`]) on the same
+//!   engine, at low priority: each time it takes everything queued, and whatever dictation sent
+//!   (segments cut while recording, the job at release, a dropped recording's record, a
+//!   reload) goes first, in the order sent ([`SttQueue`]). So a meeting delays a dictation by
+//!   at most the one meeting segment already being transcribed when the dictation's work came
+//!   in. Meeting segments never reach polish, the paste, history or the status line.
+//! - `polish`: with `polish.enabled`, cleans each transcript up with an LLM (`agt-polish`),
+//!   bounded by `polish.timeout_ms`; on any failure the transcript is kept. Then applies the
+//!   dictionary's replacements (`dictionary.toml`, see [`agt_core::dictionary`]) to that
+//!   text, polish on or off, so polish never rewrites them, and hands it to `paste`. A long
+//!   dictation transcribed while recording is also polished while recording, in pieces that
+//!   end at a sentence end (`agt_polish::ahead`, local servers only), so at release only the
+//!   rest is left to polish (see [`Partial::feed_ahead`]). The replacements are made once the
+//!   pieces are joined, so a phrase is never split across segments or pieces.
 //! - `permissions` (macOS, only while something is missing): asks for the Microphone and
 //!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
 //!   both are granted, so no restart is needed.
 //! - `paste`: saves the clipboard when a recording starts (on a helper thread, with a
 //!   deadline, so a hung clipboard owner can't block pasting), pastes, and restores the
 //!   clipboard `paste.restore_clipboard_ms` later. If that save is what keeps the clipboard
-//!   busy, the paste waits for it (up to [`BUSY_SAVE_WAIT`]). It also waits while a hotkey key
-//!   the paste would disturb is still held (see [`HOTKEY_RELEASE_POLL`]). It keeps the last
-//!   transcript in memory for the tray's "Copy last transcript".
+//!   busy, the paste waits for it (up to [`BUSY_SAVE_WAIT`]). It also waits while a key of any
+//!   hotkey that the paste would disturb is still held (see [`HOTKEY_RELEASE_POLL`]). It keeps
+//!   the last transcript in memory for the tray's "Copy last transcript".
 //!
 //! Status changes are reported through a callback (the app forwards them to the tray and the
 //! overlay).
 //!
 //! Each dictation's measurements travel with it as an [`agt_telemetry::Dictation`] and are
 //! recorded (a channel send, never a disk write) wherever it ends: after the paste, or at the
-//! stage that dropped it. Only counts and timings: never the audio or the text.
+//! stage that dropped it. Only counts and timings: never the audio or the text. Meeting
+//! segments get no such record.
 //!
 //! With `[history]` on, a transcribed dictation's text and/or audio also travel with it, as an
 //! [`agt_history::Entry`], and are handed to the history writer (again a channel send) after
@@ -66,14 +73,15 @@ use agt_core::{
 };
 use agt_history::{self as history, History};
 use agt_platform::{
-    ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key,
-    MAX_CHORD, PasteToken, Permission,
+    ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Hotkeys,
+    KEYS, Key, MAX_CHORD, PasteToken, Permission,
 };
 use agt_polish::{Outcome, ahead::Ahead};
 use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
 use agt_telemetry::{self as telemetry, Dictation, Outcome as Ended};
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     fmt,
     sync::{
         Arc, Condvar, Mutex,
@@ -88,7 +96,7 @@ use std::{
 /// of the microphone recording (the mic is still opened and recorded as usual).
 pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 
-/// While recording, how often the audio thread checks that the hotkey is really still down.
+/// While recording, how often the audio thread checks the held hotkey is really still down.
 /// The hook can miss a release: it happens on the secure desktop (UAC prompt, Ctrl+Alt+Del)
 /// or Windows dropped a hook that was too slow once. A missed release is treated as a normal
 /// release at the moment it's noticed: the user did let go, and what they said up to then is
@@ -116,12 +124,14 @@ const SNAPSHOT_WAIT: Duration = Duration::from_millis(100);
 /// before trying again (issue #3).
 const BUSY_SAVE_WAIT: Duration = Duration::from_secs(2);
 
-/// A paste waits while a hotkey key that pasting would have to release in software (Shift,
-/// Left Ctrl, Win) is still held: a Win key held a moment longer than the chord's other key,
-/// or the hotkey already held for the next dictation. Releasing them in software would leave
-/// them logically up while physically down: a still-held Win then auto-repeats as a fresh
-/// press and its release opens the Start menu, and the release watchdog can't trust its polls.
-/// After [`HOTKEY_RELEASE_MAX`] it pastes anyway (releasing them, as before).
+/// A paste waits while a key of any hotkey that pasting would have to release in software
+/// (Windows: Shift, Left Ctrl, Alt, Win; macOS: Left Command and V, see
+/// [`agt_platform::paste_may_release`]) is still held: a Win key held a moment longer than
+/// the chord's other key, or a hotkey (any of them) already held for the next dictation.
+/// Releasing them in software would leave them logically up while physically down: a
+/// still-held Win then auto-repeats as a fresh press and its release opens the Start menu,
+/// and the release watchdog can't trust its polls. After [`HOTKEY_RELEASE_MAX`] it pastes
+/// anyway (releasing them, as before).
 const HOTKEY_RELEASE_POLL: Duration = Duration::from_millis(15);
 const HOTKEY_RELEASE_MAX: Duration = Duration::from_secs(10);
 
@@ -164,10 +174,10 @@ pub enum Event {
     /// The status line changed. With the number of failures (microphone, transcription,
     /// paste) so far: a `Status::Error` is a new failure only if that went up since.
     Status(Status, u64),
-    /// The hotkey was pressed but no recording started (the model failed to load, or no
+    /// A hotkey was pressed but no recording started (the model failed to load, or no
     /// microphone); the status line says why.
     Rejected,
-    /// The hotkey was pressed while the model is still loading (or downloading): no
+    /// A hotkey was pressed while the model is still loading (or downloading): no
     /// recording.
     NotReady,
     /// Whether there is a last transcript to copy (see [`Pipeline::copy_last_transcript`]).
@@ -216,12 +226,33 @@ impl HubState {
 struct Hub {
     state: Arc<Mutex<HubState>>,
     notify: Arc<dyn Fn(Event) + Send + Sync>,
+    /// `HubState::recording`, readable without the lock ([`Pipeline::dictating`]). Not
+    /// `lingering`: between the two taps of a double tap nothing records.
+    dictating: Arc<AtomicBool>,
 }
 
 impl Hub {
+    fn new(notify: impl Fn(Event) + Send + Sync + 'static) -> Self {
+        Hub {
+            state: Arc::new(Mutex::new(HubState {
+                engine: Engine::Loading("Loading model...".into()),
+                recording: false,
+                lingering: false,
+                pending: 0,
+                error: None,
+                missing: Vec::new(),
+                failures: 0,
+                last: None,
+            })),
+            notify: Arc::new(notify),
+            dictating: Arc::default(),
+        }
+    }
+
     fn update(&self, f: impl FnOnce(&mut HubState)) {
         let mut s = self.state.lock().unwrap();
         f(&mut s);
+        self.dictating.store(s.recording, Relaxed);
         let status = if s.recording || s.lingering {
             Status::Recording
         } else if s.pending > 0 {
@@ -242,7 +273,7 @@ impl Hub {
         }
     }
 
-    /// The hotkey was pressed but no recording started.
+    /// A hotkey was pressed but no recording started.
     fn reject(&self) {
         (self.notify)(Event::Rejected);
     }
@@ -354,7 +385,7 @@ fn replace_in(scope: &Scope, text: &mut String) -> usize {
     }
 }
 
-/// Keeps the pipeline running; dropping it stops the hotkey.
+/// Keeps the pipeline running; dropping it stops the hotkeys.
 pub struct Pipeline {
     _hotkey: HotkeyHandle,
     /// Live microphone level (RMS, 0..1) while recording, for the overlay.
@@ -362,9 +393,26 @@ pub struct Pipeline {
     /// One line for the tray about LLM polish, e.g. "Polish: off".
     pub polish_info: String,
     to_paste: Sender<ToPaste>,
+    /// For meeting segments ([`Pipeline::transcriber`]).
+    to_stt: Sender<ToStt>,
     key_down: Arc<Mutex<Option<Instant>>>,
     ducker: Ducker,
     words: Words,
+    dictating: Arc<AtomicBool>,
+    /// A meeting is recording: dictations don't duck ([`Pipeline::set_meeting_active`]).
+    meeting: Arc<AtomicBool>,
+    /// For [`Pipeline::speech_model`].
+    hub: Hub,
+}
+
+/// How the speech model is doing ([`Pipeline::speech_model`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpeechModel {
+    /// Downloading or loading: what is sent to the `stt` thread waits for it.
+    Loading,
+    Ready,
+    /// It didn't load, and why (as the tray says it). Nothing is transcribed until a retry.
+    Failed(String),
 }
 
 impl Pipeline {
@@ -387,9 +435,47 @@ impl Pipeline {
         let _ = self.to_paste.send(ToPaste::CopyLast);
     }
 
-    /// When the hotkey last went down (for latency logging).
+    /// When a hotkey last went down (for latency logging).
     pub fn last_key_down(&self) -> Option<Instant> {
         *self.key_down.lock().unwrap()
+    }
+}
+
+/// For meeting notes (`agt-meeting`).
+impl Pipeline {
+    /// Speech to text for a meeting's segments: the dictation engine on the `stt` thread,
+    /// behind everything dictation sends it (see the module docs). Only queues: `done` runs on
+    /// that thread, so it must be quick (a channel send): a dictation may be waiting. Once the
+    /// pipeline is gone, segments are answered "transcription stopped".
+    pub fn transcriber(&self) -> Arc<dyn agt_meeting::Transcriber> {
+        Arc::new(MeetingTranscriber {
+            to_stt: self.to_stt.clone(),
+            words: self.words.clone(),
+        })
+    }
+
+    /// True while a dictation records: from the microphone starting to the recording ending
+    /// (a hold released, a hands-free one ended by the next press, cancelled, too short,
+    /// timed out or discarded). A meeting blanks its mic track meanwhile: the dictation isn't
+    /// part of the meeting.
+    pub fn dictating(&self) -> Arc<AtomicBool> {
+        self.dictating.clone()
+    }
+
+    /// While on (a meeting records), dictations don't turn the output volume down: that would
+    /// turn the call down. A dictation already ducked stays so until its recording ends.
+    pub fn set_meeting_active(&self, on: bool) {
+        self.meeting.store(on, Relaxed);
+    }
+
+    /// The speech model now: a meeting can't be transcribed if it failed, and its segments
+    /// wait while it loads.
+    pub fn speech_model(&self) -> SpeechModel {
+        match &self.hub.state.lock().unwrap().engine {
+            Engine::Loading(_) => SpeechModel::Loading,
+            Engine::Ready(_) => SpeechModel::Ready,
+            Engine::Failed(e) => SpeechModel::Failed(e.clone()),
+        }
     }
 }
 
@@ -415,7 +501,7 @@ struct Shared {
     dropped: AtomicBool,
     /// Segments sent and not started yet.
     queued: AtomicUsize,
-    /// The dictionary in the app focused at key-down, for its segments and pieces (see
+    /// The dictionary in the app focused at key-down, for its segments' terms (see
     /// [`Words`]).
     scope: Arc<Scope>,
 }
@@ -427,8 +513,72 @@ enum ToStt {
     /// The recording those segments were from was dropped: recorded as `Ended` once they
     /// are out of the way.
     Dropped(Box<Dictation>, Ended),
-    /// The model failed to load and the user pressed the hotkey: try again.
+    /// The model failed to load and the user pressed a hotkey: try again.
     RetryLoad,
+    /// A meeting's segment (16 kHz mono), run when nothing from dictation waits. `done` gets
+    /// its text ("" for no speech) or why not, on the `stt` thread. `scope` is the dictionary
+    /// when it was sent, in no app's profile: a meeting isn't typed into an app.
+    Meeting {
+        audio: Vec<f32>,
+        scope: Arc<Scope>,
+        done: Done,
+    },
+}
+
+/// Where a meeting segment's text goes ([`agt_meeting::Transcriber`]).
+type Done = Box<dyn FnOnce(Result<String, String>) + Send>;
+
+/// [`Pipeline::transcriber`]: meeting segments into the `stt` thread's queue.
+struct MeetingTranscriber {
+    to_stt: Sender<ToStt>,
+    words: Words,
+}
+
+impl agt_meeting::Transcriber for MeetingTranscriber {
+    fn transcribe(&self, audio: Vec<f32>, done: Done) {
+        let scope = Arc::new(Scope::new(self.words.get(), None));
+        // The `stt` thread is gone (shutting down): answer now rather than never.
+        if let Err(mpsc::SendError(ToStt::Meeting { done, .. })) =
+            self.to_stt.send(ToStt::Meeting { audio, scope, done })
+        {
+            done(Err("transcription stopped".into()));
+        }
+    }
+}
+
+/// The `stt` thread's work, by kind: [`SttQueue::next`] picks from it.
+#[derive(Default)]
+struct SttQueue {
+    /// Everything but meeting segments: what dictation sends (segments cut while recording,
+    /// the job at release, a dropped recording's record) and reloads, in the order sent,
+    /// which they depend on (a recording's segments before its job or its `Dropped`).
+    dictation: VecDeque<ToStt>,
+    /// [`ToStt::Meeting`]s, in order.
+    meeting: VecDeque<ToStt>,
+}
+
+impl SttQueue {
+    fn push(&mut self, msg: ToStt) {
+        match msg {
+            ToStt::Meeting { .. } => self.meeting.push_back(msg),
+            msg => self.dictation.push_back(msg),
+        }
+    }
+
+    /// The next message to handle: waits for one if nothing is queued, then takes every other
+    /// one already sent, without waiting, so dictation's work sent behind meeting segments is
+    /// seen, and run, before them. `None` once every sender is gone and nothing is left.
+    fn next(&mut self, rx: &Receiver<ToStt>) -> Option<ToStt> {
+        if self.dictation.is_empty() && self.meeting.is_empty() {
+            self.push(rx.recv().ok()?);
+        }
+        while let Ok(msg) = rx.try_recv() {
+            self.push(msg);
+        }
+        self.dictation
+            .pop_front()
+            .or_else(|| self.meeting.pop_front())
+    }
 }
 
 enum ToPolish {
@@ -469,35 +619,23 @@ enum ToPaste {
     CopyLast,
 }
 
-/// Starts all pipeline threads. Fails if the hotkey can't be installed (bad key name, or a
-/// platform without support yet); the model is then not loaded either.
+/// Starts all pipeline threads. Fails if the hotkey can't be installed (a bad key name or list
+/// of hotkeys, or a platform without support yet); the model is then not loaded either.
 pub fn start(
     config: &Config,
     dictionary: Dictionary,
     notify: impl Fn(Event) + Send + Sync + 'static,
 ) -> Result<Pipeline, String> {
     let words = Words::new(dictionary);
-    let hub = Hub {
-        state: Arc::new(Mutex::new(HubState {
-            engine: Engine::Loading("Loading model...".into()),
-            recording: false,
-            lingering: false,
-            pending: 0,
-            error: None,
-            missing: Vec::new(),
-            failures: 0,
-            last: None,
-        })),
-        notify: Arc::new(notify),
-    };
+    let hub = Hub::new(notify);
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     let ducker = Ducker::start(paths::ducked_volume_file());
-    let key = Hotkey::parse(&config.hotkey.key)?;
+    let hotkeys = Hotkeys::parse(&config.hotkey.keys).map_err(|e| format!("[hotkey] key: {e}"))?;
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);
 
     let (to_audio, audio_rx) = mpsc::channel::<HotkeyEvent>();
-    let hotkey = agt_platform::start_hotkey(&key, move |ev| {
+    let hotkey = agt_platform::start_hotkey(&hotkeys, move |ev| {
         let _ = to_audio.send(ev);
     })
     .map_err(|e| e.to_string())?;
@@ -507,21 +645,24 @@ pub fn start(
     let (to_paste, paste_rx) = mpsc::channel::<ToPaste>();
     let level = Level::default();
     let key_down = Arc::new(Mutex::new(None));
+    let meeting = Arc::new(AtomicBool::new(false));
 
     let test_wav = load_test_wav();
     let chunk_secs = Arc::new(AtomicU32::new(agt_stt::CHUNK_SECS.to_bits()));
     let audio = AudioThread {
         config: config.clone(),
-        key: key.clone(),
+        keys: hotkeys.clone(),
+        held: 0,
         reset: hotkey.resetter(),
         hub: hub.clone(),
-        to_stt,
+        to_stt: to_stt.clone(),
         to_paste: to_paste.clone(),
         test_wav,
         key_down: key_down.clone(),
         ducker: config.audio.duck.then(|| ducker.clone()),
         chunk_secs: chunk_secs.clone(),
         words: words.clone(),
+        meeting: meeting.clone(),
     };
     let lvl = level.clone();
     spawn("audio", move || audio.run(audio_rx, lvl));
@@ -543,7 +684,9 @@ pub fn start(
     });
 
     let (h, cfg) = (hub.clone(), config.clone());
-    spawn("paste", move || paste_thread(cfg, h, paste_rx, key, saver));
+    spawn("paste", move || {
+        paste_thread(cfg, h, paste_rx, hotkeys, saver)
+    });
 
     hub.update(|_| {});
     Ok(Pipeline {
@@ -551,9 +694,13 @@ pub fn start(
         level,
         polish_info,
         to_paste,
+        to_stt,
         key_down,
         ducker,
         words,
+        dictating: hub.dictating.clone(),
+        meeting,
+        hub,
     })
 }
 
@@ -719,16 +866,18 @@ fn load_test_wav() -> Option<Vec<f32>> {
 
 /// Decides whether a key-state poll that says "up" really means the hook missed a release.
 ///
-/// Every key of the hotkey (all keys of a chord) is polled; any one of them up means the hold
-/// ended.
+/// Every key of the held hotkey (all keys of a chord) is polled; any one of them up means the
+/// hold ended.
 ///
-/// The poll sees the *logical* key state, which our own paste can change: pasting releases
-/// held Shift and Win keys, and its Ctrl-up maps to Left Ctrl. A paste normally waits until
-/// those hotkey keys are up ([`HOTKEY_RELEASE_MAX`]), but if it gave up waiting and released
-/// them in software ([`agt_platform::paste_count`] went up since this recording started), a
-/// poll for such a key is not trusted (the chord's other keys still are): a genuinely missed
-/// release is then caught on the next press instead (the stale recording is discarded).
-/// Right Ctrl (the default) is never touched by a paste.
+/// The poll sees the *logical* key state, which our own paste can change (see
+/// [`agt_platform::paste_may_release`]): on Windows pasting releases held Shift, Alt and Win
+/// keys, and its Ctrl-up maps to Left Ctrl; on macOS Cmd+V posts Left Command and V key-ups
+/// where the poll reads them. A paste normally waits until those hotkey keys are up
+/// ([`HOTKEY_RELEASE_MAX`]), but if it gave up waiting and released them in software
+/// ([`agt_platform::paste_count`] went up since this recording started), a poll for such a
+/// key is not trusted (the chord's other keys still are): a genuinely missed release is then
+/// caught on the next press instead (the stale recording is discarded). Right Ctrl is never
+/// touched by a paste.
 #[derive(Debug, Clone, Copy)]
 struct ReleaseWatch {
     /// Bit `i`: a paste can make chord key `i` look released.
@@ -775,11 +924,12 @@ enum Latch {
     /// The double tap's second press is still down: if it's a tap, its release doesn't end
     /// it (if it's held, it was a hold after all).
     Pressed,
-    /// Recording with the hotkey up: the next press's release ends it.
+    /// Recording with no hotkey held: the next press's release (any hotkey's) ends it.
     On,
     /// That press is down: its release ends it. Another press meanwhile (an auto-repeat after
-    /// a missed press re-installed the hook) changes nothing; another key (a shortcut with the
-    /// hotkey, or Esc) goes back to `On`.
+    /// a missed press re-installed the hook, or another hotkey's) only makes its hotkey the one
+    /// whose release is watched; another key (a shortcut with the hotkey, or Esc) goes back to
+    /// `On`.
     Ending,
 }
 
@@ -789,9 +939,53 @@ fn is_double_tap(last_tap: Option<Instant>, now: Instant, gap: Duration) -> bool
     !gap.is_zero() && last_tap.is_some_and(|up| now.saturating_duration_since(up) <= gap)
 }
 
+/// Which hotkey a hands-free poll finds pressed without the hook having said so (see
+/// [`AudioThread::missed_press`]), if any: the first in the list whose keys all read down
+/// now (`key_down`; `None`, can't tell, never counts) and none of them at the previous poll
+/// (`was_up`). A hotkey held since before that poll isn't a new press (a shortcut that
+/// cancelled the press ending a hands-free recording leaves it held). A combo with a key that
+/// isn't a modifier also needs no other modifier down, as the hook does: Ctrl+Option+Space
+/// is a shortcut, not Left Control + Space (a modifier that can't be read doesn't count). Such
+/// a key alone is a hotkey whatever else is held, as in the hook.
+/// Sets `was_up` for the next poll: no key read down (a key that can't be read counts as
+/// up: Windows can't read one its hook swallows while it's up).
+fn missed_press_of(
+    hotkeys: &Hotkeys,
+    was_up: &mut [bool],
+    key_down: impl Fn(Key) -> Option<bool>,
+) -> Option<usize> {
+    let mut pressed = None;
+    for ((i, hotkey), up) in hotkeys.list().iter().enumerate().zip(was_up.iter_mut()) {
+        let keys = hotkey.keys();
+        let mut down = [None; MAX_CHORD];
+        for (d, &k) in down.iter_mut().zip(keys) {
+            *d = key_down(k);
+        }
+        let down = &down[..keys.len()];
+        let other_modifier = || {
+            KEYS.iter()
+                .filter_map(|&(.., code, _)| Key::from_code(code))
+                .any(|k| k.is_modifier() && !keys.contains(&k) && key_down(k) == Some(true))
+        };
+        let combo = keys.len() > 1 && keys.iter().any(|k| !k.is_modifier());
+        if pressed.is_none()
+            && *up
+            && down.iter().all(|&d| d == Some(true))
+            && !(combo && other_modifier())
+        {
+            pressed = Some(i);
+        }
+        *up = !down.contains(&Some(true));
+    }
+    pressed
+}
+
 struct AudioThread {
     config: Config,
-    key: Hotkey,
+    keys: Hotkeys,
+    /// The hotkey of the last press (its index in `keys`): the one whose release ends the
+    /// recording, and that the logs name.
+    held: usize,
     reset: HotkeyReset,
     hub: Hub,
     to_stt: Sender<ToStt>,
@@ -804,6 +998,8 @@ struct AudioThread {
     chunk_secs: Arc<AtomicU32>,
     /// Each recording takes the dictionary in use at key-down (see [`Words`]).
     words: Words,
+    /// A meeting is recording ([`Pipeline::set_meeting_active`]).
+    meeting: Arc<AtomicBool>,
 }
 
 /// A recording in progress: taken from the recorder every [`RELEASE_POLL`] and cut as it
@@ -887,7 +1083,12 @@ fn live_stats(d: &mut Dictation, stats: &LiveStats, max_queue: usize) {
 }
 
 impl AudioThread {
-    fn run(self, events: Receiver<HotkeyEvent>, level: Level) {
+    /// The hotkey of the last press (see [`Self::held`]).
+    fn hotkey(&self) -> &Hotkey {
+        &self.keys.list()[self.held]
+    }
+
+    fn run(mut self, events: Receiver<HotkeyEvent>, level: Level) {
         let mut recorder = Recorder::new(
             self.config.audio.keep_mic_open,
             self.config.audio.device.clone(),
@@ -904,7 +1105,7 @@ impl AudioThread {
         // output volume, and its audio. Dropping that guard puts the volume back, however the
         // hold ends (including this thread exiting or panicking).
         let mut holding: Option<(Instant, Box<Dictation>, Option<Ducked>, Feed)> = None;
-        let mut watch = ReleaseWatch::new(&self.key, 0);
+        let mut watch = ReleaseWatch::new(self.hotkey(), 0);
         let mut latch = Latch::Off;
         // When the last tap was let go: maybe the first half of a double tap.
         let mut last_tap: Option<Instant> = None;
@@ -916,16 +1117,23 @@ impl AudioThread {
         // The press ending a hands-free recording was synthesized by `missed_press`: its
         // release is polled with `key_down_past_hook`.
         let mut press_missed = false;
+        // Per hotkey, whether the last hands-free poll saw it up (see `missed_press_of`).
+        let mut was_up = vec![false; self.keys.list().len()];
 
         loop {
             press_missed &= latch == Latch::Ending;
             let hands_free = latch == Latch::On && holding.is_some();
+            // Each time hands-free starts (or resumes after a shortcut), a hotkey has to be
+            // seen up first: it may still be held.
+            if !hands_free {
+                was_up.fill(false);
+            }
             // Esc is ours only while it can end something.
             agt_platform::arm_escape(hands_free);
             // `missed`: a release synthesized after the hook missed the real one.
             let (ev, missed) = if let Some((down, .., feed)) = &mut holding {
-                // Hands-free, the hotkey is up: no release to watch for, but a press the hook
-                // missed, and the time limit.
+                // Hands-free, no hotkey is held: no release to watch for, but a press the hook
+                // missed (of any hotkey), and the time limit.
                 let until = *down + HANDS_FREE_MAX;
                 let wait = match hands_free {
                     true => until.saturating_duration_since(Instant::now()),
@@ -955,10 +1163,13 @@ impl AudioThread {
                     Err(RecvTimeoutError::Timeout) => {
                         feed.pump(&recorder, self.test_wav.as_deref(), &self.to_stt);
                         let missed = match hands_free {
-                            true => self.missed_press(&events).map(|(ev, synthesized)| {
-                                press_missed = synthesized;
-                                (ev, false)
-                            }),
+                            true => {
+                                self.missed_press(&events, &mut was_up)
+                                    .map(|(ev, synthesized)| {
+                                        press_missed = synthesized;
+                                        (ev, false)
+                                    })
+                            }
                             false => self.missed_release(&events, &watch, press_missed),
                         };
                         match missed {
@@ -985,13 +1196,20 @@ impl AudioThread {
                 }
             };
             match ev {
-                HotkeyEvent::Down(t) => {
+                HotkeyEvent::Down(t, i) => {
                     *self.key_down.lock().unwrap() = Some(t);
+                    self.held = i;
                     if matches!(latch, Latch::On | Latch::Ending) && holding.is_some() {
                         // Ends the hands-free recording on its release, like a hold: every
-                        // paste comes after the hotkey is let go.
+                        // paste comes after the hotkey is let go. Any hotkey's press does:
+                        // its keys are the ones polled from here on (pastes still counted
+                        // from the recording's start).
+                        watch = ReleaseWatch::new(self.hotkey(), watch.pastes_at_start);
                         if latch == Latch::On {
-                            tracing::debug!("hands-free recording ending: {} pressed", self.key);
+                            tracing::debug!(
+                                "hands-free recording ending: {} pressed",
+                                self.hotkey()
+                            );
                         }
                         latch = Latch::Ending;
                         continue;
@@ -1006,14 +1224,11 @@ impl AudioThread {
                         self.abort_recording(&mut recorder, down, t, d, feed, outcome);
                     }
                     // Before starting: any paste from here on counts as "during this recording".
-                    watch = ReleaseWatch::new(&self.key, agt_platform::paste_count());
+                    watch = ReleaseWatch::new(self.hotkey(), agt_platform::paste_count());
                     let double = is_double_tap(last_tap.take(), t, double_tap);
                     holding = self.start_recording(&mut recorder, t).map(|mut d| {
                         // Only once the microphone runs: never delays it (a channel send).
-                        let ducked = self
-                            .ducker
-                            .as_ref()
-                            .map(|k| k.duck(self.config.audio.duck_level()));
+                        let ducked = self.duck();
                         let secs = f32::from_bits(self.chunk_secs.load(Relaxed));
                         let scope = self.scope(&mut d);
                         (t, d, ducked, Feed::new(secs, scope))
@@ -1026,8 +1241,8 @@ impl AudioThread {
                     if double && holding.is_some() {
                         latch = Latch::Pressed;
                         tracing::info!(
-                            "double tap: recording hands-free until {} is pressed again",
-                            self.key
+                            "double tap: recording hands-free until a hotkey ({}) is pressed again",
+                            self.keys
                         );
                     }
                 }
@@ -1059,7 +1274,7 @@ impl AudioThread {
                 }
                 HotkeyEvent::Cancel if latch == Latch::Ending && holding.is_some() => {
                     // A shortcut with the hotkey while hands-free: not the end of it.
-                    tracing::debug!("{} was part of a shortcut; still hands-free", self.key);
+                    tracing::debug!("{} was part of a shortcut; still hands-free", self.hotkey());
                     latch = Latch::On;
                 }
                 HotkeyEvent::Cancel => {
@@ -1088,16 +1303,27 @@ impl AudioThread {
         }
     }
 
+    /// Turns other audio down for the recording that just started: with `audio.duck`, and not
+    /// while a meeting records (it would turn the call down).
+    fn duck(&self) -> Option<Ducked> {
+        let ducker = self.ducker.as_ref()?;
+        if self.meeting.load(Relaxed) {
+            tracing::debug!("a meeting is recording; not ducking");
+            return None;
+        }
+        Some(ducker.duck(self.config.audio.duck_level()))
+    }
+
     /// Called every [`RELEASE_POLL`] while recording with no event: returns a synthesized
-    /// release (with `true`) if the key turns out not to be down any more. `press_missed`:
-    /// the press being held was synthesized by [`Self::missed_press`].
+    /// release (with `true`) if the held hotkey turns out not to be down any more.
+    /// `press_missed`: the press being held was synthesized by [`Self::missed_press`].
     fn missed_release(
         &self,
         events: &Receiver<HotkeyEvent>,
         watch: &ReleaseWatch,
         press_missed: bool,
     ) -> Option<(HotkeyEvent, bool)> {
-        let keys = self.key.keys();
+        let keys = self.hotkey().keys();
         let mut keys_down = [None; MAX_CHORD];
         for (down, &k) in keys_down.iter_mut().zip(keys) {
             *down = match press_missed {
@@ -1119,37 +1345,38 @@ impl AudioThread {
         }
         tracing::warn!(
             "{} is no longer down but no release was seen; finishing the dictation and re-installing the keyboard hook",
-            self.key
+            self.hotkey()
         );
         self.reset.reset();
         Some((HotkeyEvent::Up(Instant::now()), true))
     }
 
     /// Called every [`RELEASE_POLL`] during a hands-free recording with no event: returns a
-    /// synthesized press if the hotkey turns out to be down without the hook having said so
-    /// (macOS disabled the event tap after a timeout, Windows dropped the hook), so the
-    /// recording can still be ended; with `true` if synthesized. A tap shorter than the poll
-    /// is caught only if a poll falls within it (a 100 ms tap: 40% of the time); the next
-    /// tap then gets another chance. (`GetAsyncKeyState`'s "pressed since the last call" bit
-    /// would catch it, but Windows documents it as unreliable.)
-    fn missed_press(&self, events: &Receiver<HotkeyEvent>) -> Option<(HotkeyEvent, bool)> {
-        let keys = self.key.keys();
-        if !keys
-            .iter()
-            .all(|&k| agt_platform::key_down(k) == Some(true))
-        {
-            return None; // up, or can't tell
-        }
+    /// synthesized press if a hotkey turns out to have gone down since the last poll without
+    /// the hook having said so (macOS disabled the event tap after a timeout, Windows dropped
+    /// the hook), so the recording can still be ended; with `true` if synthesized. Which
+    /// presses count, and `was_up`: [`missed_press_of`]. A tap shorter than the poll is caught
+    /// only if a poll falls within it (a 100 ms tap: 40% of the time), and a chord only if no
+    /// poll falls between its keys; the next press then gets another chance.
+    /// (`GetAsyncKeyState`'s "pressed since the last call" bit would catch it, but Windows
+    /// documents it as unreliable.)
+    fn missed_press(
+        &self,
+        events: &Receiver<HotkeyEvent>,
+        was_up: &mut [bool],
+    ) -> Option<(HotkeyEvent, bool)> {
+        // Up, held since before, can't tell, or part of a shortcut.
+        let i = missed_press_of(&self.keys, was_up, agt_platform::key_down)?;
         // As in `missed_release`: a real press would normally be queued already.
         if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
             return Some((ev, false));
         }
         tracing::warn!(
             "{} is down but no press was seen; ending the hands-free recording and re-installing the keyboard hook",
-            self.key
+            self.keys.list()[i]
         );
         self.reset.reset();
-        Some((HotkeyEvent::Down(Instant::now()), true))
+        Some((HotkeyEvent::Down(Instant::now(), i), true))
     }
 
     /// Stops a recording that isn't transcribed (cancelled, or stale; `end`: when): recorded
@@ -1205,7 +1432,10 @@ impl AudioThread {
             ..Default::default()
         });
         if !self.hub.engine_ready() {
-            tracing::info!("{} pressed but the model isn't ready; ignoring", self.key);
+            tracing::info!(
+                "{} pressed but the model isn't ready; ignoring",
+                self.hotkey()
+            );
             if self.hub.engine_failed() {
                 let _ = self.to_stt.send(ToStt::RetryLoad);
                 self.hub.reject();
@@ -1219,7 +1449,7 @@ impl AudioThread {
             // macOS would record silence. The status line already says what to do.
             tracing::info!(
                 "{} pressed but the Microphone permission isn't granted; ignoring",
-                self.key
+                self.hotkey()
             );
             self.hub.reject();
             return None;
@@ -1372,7 +1602,7 @@ fn load_engine(config: &Config, hub: &Hub) -> Option<Box<dyn SttEngine>> {
             tracing::error!("cannot load speech model: {e}");
             hub.update(|s| {
                 s.engine =
-                    Engine::Failed("model unavailable, see log (press the hotkey to retry)".into())
+                    Engine::Failed("model unavailable, see log (press a hotkey to retry)".into())
             });
             None
         }
@@ -1468,6 +1698,45 @@ fn set_chunk_secs(engine: &dyn SttEngine, chunk_secs: &AtomicU32) {
     chunk_secs.store(secs.to_bits(), Relaxed);
 }
 
+/// A meeting segment's text, made like a dictation's raw text (whitespace collapsed, no
+/// trailing space, "" for no speech), with `scope`'s terms favored (by `boost`) and its
+/// replacements made. Never polished (polish is for pasted text), and it leaves no trace in
+/// the dictation records or history; the status line only learns of a change in how the
+/// engine runs, as from any call ([`transcribe`]). The log gets timings only, never the text.
+fn transcribe_segment(
+    engine: Option<&mut Box<dyn SttEngine>>,
+    audio: &[f32],
+    scope: &Scope,
+    boost: f32,
+    hub: &Hub,
+    chunk_secs: &AtomicU32,
+) -> Result<String, String> {
+    let Some(engine) = engine else {
+        // At debug: a meeting sends one every few seconds, and the load failure is logged.
+        tracing::debug!("meeting segment not transcribed: the model isn't loaded");
+        return Err("model not ready".into());
+    };
+    let start = Instant::now();
+    match transcribe(engine.as_mut(), audio, &opts(scope, boost), hub, chunk_secs) {
+        Ok(text) => {
+            let mut text = finish_text(&text, false);
+            let replaced = replace_in(scope, &mut text);
+            tracing::debug!(
+                "meeting segment: {:.1} s of audio, stt {:.0} ms, {replaced} replacement(s)",
+                secs(audio),
+                ms(start.elapsed())
+            );
+            Ok(text)
+        }
+        Err(e) => {
+            tracing::error!("meeting segment transcription failed: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Transcribes dictations and meeting segments, one at a time, dictation first (see the
+/// module docs).
 #[allow(clippy::too_many_arguments)]
 fn stt_thread(
     config: Config,
@@ -1489,12 +1758,14 @@ fn stt_thread(
         set_chunk_secs(e.as_ref(), &chunk_secs);
     }
     let mut partial: Option<Partial> = None;
-    // When the engine's last call ended (it's been idle since: a GPU wakes up slowly).
+    // When the engine's last call ended (it's been idle since: a GPU wakes up slowly). A
+    // meeting segment's call counts: the engine was busy with it.
     let mut engine_done: Option<Instant> = None;
+    let mut queue = SttQueue::default();
     loop {
-        // Free from here on, until the next message.
+        // Free from here on, until the next message (none if one is queued already).
         let free_at = Instant::now();
-        let Ok(msg) = jobs.recv() else { return };
+        let Some(msg) = queue.next(&jobs) else { return };
         let mut job = match msg {
             ToStt::RetryLoad => {
                 if engine.is_none() {
@@ -1556,6 +1827,20 @@ fn stt_thread(
                     d.live_discarded_ms = (p.discarded_ms > 0.0).then_some(p.discarded_ms);
                 }
                 telemetry::global().dictation(d, outcome);
+                continue;
+            }
+            ToStt::Meeting { audio, scope, done } => {
+                done(transcribe_segment(
+                    engine.as_mut(),
+                    &audio,
+                    &scope,
+                    boost,
+                    &hub,
+                    &chunk_secs,
+                ));
+                if engine.is_some() {
+                    engine_done = Some(Instant::now());
+                }
                 continue;
             }
             ToStt::Transcribe(job) => job,
@@ -1672,10 +1957,8 @@ struct Pieces {
     shared: Arc<Shared>,
     texts: Vec<String>,
     outcomes: Vec<Outcome>,
-    /// Words of the pieces as transcribed (before the dictionary's replacements).
+    /// Words of the pieces as transcribed.
     raw_words: usize,
-    /// The dictionary's replacements made in the pieces.
-    replacements: usize,
     /// Time spent on the pieces polished in the background, before the transcript was ready.
     ahead_ms: f64,
     /// A request ran out of time: the rest of the pieces stay raw.
@@ -1689,22 +1972,19 @@ impl Pieces {
             texts: Vec::new(),
             outcomes: Vec::new(),
             raw_words: 0,
-            replacements: 0,
             ahead_ms: 0.0,
             timed_out: false,
         }
     }
 
-    /// Applies the dictionary's replacements to the next piece (`raw`, as transcribed) and
-    /// polishes it, or keeps it unpolished once a request for this dictation failed by
-    /// running out of time: a hung server would make every piece wait out its own deadline,
-    /// one after the other. A quick failure (a server restarting) doesn't stop the rest.
-    fn polish(&mut self, p: &dyn Polisher, raw: &str, cfg: &PolishConfig, scope: &Scope) {
-        self.raw_words += raw.split_whitespace().count();
-        let (piece, replaced) = scope.replace(raw);
-        self.replacements += replaced;
-        let piece = piece.as_ref();
+    /// Polishes the next piece (`piece`, as transcribed), or keeps it unpolished once a
+    /// request for this dictation failed by running out of time: a hung server would make
+    /// every piece wait out its own deadline, one after the other. A quick failure (a server
+    /// restarting) doesn't stop the rest. The dictionary's replacements are made once the
+    /// pieces are joined.
+    fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
         let words = piece.split_whitespace().count();
+        self.raw_words += words;
         let (text, outcome) = if self.timed_out {
             let why = "an earlier piece timed out".to_owned();
             (piece.to_owned(), Outcome::Failed(why))
@@ -1788,7 +2068,7 @@ fn polish_thread(
                 // Dropped (cancelled): its pieces still queued are skipped.
                 if !shared.dropped.load(Relaxed) {
                     let t = Instant::now();
-                    p.polish(polisher, &text, &piece_cfg, &shared.scope);
+                    p.polish(polisher, &text, &piece_cfg);
                     p.ahead_ms += ms(t.elapsed());
                 }
                 continue;
@@ -1807,8 +2087,6 @@ fn polish_thread(
         } = *job;
         // Pieces sent before it are its own (or a failed dictation's).
         let earlier = pieces.take();
-        // Polished in pieces, the replacements are made in each (see `Pieces::polish`).
-        let mut replacements = None;
         if let Some(polisher) = polisher.as_deref() {
             let start = Instant::now();
             d.polish_wait_ms = Some(ms(start.saturating_duration_since(ready)));
@@ -1830,9 +2108,8 @@ fn polish_thread(
                 Some((mut p, rest, words)) => {
                     let ahead = p.texts.len();
                     for piece in &rest {
-                        p.polish(polisher, piece, &piece_cfg, &scope);
+                        p.polish(polisher, piece, &piece_cfg);
                     }
-                    replacements = Some(p.replacements);
                     tracing::debug!(
                         "polished in {} pieces, {ahead} in the background ({:.0} ms); {words} words left at release",
                         ahead + rest.len(),
@@ -1847,7 +2124,6 @@ fn polish_thread(
                     outcome
                 }
                 None => {
-                    replacements = Some(replace_in(&scope, &mut text));
                     let (polished, outcome) =
                         agt_polish::polish_or_raw(polisher, &text, &config.polish);
                     log_outcome(&outcome, &text, "transcript");
@@ -1858,13 +2134,13 @@ fn polish_thread(
             d.polish_ms = Some(ms(start.elapsed()));
             d.polish_outcome = Some(outcome);
         }
-        let replacements = replacements.unwrap_or_else(|| replace_in(&scope, &mut text));
-        d.replacements = Some(replacements as i64);
         if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
             t.polish_outcome = d.polish_outcome;
             t.polished =
                 matches!(d.polish_outcome, Some("polished" | "partial")).then(|| text.clone());
         }
+        // After polish, which so never rewrites them; the history's "pasted" has them.
+        d.replacements = Some(replace_in(&scope, &mut text) as i64);
         if config.paste.trailing_space && !text.is_empty() {
             text.push(' ');
         }
@@ -1978,14 +2254,16 @@ fn may_paste(at_release: Option<usize>, now: Option<usize>) -> bool {
     at_release.is_none() || at_release == now
 }
 
-/// The hotkey keys a paste would have to release in software if they were held.
-fn paste_sensitive_keys(hotkey: &Hotkey) -> Vec<Key> {
-    hotkey
-        .keys()
-        .iter()
-        .copied()
-        .filter(|&k| agt_platform::paste_may_release(k))
-        .collect()
+/// The hotkey keys a paste would have to release in software if they were held: every
+/// hotkey's (the one held for the next dictation may be any of them), each once.
+fn paste_sensitive_keys(hotkeys: &Hotkeys) -> Vec<Key> {
+    let mut keys = Vec::new();
+    for &k in hotkeys.list().iter().flat_map(Hotkey::keys) {
+        if agt_platform::paste_may_release(k) && !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
 }
 
 /// Waits while `held()` says a paste-sensitive hotkey key is down, polling every `poll`, for
@@ -2070,7 +2348,7 @@ fn paste_thread(
     config: Config,
     hub: Hub,
     rx: Receiver<ToPaste>,
-    hotkey: Hotkey,
+    hotkeys: Hotkeys,
     history: Option<History>,
 ) {
     let restore_after = Duration::from_millis(config.paste.restore_clipboard_ms);
@@ -2081,7 +2359,7 @@ fn paste_thread(
     // Our paste that still has to be undone, and when.
     let mut pending_restore: Option<(PasteToken, Instant)> = None;
     let mut last = LastTranscript::default();
-    let sensitive = paste_sensitive_keys(&hotkey);
+    let sensitive = paste_sensitive_keys(&hotkeys);
     // The clipboard save started for the next paste (its time is credited to that one).
     let mut save_for_paste: Option<u64> = None;
 
@@ -2128,12 +2406,12 @@ fn paste_thread(
                     d.hotkey_wait_ms = Some(ms(waited));
                     if released {
                         tracing::debug!(
-                            "paste waited {:.0} ms for {hotkey} to be released",
+                            "paste waited {:.0} ms for the hotkey ({hotkeys}) to be released",
                             ms(waited)
                         );
                     } else {
                         tracing::warn!(
-                            "{hotkey} still held after {} s; pasting anyway",
+                            "hotkey ({hotkeys}) still held after {} s; pasting anyway",
                             waited.as_secs()
                         );
                     }
@@ -2602,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn replacements_apply_before_polish_and_the_history_keeps_the_raw_text() {
+    fn replacements_apply_after_polish_and_the_history_keeps_the_text_before() {
         let text = "merge it into Maine and copy the dot env file";
         let out = polish_with(
             vec![with_history(whole_with(text, test_dictionary()))],
@@ -2615,7 +2893,47 @@ mod tests {
         assert_eq!(d.replacements, Some(2));
         let t = saved.as_ref().unwrap().text.as_ref().unwrap();
         assert_eq!(t.raw, text, "the engine's output, for the eval");
-        assert_eq!(t.polished.as_deref(), Some(pasted.as_str()));
+        assert_eq!(t.polished, Some(format!("{text} ok.")), "what polish wrote");
+    }
+
+    /// Polish that writes a phrase its own way, as an LLM may.
+    struct Hyphenates;
+    impl Polisher for Hyphenates {
+        fn name(&self) -> String {
+            "hyphenates".into()
+        }
+        fn polish(
+            &self,
+            text: &str,
+            _: &agt_core::polish::PolishCtx,
+        ) -> agt_core::polish::Result<String> {
+            Ok(text.replace("true tide", "True-Tide"))
+        }
+    }
+
+    #[test]
+    fn polish_never_rewrites_a_replacement() {
+        // However polish writes the phrase, it's replaced after, with a capital where it
+        // starts the sentence.
+        let scope = in_app(
+            "[[replace]]\nfrom = \"Reddit true tide\"\nto = \"retatrutide\"\n",
+            None,
+        );
+        let text = "Reddit true tide daily, then reddit true tide weekly";
+        let out = polish_with(
+            vec![with_history(whole_with(text, scope))],
+            Some(Arc::new(Hyphenates)),
+        );
+        let [(pasted, d, saved)] = &out[..] else {
+            panic!()
+        };
+        assert_eq!(pasted, "Retatrutide daily, then retatrutide weekly");
+        assert_eq!(d.replacements, Some(2));
+        let t = saved.as_ref().unwrap().text.as_ref().unwrap();
+        assert_eq!(
+            t.polished.as_deref(),
+            Some("Reddit True-Tide daily, then reddit True-Tide weekly")
+        );
     }
 
     #[test]
@@ -2623,8 +2941,8 @@ mod tests {
         let cases = [
             // Polish off.
             (None, "into Maine please", "into main please"),
-            // Too short to polish.
-            (Some(Arc::new(Marks) as Arc<dyn Polisher>), "Maine", "main"),
+            // Too short to polish (and it starts the sentence: a capital).
+            (Some(Arc::new(Marks) as Arc<dyn Polisher>), "Maine", "Main"),
             // Polish failed: the transcript pasted as is, replaced.
             (
                 Some(Arc::new(Marks) as Arc<dyn Polisher>),
@@ -2645,7 +2963,7 @@ mod tests {
     }
 
     #[test]
-    fn replacements_apply_to_every_piece_of_a_long_dictation() {
+    fn replacements_apply_to_the_joined_pieces_of_a_long_dictation() {
         let a = shared_with(test_dictionary());
         // Each piece and the rest have a phrase to replace; "dot env" -> ".env" drops a word,
         // which must not make the pieces look like they don't add up to the transcript.
@@ -2663,7 +2981,8 @@ mod tests {
         assert_eq!(
             text,
             &format!(
-                "{} main .env. ok. {} then .env. ok. into main ok.",
+                // "Maine" starts a sentence there: "Main".
+                "{} Main .env. ok. {} then .env. ok. into main ok.",
                 sentences(25, "one"),
                 sentences(25, "two")
             )
@@ -2728,7 +3047,7 @@ mod tests {
         let [(text, d)] = &out[..] else { panic!() };
         assert_eq!(
             text,
-            &format!("{} main. ok. into main ok.", sentences(25, "one"))
+            &format!("{} Main. ok. into main ok.", sentences(25, "one"))
         );
         assert_eq!(d.replacements, Some(2));
         // The next dictation gets the new one.
@@ -2900,11 +3219,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn release_watch_trusts_the_hardware_state_on_macos() {
-        // The poll reads the HID state, which our injected Cmd+V never changes.
+        // The poll reads the HID state, which our injected Cmd+V changes only for its own keys
+        // (Left Command and V).
         for name in ["Fn", "RightOption", "RightCommand+F13", "Fn+RightOption"] {
             let w = ReleaseWatch::new(&Hotkey::parse(name).unwrap(), 5);
             assert_eq!(w.paste_may_release, 0, "{name}");
-            assert!(paste_sensitive_keys(&Hotkey::parse(name).unwrap()).is_empty());
+            assert!(paste_sensitive_keys(&Hotkeys::parse(&[name.into()]).unwrap()).is_empty());
         }
     }
 
@@ -2952,14 +3272,123 @@ mod tests {
         let k = |n| Hotkey::parse(n).unwrap();
         let w = ReleaseWatch::new(&k("RightCtrl+RightWin"), 5);
         assert_eq!(w.paste_may_release, 0b10);
+        let one = |n: &str| Hotkeys::parse(&[n.into()]).unwrap();
         assert_eq!(
-            paste_sensitive_keys(&k("LeftCtrl+RightCtrl+LeftWin"))
+            paste_sensitive_keys(&one("LeftCtrl+RightCtrl+LeftWin"))
                 .iter()
                 .map(|k| k.name)
                 .collect::<Vec<_>>(),
             ["LeftCtrl", "LeftWin"]
         );
-        assert!(paste_sensitive_keys(&k("RightCtrl")).is_empty());
+        assert!(paste_sensitive_keys(&one("RightCtrl")).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paste_waits_for_every_hotkeys_sensitive_keys() {
+        let hk = Hotkeys::parse(&[
+            "LeftShift+F13".into(),
+            "RightCtrl".into(),
+            "RightShift".into(),
+            "F14+LeftShift".into(),
+        ])
+        .unwrap();
+        let names: Vec<_> = paste_sensitive_keys(&hk).iter().map(|k| k.name).collect();
+        assert_eq!(names, ["LeftShift", "RightShift"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paste_waits_for_every_hotkeys_sensitive_keys_on_macos() {
+        // Cmd+V's own keys: once each, in the order the hotkeys first have them.
+        let hk = Hotkeys::parse(&[
+            "LeftCommand+F13".into(),
+            "RightOption".into(),
+            "F14+LeftCommand".into(),
+            "V".into(),
+        ])
+        .unwrap();
+        let names: Vec<_> = paste_sensitive_keys(&hk).iter().map(|k| k.name).collect();
+        assert_eq!(names, ["LeftCommand", "V"]);
+    }
+
+    /// A key-state source for [`missed_press_of`]: the keys named `down` are down, the rest up.
+    fn down_keys(down: &'static [&'static str]) -> impl Fn(Key) -> Option<bool> {
+        move |k| Some(down.contains(&k.name))
+    }
+
+    #[test]
+    fn a_missed_press_is_a_hotkey_going_down_between_polls() {
+        let hk = Hotkeys::parse(&["LeftShift+F13".into(), "F14".into(), "V".into()]).unwrap();
+        // A hands-free stretch's first poll: F14 may have been held since before (a shortcut
+        // cancelled the press that was ending the recording).
+        let mut was_up = [false; 3];
+        assert_eq!(missed_press_of(&hk, &mut was_up, down_keys(&["F14"])), None);
+        assert_eq!(was_up, [true, false, true]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, down_keys(&["F14"])), None);
+        // Let go, then pressed again.
+        assert_eq!(missed_press_of(&hk, &mut was_up, down_keys(&[])), None);
+        assert_eq!(was_up, [true; 3]);
+        assert_eq!(
+            missed_press_of(&hk, &mut was_up, down_keys(&["F14"])),
+            Some(1)
+        );
+        // Half a chord down at the poll before: not seen up, so not a press yet.
+        let mut was_up = [true; 3];
+        assert_eq!(
+            missed_press_of(&hk, &mut was_up, down_keys(&["LeftShift"])),
+            None
+        );
+        assert_eq!(was_up, [false, true, true]);
+        let both = down_keys(&["LeftShift", "F13"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, both), None);
+        // Two going down at once: the first in the list.
+        let mut was_up = [true; 3];
+        assert_eq!(
+            missed_press_of(&hk, &mut was_up, down_keys(&["V", "F14"])),
+            Some(1)
+        );
+        assert_eq!(was_up, [true, false, false]);
+    }
+
+    #[test]
+    fn a_key_that_cant_be_read_down_never_makes_a_missed_press() {
+        let hk = Hotkeys::parse(&["LeftShift+F13".into()]).unwrap();
+        // F13 reads `None` (Windows: a key the hook swallows, while it's up).
+        let f13_unread = |shift: bool| move |k: Key| (k.name != "F13").then_some(shift);
+        let mut was_up = [true];
+        assert_eq!(missed_press_of(&hk, &mut was_up, f13_unread(true)), None);
+        // Not read down counts as up for the next poll, so a press that got past the hook
+        // (F13 then reads down) is caught.
+        assert_eq!(missed_press_of(&hk, &mut was_up, f13_unread(false)), None);
+        assert_eq!(was_up, [true]);
+        let both = down_keys(&["LeftShift", "F13"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, both), Some(0));
+    }
+
+    #[test]
+    fn a_shortcut_with_another_modifier_is_not_a_missed_press() {
+        // The hook lets LeftShift+F13 with Right Shift also down through to apps.
+        let hk = Hotkeys::parse(&["LeftShift+F13".into()]).unwrap();
+        let mut was_up = [true];
+        let shortcut = down_keys(&["LeftShift", "F13", "RightShift"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, shortcut), None);
+        assert_eq!(was_up, [false]);
+        // A modifier that can't be read doesn't count as down.
+        let mut was_up = [true];
+        let rest_unread = |k: Key| ["LeftShift", "F13"].contains(&k.name).then_some(true);
+        assert_eq!(missed_press_of(&hk, &mut was_up, rest_unread), Some(0));
+        // A hotkey of modifiers only dictates with other modifiers down too (Shift + Fn
+        // still does).
+        let hk = Hotkeys::parse(&["LeftShift".into()]).unwrap();
+        let mut was_up = [true];
+        let with_other = down_keys(&["LeftShift", "RightShift"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, with_other), Some(0));
+        // So does a key that isn't a modifier on its own: the hook takes it with any held.
+        let hk = Hotkeys::parse(&["F14".into()]).unwrap();
+        let mut was_up = [true];
+        let with_shift = down_keys(&["F14", "LeftShift"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, with_shift), Some(0));
     }
 
     /// A fake key-state source: held for the first `n` polls.
@@ -3133,6 +3562,223 @@ mod tests {
         assert!(is_paste_error(COPY_FAILED));
         assert!(!is_paste_error("microphone unavailable (see log)"));
         assert!(!is_paste_error("transcription failed (see log)"));
+    }
+
+    fn job(audio: Vec<f32>) -> Job {
+        Job {
+            audio,
+            released: Instant::now(),
+            target: None,
+            dictation: Box::default(),
+            live: None,
+            scope: Arc::default(),
+        }
+    }
+
+    fn meeting_segment(audio: Vec<f32>) -> ToStt {
+        ToStt::Meeting {
+            audio,
+            scope: Arc::default(),
+            done: Box::new(|_| {}),
+        }
+    }
+
+    /// What a message is, to check the order they're handled in (audio by its first sample).
+    fn label(msg: &ToStt) -> String {
+        match msg {
+            ToStt::Transcribe(j) => format!("job {}", j.audio[0]),
+            ToStt::Segment(p, _) => format!("segment {}", p.audio[0]),
+            ToStt::Dropped(..) => "dropped".into(),
+            ToStt::RetryLoad => "reload".into(),
+            ToStt::Meeting { audio, .. } => format!("meeting {}", audio[0]),
+        }
+    }
+
+    #[test]
+    fn dictation_goes_first_in_the_order_sent() {
+        // Two meeting segments are waiting when a held dictation's segment, then its job at
+        // release, come in behind them.
+        let (tx, rx) = mpsc::channel();
+        let piece = Piece {
+            audio: vec![7.0],
+            cut: Cut::Pause,
+            redo: false,
+        };
+        for msg in [
+            meeting_segment(vec![1.0]),
+            meeting_segment(vec![2.0]),
+            ToStt::Segment(piece, Arc::default()),
+            ToStt::Transcribe(job(vec![9.0])),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        let mut queue = SttQueue::default();
+        // All four taken in one go, without blocking.
+        let first = queue.next(&rx).map(|m| label(&m));
+        assert_eq!(first.as_deref(), Some("segment 7"));
+        // A dropped recording's record and a reload come in while the meeting waits.
+        tx.send(ToStt::Dropped(Box::default(), Ended::Cancelled))
+            .unwrap();
+        tx.send(ToStt::RetryLoad).unwrap();
+        // Every sender gone: what's queued is still handed out, then the thread ends.
+        drop(tx);
+        let rest: Vec<String> = std::iter::from_fn(|| queue.next(&rx))
+            .map(|m| label(&m))
+            .collect();
+        assert_eq!(
+            rest,
+            ["job 9", "dropped", "reload", "meeting 1", "meeting 2"],
+            "dictation's work in the order sent, then the meeting's"
+        );
+    }
+
+    /// An engine that answers from a script.
+    struct Scripted(VecDeque<Result<&'static str, &'static str>>);
+
+    impl SttEngine for Scripted {
+        fn name(&self) -> String {
+            "scripted".into()
+        }
+        fn warmup(&mut self) -> agt_core::stt::Result<()> {
+            Ok(())
+        }
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            _: &TranscribeOpts,
+        ) -> agt_core::stt::Result<agt_core::stt::Transcript> {
+            match self.0.pop_front().expect("scripted") {
+                Ok(text) => Ok(agt_core::stt::Transcript { text: text.into() }),
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn meeting_segments_get_plain_text_or_an_error() {
+        let hub = Hub::new(|_| {});
+        let chunk_secs = AtomicU32::new(agt_stt::CHUNK_SECS.to_bits());
+        let mut engine: Box<dyn SttEngine> = Box::new(Scripted(VecDeque::from([
+            Ok("  Hello,\n world. "),
+            Ok("   "),
+            Err("engine fell over"),
+        ])));
+        let run = |e: Option<&mut Box<dyn SttEngine>>| {
+            transcribe_segment(e, &[0.0; 16], &Scope::default(), 0.0, &hub, &chunk_secs)
+        };
+        assert_eq!(
+            run(Some(&mut engine)),
+            Ok("Hello, world.".into()),
+            "no trailing space"
+        );
+        assert_eq!(run(Some(&mut engine)), Ok(String::new()), "no speech");
+        assert_eq!(run(Some(&mut engine)), Err("engine fell over".into()));
+        assert_eq!(run(None), Err("model not ready".into()));
+        // The status line knows nothing of it: no job pending, no failure shown.
+        let s = hub.state.lock().unwrap();
+        assert_eq!((s.pending, s.failures, s.error.as_deref()), (0, 0, None));
+    }
+
+    /// The terms each call was asked to favor, and how much.
+    type Heard = Arc<Mutex<Vec<(Vec<String>, f32)>>>;
+
+    /// Says its text and keeps what each call asked of it.
+    struct Hears(&'static str, Heard);
+
+    impl SttEngine for Hears {
+        fn name(&self) -> String {
+            "hears".into()
+        }
+        fn warmup(&mut self) -> agt_core::stt::Result<()> {
+            Ok(())
+        }
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            opts: &TranscribeOpts,
+        ) -> agt_core::stt::Result<agt_core::stt::Transcript> {
+            let terms = opts.vocabulary.to_vec();
+            self.1.lock().unwrap().push((terms, opts.boost));
+            Ok(agt_core::stt::Transcript {
+                text: self.0.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn meeting_segments_use_the_dictionary_outside_profiles() {
+        // The global terms and replacements apply, as everywhere; a profile's don't: a
+        // meeting isn't typed into an app.
+        let d = Dictionary::parse(
+            "terms = [\"AGT\"]\n\
+             [profiles.code]\napps = [\"Code.exe\"]\nterms = [\"main\"]\n\
+             [[replace]]\nfrom = \"dot env\"\nto = \".env\"\n\
+             [[replace]]\nfrom = \"Maine\"\nto = \"main\"\nprofiles = [\"code\"]\n",
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let t = MeetingTranscriber {
+            to_stt: tx,
+            words: Words::new(d),
+        };
+        agt_meeting::Transcriber::transcribe(&t, vec![0.0; 16], Box::new(|_| {}));
+        let Ok(ToStt::Meeting { audio, scope, .. }) = rx.try_recv() else {
+            panic!("expected a meeting segment");
+        };
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let mut engine: Box<dyn SttEngine> =
+            Box::new(Hears("Push dot env to Maine.", heard.clone()));
+        let hub = Hub::new(|_| {});
+        let chunk_secs = AtomicU32::new(agt_stt::CHUNK_SECS.to_bits());
+        assert_eq!(
+            transcribe_segment(Some(&mut engine), &audio, &scope, 2.0, &hub, &chunk_secs),
+            Ok("Push .env to Maine.".into())
+        );
+        assert_eq!(*heard.lock().unwrap(), [(vec!["AGT".to_owned()], 2.0)]);
+    }
+
+    #[test]
+    fn meeting_transcriber_queues_segments_and_answers_once_stopped() {
+        let (tx, rx) = mpsc::channel();
+        let t: Arc<dyn agt_meeting::Transcriber> = Arc::new(MeetingTranscriber {
+            to_stt: tx,
+            words: Words::new(Dictionary::default()),
+        });
+        let (answers, answer) = mpsc::channel();
+        let a = answers.clone();
+        t.transcribe(vec![0.5], Box::new(move |r| a.send(r).unwrap()));
+        match rx.try_recv() {
+            Ok(ToStt::Meeting { audio, done, .. }) => {
+                assert_eq!(audio, [0.5]);
+                done(Ok("hi".into()));
+            }
+            _ => panic!("expected a meeting segment"),
+        }
+        assert_eq!(answer.try_recv(), Ok(Ok("hi".into())));
+        // The stt thread is gone: the segment is answered at once, not lost.
+        drop(rx);
+        t.transcribe(vec![0.5], Box::new(move |r| answers.send(r).unwrap()));
+        assert_eq!(answer.try_recv(), Ok(Err("transcription stopped".into())));
+    }
+
+    #[test]
+    fn dictating_follows_the_recording_state() {
+        let hub = Hub::new(|_| {});
+        let dictating = hub.dictating.clone();
+        assert!(!dictating.load(Relaxed));
+        hub.update(|s| s.recording = true);
+        assert!(dictating.load(Relaxed));
+        // Between the two taps of a double tap: shown as recording, but nothing records.
+        hub.update(|s| {
+            s.recording = false;
+            s.lingering = true;
+        });
+        assert!(!dictating.load(Relaxed), "lingering is not dictating");
+        hub.update(|s| {
+            s.lingering = false;
+            s.pending += 1;
+        });
+        assert!(!dictating.load(Relaxed), "transcribing is not dictating");
     }
 
     #[test]

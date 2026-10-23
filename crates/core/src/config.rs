@@ -24,12 +24,27 @@ macro_rules! default_hotkey {
 /// Default `hotkey.key`: Fn (the Globe key) on macOS, Left Ctrl + Left Win elsewhere.
 pub const DEFAULT_HOTKEY: &str = default_hotkey!();
 
+// Default `meeting.enabled` in the file, as [`MeetingConfig::default`] has it.
+#[cfg(target_os = "macos")]
+macro_rules! default_meeting_enabled {
+    () => {
+        "true"
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! default_meeting_enabled {
+    () => {
+        "false"
+    };
+}
+
 /// Written on first run. Kept as text (not serialized) so the comments survive.
 pub const DEFAULT_CONFIG: &str = concat!(
     r#"# AGT configuration. The tray menu's Settings window changes this file too. AGT applies a
 # saved change by restarting itself once you're not dictating.
 # If this file has an error, a running AGT keeps its settings until it's fixed; starting with
-# an error, AGT uses defaults (updates and polish off). Either way it records the error.
+# an error, AGT uses defaults (updates, polish and meeting detection off). Either way it
+# records the error.
 
 # Which events are recorded in agt.db (the events table): "error", "warn", "info", "debug"
 # or "trace".
@@ -40,25 +55,41 @@ log_level = "info"
 launch_at_login = true
 
 [hotkey]
-# Hold this key to dictate, release to paste. One of: RightCtrl, LeftCtrl, RightShift,
-# LeftShift (still work normally in apps), or F13-F24 (e.g. a remapped mouse button; AGT
-# takes these keys over). Pressing any other key while holding it (e.g. Esc) cancels.
-# Or a chord of up to 3 keys held together, e.g. "LeftCtrl+LeftWin" (the default on
-# Windows); LeftWin/RightWin only work in a chord with Ctrl or Shift. A chord starts once
-# all its keys are down and ends when any of them is released.
-# macOS keys: Fn (the Globe key, the default; on its own, tapping it no longer also opens
-# the emoji picker), RightOption, RightCommand, or F13-F20.
-# With LeftCtrl, LeftShift, RightShift or Win in the hotkey, text is only pasted once those
-# keys are up: if you already hold the hotkey for the next dictation, the previous text
-# lands when you release it (after 10 s it's pasted anyway).
+# Hold a hotkey to dictate, let go to paste. Nearly any key can be one (not Esc, nor Caps
+# Lock on macOS or Pause on Windows), by its name in one word: F13, A, Space, Slash,
+# LeftShift, RightOption or LeftCommand (macOS), RightCtrl, RightAlt or LeftWin (Windows)...
+# Pressing a key that isn't a modifier while holding a hotkey (e.g. Esc) cancels.
+# Or a combo of up to 4 keys held together, at most one of them not a modifier, e.g.
+# "LeftCtrl+LeftWin" (the default on Windows) or "LeftControl+Space" (macOS). A combo of only
+# modifiers starts once all are down, in any order. With a key that isn't a modifier, it
+# starts only when exactly its modifiers are held, pressed before that key, and only then is
+# that key kept from the app. A combo ends when any of its keys is released.
+# Several hotkeys can be listed, and any of them dictates: key = ["Fn", "LeftControl+Space"]
+# on macOS, or ["LeftCtrl+LeftWin", "F13"] on Windows. They can share keys, but one can't
+# contain another (LeftShift and LeftShift+Space). In the Settings window you set them by
+# pressing the keys.
+# Alone, a key that isn't a modifier is taken over: it won't type in other apps while AGT runs
+# (F13-F24 cost nothing: they're usually spare mouse or keyboard buttons). A combo with one is
+# taken over in every app too: with only Shift or Option (Windows: RightAlt, AltGr on many
+# layouts) and a key that types (a letter, digit, Space, punctuation), it types a character;
+# otherwise (other modifiers, or Tab, Enter, an arrow...) it's a shortcut apps won't see.
+# Alone, a modifier you use in shortcuts and typing (either Shift; macOS: either Control,
+# LeftOption, LeftCommand; Windows: LeftCtrl, either Alt, either Win) starts AGT listening
+# each time you hold it, and a tap of Win or Alt alone no longer opens Start or an app's menu.
+# macOS: Fn is the Globe key (the default; as a hotkey on its own, tapping it no longer also
+# opens the emoji picker).
+# With a key in a hotkey that pasting would let go of (macOS: LeftCommand or V; Windows:
+# LeftCtrl, either Shift, either Alt or either Win), text is only pasted once those keys are
+# up: if you already hold a hotkey for the next dictation, the previous text lands when you
+# release it (after 10 s it's pasted anyway).
 key = ""#,
     default_hotkey!(),
     r#""
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
-# Hands-free: tap the hotkey twice (the second press within this many milliseconds of letting
-# go of the first) and AGT keeps recording after you let go, until you press the hotkey
-# again; that press pastes. Esc cancels, and so does running for 30 minutes. 0: off.
+# Hands-free: tap a hotkey twice (the second press within this many milliseconds of letting
+# go of the first) and AGT keeps recording after you let go, until you press a hotkey again;
+# that press pastes. Esc cancels, and so does running for 30 minutes. 0: off.
 double_tap_ms = 400
 
 [audio]
@@ -198,6 +229,38 @@ save_audio = false
 # agt.db, which keeps those 180 days: older records no longer find theirs.
 keep_days = 30
 
+[meeting]
+# Meeting notes (tray: Start meeting notes): AGT records your microphone ("Me") and what this
+# computer plays ("Them": everyone else on the call), transcribes both on this machine with the
+# dictation model, and keeps the text next to the notes you type. No bot joins the call. Kept
+# only on this machine, in the "meetings" folder next to agt.db. Let people know you're taking
+# notes. On by default on macOS; off on Windows until it has been tested there.
+enabled = "#,
+    default_meeting_enabled!(),
+    r#"
+# Also keep the recording: one WAV file per side (16 kHz mono; about 1.9 MB per minute each).
+# Off: only the text is kept.
+save_audio = false
+# When another app (a browser, Zoom, Teams) starts using the microphone, offer to take notes.
+detect = true
+# AI notes (summary, decisions, action items): "claude" runs your own Claude Code CLI
+# (`claude -p`, signed in with your Claude account), "off" leaves them out. The transcript and
+# your notes go to Claude when you click Generate notes, or automatically after each meeting if
+# you turn on auto_summary.
+summary = "claude"
+# Write the AI notes by themselves when a meeting of more than a few sentences ends: its
+# transcript and your notes then go to Claude without a click.
+auto_summary = false
+# The claude program; "" = look on PATH, then in ~/.local/bin, ~/.claude/local,
+# /opt/homebrew/bin and /usr/local/bin.
+claude_path = ""
+# The model for AI notes: "sonnet" (fast), "opus", or a full model name.
+claude_model = "sonnet"
+# Let `agt meeting start` start a meeting (macOS: for Shortcuts, Raycast, scripts). Off by
+# default: otherwise any program running as you could record through AGT's microphone and
+# system audio permissions. `agt meeting status` and `stop` work either way.
+command_line = false
+
 [update]
 # Check GitHub Releases for updates on startup and periodically (tray "Check for updates" works
 # either way).
@@ -246,6 +309,7 @@ names!(S1Structure { Prose => "prose", Lists => "lists" });
 names!(S1Context { General => "general", Email => "email" });
 names!(S1Device { Auto => "auto", Cpu => "cpu" });
 names!(OverlayPosition { Bottom => "bottom", Top => "top" });
+names!(MeetingSummary { Claude => "claude", Off => "off" });
 
 /// Lower bound for `update.check_interval_minutes`.
 pub const MIN_CHECK_INTERVAL_MINUTES: u64 = 30;
@@ -262,6 +326,7 @@ pub struct Config {
     pub polish: PolishConfig,
     pub overlay: OverlayConfig,
     pub history: HistoryConfig,
+    pub meeting: MeetingConfig,
     pub update: UpdateConfig,
     /// Why `[polish]` couldn't be used (see [`Config::parse`]); polish is then off.
     #[serde(skip)]
@@ -274,8 +339,10 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeyConfig {
-    /// Key name or `+`-separated chord; parsed (and rejected if invalid) by `agt-platform`.
-    pub key: String,
+    /// `key`: one hotkey, or a list of them. Each is a key name or a `+`-separated chord;
+    /// parsed (and rejected if invalid) by `agt-platform`.
+    #[serde(rename = "key", deserialize_with = "one_or_more")]
+    pub keys: Vec<String>,
     pub min_hold_ms: u64,
     /// Max gap between a tap's release and the next press for a double tap; 0 = off.
     pub double_tap_ms: u64,
@@ -634,6 +701,66 @@ impl HistoryConfig {
     }
 }
 
+/// `[meeting]`: meeting notes, the user's microphone and the computer's output transcribed
+/// on this machine (see `agt-meeting`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MeetingConfig {
+    /// Off: meeting notes are hidden and can't be started. On by default only on macOS
+    /// ([`MeetingConfig::defaults`]).
+    pub enabled: bool,
+    /// Keep each side's audio as a WAV file next to the transcript. Text is always kept.
+    pub save_audio: bool,
+    /// Offer to take notes when another app starts using the microphone.
+    pub detect: bool,
+    pub summary: MeetingSummary,
+    /// Write the AI notes by themselves after each meeting (long enough to be worth it). Off:
+    /// nothing leaves the machine until the user clicks Generate notes.
+    pub auto_summary: bool,
+    /// The `claude` executable; "" = searched for (`agt_meeting::summary`).
+    pub claude_path: String,
+    /// `claude --model`: an alias (`sonnet`, `opus`) or a full model name.
+    pub claude_model: String,
+    /// `agt meeting start` may start a meeting. Off: the command line's socket answers
+    /// `status` and `stop` only, so no other program can record through AGT's permissions.
+    pub command_line: bool,
+}
+
+/// What writes the AI notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeetingSummary {
+    /// The user's Claude Code CLI (`claude -p`, their own login, no API key): on request,
+    /// and after each meeting with `auto_summary`.
+    Claude,
+    /// No AI notes.
+    Off,
+}
+
+impl MeetingConfig {
+    /// The defaults on macOS (`macos`) or elsewhere. Meeting notes are on only where they have
+    /// been tested: macOS. On Windows nobody has run them yet (the system audio, the windows'
+    /// pages), so they stay off until someone has; `enabled = true` turns them on.
+    pub fn defaults(macos: bool) -> Self {
+        Self {
+            enabled: macos,
+            save_audio: false,
+            detect: true,
+            summary: MeetingSummary::Claude,
+            auto_summary: false,
+            claude_path: String::new(),
+            claude_model: "sonnet".into(),
+            command_line: false,
+        }
+    }
+}
+
+impl Default for MeetingConfig {
+    fn default() -> Self {
+        Self::defaults(cfg!(target_os = "macos"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
@@ -654,6 +781,7 @@ impl Default for Config {
             polish: PolishConfig::default(),
             overlay: OverlayConfig::default(),
             history: HistoryConfig::default(),
+            meeting: MeetingConfig::default(),
             update: UpdateConfig::default(),
             polish_error: None,
             polish_notices: Vec::new(),
@@ -664,11 +792,39 @@ impl Default for Config {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            key: DEFAULT_HOTKEY.into(),
+            keys: vec![DEFAULT_HOTKEY.into()],
             min_hold_ms: 150,
             double_tap_ms: 400,
         }
     }
+}
+
+/// `key = "Fn"` or `key = ["Fn", "LeftControl+Space"]`.
+fn one_or_more<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    struct Keys;
+    impl<'de> serde::de::Visitor<'de> for Keys {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a hotkey or a list of hotkeys")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_owned()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut keys = Vec::new();
+            while let Some(key) = seq.next_element()? {
+                keys.push(key);
+            }
+            Ok(keys)
+        }
+    }
+    d.deserialize_any(Keys)
 }
 
 impl Default for SttConfig {
@@ -900,19 +1056,34 @@ impl Config {
         Self::parse(&fs::read_to_string(path).map_err(ConfigError::Io)?)
     }
 
-    /// What to run with when the config file can't be loaded: defaults, but with updates
-    /// and polish off, since the user may have disabled them in the file we couldn't read
-    /// (polish would otherwise download S1-mini and change the pasted text).
+    /// What to run with when the config file can't be loaded: defaults, but with updates,
+    /// polish and meeting detection off, since the user may have disabled them in the file we
+    /// couldn't read (polish would otherwise download S1-mini and change the pasted text, and
+    /// detection would offer to take notes in every call).
     pub fn fallback() -> Self {
         let mut c = Self::default();
         c.update.enabled = false;
         c.polish.enabled = false;
+        c.meeting.detect = false;
         c
     }
 }
 
-/// A value to write with [`set`] (a string, integer or bool).
+/// A value to write with [`set`] (a string, integer, bool or list).
 pub use toml_edit::Value as SettingValue;
+
+/// `hotkey.key` as [`set`] writes it: a string for one hotkey (a single-key file looks as it
+/// always has), a list for more.
+pub fn hotkey_value(keys: &[String]) -> SettingValue {
+    match keys {
+        [one] => one.as_str().into(),
+        _ => keys
+            .iter()
+            .map(String::as_str)
+            .collect::<toml_edit::Array>()
+            .into(),
+    }
+}
 
 /// A setting's place in the file, e.g. `&["polish", "s1-mini", "styling"]`.
 pub type SettingPath = &'static [&'static str];
@@ -971,10 +1142,17 @@ pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Confi
         Err(e) => return Err(ConfigError::Io(e)),
     };
     let out = with_settings(&text, changes)?;
+    write_whole(path, &out).map_err(ConfigError::Io)?;
+    Config::parse(&out)
+}
+
+/// Writes `text` over `path` (a symlink's target) in one step: a temporary file next to it,
+/// renamed over it, so AGT never reads half a file. Keeps the file's permissions.
+pub(crate) fn write_whole(path: &Path, text: &str) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     // Per process: the tray and the settings window may both be writing.
     let tmp = target.with_extension(format!("toml.{}.tmp", std::process::id()));
-    let written = fs::write(&tmp, &out).and_then(|()| {
+    let written = fs::write(&tmp, text).and_then(|()| {
         // Keep the file's permissions (e.g. 0600 for a file holding an API key).
         if let Ok(m) = fs::metadata(&target) {
             fs::set_permissions(&tmp, m.permissions())?;
@@ -984,8 +1162,7 @@ pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Confi
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    written.map_err(ConfigError::Io)?;
-    Config::parse(&out)
+    written
 }
 
 /// `fs::rename`, retried briefly: on Windows it fails while another process (a virus scanner,
@@ -1166,7 +1343,8 @@ mod tests {
             err.contains("[polish]") && !err.contains("something-unknown"),
             "{err}"
         );
-        assert_eq!((c.hotkey.key.as_str(), c.hotkey.min_hold_ms), ("F13", 300));
+        assert_eq!(c.hotkey.keys, ["F13"]);
+        assert_eq!(c.hotkey.min_hold_ms, 300);
         assert_eq!(c.stt.device, Device::Cpu);
         assert_eq!(c.overlay.position, OverlayPosition::Top);
         assert!(!c.update.enabled);
@@ -1203,6 +1381,33 @@ mod tests {
                 .polish_notices
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hotkey_list() {
+        let c = Config::parse("[hotkey]\nkey = [\"Fn\", \"LeftControl+Space\"]\n").unwrap();
+        assert_eq!(c.hotkey.keys, ["Fn", "LeftControl+Space"]);
+        let one = with_settings(
+            DEFAULT_CONFIG,
+            &[(&["hotkey", "key"], hotkey_value(&["F13".into()]))],
+        )
+        .unwrap();
+        assert!(one.contains("key = \"F13\""));
+        let two = with_settings(
+            DEFAULT_CONFIG,
+            &[(
+                &["hotkey", "key"],
+                hotkey_value(&["F13".into(), "F14".into()]),
+            )],
+        )
+        .unwrap();
+        assert_eq!(Config::parse(&two).unwrap().hotkey.keys, ["F13", "F14"]);
+        assert!(two.contains("\nkey = [\"F13\", \"F14\"]\n"), "{two}");
+        assert!(Config::parse("[hotkey]\nkey = 3\n").is_err());
+        assert!(Config::parse("[hotkey]\nkey = [\"F13\", 3]\n").is_err());
+        assert_eq!(Config::default().hotkey.keys, [DEFAULT_HOTKEY]);
+        let no_key = Config::parse("[hotkey]\nmin_hold_ms = 300\n").unwrap();
+        assert_eq!(no_key.hotkey.keys, [DEFAULT_HOTKEY]);
     }
 
     #[test]
@@ -1250,6 +1455,98 @@ mod tests {
         let out =
             with_settings(DEFAULT_CONFIG, &[(&["history", "keep_days"], 7i64.into())]).unwrap();
         assert_eq!(Config::parse(&out).unwrap().history.keep_days, 7);
+    }
+
+    #[test]
+    fn meeting_defaults() {
+        let c = Config::default().meeting;
+        assert_eq!(c.enabled, cfg!(target_os = "macos"));
+        assert!(c.detect && !c.save_audio);
+        assert_eq!(c.summary, MeetingSummary::Claude);
+        // Nothing goes to Claude without a click, and no other program starts a recording.
+        assert!(!c.auto_summary && !c.command_line);
+        assert_eq!(
+            (c.claude_path.as_str(), c.claude_model.as_str()),
+            ("", "sonnet")
+        );
+        assert_eq!(Config::parse("").unwrap().meeting, c);
+    }
+
+    #[test]
+    fn meeting_notes_on_by_default_only_on_macos() {
+        let (mac, other) = (
+            MeetingConfig::defaults(true),
+            MeetingConfig::defaults(false),
+        );
+        assert!(mac.enabled);
+        assert!(!other.enabled);
+        // Nothing else differs.
+        assert_eq!(
+            MeetingConfig {
+                enabled: true,
+                ..other
+            },
+            mac
+        );
+        assert_eq!(
+            MeetingConfig::default(),
+            MeetingConfig::defaults(cfg!(target_os = "macos"))
+        );
+        // The file written on first run says the same (see default_file_matches_default_struct).
+        let enabled = format!("\nenabled = {}\n", cfg!(target_os = "macos"));
+        let meeting = &DEFAULT_CONFIG[DEFAULT_CONFIG.find("[meeting]").unwrap()..];
+        assert!(meeting.contains(&enabled), "{meeting}");
+        assert!(meeting.contains("On by default on macOS; off on Windows"));
+    }
+
+    #[test]
+    fn meeting_section_parses() {
+        let c = Config::parse("[meeting]\nsave_audio = true\nclaude_model = \"opus\"")
+            .unwrap()
+            .meeting;
+        assert!(c.save_audio);
+        assert_eq!(c.enabled, cfg!(target_os = "macos"));
+        assert_eq!(c.claude_model, "opus");
+        assert!(
+            Config::parse("[meeting]\nenabled = true")
+                .unwrap()
+                .meeting
+                .enabled
+        );
+        assert!(
+            !Config::parse("[meeting]\nenabled = false")
+                .unwrap()
+                .meeting
+                .enabled
+        );
+        let c = Config::parse(
+            "[meeting]\nsummary = \"off\"\ndetect = false\nclaude_path = '/x/claude'",
+        )
+        .unwrap()
+        .meeting;
+        assert_eq!(c.summary, MeetingSummary::Off);
+        assert!(!c.detect);
+        assert_eq!(c.claude_path, "/x/claude");
+        let c = Config::parse("[meeting]\nauto_summary = true\ncommand_line = true")
+            .unwrap()
+            .meeting;
+        assert!(c.auto_summary && c.command_line);
+        let out = with_settings(
+            DEFAULT_CONFIG,
+            &[(&["meeting", "command_line"], true.into())],
+        )
+        .unwrap();
+        assert!(Config::parse(&out).unwrap().meeting.command_line);
+        let out =
+            with_settings(DEFAULT_CONFIG, &[(&["meeting", "save_audio"], true.into())]).unwrap();
+        assert!(Config::parse(&out).unwrap().meeting.save_audio);
+    }
+
+    #[test]
+    fn meeting_unknown_key_rejected() {
+        assert!(Config::parse("[meeting]\ntypo = 1").is_err());
+        assert!(Config::parse("[meeting]\nsummary = \"gpt\"").is_err());
+        assert!(Config::parse("[meeting]\nenabled = \"yes\"").is_err());
     }
 
     #[test]
@@ -1356,6 +1653,7 @@ mod tests {
         check(S1Context::ALL, S1Context::as_str);
         check(S1Device::ALL, S1Device::as_str);
         check(OverlayPosition::ALL, OverlayPosition::as_str);
+        check(MeetingSummary::ALL, MeetingSummary::as_str);
     }
 
     #[test]
@@ -1479,9 +1777,13 @@ mod tests {
     }
 
     #[test]
-    fn fallback_disables_updates_and_polish() {
-        assert!(!Config::fallback().update.enabled);
-        assert!(!Config::fallback().polish.enabled);
+    fn fallback_disables_updates_polish_and_meeting_detection() {
+        let c = Config::fallback();
+        assert!(!c.update.enabled);
+        assert!(!c.polish.enabled);
+        assert!(!c.meeting.detect);
+        // Meeting notes still start by hand where they're on.
+        assert_eq!(c.meeting.enabled, Config::default().meeting.enabled);
     }
 
     #[test]

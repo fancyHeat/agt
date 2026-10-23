@@ -3,15 +3,20 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkey (event tap), swallowing F13-F20 and the Globe key, sending Cmd+V | Accessibility |
+//! | Seeing the hotkeys (event tap), swallowing their keys that aren't modifiers and the Globe key, sending Cmd+V, recording a hotkey (settings window) | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
+//! | Meeting notes' system audio track (same: silence without it) | System Audio Recording Only |
 //!
 //! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
-//! Monitoring (which macOS only applies after quitting and reopening the app). Neither needs a
-//! restart once granted: the hotkey thread retries creating its tap every second until it
-//! works, and the others are checked when used.
+//! Monitoring (which macOS only applies after quitting and reopening the app). None of them
+//! needs a restart once granted: the hotkey thread retries creating its tap every second until
+//! it works, the microphone is checked each time a recording starts, and system audio applies
+//! to the next system audio capture (the next meeting).
 
-use crate::{Error, HoldDetector, Hotkey, HotkeyEvent, Key, LoginItem, Permission};
+use crate::{
+    Capture, Error, Hotkey, HotkeyEvent, Hotkeys, Key, LoginItem, MicUser, Permission,
+    capture::KeyCapture, hotkeys::Detector, keys::CAPS_LOCK_CODE,
+};
 use block2::RcBlock;
 use objc2::{
     msg_send,
@@ -22,8 +27,8 @@ use objc2_app_kit::{
     NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
 };
 use objc2_core_foundation::{
-    CFGetTypeID, CFMachPort, CFRetained, CFRunLoop, CFString, CFType, CFTypeID, kCFBooleanTrue,
-    kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    CFGetTypeID, CFMachPort, CFRetained, CFRunLoop, CFRunLoopRunResult, CFString, CFType, CFTypeID,
+    kCFBooleanTrue, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
@@ -41,6 +46,7 @@ use std::{
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -62,7 +68,7 @@ const KVK_GLOBE: u16 = 0xB3;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
 
-/// Event times for [`HoldDetector`], in ms since this module was first used (wraps after 49
+/// Event times for the [`Detector`], in ms since this module was first used (wraps after 49
 /// days, which the detector handles). Our own clock: `CGEventGetTimestamp`'s unit differs
 /// between Intel and Apple Silicon.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -74,21 +80,58 @@ fn now_ms() -> u32 {
 // ---------------------------------------------------------------------------------------
 // Hotkey
 
-/// Command, Shift, CapsLock, Option, Control (left and right) and Fn: the keys that arrive as
-/// `flagsChanged` events.
-fn is_modifier(code: u16) -> bool {
-    matches!(code, 0x36..=0x3F)
+/// The modifier flag that is set while the modifier with key code `code` (one in
+/// [`crate::KEYS`]) is down: its device-dependent left/right bit from IOKit's
+/// `NX_DEVICE*KEYMASK` (IOLLEvent.h), or Fn's flag. Empty for any other key, Caps Lock
+/// included: macOS reports Caps Lock switching on and off, not being held.
+fn down_flag(code: u16) -> CGEventFlags {
+    let bits = match code {
+        0x3B => 0x0001, // Left Control: NX_DEVICELCTLKEYMASK
+        0x38 => 0x0002, // Left Shift: NX_DEVICELSHIFTKEYMASK
+        0x3C => 0x0004, // Right Shift: NX_DEVICERSHIFTKEYMASK
+        0x37 => 0x0008, // Left Command: NX_DEVICELCMDKEYMASK
+        0x36 => 0x0010, // Right Command: NX_DEVICERCMDKEYMASK
+        0x3A => 0x0020, // Left Option: NX_DEVICELALTKEYMASK
+        0x3D => 0x0040, // Right Option: NX_DEVICERALTKEYMASK
+        0x3E => 0x2000, // Right Control: NX_DEVICERCTLKEYMASK
+        KVK_FUNCTION => return CGEventFlags::MaskSecondaryFn,
+        _ => 0,
+    };
+    CGEventFlags::from_bits_retain(bits)
 }
 
-/// The modifier flag that is set while `code` (a modifier hotkey) is down: the
-/// device-dependent left/right bits from IOKit's `NX_DEVICE*KEYMASK`, or Fn's flag.
-fn down_flag(code: u16) -> CGEventFlags {
-    match code {
-        0x3D => CGEventFlags::from_bits_retain(0x40), // NX_DEVICERALTKEYMASK
-        0x36 => CGEventFlags::from_bits_retain(0x10), // NX_DEVICERCMDKEYMASK
-        0x3F => CGEventFlags::MaskSecondaryFn,
-        _ => CGEventFlags::empty(),
+/// Whether macOS sets Fn's flag on every key event of `code`, Fn held or not: it does for the
+/// F-keys and the navigation keys (arrows, Home, End, Page Up, Page Down, Forward Delete,
+/// Help).
+fn fn_flag_always(code: u16) -> bool {
+    Key::from_code(code).is_some_and(|k| {
+        k.name
+            .strip_prefix('F')
+            .is_some_and(|n| n.parse::<u8>().is_ok())
+            || matches!(
+                k.name,
+                "LeftArrow"
+                    | "RightArrow"
+                    | "UpArrow"
+                    | "DownArrow"
+                    | "Home"
+                    | "End"
+                    | "PageUp"
+                    | "PageDown"
+                    | "ForwardDelete"
+                    | "Help"
+            )
+    })
+}
+
+/// Whether the modifier `key` is down, by the `flags` of a key event of `code` (for
+/// [`Detector::resync_modifiers`]): its own left/right bit, and Fn's flag unless `code` is a
+/// key that always carries it (`None`: Fn stays as the tap saw it).
+fn modifier_down_in(flags: CGEventFlags, code: u16, key: Key) -> Option<bool> {
+    if key.code == KVK_FUNCTION && fn_flag_always(code) {
+        return None;
     }
+    Some(flags.intersects(down_flag(key.code)))
 }
 
 /// CoreFoundation objects owned by the hotkey thread but poked from others: enabling a tap
@@ -97,19 +140,19 @@ struct Cf<T>(T);
 unsafe impl<T> Send for Cf<T> {}
 
 struct TapState {
-    detector: HoldDetector,
+    detector: Detector,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
     tap: Option<Cf<CFRetained<CFMachPort>>>,
     run_loop: Option<Cf<CFRetained<CFRunLoop>>>,
 }
 
 struct Shared {
-    hotkey: Hotkey,
-    /// Whether any chord key is swallowed (F13-F20), or `hide_globe`: both take an active tap.
+    /// Whether a key of any hotkey can be swallowed (one that isn't a modifier: F13-F20, A,
+    /// Space...), or `hide_globe`: both take an active tap.
     swallow: bool,
-    /// Whether the hotkey is Fn alone, whose every tap is followed by [`KVK_GLOBE`]: apps never
-    /// see that, or each dictation would also do what "Press 🌐 key to" says (the emoji
-    /// picker, by default), which then takes the paste. Fn itself still reaches apps.
+    /// Whether one of the hotkeys is Fn alone, whose every tap is followed by [`KVK_GLOBE`]:
+    /// apps never see that, or each dictation would also do what "Press 🌐 key to" says (the
+    /// emoji picker, by default), which then takes the paste. Fn itself still reaches apps.
     hide_globe: bool,
     stop: AtomicBool,
     state: Mutex<TapState>,
@@ -157,21 +200,28 @@ impl Drop for HotkeyHandle {
 }
 
 pub fn start_hotkey(
-    hotkey: Hotkey,
+    hotkeys: Hotkeys,
     on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
-    let hide_globe = matches!(hotkey.keys(), [k] if k.code == KVK_FUNCTION);
+    let hide_globe = hotkeys
+        .list()
+        .iter()
+        .any(|h| matches!(h.keys(), [k] if k.code == KVK_FUNCTION));
+    let swallow = hotkeys
+        .list()
+        .iter()
+        .flat_map(Hotkey::keys)
+        .any(Key::swallowed);
     let shared = Arc::new(Shared {
-        swallow: hotkey.keys().iter().any(Key::swallowed) || hide_globe,
+        swallow: swallow || hide_globe,
         hide_globe,
         stop: AtomicBool::new(false),
         state: Mutex::new(TapState {
-            detector: HoldDetector::new(hotkey.keys().len()),
+            detector: Detector::new(&hotkeys),
             on_event,
             tap: None,
             run_loop: None,
         }),
-        hotkey,
     });
     let s = shared.clone();
     thread::Builder::new()
@@ -211,8 +261,8 @@ fn run_tap_thread(shared: Arc<Shared>) {
             let mut st = shared.state.lock().unwrap();
             st.tap = Some(Cf(tap.clone()));
             st.run_loop = Some(Cf(run_loop));
+            tracing::info!("hotkey: hold {} to dictate", st.detector.hotkeys());
         }
-        tracing::info!("hotkey: hold {} to dictate", shared.hotkey);
         // Until the handle is dropped. Its `stop()` ends a wait at once; the timeout catches a
         // stop that came before the run loop was running (stopping an idle loop does nothing).
         while !shared.stop.load(Ordering::SeqCst) {
@@ -292,16 +342,16 @@ unsafe extern "C-unwind" fn tap_callback(
     {
         return null_mut();
     }
-    let chord_key = shared.hotkey.index_of(code as u32);
-    let down = match (ty, chord_key) {
-        // Modifiers that aren't in the chord don't cancel: they're part of a shortcut only
-        // together with a non-modifier key, which does cancel.
-        (_, None) if is_modifier(code) => return pass,
-        (CGEventType::FlagsChanged, Some(_)) => {
-            CGEvent::flags(Some(ev)).intersects(down_flag(code))
+    let flags = CGEvent::flags(Some(ev));
+    let down = match ty {
+        CGEventType::KeyDown => true,
+        CGEventType::KeyUp => false,
+        // A modifier is down while its flag is set. Caps Lock (and any other key that changes
+        // the flags but isn't a modifier in KEYS) is left alone: as another key, it would
+        // cancel a hold.
+        CGEventType::FlagsChanged if !down_flag(code).is_empty() => {
+            flags.intersects(down_flag(code))
         }
-        (CGEventType::KeyDown, _) => true,
-        (CGEventType::KeyUp, _) => false,
         _ => return pass,
     };
     let Ok(mut st) = shared.state.lock() else {
@@ -311,29 +361,37 @@ unsafe extern "C-unwind" fn tap_callback(
         | CGEventFlags::MaskControl
         | CGEventFlags::MaskAlternate
         | CGEventFlags::MaskCommand;
-    let armed = crate::escape_armed() && !CGEvent::flags(Some(ev)).intersects(modifiers);
-    let (e, swallow_esc) = st.detector.on_hook_key(
-        chord_key,
+    let armed = crate::escape_armed() && !flags.intersects(modifiers);
+    if down && st.detector.press_needs_resync(code) {
+        // A modifier's release the tap missed may be what keeps this press from completing a
+        // combo: the event's own flags say which modifiers are down.
+        st.detector
+            .resync_modifiers(|key| modifier_down_in(flags, code, key));
+    }
+    let (e, keep) = st.detector.on_key(
+        code,
+        down,
         code == KVK_ESCAPE,
         armed,
-        down,
         now_ms(),
         Instant::now(),
     );
     if let Some(e) = e {
         (st.on_event)(e);
     }
-    if swallow_esc || chord_key.is_some_and(|i| shared.hotkey.keys()[i].swallowed()) {
-        // F13-F20, and the Esc that ends a hands-free recording: apps never see them.
+    if keep {
+        // A hotkey's key that isn't a modifier while it counts (F13-F20, a combo's Space...),
+        // and the Esc that ends a hands-free recording: apps never see them.
         return null_mut();
     }
     pass
 }
 
-/// macOS side of [`crate::paste_may_release`]: never. [`send_paste`] only posts Left Command
-/// and V, neither of which can be a hotkey key, and nothing for the keys the user holds.
-pub fn paste_may_release(_key: Key) -> bool {
-    false
+/// macOS side of [`crate::paste_may_release`]: Left Command and V. [`send_paste`] posts their
+/// key-ups at the HID level, whose key state [`key_down`] reads, so either one held as (part
+/// of) a hotkey looks released. It posts nothing for the other keys the user holds.
+pub fn paste_may_release(key: Key) -> bool {
+    matches!(key.code, KVK_COMMAND | KVK_ANSI_V)
 }
 
 /// Swallowing doesn't hide a key's state here: the same as [`key_down`].
@@ -343,11 +401,276 @@ pub fn key_down_past_hook(key: Key) -> Option<bool> {
 
 pub fn key_down(key: Key) -> Option<bool> {
     // The HID system state: swallowing at the session tap doesn't change it. (Events posted at
-    // the HID tap do; `send_paste` posts none for hotkey keys.)
+    // the HID tap do: `send_paste`'s Left Command and V, see `paste_may_release`.)
     Some(CGEventSource::key_state(
         CGEventSourceStateID::HIDSystemState,
         key.code,
     ))
+}
+
+// ---------------------------------------------------------------------------------------
+// Key recorder
+
+/// How long the key recorder's run loop runs at a time, in seconds: the longest its thread
+/// can miss that the handle was dropped (stopping a run loop that isn't running does nothing).
+const CAPTURE_WAKE: f64 = 0.2;
+/// How often the key recorder's tap is made afresh when it's at the session level (see
+/// [`run_capture_thread`]).
+const CAPTURE_RENEW: Duration = Duration::from_millis(500);
+
+struct CaptureState {
+    capture: KeyCapture,
+    on: Box<dyn Fn(Capture) + Send>,
+    tap: Option<Cf<CFRetained<CFMachPort>>>,
+    run_loop: Option<Cf<CFRetained<CFRunLoop>>>,
+}
+
+struct CaptureShared {
+    stop: AtomicBool,
+    /// [`KeyCapture::keys_up`], after each key event: read without taking `state`'s lock.
+    keys_up: AtomicBool,
+    state: Mutex<CaptureState>,
+}
+
+pub struct CaptureHandle {
+    shared: Arc<CaptureShared>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CaptureHandle {
+    pub fn keys_up(&self) -> bool {
+        self.shared.keys_up.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        if let Ok(st) = self.shared.state.lock()
+            && let Some(rl) = &st.run_loop
+        {
+            rl.0.stop();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// macOS side of [`crate::capture_keys`]: an active tap at the HID level, ahead of AGT's own
+/// tap (at the session level) and of every app; or at the head of the session level, made
+/// afresh to stay there (see [`run_capture_thread`]).
+pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
+    if !post_access() {
+        let name = accessibility_name();
+        return Err(format!(
+            "Recording a key needs the {name} permission (System Settings > Privacy & Security > {name})"
+        )
+        .into());
+    }
+    let shared = Arc::new(CaptureShared {
+        stop: AtomicBool::new(false),
+        keys_up: AtomicBool::new(true),
+        state: Mutex::new(CaptureState {
+            capture: KeyCapture::default(),
+            on,
+            tap: None,
+            run_loop: None,
+        }),
+    });
+    let (tx, rx) = mpsc::sync_channel(1);
+    let s = shared.clone();
+    let thread = thread::Builder::new()
+        .name("key-capture".into())
+        .spawn(move || run_capture_thread(s, tx))?;
+    rx.recv().map_err(|_| "key recorder thread died")??;
+    Ok(CaptureHandle {
+        shared,
+        thread: Some(thread),
+    })
+}
+
+fn run_capture_thread(shared: Arc<CaptureShared>, ready: mpsc::SyncSender<Result<(), String>>) {
+    // Every key event on the system waits for this tap: keep the thread ahead of the others.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    let Some(run_loop) = CFRunLoop::current() else {
+        let _ = ready.send(Err("cannot run the key recorder's event tap".into()));
+        return;
+    };
+    // At the HID level the tap comes before every session-level one (AGT's), whenever that was
+    // made. Apple documents HID-level taps as needing more than Accessibility, so failing that:
+    // at the head of the session level, which a tap put there later runs before (AGT's, made
+    // anew when it restarts after a hotkey is saved). Made afresh every [`CAPTURE_RENEW`], it's
+    // soon first again.
+    let (mut tap, hid) = match capture_tap(&shared, &run_loop, CGEventTapLocation::HIDEventTap) {
+        Some(tap) => (tap, true),
+        None => match capture_tap(&shared, &run_loop, CGEventTapLocation::SessionEventTap) {
+            Some(tap) => (tap, false),
+            None => {
+                let _ = ready.send(Err("cannot create the key recorder's event tap".into()));
+                return;
+            }
+        },
+    };
+    tracing::info!(
+        "key recorder: {}",
+        if hid {
+            "event tap at the HID level"
+        } else {
+            "event tap at the session level (none at the HID level), made afresh every 0.5 s"
+        }
+    );
+    {
+        let mut st = shared.state.lock().unwrap();
+        st.tap = Some(Cf(tap.clone()));
+        st.run_loop = Some(Cf(run_loop.clone()));
+    }
+    let _ = ready.send(Ok(()));
+    // Until the handle is dropped. Its `stop()` ends a wait at once; the timeout catches a stop
+    // that came before the run loop was running (stopping an idle loop does nothing).
+    let mut made = Instant::now();
+    let mut renew_failed = false;
+    while !shared.stop.load(Ordering::SeqCst) {
+        let wait = if hid {
+            CAPTURE_WAKE
+        } else {
+            CAPTURE_RENEW
+                .saturating_sub(made.elapsed())
+                .as_secs_f64()
+                .min(CAPTURE_WAKE)
+        };
+        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, wait, false);
+        if hid || made.elapsed() < CAPTURE_RENEW || shared.stop.load(Ordering::SeqCst) {
+            continue;
+        }
+        made = Instant::now();
+        // The new tap first, then the old one goes: no key gets past both. Disabled, the old
+        // one gets no more events; any it was already sent (one may have come in since the run
+        // loop last ran) are handled before it's invalidated, or a kept key's release would be
+        // lost and the key taken as still down. A run of 0 s handles one at most.
+        match capture_tap(&shared, &run_loop, CGEventTapLocation::SessionEventTap) {
+            Some(new) => {
+                shared.state.lock().unwrap().tap = Some(Cf(new.clone()));
+                let old = std::mem::replace(&mut tap, new);
+                CGEvent::tap_enable(&old, false);
+                while CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.0, true)
+                    == CFRunLoopRunResult::HandledSource
+                {}
+                CFMachPort::invalidate(&old);
+            }
+            None if !renew_failed => {
+                tracing::warn!(
+                    "key recorder: cannot make its event tap afresh; keeping the old one"
+                );
+                renew_failed = true;
+            }
+            None => {}
+        }
+    }
+    CFMachPort::invalidate(&tap);
+    let mut st = shared.state.lock().unwrap();
+    st.tap = None;
+    st.run_loop = None;
+}
+
+/// A key recorder's active tap at `location`, at the head of the taps there, running on
+/// `run_loop` (this thread's).
+fn capture_tap(
+    shared: &Arc<CaptureShared>,
+    run_loop: &CFRunLoop,
+    location: CGEventTapLocation,
+) -> Option<CFRetained<CFMachPort>> {
+    let mask = (1u64 << CGEventType::KeyDown.0)
+        | (1u64 << CGEventType::KeyUp.0)
+        | (1u64 << CGEventType::FlagsChanged.0);
+    let tap = unsafe {
+        CGEvent::tap_create(
+            location,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            mask,
+            Some(capture_callback),
+            Arc::as_ptr(shared) as *mut c_void,
+        )
+    }?;
+    let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
+        CFMachPort::invalidate(&tap);
+        return None;
+    };
+    run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+    CGEvent::tap_enable(&tap, true);
+    Some(tap)
+}
+
+unsafe extern "C-unwind" fn capture_callback(
+    _proxy: CGEventTapProxy,
+    ty: CGEventType,
+    event: NonNull<CGEvent>,
+    info: *mut c_void,
+) -> *mut CGEvent {
+    // SAFETY: `info` is the `CaptureShared` the thread running this tap holds an `Arc` of.
+    let shared = unsafe { &*(info as *const CaptureShared) };
+    let pass = event.as_ptr();
+    let ev = unsafe { event.as_ref() };
+    let Ok(mut st) = shared.state.lock() else {
+        return pass;
+    };
+    if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
+        // The current tap still enabled: this was about one being made afresh, disabled on
+        // purpose (see `run_capture_thread`).
+        if let Some(tap) = &st.tap
+            && !CGEvent::tap_is_enabled(&tap.0)
+        {
+            CGEvent::tap_enable(&tap.0, true);
+            tracing::warn!("key recorder's event tap was disabled; re-enabled it");
+        }
+        return pass;
+    }
+    if CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUserData) == INJECTED_MARK {
+        return pass;
+    }
+    let code = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
+    let st = &mut *st;
+    let mut key = |down, repeat| {
+        let (c, keep) = st.capture.on_key(code, down, repeat);
+        shared.keys_up.store(st.capture.keys_up(), Ordering::SeqCst);
+        if let Some(c) = c {
+            (st.on)(c);
+        }
+        keep
+    };
+    let keep = match ty {
+        // Not a key: what macOS sends after Fn is released on its own. Apps don't see it
+        // either.
+        CGEventType::KeyDown | CGEventType::KeyUp if code == KVK_GLOBE => true,
+        CGEventType::KeyDown => key(
+            true,
+            CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventAutorepeat) != 0,
+        ),
+        CGEventType::KeyUp => key(false, false),
+        // A modifier: no auto-repeat. The release of one that was down before the tap started
+        // passes, like any other.
+        CGEventType::FlagsChanged if !down_flag(code).is_empty() => {
+            key(CGEvent::flags(Some(ev)).intersects(down_flag(code)), false)
+        }
+        // Caps Lock: macOS reports it switching on or off, not being let go. Taken as a press
+        // and its release, so the window can say why it can't be a hotkey.
+        CGEventType::FlagsChanged if code == CAPS_LOCK_CODE => {
+            key(true, false);
+            key(false, false)
+        }
+        // Any other key that changes the flags but isn't in KEYS: kept from apps, not recorded
+        // (a hold can't use it either).
+        CGEventType::FlagsChanged => true,
+        _ => return pass,
+    };
+    if keep {
+        // Apps and AGT's own tap never see it.
+        return null_mut();
+    }
+    pass
 }
 
 // ---------------------------------------------------------------------------------------
@@ -690,17 +1013,28 @@ fn add_markers(item: &NSPasteboardItem, markers: &[&str]) {
 }
 
 pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
+    let pb = put_text(text, &[TRANSIENT, CONCEALED])?;
+    Ok(PasteToken {
+        change_count: pb.changeCount(),
+    })
+}
+
+/// No markers: a copy to keep, which clipboard managers and Universal Clipboard may see.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    put_text(text, &[]).map(drop)
+}
+
+/// Replaces the general pasteboard's contents with `text`, marked with `markers`.
+fn put_text(text: &str, markers: &[&str]) -> Result<Retained<NSPasteboard>, Error> {
     let pb = NSPasteboard::generalPasteboard();
     let item = NSPasteboardItem::new();
     if !item.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }) {
         return Err("cannot put text in a pasteboard item".into());
     }
-    add_markers(&item, &[TRANSIENT, CONCEALED]);
+    add_markers(&item, markers);
     pb.clearContents();
     write_items(&pb, vec![item])?;
-    Ok(PasteToken {
-        change_count: pb.changeCount(),
-    })
+    Ok(pb)
 }
 
 pub fn restore_clipboard(snapshot: &ClipboardSnapshot, token: &PasteToken) -> Result<bool, Error> {
@@ -736,15 +1070,19 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
     None
 }
 
-/// Never releases a held modifier (see [`paste_may_release`]), so `_before_releasing` is never
-/// called.
-pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
+/// Calls `before_releasing` first if Left Command or V is held: its posted key-up makes that
+/// key look released (see [`paste_may_release`]).
+pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {
     if !post_access() {
         let name = accessibility_name();
         return Err(format!(
             "AGT doesn't have the {name} permission (System Settings > Privacy & Security > {name})"
         )
         .into());
+    }
+    let held = |code| CGEventSource::key_state(CGEventSourceStateID::HIDSystemState, code);
+    if held(KVK_COMMAND) || held(KVK_ANSI_V) {
+        before_releasing();
     }
     // A private source: the events carry exactly the flags we set, not the modifiers the user
     // is holding (e.g. Option for the next dictation, which would make it Cmd+Option+V).
@@ -854,36 +1192,37 @@ fn post_access() -> bool {
 /// What System Settings calls the Accessibility permission: "Device Control" from macOS 27 on.
 pub fn accessibility_name() -> &'static str {
     static NAME: LazyLock<&str> = LazyLock::new(|| {
-        let mut buf = [0u8; 32];
-        let mut len = buf.len();
-        // SAFETY: `buf`/`len` describe a writable buffer.
-        let rc = unsafe {
-            libc::sysctlbyname(
-                c"kern.osproductversion".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                &mut len,
-                null_mut(),
-                0,
-            )
-        };
-        let major = (rc == 0)
-            .then(|| std::str::from_utf8(&buf[..len]).ok())
-            .flatten()
-            .and_then(|v| {
-                v.trim_end_matches('\0')
-                    .split('.')
-                    .next()?
-                    .parse::<u32>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        if major >= 27 {
+        if os_version().is_some_and(|(major, _)| major >= 27) {
             "Device Control"
         } else {
             "Accessibility"
         }
     });
     *NAME
+}
+
+/// macOS's version as (major, minor), e.g. (14, 2); `None` if it can't be read.
+fn os_version() -> Option<(u32, u32)> {
+    let mut buf = [0u8; 32];
+    let mut len = buf.len();
+    // SAFETY: `buf`/`len` describe a writable buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let version = std::str::from_utf8(&buf[..len.min(buf.len())]).ok()?;
+    let mut parts = version.trim_end_matches('\0').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some((major, minor))
 }
 
 /// Asks for the Microphone first and for Accessibility only once it's answered: two prompts
@@ -928,10 +1267,64 @@ pub fn open_permission_settings(permission: Permission) {
         Permission::Microphone => "Privacy_Microphone",
         Permission::Accessibility => "Privacy_Accessibility",
     };
+    open_privacy_pane(pane);
+}
+
+fn open_privacy_pane(pane: &str) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
         tracing::error!("cannot open {url}: {e}");
     }
+}
+
+// System audio (meeting notes). There is no public API to check this permission: the capture
+// (a Core Audio process tap) just records silence without it. So AGT asks TCC itself, through
+// the private TCC.framework's preflight; macOS shows its prompt the first time a tap starts.
+
+/// `int TCCAccessPreflight(CFStringRef service, CFDictionaryRef options)` in the private
+/// `TCC.framework`: 0 granted, 1 denied, 2 not asked yet. A preflight only reads the
+/// permission's state: it never prompts and changes nothing.
+type TccAccessPreflight = unsafe extern "C" fn(service: &CFString, options: *const c_void) -> i32;
+
+/// TCC's preflight, looked up at run time: it's private, so it may be gone in some macOS, and
+/// then we know nothing rather than failing to launch.
+static TCC_PREFLIGHT: LazyLock<Option<TccAccessPreflight>> = LazyLock::new(|| {
+    // SAFETY: NUL-terminated strings. The handle is never closed: the function must stay
+    // loaded for the rest of the process.
+    let symbol = unsafe {
+        let tcc = libc::dlopen(
+            c"/System/Library/PrivateFrameworks/TCC.framework/TCC".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_LOCAL,
+        );
+        if tcc.is_null() {
+            tracing::warn!("cannot load TCC.framework: system audio permission unknown");
+            return None;
+        }
+        libc::dlsym(tcc, c"TCCAccessPreflight".as_ptr())
+    };
+    if symbol.is_null() {
+        tracing::warn!("no TCCAccessPreflight: system audio permission unknown");
+        return None;
+    }
+    // SAFETY: a non-null `TCCAccessPreflight` is the function declared above. A macOS without
+    // the symbol gives `None` (the permission reads as unknown), and its answer only picks the
+    // message the notes page shows: it never decides what is recorded.
+    Some(unsafe { std::mem::transmute::<*mut c_void, TccAccessPreflight>(symbol) })
+});
+
+pub fn system_audio_permission() -> Option<bool> {
+    let preflight = (*TCC_PREFLIGHT)?;
+    let service = CFString::from_static_str("kTCCServiceAudioCapture");
+    // SAFETY: a valid CFString; no options (NULL is allowed).
+    match unsafe { preflight(&service, std::ptr::null()) } {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+pub fn open_system_audio_settings() {
+    open_privacy_pane("Privacy_AudioCapture");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -979,6 +1372,13 @@ struct PropertyAddress {
 #[link(name = "CoreAudio", kind = "framework")]
 unsafe extern "C" {
     fn AudioObjectHasProperty(id: u32, address: *const PropertyAddress) -> u8;
+    fn AudioObjectGetPropertyDataSize(
+        id: u32,
+        address: *const PropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: *mut u32,
+    ) -> i32;
     fn AudioObjectIsPropertySettable(
         id: u32,
         address: *const PropertyAddress,
@@ -1159,9 +1559,272 @@ impl OutputVolume {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Mic users (meeting detection): Core Audio's process objects (macOS 14.2+), one per HAL
+// client process, each saying whether it is recording right now. They are property
+// selectors, not new functions, so there's nothing extra to link: on older macOS the list
+// query fails (unknown property) and nobody is found.
+
+/// `kAudioHardwarePropertyProcessObjectList`: the `AudioObjectID`s of the client processes.
+const PROCESS_OBJECT_LIST: u32 = fourcc(b"prs#");
+/// `kAudioProcessPropertyPID` (`pid_t`).
+const PROCESS_PID: u32 = fourcc(b"ppid");
+/// `kAudioProcessPropertyBundleID`: a `CFString` the caller releases.
+const PROCESS_BUNDLE_ID: u32 = fourcc(b"pbid");
+/// `kAudioProcessPropertyIsRunningInput`: a `UInt32`, non-zero while the process runs IO on
+/// any input device.
+const PROCESS_IS_RUNNING_INPUT: u32 = fourcc(b"piri");
+
+/// Set once listing the processes failed, so an old macOS logs it once rather than every poll.
+static NO_PROCESS_LIST: AtomicBool = AtomicBool::new(false);
+
+pub fn mic_users() -> Vec<MicUser> {
+    let objects = match process_objects() {
+        Ok(objects) => objects,
+        Err(e) => {
+            if !NO_PROCESS_LIST.swap(true, Ordering::Relaxed) {
+                tracing::info!("cannot list audio processes (needs macOS 14.2): {e}");
+            }
+            return Vec::new();
+        }
+    };
+    let me = std::process::id() as i32;
+    // AppKit's names come back autoreleased, and the polling thread may have no pool.
+    autoreleasepool(|_| {
+        objects
+            .into_iter()
+            .filter_map(|object| {
+                // A process can exit between the list and these reads: it's skipped.
+                let running = get_property(object, &global_address(PROCESS_IS_RUNNING_INPUT), 0u32);
+                if running.ok()? == 0 {
+                    return None;
+                }
+                let pid = get_property(object, &global_address(PROCESS_PID), 0i32).ok()?;
+                if pid <= 0 || pid == me {
+                    // Not a real process, or AGT itself (recording a dictation or meeting).
+                    return None;
+                }
+                let bundle_id = process_bundle_id(object).unwrap_or_default();
+                let app = display_name(pid, &bundle_id);
+                Some(MicUser {
+                    pid,
+                    bundle_id,
+                    app,
+                })
+            })
+            .collect()
+    })
+}
+
+/// The process objects: `AudioObjectID`s, read with [`get_property`] like devices.
+fn process_objects() -> Result<Vec<u32>, Error> {
+    let address = global_address(PROCESS_OBJECT_LIST);
+    let mut size = 0u32;
+    // SAFETY: `size` is writable; no qualifier.
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(SYSTEM_OBJECT, &address, 0, std::ptr::null(), &mut size)
+    };
+    if status != 0 {
+        return Err(format!("AudioObjectGetPropertyDataSize failed (OSStatus {status})").into());
+    }
+    let mut objects = vec![0u32; size as usize / size_of::<u32>()];
+    let mut size = size_of_val(objects.as_slice()) as u32;
+    // SAFETY: `objects` has room for `size` bytes, and the HAL writes at most that much.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            SYSTEM_OBJECT,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            objects.as_mut_ptr().cast(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("AudioObjectGetPropertyData failed (OSStatus {status})").into());
+    }
+    // Processes may have left since the size was read (new ones wait for the next poll).
+    objects.truncate(size as usize / size_of::<u32>());
+    Ok(objects)
+}
+
+/// `None` for processes without a bundle.
+fn process_bundle_id(object: u32) -> Option<String> {
+    let id: *const CFString =
+        get_property(object, &global_address(PROCESS_BUNDLE_ID), std::ptr::null()).ok()?;
+    let id = NonNull::new(id.cast_mut())?;
+    // SAFETY: a copy we own (the property's rule for CFString values).
+    Some(unsafe { CFRetained::from_raw(id) }.to_string())
+}
+
+/// [`MicUser::app`](crate::MicUser::app): the meeting app's name, else the app's own (helpers
+/// and command-line tools have none), else the process name, else the bundle ID or pid.
+fn display_name(pid: i32, bundle_id: &str) -> String {
+    if let Some(name) = crate::meeting_app_name(bundle_id) {
+        return name.to_owned();
+    }
+    if let Some(name) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.localizedName())
+    {
+        return name.to_string();
+    }
+    let mut buf = [0u8; 64]; // names are at most 2 * MAXCOMLEN (16) bytes
+    // SAFETY: `buf` is writable for its length.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if len > 0
+        && let Ok(name) = std::str::from_utf8(&buf[..len as usize])
+    {
+        return name.to_owned();
+    }
+    if bundle_id.is_empty() {
+        format!("pid {pid}")
+    } else {
+        bundle_id.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{KEYS, keys::CAPS_LOCK_CODE};
+
+    #[test]
+    fn every_modifier_has_its_own_flag() {
+        // IOKit's NX_DEVICE*KEYMASK bits (IOLLEvent.h), and Fn's flag.
+        for (name, bits) in [
+            ("LeftControl", 0x1),
+            ("LeftShift", 0x2),
+            ("RightShift", 0x4),
+            ("LeftCommand", 0x8),
+            ("RightCommand", 0x10),
+            ("LeftOption", 0x20),
+            ("RightOption", 0x40),
+            ("RightControl", 0x2000),
+            ("Fn", CGEventFlags::MaskSecondaryFn.bits()),
+        ] {
+            assert_eq!(
+                down_flag(Key::parse(name).unwrap().code).bits(),
+                bits,
+                "{name}"
+            );
+        }
+        // Those are all of the modifiers; Caps Lock and the keys that aren't modifiers have none.
+        for &(name, _, code, _) in KEYS {
+            let modifier = Key::parse(name).unwrap().is_modifier();
+            assert_eq!(!down_flag(code).is_empty(), modifier, "{name}");
+        }
+        assert!(down_flag(CAPS_LOCK_CODE).is_empty());
+    }
+
+    #[test]
+    fn modifiers_read_from_a_key_event() {
+        let key = |n| Key::parse(n).unwrap();
+        // Left Shift, Right Option and Fn held.
+        let flags = CGEventFlags::from_bits_retain(0x2 | 0x40) | CGEventFlags::MaskSecondaryFn;
+        let a = key("A").code;
+        assert_eq!(modifier_down_in(flags, a, key("LeftShift")), Some(true));
+        assert_eq!(modifier_down_in(flags, a, key("RightShift")), Some(false));
+        assert_eq!(modifier_down_in(flags, a, key("RightOption")), Some(true));
+        assert_eq!(modifier_down_in(flags, a, key("Fn")), Some(true));
+        let none = CGEventFlags::empty();
+        assert_eq!(modifier_down_in(none, a, key("Fn")), Some(false));
+        // These carry Fn's flag whether or not it's held: Fn stays as the tap saw it.
+        for n in [
+            "LeftArrow",
+            "DownArrow",
+            "F1",
+            "F5",
+            "F13",
+            "F20",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "ForwardDelete",
+            "Help",
+        ] {
+            assert_eq!(modifier_down_in(none, key(n).code, key("Fn")), None, "{n}");
+            assert_eq!(
+                modifier_down_in(flags, key(n).code, key("LeftShift")),
+                Some(true),
+                "{n}"
+            );
+        }
+        for n in [
+            "A",
+            "F",
+            "Space",
+            "Return",
+            "Backspace",
+            "Keypad5",
+            "KeypadEnter",
+            "Slash",
+            "Section",
+        ] {
+            assert!(!fn_flag_always(key(n).code), "{n}");
+        }
+    }
+
+    #[test]
+    fn paste_may_release_left_command_and_v() {
+        // Cmd+V goes out at the HID level, whose key state `key_down` reads.
+        let sensitive = |spec: &str| {
+            Hotkey::parse(spec)
+                .unwrap()
+                .keys()
+                .iter()
+                .filter(|&&k| paste_may_release(k))
+                .map(|k| k.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sensitive("LeftCommand"), ["LeftCommand"]);
+        assert_eq!(sensitive("LeftControl+V"), ["V"]);
+        for spec in ["Fn", "RightOption", "RightCommand+F13", "Fn+RightOption"] {
+            assert!(sensitive(spec).is_empty(), "{spec}");
+        }
+    }
+
+    /// Proves the list, PID and bundle ID reads, which `mic_users` can't show while nothing
+    /// records: this test process is a HAL client too (it just queried the HAL). Skipped
+    /// (passes, saying why) where it can't tell: before macOS 14.2 (no process objects), and
+    /// where the HAL doesn't list this process (a CI virtual machine without audio devices).
+    /// A selector the HAL doesn't know still fails it: the list query on 14.2 or later, or a
+    /// PID read that fails for every process listed.
+    #[test]
+    fn process_objects_include_this_process() {
+        match os_version() {
+            Some(v) if v >= (14, 2) => {}
+            v => return eprintln!("skipped: process objects need macOS 14.2 (this is {v:?})"),
+        }
+        let objects = process_objects().expect("the process list on macOS 14.2 or later");
+        let pid = |o: u32| get_property(o, &global_address(PROCESS_PID), 0i32).ok();
+        let pids: Vec<i32> = objects.iter().filter_map(|&o| pid(o)).collect();
+        assert!(
+            objects.is_empty() || !pids.is_empty(),
+            "no PID read for any of {} audio processes",
+            objects.len()
+        );
+        let me = std::process::id() as i32;
+        let mine = objects.iter().copied().find(|&o| pid(o) == Some(me));
+        let Some(mine) = mine else {
+            return eprintln!(
+                "skipped: pid {me} not among the HAL's {} audio processes (no audio devices?)",
+                objects.len()
+            );
+        };
+        // Each is a CFString copy we release: reading them all must not crash.
+        for &o in &objects {
+            let _ = process_bundle_id(o);
+        }
+        // A test binary has no bundle (the HAL says "", not an error).
+        assert_eq!(process_bundle_id(mine).unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn os_version_reads() {
+        let (major, minor) = os_version().expect("kern.osproductversion");
+        assert!((11..100).contains(&major), "{major}.{minor}");
+    }
 
     #[test]
     fn text_roles_and_editable_regions_take_text() {

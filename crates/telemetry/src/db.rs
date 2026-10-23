@@ -5,7 +5,7 @@
 
 use crate::{Dictation, Msg, Outcome, Queue, SessionStart, SessionUpdate, now_ms, stats::Summary};
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use std::{
     path::{Path, PathBuf},
@@ -511,31 +511,38 @@ pub(crate) fn insert_dictation(
 /// a lock held by another program is waited for once per batch, not once per record).
 /// `Err` if nothing was committed: busy (retry the whole batch), corrupt, or a failed
 /// commit. A record that fails on its own is skipped (reported on stderr) and the rest
-/// committed.
+/// committed. With no `session` (a process beside the app, see [`event_writer`]), only the
+/// events are written.
 fn write_batch(
     conn: &mut Connection,
-    session: i64,
+    session: Option<i64>,
     batch: &[Msg],
     home: &Home,
 ) -> rusqlite::Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for msg in batch {
-        let r = match msg {
-            Msg::Event {
-                ts,
-                level,
-                target,
-                message,
-            } => tx
+        let r = match (msg, session) {
+            (
+                Msg::Event {
+                    ts,
+                    level,
+                    target,
+                    message,
+                },
+                _,
+            ) => tx
                 .execute(
                     "INSERT INTO events (ts, session_id, level, target, message)
                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![ts, session, level, target, home.redact(message)],
                 )
                 .map(drop),
-            Msg::Dictation(d, outcome) => insert_dictation(&tx, session, d, *outcome),
-            Msg::Session(u) => update_session(&tx, session, u),
-            Msg::Update(u, ts) => tx
+            (Msg::Flush(_), _) | (_, None) => Ok(()),
+            (Msg::Dictation(d, outcome), Some(session)) => {
+                insert_dictation(&tx, session, d, *outcome)
+            }
+            (Msg::Session(u), Some(session)) => update_session(&tx, session, u),
+            (Msg::Update(u, ts), Some(session)) => tx
                 .execute(
                     "INSERT INTO updates (ts, session_id, kind, from_version, to_version,
                         result, error, duration_ms)
@@ -552,13 +559,12 @@ fn write_batch(
                     ],
                 )
                 .map(drop),
-            Msg::Exit(reason, ts) => tx
+            (Msg::Exit(reason, ts), Some(session)) => tx
                 .execute(
                     "UPDATE app_sessions SET ended_at = ?2, exit_reason = ?3 WHERE id = ?1",
                     params![session, ts, reason.as_str()],
                 )
                 .map(drop),
-            Msg::Flush(_) => Ok(()),
         };
         match r {
             Err(e) if is_busy(&e) || is_corrupt(&e) => return Err(e),
@@ -824,23 +830,10 @@ pub(crate) fn writer(path: &Path, session: &SessionStart, rx: Receiver<Msg>, que
             Err(RecvTimeoutError::Disconnected) => return,
         };
         if let Some(first) = first {
-            let mut batch: Vec<Msg> = std::iter::once(first)
-                .chain(rx.try_iter().take(MAX_BATCH))
-                .collect();
-            queue.received(batch.len());
-            if let Some(event) = queue.dropped_event() {
-                batch.push(event);
-            }
+            let batch = take_batch(first, &rx, queue);
             // The whole batch is kept and retried while another program holds the lock.
-            match while_busy(|| write_batch(&mut conn, session_id, &batch, &home)) {
-                Ok(()) => {
-                    // Flushes are answered only after their records were committed.
-                    for msg in batch {
-                        if let Msg::Flush(ack) = msg {
-                            let _ = ack.send(());
-                        }
-                    }
-                }
+            match while_busy(|| write_batch(&mut conn, Some(session_id), &batch, &home)) {
+                Ok(()) => acknowledge(batch),
                 Err(e) if is_corrupt(&e) => {
                     // Corrupted while running: start over with a fresh file and session.
                     drop(conn);
@@ -865,6 +858,76 @@ pub(crate) fn writer(path: &Path, session: &SessionStart, rx: Receiver<Msg>, que
                 day = now;
                 maintenance_due = true;
             }
+        }
+    }
+}
+
+/// The writer thread of a process beside the app (see [`crate::Sink::start_events`]): its
+/// events, as they come. Returns, dropping `rx` (which turns every send into a no-op), if
+/// the database can't be used: the app hasn't made it yet, or it's corrupt (the app's own
+/// writer moves it aside).
+pub(crate) fn event_writer(path: &Path, rx: Receiver<Msg>, queue: &Queue) {
+    let mut conn = match open_beside(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "agt: events not recorded, cannot open {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let home = Home::from_env();
+    while let Ok(first) = rx.recv() {
+        let batch = take_batch(first, &rx, queue);
+        match while_busy(|| write_batch(&mut conn, None, &batch, &home)) {
+            Ok(()) => acknowledge(batch),
+            Err(e) if is_corrupt(&e) => {
+                eprintln!("agt: events not recorded, telemetry database corrupt: {e}");
+                return;
+            }
+            Err(e) => eprintln!("agt: telemetry write failed: {e}"),
+        }
+    }
+}
+
+/// Opens the app's database for [`event_writer`]: never creates it, and only once the app has
+/// migrated it (the `events` table is there).
+fn open_beside(path: &Path) -> Result<Connection, String> {
+    let open = || -> rusqlite::Result<_> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        Ok((conn, version))
+    };
+    match open().map_err(|e| e.to_string())? {
+        (_, 0) => Err("AGT hasn't set it up yet".into()),
+        (conn, _) => Ok(conn),
+    }
+}
+
+/// `first` and the records queued after it (up to [`MAX_BATCH`]), plus an event counting the
+/// ones dropped meanwhile, if any.
+fn take_batch(first: Msg, rx: &Receiver<Msg>, queue: &Queue) -> Vec<Msg> {
+    let mut batch: Vec<Msg> = std::iter::once(first)
+        .chain(rx.try_iter().take(MAX_BATCH))
+        .collect();
+    queue.received(batch.len());
+    if let Some(event) = queue.dropped_event() {
+        batch.push(event);
+    }
+    batch
+}
+
+/// Answers the flushes in `batch`, once it's committed (never before).
+fn acknowledge(batch: Vec<Msg>) {
+    for msg in batch {
+        if let Msg::Flush(ack) = msg {
+            let _ = ack.send(());
         }
     }
 }

@@ -24,7 +24,7 @@
 //!
 //! With a dictionary, the terms that apply in a clip's app (its global terms, and those of
 //! the profiles the app is in) go to the engine with the boost weight, and its replacements
-//! for that app are applied to each transcript, exactly as AGT does before polish. A per-term
+//! for that app are applied to each transcript, exactly as AGT does with polish off. A per-term
 //! table (see [`terms`]) counts every term (and each replacement's `to`) in the references
 //! and transcripts, case-sensitive. A clip's app comes from `--app`, else from `<name>.app`
 //! (one line: an exe name or bundle id; `export-history` writes them from agt.db); without
@@ -400,7 +400,7 @@ fn transcribe_all(
         let first = times[0];
         times.sort_by(f64::total_cmp);
         let median = times[times.len() / 2];
-        // What AGT does before polish (the pipeline's polish thread).
+        // What AGT does with polish off (the pipeline's polish thread; with polish, after it).
         let (replaced, n) = input.scope.replace(&text);
         pass.replacements += n;
         let text = replaced.into_owned();

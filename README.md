@@ -30,7 +30,8 @@ text **on your own computer**; your voice never leaves it.
    - Windows: **Left Ctrl + Windows key**
    - macOS: **Fn** (the Globe key)
 
-   A small bar at the bottom of the screen shows that AGT is listening.
+   A small bar at the bottom of the screen shows that AGT is listening. To use other keys, or
+   several, see [Hotkeys](#hotkeys).
 4. **Let go.** A moment later the text is pasted where your cursor is.
 
 Good to know:
@@ -45,8 +46,8 @@ Good to know:
   Settings... → Polish → **Fast drafting**
   (`fast_drafting` under `[polish.s1-mini]`) polishes long text about twice as fast on a GPU,
   at the cost of an occasional different word or comma; it's off by default.
-- **Hands-free:** tap the hotkey twice quickly and AGT keeps recording after you let go; press
-  it once more to stop and paste. Esc cancels, and one left running for 30 minutes is
+- **Hands-free:** tap a hotkey twice quickly and AGT keeps recording after you let go; press
+  a hotkey once more to stop and paste. Esc cancels, and one left running for 30 minutes is
   discarded. `double_tap_ms` under `[hotkey]` in `config.toml` sets how quick (0 turns it
   off).
 - While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
@@ -63,6 +64,42 @@ Good to know:
   page, a link or the desktop), the text is still pasted, and a note where the bar was says so,
   with a **Copy** button that puts the text on your clipboard. It needs the overlay on.
 
+## Hotkeys
+
+Settings... → General lists your hotkeys, and holding any of them dictates. Click one and
+press the key or combo you want instead: it's saved once you let go of every key, and **Esc**
+cancels. **+ Add hotkey** adds one the same way, and the minus button next to a hotkey
+removes it (there's always at least one).
+
+- Nearly any key can be a hotkey, on its own or in a combo of up to 4 keys held together, at
+  most one of them not a modifier (Shift, Ctrl or Control, Alt or Option, Win or Command, and
+  Fn on a Mac). Esc can't be one, and neither can Caps Lock on macOS or Pause on Windows.
+- A combo of only modifiers (**Left Ctrl + Left Win**) starts once all its keys are down, in
+  any order, even with other modifiers held too. A combo with a regular key (**Left Control +
+  Space**) starts only when exactly its modifiers are held, pressed before that key. Space on
+  its own, Space then Control, and Control + Shift + Space reach your apps as usual.
+- One hotkey can't contain another (**Left Shift** and **Left Shift + Space**): holding the
+  longer one would start the shorter one first. Sharing keys is fine (**Left Shift + A** and
+  **Left Shift + B**).
+- Some hotkeys cost you something, and the settings window says so under them:
+  - A regular key on its own (A, Space, F5) is taken over: it won't type in other apps while
+    AGT runs. F13 to F24 cost nothing, as nothing types them (they're usually spare mouse or
+    keyboard buttons).
+  - A combo with a regular key (F13 to F24 aside) is taken over in every app while AGT runs.
+    When that key types (a letter, digit, Space, punctuation, or a keypad digit or sign) and
+    the only modifiers are Shift or Option (Windows: Right Alt, which is AltGr on many keyboard
+    layouts), it types a character, so that character is gone (**Left Shift + A**); otherwise
+    it's a shortcut your apps won't see (**Left Control + Space**, **Left Shift + Tab**).
+  - A modifier you use in shortcuts and typing, on its own (either Shift; macOS: either
+    Control, Left Option or Left Command; Windows: Left Ctrl, either Alt or either Win), starts
+    AGT listening each time you hold it.
+  - Windows: Win or Alt on its own no longer opens the Start menu or an app's menu when you
+    tap it.
+
+In `config.toml` they're `key` under `[hotkey]`: one (`key = "Fn"`) or a list (macOS:
+`key = ["Fn", "LeftControl+Space"]`; Windows: `key = ["LeftCtrl+LeftWin", "RightCtrl"]`), each
+key named in one word, with `+` between the keys of a combo.
+
 ## macOS
 
 AGT asks for two permissions on first launch, one after the other:
@@ -74,12 +111,11 @@ AGT asks for two permissions on first launch, one after the other:
 Until everything is granted, the menu-bar item says which permission is missing, and its
 "Privacy & Security settings..." item opens the right page.
 
-The default hotkey is **Fn** (the 🌐 Globe key). While AGT runs, tapping it no longer does
-what System Settings > Keyboard > "Press 🌐 key to" says (by default, opening the emoji
-picker), so a dictation doesn't also open the picker. Fn+key shortcuts still work. If a
-tap still sets off something else, set "Press 🌐 key to" to **Do Nothing**.
-Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
-`"Fn+RightOption"`.
+The default hotkey is **Fn** (the 🌐 Globe key). While AGT runs with Fn on its own as a
+hotkey, tapping it no longer does what System Settings > Keyboard > "Press 🌐 key to" says
+(by default, opening the emoji picker), so a dictation doesn't also open the picker. Fn+key
+shortcuts still work. If a tap still sets off something else, set "Press 🌐 key to" to **Do
+Nothing**. To use other keys, see [Hotkeys](#hotkeys).
 
 AGT transcribes on the CPU by default: with the usual pauses between dictations it's faster
 than the GPU for anything under ~20 s, and more accurate (see
@@ -100,8 +136,9 @@ clicks. The settings window's **Updates** page turns the background checks on or
 ## Settings
 
 Tray menu → **Settings...** opens the settings window, in pages (General, Speech, Polish,
-History, Updates). Each page shows the settings most people need; **Show advanced settings**
-at the bottom adds the rest (timeouts, devices, prompts, log level and so on).
+Replacements, History, Updates). Each page shows the settings most people need; **Show
+advanced settings** at the bottom adds the rest (timeouts, devices, prompts, log level and so
+on).
 
 Settings live in a plain text file, `config.toml`, with a comment on every option:
 
@@ -110,7 +147,7 @@ Settings live in a plain text file, `config.toml`, with a comment on every optio
 
 Tray menu → **Open config folder** takes you there. AGT restarts on its own to apply a change
 a few seconds after the last change, once dictation is idle; tray menu → **Restart now to
-apply settings** does it right away. You can change the hotkey, turn the
+apply settings** does it right away. You can change or add hotkeys, turn the
 overlay off, or turn off AI clean-up of your text (removes "um"s, fixes punctuation; on by
 default, and it runs locally unless you point it at a cloud service).
 
@@ -145,11 +182,24 @@ profiles = ["code"]
   model hears it in your email. `apps` are, on Windows, the program's file name
   (`Code.exe`); on macOS, the app's bundle identifier (`com.microsoft.VSCode`); case doesn't
   matter, and an app can be in several profiles. Terms outside a profile apply everywhere.
-- **Replacements** (`[[replace]]`) rewrite every transcript before the AI clean-up: `from`
-  matches whole words and phrases, ignoring case; `to` is pasted exactly as you wrote it.
-  Only use them for things that are never meant: a replacement of a real word applies
-  everywhere (unless you limit it with `profiles`), so `from = "Maine"`, `to = "main"` means
-  you can't dictate the state of Maine any more.
+- **Replacements** (`[[replace]]`) rewrite what AGT pastes, after the AI clean-up, so the
+  clean-up never rewrites them. `from` matches whole words and phrases, ignoring case and
+  what's between its words: a space, a hyphen, a comma or nothing, so "Reddit True Tide"
+  also matches "reddit true-tide" and "Reddit truetide". `to` is pasted as you wrote it,
+  except that `\n` in it starts a new line, and a `to` that starts with a lowercase word
+  ("retatrutide") gets a capital where it starts a sentence. Only use them for things that
+  are never meant: a replacement of a real word applies everywhere (unless you limit it with
+  `profiles`), so `from = "Maine"`, `to = "main"` means you can't dictate the state of Maine
+  any more. Meeting notes get the replacements and terms that apply everywhere, not a
+  profile's.
+
+**Settings... → Replacements** changes the replacements without opening the file: type the
+**Speech** (what you say, e.g. "Reddit True Tide") and the **Inserted text** (what AGT types
+instead, e.g. "retatrutide"), then click **Add replacement**. It's added to `dictionary.toml`
+for everywhere; a speech that's already there (capitals and what's between the words don't
+count) gets the new text instead. Your replacements are listed under it, each with its inserted text in a field
+(a profile's with the profile's name): change it there, or empty it to remove the
+replacement. Profiles and terms are only in the file.
 
 A new `dictionary.toml` has a commented-out `code` profile with the common editors, terminals
 and IDEs. If you already have the file, paste this in (and remove the apps you don't use):
@@ -235,19 +285,64 @@ clean-up style, ...), so the two can be joined, e.g. to label data with a bigger
 build a custom dictionary. `agt.db` keeps those rows for 180 days: history kept longer than
 that no longer joins.
 
+## Meeting notes
+
+Tray menu → **Start meeting notes** writes down a call in any app (Google Meet, Teams, Zoom,
+...) with no bot joining it. AGT listens to your microphone ("Me") and to what your computer
+plays ("Them"), and transcribes both on your computer with the dictation model. While it
+records, a small pill sits at the right edge of the screen (hover it for Notes, Pause and
+Stop), and the **Meeting notes** window shows the transcript as it comes and a notes field to
+type into during the call. Dictation keeps working; what you dictate isn't part of the meeting.
+
+- **macOS:** hearing the other side needs macOS 14.2 or later and the **System Audio Recording
+  Only** permission (System Settings > Privacy & Security > Screen & System Audio Recording),
+  which macOS asks for the first time. Without it only your microphone is recorded.
+- **Headphones** work best: on speakers your microphone hears the other side too. AGT drops
+  those echoes from the transcript, but headphones avoid them.
+- **AI notes:** **Generate notes** turns the transcript and your notes into a summary,
+  decisions and action items with your own Claude Code CLI (`claude`, signed in with your
+  Claude account; AGT holds no API key). A new meeting reads "New meeting..." until then, and
+  the AI notes give it a title, unless you typed one first; without AI notes it goes by its
+  date. If `ANTHROPIC_API_KEY` is set in AGT's environment, the CLI uses that key instead,
+  and the notes are billed to it. The transcript and your notes go to Claude when you click
+  Generate notes, or automatically after each meeting if you turn on `auto_summary = true`
+  under `[meeting]` in `config.toml`. This is the only time meeting text leaves your
+  computer, and it goes only to Claude. `summary = "off"` turns AI notes off; `claude_path`
+  and `claude_model` pick the program and the model.
+- **Files:** one folder per meeting in `meetings` next to `agt.db`, with `meeting.json` (the
+  title, your notes, the AI notes), `transcript.jsonl` (one line per thing said) and
+  `meeting.md` (all of it as Markdown). The window's **Copy** and **Folder** buttons get you
+  there. Audio is kept only with `save_audio = true`.
+- **Let people know** you're taking notes. In many places recording a call needs everyone's
+  consent.
+- **Detection (macOS):** when a call app starts using the microphone, the pill offers to take
+  notes (`detect = false` turns that off).
+- **Command line (macOS):** `agt meeting stop` (answers once the transcript is complete) and
+  `agt meeting status` (`idle` or `recording <id> <seconds>`), for Shortcuts, Raycast or
+  scripts. `agt meeting start` works once you set `command_line = true` under `[meeting]`:
+  it's off by default, so no other program can start a recording through AGT's permissions.
+  `agt` is the program in `AGT.app/Contents/MacOS`.
+- **Windows:** meeting notes are off by default, since they haven't been tested on Windows
+  yet. `enabled = true` under `[meeting]` turns them on.
+
 ## Privacy
 
 - Transcription runs entirely on your computer. Audio is never uploaded, and only saved if you
-  turn on the [dictation history](#dictation-history).
+  turn on the [dictation history](#dictation-history), or `save_audio` for
+  [meeting notes](#meeting-notes).
 - AGT goes online only to download its models and to check for updates. For the local AI
   clean-up (on by default), it also downloads llama.cpp (12–32 MB) once to run it. That goes
   in AGT's own data folder, not the models folder, which may be shared.
 - The one exception is opt-in: if you configure the clean-up to use a cloud service
   (such as Claude), the text of each dictation is sent to that service.
+- AI notes for a [meeting](#meeting-notes) send its transcript and your notes to your own
+  Claude Code CLI when you click Generate notes, or automatically after each meeting if you
+  turn on `auto_summary` (`summary = "off"` under `[meeting]` turns AI notes off).
 - Usage data stays local: timings, outcomes and errors go to `agt.db` (Windows:
   `%LOCALAPPDATA%\AGT-data`, macOS: next to the config), with the program each dictation was
   for (e.g. `Code.exe`, never a window title), never audio or text (those only go to the
-  opt-in dictation history). `agt stats` sums it up;
+  opt-in dictation history, and the transcripts of meeting notes you take to their `meetings`
+  folder). `agt stats` sums it up;
   raw rows are kept 180 days (events 30, sessions 365), daily summaries for good.
 
 ## Building from source

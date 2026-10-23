@@ -25,14 +25,15 @@ impl TermCount {
     }
 }
 
-/// The terms to count for `dictionary`: its terms (global, then the profiles'), then each
-/// replacement's `to`, in file order, without duplicates.
+/// The terms to count for `dictionary`: its terms (global, then the profiles'), then what
+/// each replacement types, in file order, without duplicates.
 pub fn of(dictionary: &Dictionary) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
-    let tos = dictionary.replacements().iter().map(|r| &r.to);
-    for t in dictionary.all_terms().iter().chain(tos) {
-        if !terms.contains(t) {
-            terms.push(t.clone());
+    let all = dictionary.all_terms();
+    let inserted = dictionary.replacements().iter().map(|r| r.inserted());
+    for t in all.iter().map(String::as_str).chain(inserted) {
+        if !terms.iter().any(|x| x == t) {
+            terms.push(t.to_owned());
         }
     }
     terms

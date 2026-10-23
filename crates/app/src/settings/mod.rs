@@ -15,4 +15,9 @@ pub enum Action {
     EditDictionary,
     /// Open the saved dictations' folder (created if needed).
     OpenHistory,
+    /// Show a hotkey row that listens for the keys of a new hotkey.
+    AddHotkey,
+    /// Add the replacement typed on the Replacements page ([`schema::Draft`]) to
+    /// `dictionary.toml`.
+    AddReplacement,
 }

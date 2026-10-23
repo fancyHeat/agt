@@ -4,8 +4,13 @@
 //! - Windows: low-level keyboard hook, Win32 clipboard, `SendInput`.
 //! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone and Accessibility
 //!   permissions (see [`missing_permissions`]).
+//! - Recording a hotkey for the settings window ([`capture_keys`]): the keys pressed, kept from
+//!   every other app and from AGT's own hotkey listener.
 //! - Ducking other audio while dictating ([`Ducker`]): the default output device's volume
 //!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL).
+//! - Meeting notes: the system audio recording permission ([`system_audio_permission`]) and
+//!   which apps are using the microphone ([`mic_users`], [`meeting_app_name`]), to offer notes
+//!   when a call starts.
 //! - Starting AGT at login ([`set_launch_at_login`]; Windows: the `Run` key; macOS:
 //!   `SMAppService`).
 //! - Anything else returns [`Error`]s saying it's unsupported.
@@ -34,35 +39,52 @@ use unsupported as imp;
 mod duck;
 pub use duck::{Ducked, Ducker};
 
+mod hotkeys;
+pub use hotkeys::Hotkeys;
+
+mod capture;
+pub use capture::{Capture, CaptureHandle, capture_keys};
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// What the hotkey thread reports. Delivered from the hook thread: handlers must not block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    /// The hotkey (every key of a chord) went down (auto-repeat is filtered out). Can also
-    /// arrive while a hold is still believed active, if its release was never seen (e.g. it
-    /// happened on the secure desktop): the receiver should then drop the stale hold and
-    /// start over.
-    Down(Instant),
-    /// A hotkey key was released after a `Down` (and no `Cancel`).
+    /// Hotkey `.1` (its index in [`Hotkeys::list`]) went down, every key of it (auto-repeat
+    /// is filtered out). Only one hotkey is held at a time. Can also arrive while a hold is
+    /// still believed active, if its release was never seen (e.g. it happened on the secure
+    /// desktop): the receiver should then drop the stale hold and start over.
+    Down(Instant, usize),
+    /// A key of the held hotkey was released after its `Down` (and no `Cancel`).
     Up(Instant),
     /// Another key was pressed while holding the hotkey (Esc, or a shortcut such as Ctrl+C),
     /// or the hold turned out to be stale (a chord key was pressed again long after its
     /// release was missed): the hold is not a dictation. No `Up` follows.
     Cancel,
-    /// Esc (no modifier) was pressed while the hotkey wasn't held (with it held, that's a
+    /// Esc (no modifier) was pressed while no hotkey was held (with one held, that's a
     /// `Cancel`) and [`arm_escape`] was on: ends a hands-free recording. The focused app
     /// doesn't see that Esc.
     Escape,
 }
 
-/// A single key, by name. See [`KEYS`]. The configured hotkey is a [`Hotkey`]: one key or a
+mod keys;
+#[cfg(target_os = "macos")]
+use keys::CAPS_LOCK_CODE;
+pub use keys::KEYS;
+#[cfg(not(target_os = "macos"))]
+use keys::PAUSE_CODE;
+use keys::{
+    CHARACTER_MODIFIERS, CHORD_EXAMPLE, ESC_CODE, EVERYDAY_MODIFIERS, MENU_KEYS, START_KEYS,
+    is_spare_f_key, key_names, types_character,
+};
+
+/// A single key, by name. See [`KEYS`]. Each configured hotkey is a [`Hotkey`]: one key or a
 /// chord of several.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     pub name: &'static str,
+    label: &'static str,
     /// Platform key code: Windows virtual-key code, or macOS virtual key code (`kVK_*`).
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     code: u16,
     kind: KeyKind,
 }
@@ -71,111 +93,26 @@ pub struct Key {
 /// of its keys is which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKind {
-    /// A modifier passed through to apps that does nothing when held alone (Ctrl, Shift).
+    /// A modifier passed through to apps that does nothing when held alone (Ctrl, Shift; on
+    /// macOS also Fn, Option and Command).
     Modifier,
-    /// A modifier passed through to apps that the OS reacts to when pressed alone (Win: the
-    /// Start menu, and every key typed while holding it is a system shortcut). Only allowed
-    /// in a chord with a [`KeyKind::Modifier`]; see [`CHORD_ONLY_WHY`].
-    ChordOnly,
-    /// Not a modifier, so passing it through would act in the focused app: the hook swallows
-    /// it (F13-F24). At most one per chord.
+    /// A modifier passed through to apps that the OS reacts to when pressed and released
+    /// alone (Windows: Win opens the Start menu, Alt the focused app's menu bar): while it's
+    /// held as the hotkey, AGT injects a mask key so that release does nothing.
+    Masked,
+    /// Not a modifier, so passing it through would act in the focused app: the hook keeps it
+    /// from apps when it's the hotkey's (F13-F24, letters, Space...). At most one per chord.
     Swallowed,
 }
 
-#[cfg(not(target_os = "macos"))]
-use KeyKind::ChordOnly;
-use KeyKind::{Modifier, Swallowed};
-
-/// Supported hotkey keys (names are case-insensitive), their Windows virtual-key codes and
-/// kinds.
-///
-/// - Ctrl and Shift are passed through to apps (holding them alone does nothing), and their
-///   state can be polled to catch a release the hook missed.
-/// - Win is passed through too, but only allowed in a chord with Ctrl or Shift.
-/// - F13-F24 (typically mapped to spare mouse/keyboard buttons) are swallowed: apps never
-///   see them while AGT runs.
-///
-/// Deliberately absent: Alt (releasing it alone opens the menu bar), and CapsLock, F1-F12,
-/// Insert, Pause (they would have to be swallowed, taking them away from apps).
-#[cfg(not(target_os = "macos"))]
-pub const KEYS: &[(&str, u16, KeyKind)] = &[
-    ("RightCtrl", 0xA3, Modifier),
-    ("LeftCtrl", 0xA2, Modifier),
-    ("RightShift", 0xA1, Modifier),
-    ("LeftShift", 0xA0, Modifier),
-    ("LeftWin", 0x5B, ChordOnly),
-    ("RightWin", 0x5C, ChordOnly),
-    ("F13", 0x7C, Swallowed),
-    ("F14", 0x7D, Swallowed),
-    ("F15", 0x7E, Swallowed),
-    ("F16", 0x7F, Swallowed),
-    ("F17", 0x80, Swallowed),
-    ("F18", 0x81, Swallowed),
-    ("F19", 0x82, Swallowed),
-    ("F20", 0x83, Swallowed),
-    ("F21", 0x84, Swallowed),
-    ("F22", 0x85, Swallowed),
-    ("F23", 0x86, Swallowed),
-    ("F24", 0x87, Swallowed),
-];
-
-/// Why a [`KeyKind::ChordOnly`] key can't be the hotkey on its own (goes with [`KEYS`]).
-#[cfg(not(target_os = "macos"))]
-pub const CHORD_ONLY_WHY: &str = "on its own, a tap of Win could no longer open the Start menu and every key typed while holding it would trigger a Windows shortcut";
-
-/// An example chord for error messages (goes with [`KEYS`]).
-#[cfg(not(target_os = "macos"))]
-const CHORD_EXAMPLE: &str = "LeftCtrl+LeftWin";
-
-/// Supported hotkey keys (names are case-insensitive), their macOS virtual key codes and
-/// kinds.
-///
-/// - Fn (the Globe key on newer keyboards), Right Option and Right Command are passed through
-///   to apps (holding them alone does nothing; Option+letter or Command+letter while holding
-///   cancels the dictation). As the whole hotkey, Fn's Globe-key event is kept from apps, or
-///   each tap would also do what System Settings > Keyboard > "Press 🌐 key to" says (the
-///   emoji picker, by default), which then takes the paste.
-/// - F13-F20 are swallowed: apps never see them while AGT runs.
-///
-/// Deliberately absent: the left modifiers and Control/Shift (used in everyday shortcuts and
-/// for typing), CapsLock, and F1-F12 (media and brightness keys).
-#[cfg(target_os = "macos")]
-pub const KEYS: &[(&str, u16, KeyKind)] = &[
-    ("Fn", 0x3F, Modifier),
-    ("RightOption", 0x3D, Modifier),
-    ("RightCommand", 0x36, Modifier),
-    ("F13", 0x69, Swallowed),
-    ("F14", 0x6B, Swallowed),
-    ("F15", 0x71, Swallowed),
-    ("F16", 0x6A, Swallowed),
-    ("F17", 0x40, Swallowed),
-    ("F18", 0x4F, Swallowed),
-    ("F19", 0x50, Swallowed),
-    ("F20", 0x5A, Swallowed),
-];
-
-/// macOS has no [`KeyKind::ChordOnly`] keys; kept so the shared chord checks compile.
-#[cfg(target_os = "macos")]
-pub const CHORD_ONLY_WHY: &str = "";
-
-#[cfg(target_os = "macos")]
-const CHORD_EXAMPLE: &str = "Fn+RightOption";
-
-fn key_names() -> String {
-    KEYS.iter()
-        .map(|&(n, _, kind)| match kind {
-            KeyKind::ChordOnly => format!("{n} (in a chord only)"),
-            _ => n.to_owned(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+use KeyKind::Swallowed;
 
 impl Key {
+    /// The key named `name` in [`KEYS`] (case-insensitive), as the config file has it.
     pub fn parse(name: &str) -> Result<Self, String> {
         KEYS.iter()
-            .find(|(n, _, _)| n.eq_ignore_ascii_case(name.trim()))
-            .map(|&(name, code, kind)| Key { name, code, kind })
+            .find(|(n, ..)| n.eq_ignore_ascii_case(name.trim()))
+            .map(Self::from_entry)
             .ok_or_else(|| {
                 format!(
                     "unknown key {:?}; expected one of {}",
@@ -185,8 +122,41 @@ impl Key {
             })
     }
 
+    /// The key with platform key code `code` (as a keyboard hook sees it), if a hotkey can
+    /// use it.
+    pub fn from_code(code: u16) -> Option<Self> {
+        KEYS.iter()
+            .find(|(.., c, _)| *c == code)
+            .map(Self::from_entry)
+    }
+
+    fn from_entry(&(name, label, code, kind): &(&'static str, &'static str, u16, KeyKind)) -> Self {
+        Key {
+            name,
+            label,
+            code,
+            kind,
+        }
+    }
+
+    /// The key in plain words, as the settings window shows it ("Left Option", "Space", "/").
+    pub fn label(&self) -> &'static str {
+        self.label
+    }
+
+    /// Platform key code: Windows virtual-key code, or macOS virtual key code (`kVK_*`).
+    pub fn code(&self) -> u16 {
+        self.code
+    }
+
     pub fn kind(&self) -> KeyKind {
         self.kind
+    }
+
+    /// Whether it's a modifier ([`KeyKind::Modifier`] or [`KeyKind::Masked`]): passed through
+    /// to apps, and a chord can have any number of them.
+    pub fn is_modifier(&self) -> bool {
+        matches!(self.kind, KeyKind::Modifier | KeyKind::Masked)
     }
 
     /// Whether the hook swallows this key: it's not a modifier, so passing it through would
@@ -197,66 +167,92 @@ impl Key {
     }
 }
 
-/// The most keys a chord may have.
-pub const MAX_CHORD: usize = 3;
+/// Why the key with platform code `code`, not in [`KEYS`], can't be part of a hotkey.
+fn unusable_key(code: u16) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if code == CAPS_LOCK_CODE {
+        return "macOS doesn't say when Caps Lock is let go, so it can't be held as a hotkey.";
+    }
+    #[cfg(not(target_os = "macos"))]
+    if code == PAUSE_CODE {
+        return "Windows sends Pause's press and release together, so it can't be held as a hotkey.";
+    }
+    if code == ESC_CODE {
+        "Esc cancels a recording, so it can't be a hotkey."
+    } else {
+        "AGT doesn't know that key."
+    }
+}
 
-/// The configured hotkey: one key, or a chord of up to [`MAX_CHORD`] keys (e.g.
-/// `LeftCtrl+LeftWin`) that must all be held together. A dictation starts once every key is
-/// down (in any order) and ends as soon as any of them is released.
+/// The most keys a chord may have (e.g. Left Control + Left Option + Left Command + Space).
+pub const MAX_CHORD: usize = 4;
+
+/// A configured hotkey (see [`Hotkeys`]): one key, or a chord of up to [`MAX_CHORD`] keys
+/// (e.g. `LeftCtrl+LeftWin`) that must all be held together. A dictation starts once every
+/// key is down and ends as soon as any of them is released. A hotkey made only of modifiers
+/// starts in whatever order they go down; a combo with a key that isn't a modifier
+/// (`LeftShift+Space`) needs exactly its modifiers down first, then that key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hotkey {
     keys: Vec<Key>,
 }
 
 impl Hotkey {
-    /// Parses `"RightCtrl"` or a `+`-separated chord such as `"LeftCtrl+LeftWin"` (names are
-    /// case-insensitive; left and right keys are distinct). A chord has 1-3 distinct keys, at
-    /// most one of which is [`KeyKind::Swallowed`] (F13-F24); [`KeyKind::ChordOnly`] keys
-    /// (Win) need a [`KeyKind::Modifier`] (Ctrl, Shift) in the chord.
+    /// Parses `"RightCtrl"` or a `+`-separated chord such as `"LeftCtrl+LeftWin"`, as the
+    /// config file has it (names are case-insensitive; left and right keys are distinct). The
+    /// rules are [`Self::from_codes`]'s; errors start with `invalid hotkey "<spec>": `.
     pub fn parse(spec: &str) -> Result<Self, String> {
+        let invalid = |e: String| format!("invalid hotkey {spec:?}: {e}");
         let names: Vec<&str> = spec.split('+').map(str::trim).collect();
         if names.iter().any(|n| n.is_empty()) {
-            return Err(format!(
-                "invalid hotkey {spec:?}: expected a key name or a chord like \"{CHORD_EXAMPLE}\" (keys: {})",
+            return Err(invalid(format!(
+                "expected a key name or a chord like \"{CHORD_EXAMPLE}\" (keys: {})",
                 key_names()
-            ));
+            )));
         }
-        if names.len() > MAX_CHORD {
-            return Err(format!(
-                "invalid hotkey {spec:?}: a chord can have at most {MAX_CHORD} keys"
-            ));
+        let keys = names
+            .into_iter()
+            .map(Key::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(invalid)?;
+        Self::from_keys(keys).map_err(invalid)
+    }
+
+    /// The hotkey made of the keys with platform key codes `codes` (as the key recorder saw
+    /// them go down, in that order). A chord has 1 to [`MAX_CHORD`] distinct keys, at most one
+    /// of which isn't a modifier; Esc and keys missing from [`KEYS`] can't be in one. Errors
+    /// are plain sentences for the settings window. The modifiers come first, in the order they
+    /// went down, then the key that isn't one: Space then Left Control is "Left Control +
+    /// Space".
+    pub fn from_codes(codes: &[u16]) -> Result<Self, String> {
+        let (mut keys, others): (Vec<_>, Vec<_>) = codes
+            .iter()
+            .map(|&code| Key::from_code(code).ok_or_else(|| unusable_key(code).to_owned()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .partition(Key::is_modifier);
+        keys.extend(others);
+        Self::from_keys(keys)
+    }
+
+    /// The rules every hotkey follows, wherever it comes from.
+    fn from_keys(keys: Vec<Key>) -> Result<Self, String> {
+        if keys.is_empty() {
+            return Err("No key was pressed.".into());
         }
-        let mut keys = Vec::with_capacity(names.len());
-        for name in names {
-            let key = Key::parse(name).map_err(|e| format!("invalid hotkey {spec:?}: {e}"))?;
-            if keys.contains(&key) {
-                return Err(format!(
-                    "invalid hotkey {spec:?}: {} is listed twice",
-                    key.name
-                ));
+        if keys.len() > MAX_CHORD {
+            return Err(format!("A hotkey can have at most {MAX_CHORD} keys."));
+        }
+        for (i, key) in keys.iter().enumerate() {
+            if keys[..i].contains(key) {
+                return Err(format!("{} is listed twice.", key.label));
             }
-            keys.push(key);
         }
-        let of_kind = |kind| keys.iter().filter(move |k| k.kind == kind);
-        if of_kind(Swallowed).count() > 1 {
-            let names: Vec<_> = of_kind(Swallowed).map(|k| k.name).collect();
+        let mut others = keys.iter().filter(|k| !k.is_modifier());
+        if let (Some(a), Some(b)) = (others.next(), others.next()) {
             return Err(format!(
-                "invalid hotkey {spec:?}: a chord can have only one key that isn't a modifier ({})",
-                names.join(", ")
-            ));
-        }
-        if let Some(k) = of_kind(KeyKind::ChordOnly).next()
-            && of_kind(Modifier).next().is_none()
-        {
-            let partners: Vec<_> = KEYS
-                .iter()
-                .filter(|(_, _, kind)| *kind == Modifier)
-                .map(|(n, _, _)| *n)
-                .collect();
-            return Err(format!(
-                "invalid hotkey {spec:?}: {} only works in a chord with one of {} (e.g. \"{CHORD_EXAMPLE}\"): {CHORD_ONLY_WHY}",
-                k.name,
-                partners.join(", ")
+                "A hotkey can have only one key that isn't a modifier ({}, {}).",
+                a.label, b.label
             ));
         }
         Ok(Hotkey { keys })
@@ -264,6 +260,69 @@ impl Hotkey {
 
     pub fn keys(&self) -> &[Key] {
         &self.keys
+    }
+
+    /// The hotkey in plain words, its keys' labels joined with " + " ("Left Control + Space").
+    pub fn label(&self) -> String {
+        self.keys
+            .iter()
+            .map(|k| k.label)
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
+    /// What the settings window says under this hotkey, if it costs something (one text, the
+    /// most specific):
+    ///
+    /// - A key that isn't a modifier is kept from apps (F13-F24 cost nothing: nothing types
+    ///   them): alone, always; in a combo, whenever the combo is held. In a combo that takes
+    ///   over a character when the key types one and its modifiers only pick which (Shift,
+    ///   Option, AltGr), and an app's shortcut otherwise (Shift + Tab, Option + Left Arrow).
+    /// - Alone, a Windows Win or Alt key no longer opens its menu when tapped (AGT masks the
+    ///   tap), and a modifier used in everyday shortcuts and typing starts AGT listening every
+    ///   time it's held.
+    /// - A combo of only modifiers costs nothing: they say they're not typing.
+    pub fn warning(&self) -> Option<&'static str> {
+        let Some(key) = self.keys.iter().find(|k| !k.is_modifier()) else {
+            let [key] = self.keys.as_slice() else {
+                return None;
+            };
+            return if START_KEYS.contains(&key.name) {
+                Some("A tap of this key no longer opens Start while AGT runs.")
+            } else if MENU_KEYS.contains(&key.name) {
+                Some("A tap of this key no longer opens an app's menu while AGT runs.")
+            } else {
+                EVERYDAY_MODIFIERS.contains(&key.name).then_some(
+                    "You use this key in shortcuts and typing. AGT starts listening each time you hold it.",
+                )
+            };
+        };
+        if is_spare_f_key(key.name) {
+            None
+        } else if self.keys.len() == 1 {
+            Some("AGT takes this key over: it won't type in other apps while AGT runs.")
+        } else if types_character(key.name)
+            && self
+                .keys
+                .iter()
+                .filter(|k| k.is_modifier())
+                .all(|k| CHARACTER_MODIFIERS.contains(&k.name))
+        {
+            Some("This types a character, so AGT takes it over in every app while AGT runs.")
+        } else {
+            Some("Apps won't see this shortcut while AGT runs.")
+        }
+    }
+
+    /// Whether `other` is made of the same keys, in whatever order.
+    pub fn same_keys(&self, other: &Hotkey) -> bool {
+        self.keys.len() == other.keys.len() && self.contains(other)
+    }
+
+    /// Whether every key of `other` is in this hotkey too, so holding this one holds `other`
+    /// as well (true for the same keys).
+    pub fn contains(&self, other: &Hotkey) -> bool {
+        other.keys.iter().all(|k| self.keys.contains(k))
     }
 
     /// Which chord key the platform key `code` is, if any.
@@ -290,9 +349,9 @@ impl std::fmt::Display for Hotkey {
 pub enum Permission {
     /// Recording (without it, macOS delivers silence).
     Microphone,
-    /// Seeing the hotkey (the keyboard event tap), sending Cmd+V and swallowing F13-F20. (With
-    /// it, Input Monitoring isn't needed.) Listed as "Device Control" in System Settings from
-    /// macOS 27 on.
+    /// Seeing the hotkeys (the keyboard event tap), sending Cmd+V and swallowing hotkey keys.
+    /// (With it, Input Monitoring isn't needed.) Listed as "Device Control" in System Settings
+    /// from macOS 27 on.
     Accessibility,
 }
 
@@ -319,6 +378,72 @@ pub fn request_permissions(missing: &[Permission]) {
 /// Opens the system settings page where `permission` is granted.
 pub fn open_permission_settings(permission: Permission) {
     imp::open_permission_settings(permission)
+}
+
+// Meeting notes: recording the other side of a call, and noticing that a call started. Kept
+// apart from `Permission`: dictation never needs these, so they must not show up in its
+// permission checks.
+
+/// Whether AGT may record other apps' audio (meeting notes' "Them" track). macOS: the "System
+/// Audio Recording Only" permission (TCC's `kTCCServiceAudioCapture`); without it the capture
+/// runs but delivers silence. `None`: not known, either not asked yet (macOS shows its prompt
+/// the first time a capture starts) or the check isn't available (it's a private macOS API).
+/// Windows and others: always `Some(true)`, loopback capture needs no permission. Cheap: fine
+/// to poll.
+pub fn system_audio_permission() -> Option<bool> {
+    imp::system_audio_permission()
+}
+
+/// Opens the system settings page where system audio recording is allowed (Windows: the
+/// microphone privacy page, the closest there is).
+pub fn open_system_audio_settings() {
+    imp::open_system_audio_settings()
+}
+
+/// A process that is recording from an input device right now (see [`mic_users`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicUser {
+    pub pid: i32,
+    /// Empty for processes without a bundle (command-line tools).
+    pub bundle_id: String,
+    /// A name to show the user: [`meeting_app_name`] if it's a known meeting app (so Chrome's
+    /// helper process reads "Google Chrome"), else the app's own name, else the process name,
+    /// its bundle ID or "pid N". Never empty.
+    pub app: String,
+}
+
+/// The other processes recording from a microphone (any input device) right now, to notice a
+/// call starting. AGT itself is never listed. macOS 14.2+ (Core Audio process objects); empty
+/// on older macOS, on Windows and on error. A few HAL queries per process: poll every second
+/// or two, not per frame.
+pub fn mic_users() -> Vec<MicUser> {
+    imp::mic_users()
+}
+
+/// Apps people take calls in, by bundle ID prefix (a prefix so helper processes and variants
+/// match: `com.google.Chrome.helper`, `com.microsoft.teams2`).
+const MEETING_APPS: &[(&str, &str)] = &[
+    ("com.google.Chrome", "Google Chrome"),
+    ("com.apple.Safari", "Safari"),
+    ("com.microsoft.edgemac", "Microsoft Edge"),
+    ("company.thebrowser.Browser", "Arc"),
+    ("com.brave.Browser", "Brave"),
+    ("org.mozilla.firefox", "Firefox"),
+    ("com.microsoft.teams", "Microsoft Teams"),
+    ("us.zoom.xos", "Zoom"),
+    ("com.tinyspeck.slackmacgap", "Slack"),
+    ("com.cisco.webex", "Webex"),
+    ("com.apple.FaceTime", "FaceTime"),
+    ("com.hnc.Discord", "Discord"),
+];
+
+/// The display name of the meeting app (or browser, for web calls) `bundle_id` belongs to;
+/// `None` if it isn't one (a voice memo, a dictation app: no "Take notes?" for those).
+pub fn meeting_app_name(bundle_id: &str) -> Option<&'static str> {
+    MEETING_APPS
+        .iter()
+        .find(|(prefix, _)| bundle_id.starts_with(prefix))
+        .map(|&(_, name)| name)
 }
 
 /// What [`set_launch_at_login`] did.
@@ -363,17 +488,31 @@ impl HotkeyReset {
     }
 }
 
-/// Starts watching `hotkey` on a dedicated, high-priority thread. `on_event` runs on that
-/// thread and must return quickly (e.g. just send on a channel): a slow handler delays every
-/// keystroke on the system. Modifier keys are passed through; F13-F24 are swallowed.
+/// Starts watching `hotkeys` on a dedicated, high-priority thread: any of them dictates, one
+/// hold at a time. `on_event` runs on that thread and must return quickly (e.g. just send on
+/// a channel): a slow handler delays every keystroke on the system. Modifier keys are passed
+/// through; a hotkey's key that isn't a modifier is swallowed while it counts for that
+/// hotkey (always for a key that is a whole hotkey on its own; for a combo's, only when its
+/// press completes the combo, with the combo's modifiers and no others held first).
 ///
 /// macOS: if Accessibility isn't granted yet, this still succeeds; the thread waits for the
 /// permission and starts watching as soon as it's granted (no restart needed).
 pub fn start_hotkey(
-    hotkey: &Hotkey,
+    hotkeys: &Hotkeys,
     on_event: impl Fn(HotkeyEvent) + Send + 'static,
 ) -> Result<HotkeyHandle, Error> {
-    imp::start_hotkey(hotkey.clone(), Box::new(on_event)).map(HotkeyHandle)
+    imp::start_hotkey(hotkeys.clone(), Box::new(on_event)).map(HotkeyHandle)
+}
+
+/// Whether a key of any of `hotkeys` is [`KeyKind::Masked`] (Windows: Win, Alt), so the hook
+/// needs its masking thread.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn needs_masker(hotkeys: &Hotkeys) -> bool {
+    hotkeys
+        .list()
+        .iter()
+        .flat_map(Hotkey::keys)
+        .any(|k| k.kind == KeyKind::Masked)
 }
 
 /// Whether `key` is physically down right now, if that can be known: `None` on unsupported
@@ -444,6 +583,14 @@ pub fn set_clipboard_text(text: &str) -> Result<PasteToken, Error> {
     imp::set_clipboard_text(text).map(PasteToken)
 }
 
+/// Puts `text` on the clipboard the way any app's Copy does: unlike [`set_clipboard_text`],
+/// which is for a paste and keeps its text out of clipboard history, managers and other
+/// devices, this is a copy the user asked for to keep and paste elsewhere (the meeting notes
+/// window's Copy). Nothing is restored afterwards.
+pub fn copy_text(text: &str) -> Result<(), Error> {
+    imp::copy_text(text)
+}
+
 /// Call between [`set_clipboard_text`] and [`send_paste`]. Windows: clipboard listeners
 /// (Logi Options+, WSLg, clipboard managers) open the clipboard right after every change, and
 /// an app whose paste finds it open pastes nothing, so this waits until they're likely done
@@ -485,17 +632,17 @@ fn escape_armed() -> bool {
     ESCAPE_ARMED.load(Ordering::Relaxed)
 }
 
-/// How many times [`send_paste`] released a modifier that was held down (and so could have
-/// made a hotkey key look released). With [`paste_may_release`], lets a caller tell a real
-/// release of the hotkey from our own injected key-ups.
+/// How many times [`send_paste`] released a key that was held down (and so could have made a
+/// hotkey key look released). With [`paste_may_release`], lets a caller tell a real release
+/// of the hotkey from our own injected key-ups.
 pub fn paste_count() -> u64 {
     PASTES.load(Ordering::SeqCst)
 }
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
-/// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
-/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, Cmd+V only posts Left
-/// Command and V).
+/// physically held (Windows: it injects key-ups for held Shift, Alt and Win keys, and a
+/// Ctrl-up that maps to Left Ctrl; Right Ctrl is never touched. macOS: Left Command and V,
+/// whose key-ups Cmd+V posts at the level `key_down` reads).
 pub fn paste_may_release(key: Key) -> bool {
     imp::paste_may_release(key)
 }
@@ -527,8 +674,9 @@ const STALE_GAP_MS: u32 = 1500;
 ///   release was missed (e.g. on the secure desktop): the stale state is dropped.
 ///
 /// The caller filters out modifiers that aren't part of the chord (they neither cancel nor
-/// disarm: they only matter together with a non-modifier key, which does). Platform-
-/// independent so it can be unit-tested.
+/// disarm: they only matter together with a non-modifier key, which does). Its `Down`s say
+/// hotkey 0: [`Detector`](hotkeys::Detector), which runs one per hotkey, puts in the right
+/// one. Platform-independent so it can be unit-tested.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct HoldDetector {
@@ -539,8 +687,6 @@ pub(crate) struct HoldDetector {
     down: u8,
     /// Event time (ms, wrapping) of each chord key's last transition.
     last_ms: [u32; MAX_CHORD],
-    /// The last Esc press was reported as `Escape`: its release is kept from the app too.
-    escape_down: bool,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -563,12 +709,17 @@ impl HoldDetector {
             state: Hold::Idle,
             down: 0,
             last_ms: [0; MAX_CHORD],
-            escape_down: false,
         }
     }
 
     fn complete(&self) -> bool {
         self.down == (1u8 << self.len) - 1
+    }
+
+    /// Whether a press of chord key `i` would start the hold now: the chord is armed (not
+    /// waiting for its keys to be released) and every other chord key is down.
+    pub(crate) fn would_complete(&self, i: usize) -> bool {
+        self.state == Hold::Idle && (self.down | (1 << i)) == (1u8 << self.len) - 1
     }
 
     /// `chord_key`: which chord key this transition is for (`None`: another key); `down`:
@@ -617,7 +768,7 @@ impl HoldDetector {
             self.down |= bit;
             if self.state == Hold::Idle && self.complete() {
                 self.state = Hold::Held;
-                return Some(HotkeyEvent::Down(now));
+                return Some(HotkeyEvent::Down(now, 0));
             }
             return None;
         }
@@ -635,7 +786,7 @@ impl HoldDetector {
         self.state = Hold::Idle;
         if self.complete() {
             self.state = Hold::Held;
-            Some(HotkeyEvent::Down(now))
+            Some(HotkeyEvent::Down(now, 0))
         } else {
             was_held.then_some(HotkeyEvent::Cancel)
         }
@@ -650,35 +801,15 @@ impl HoldDetector {
         self.down & (1 << i) != 0 && self.state != Hold::Idle
     }
 
-    /// What the hooks call for every key event: [`Self::on_key`], plus Esc. `esc`: the key is
-    /// Esc; `armed`: [`arm_escape`] is on and no modifier is held. An armed Esc press with no
-    /// chord key down is [`HotkeyEvent::Escape`] (with the hotkey held, Esc is a `Cancel`).
-    /// Also returns whether to keep the key from the focused app: an Esc reported as `Escape`,
-    /// its auto-repeat and its release.
-    pub(crate) fn on_hook_key(
-        &mut self,
-        chord_key: Option<usize>,
-        esc: bool,
-        armed: bool,
-        down: bool,
-        time_ms: u32,
-        now: Instant,
-    ) -> (Option<HotkeyEvent>, bool) {
-        let ev = self.on_key(chord_key, down, time_ms, now);
-        if !esc {
-            return (ev, false);
-        }
-        if !down {
-            return (ev, std::mem::take(&mut self.escape_down));
-        }
-        if self.escape_down {
-            return (ev, true); // its auto-repeat
-        }
-        if ev.is_none() && armed && self.state == Hold::Idle && self.down == 0 {
-            self.escape_down = true;
-            return (Some(HotkeyEvent::Escape), true);
-        }
-        (ev, false)
+    /// Whether no chord key is down (so there's no hold, nor a wait for one to end).
+    pub(crate) fn idle(&self) -> bool {
+        self.state == Hold::Idle && self.down == 0
+    }
+
+    /// Drops the hold that just started: another hotkey holds. Like a hold that ended, it
+    /// waits until every chord key is released.
+    pub(crate) fn rearm(&mut self) {
+        self.state = Hold::Rearm;
     }
 
     /// Forget any hold in progress.
@@ -691,6 +822,10 @@ impl HoldDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use KeyKind::Masked;
+    #[cfg(target_os = "macos")]
+    use KeyKind::Modifier;
 
     const HOT: Option<usize> = Some(0);
     const OTHER: Option<usize> = None;
@@ -698,101 +833,360 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn parse_keys_macos() {
-        assert_eq!(Key::parse("rightoption").unwrap().name, "RightOption");
-        assert_eq!(Key::parse(" F13 ").unwrap().code, 0x69);
-        for gone in ["RightCtrl", "LeftOption", "CapsLock", "F5", "F21"] {
-            assert!(Key::parse(gone).is_err(), "{gone} should not be allowed");
-        }
-        for (name, swallowed) in [
-            ("Fn", false),
-            ("RightOption", false),
-            ("RightCommand", false),
-            ("F13", true),
-            ("F20", true),
+        for (name, kind) in [
+            ("Fn", Modifier),
+            ("RightOption", Modifier),
+            ("LeftOption", Modifier),
+            ("LeftCommand", Modifier),
+            ("LeftControl", Modifier),
+            ("RightShift", Modifier),
+            ("F13", Swallowed),
+            ("F5", Swallowed),
+            ("A", Swallowed),
+            ("Space", Swallowed),
         ] {
-            let k = Key::parse(name).unwrap();
-            assert_eq!(k.swallowed(), swallowed, "{name}");
-            assert!(!paste_may_release(k), "{name}");
+            assert_eq!(Key::parse(name).unwrap().kind(), kind, "{name}");
         }
+        assert_eq!(Key::parse("leftoption").unwrap().label(), "Left Option");
+        assert_eq!(Key::from_code(0x3F).unwrap().name, "Fn");
+        assert!(Key::parse("CapsLock").is_err());
         assert_eq!(
-            Hotkey::parse("fn+rightoption").unwrap().to_string(),
-            "Fn+RightOption"
+            Hotkey::from_codes(&[0x39]).unwrap_err(),
+            "macOS doesn't say when Caps Lock is let go, so it can't be held as a hotkey."
         );
-        assert!(Hotkey::parse("F13+F14").is_err());
+        assert_eq!(
+            Hotkey::from_codes(&[0x35]).unwrap_err(),
+            "Esc cancels a recording, so it can't be a hotkey."
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn parse_keys() {
-        assert_eq!(Key::parse("rightctrl").unwrap().name, "RightCtrl");
-        assert_eq!(Key::parse(" F13 ").unwrap().code, 0x7C);
-        assert!(Key::parse("Hyper").is_err());
-        for gone in ["RightAlt", "CapsLock", "F5", "Insert", "Pause"] {
-            assert!(Key::parse(gone).is_err(), "{gone} should not be allowed");
+    fn windows_old_configs_parse() {
+        for old in [
+            "RightCtrl",
+            "LeftCtrl+LeftWin",
+            "LeftWin+LeftShift",
+            "RightCtrl+F13",
+            "LeftCtrl+LeftShift+LeftWin",
+            "F24",
+        ] {
+            assert!(Hotkey::parse(old).is_ok(), "{old}");
         }
-        assert!(!Key::parse("LeftShift").unwrap().swallowed());
-        assert!(!Key::parse("LeftWin").unwrap().swallowed());
-        assert_eq!(Key::parse("LeftWin").unwrap().kind(), ChordOnly);
-        assert!(Key::parse("F24").unwrap().swallowed());
+        assert!(Hotkey::parse("LeftWin").is_ok());
+        assert_eq!(Key::parse("LeftAlt").unwrap().kind(), Masked);
+        assert_eq!(Key::parse("LeftWin").unwrap().kind(), Masked);
+        assert_eq!(Key::parse("CapsLock").unwrap().kind(), Swallowed);
+        assert!(Key::parse("Pause").is_err());
+        assert_eq!(
+            Hotkey::from_codes(&[0x13]).unwrap_err(),
+            "Windows sends Pause's press and release together, so it can't be held as a hotkey."
+        );
+        assert_eq!(
+            Hotkey::from_codes(&[0x1B]).unwrap_err(),
+            "Esc cancels a recording, so it can't be a hotkey."
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn parse_hotkeys() {
-        let names = |s: &str| {
-            Hotkey::parse(s)
-                .unwrap()
-                .keys()
-                .iter()
-                .map(|k| k.name)
-                .collect::<Vec<_>>()
+    fn masked_keys_need_masker() {
+        let hk = |v: &[&str]| {
+            Hotkeys::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
         };
-        assert_eq!(names("RightCtrl"), ["RightCtrl"]);
-        assert_eq!(names("leftctrl + LEFTWIN"), ["LeftCtrl", "LeftWin"]);
-        assert_eq!(names("LeftWin+LeftShift"), ["LeftWin", "LeftShift"]);
-        assert_eq!(names("RightCtrl+F13"), ["RightCtrl", "F13"]);
-        assert_eq!(
-            names("LeftCtrl+LeftShift+LeftWin"),
-            ["LeftCtrl", "LeftShift", "LeftWin"]
-        );
-        assert_eq!(names("LeftCtrl+RightCtrl"), ["LeftCtrl", "RightCtrl"]);
-        assert_eq!(
-            Hotkey::parse("leftctrl+leftwin").unwrap().to_string(),
-            "LeftCtrl+LeftWin"
-        );
+        assert!(needs_masker(&hk(&["LeftCtrl+LeftWin"])));
+        assert!(needs_masker(&hk(&["RightCtrl", "LeftAlt"])));
+        assert!(!needs_masker(&hk(&["RightCtrl", "F13"])));
+    }
+
+    #[test]
+    fn hotkey_rules() {
         let err = |s: &str| Hotkey::parse(s).unwrap_err();
-        assert!(err("Hyper").contains("LeftWin"), "lists valid names");
-        assert!(err("LeftCtrl+Hyper").contains("unknown key \"Hyper\""));
-        assert!(err("").contains("chord like"));
-        assert!(err("LeftCtrl+").contains("chord like"));
-        assert!(err("LeftCtrl++LeftWin").contains("chord like"));
-        assert!(err("LeftCtrl+leftctrl").contains("twice"));
-        assert!(err("LeftCtrl+LeftShift+LeftWin+RightCtrl").contains("at most 3"));
-        assert!(err("F13+F14").contains("only one key that isn't a modifier (F13, F14)"));
-        assert!(err("LeftCtrl+F13+F14").contains("only one key that isn't a modifier"));
-        for win_only in ["LeftWin", "RightWin", "LeftWin+RightWin", "LeftWin+F13"] {
-            let e = err(win_only);
-            assert!(e.contains("Start menu"), "{win_only}: {e}");
-            assert!(e.contains("one of RightCtrl, LeftCtrl"), "{win_only}: {e}");
+        // Platform-neutral names: A, Space, F13, F14 exist on both.
+        assert!(Hotkey::parse("A").is_ok());
+        assert!(err("A+Space").contains("only one key that isn't a modifier (A, Space)"));
+        assert!(err("F13+F14+A+Space+F15").contains("at most 4 keys"));
+        assert!(err("A+a").contains("twice"));
+        assert!(err("a+F13").contains("(A, F13)"));
+        // The config file's own mistakes.
+        for empty in ["", "LeftShift+", "LeftShift++A"] {
+            assert!(err(empty).contains("chord like"), "{empty:?}");
         }
-        assert!(
-            err("Hyper").contains("LeftWin (in a chord only), RightWin (in a chord only), F13"),
-            "{}",
-            err("Hyper")
+        assert!(err("LeftShift+Hyper").contains("unknown key \"Hyper\"; expected one of"));
+        assert!(err("Hyper").contains("LeftShift"), "lists valid names");
+    }
+
+    const TAKEN: Option<&str> =
+        Some("AGT takes this key over: it won't type in other apps while AGT runs.");
+    const EVERYDAY: Option<&str> = Some(
+        "You use this key in shortcuts and typing. AGT starts listening each time you hold it.",
+    );
+    const TYPES: Option<&str> =
+        Some("This types a character, so AGT takes it over in every app while AGT runs.");
+    const SHORTCUT: Option<&str> = Some("Apps won't see this shortcut while AGT runs.");
+
+    #[test]
+    fn labels_and_warnings() {
+        let lone = Hotkey::parse("Space").unwrap();
+        assert_eq!(lone.label(), "Space");
+        assert_eq!(lone.warning(), TAKEN);
+        assert_eq!(Hotkey::parse("F13").unwrap().warning(), None);
+        // Names both platforms have.
+        let k = |s| Hotkey::parse(s).unwrap();
+        for (name, warning) in [
+            ("LeftShift+A", TYPES),
+            ("A+LeftShift", TYPES),
+            ("LeftShift+RightShift+Space", TYPES),
+            ("LeftShift+Slash", TYPES),
+            ("RightShift+KeypadMinus", TYPES),
+            // Keys that type nothing: a shortcut whatever the modifiers.
+            ("LeftShift+F5", SHORTCUT),
+            ("LeftShift+Tab", SHORTCUT),
+            ("RightShift+UpArrow", SHORTCUT),
+            ("LeftShift+Backspace", SHORTCUT),
+            ("LeftShift+F13", None),
+            ("LeftShift+RightShift", None),
+            ("LeftShift", EVERYDAY),
+            ("RightShift", EVERYDAY),
+        ] {
+            assert_eq!(k(name).warning(), warning, "{name}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let combo = Hotkey::parse("LeftControl+Space").unwrap();
+            assert_eq!(combo.label(), "Left Control + Space");
+            for (name, warning) in [
+                ("LeftControl+Space", SHORTCUT),
+                ("RightCommand+F5", SHORTCUT),
+                ("Fn+A", SHORTCUT),
+                ("LeftShift+LeftControl+A", SHORTCUT),
+                ("RightOption+E", TYPES),
+                ("LeftOption+LeftShift+2", TYPES),
+                ("LeftOption+KeypadEquals", TYPES),
+                ("LeftShift+Section", TYPES),
+                ("RightOption+LeftArrow", SHORTCUT),
+                ("LeftOption+Return", SHORTCUT),
+                ("LeftShift+KeypadEnter", SHORTCUT),
+                ("RightOption+Help", SHORTCUT),
+                ("LeftShift+ForwardDelete", SHORTCUT),
+                ("RightCommand+F20", None),
+                ("LeftControl+LeftOption", None),
+                ("Fn", None),
+                ("RightOption", None),
+                ("RightCommand", None),
+                ("LeftCommand", EVERYDAY),
+                ("LeftOption", EVERYDAY),
+                ("LeftControl", EVERYDAY),
+                ("RightControl", EVERYDAY),
+                ("Help", TAKEN),
+                ("KeypadEnter", TAKEN),
+                ("Section", TAKEN),
+            ] {
+                assert_eq!(k(name).warning(), warning, "{name}");
+            }
+        }
+    }
+
+    /// Every key the warnings name is in [`KEYS`], as a modifier.
+    #[test]
+    fn warning_lists_name_modifiers() {
+        for name in EVERYDAY_MODIFIERS
+            .iter()
+            .chain(CHARACTER_MODIFIERS)
+            .chain(START_KEYS)
+            .chain(MENU_KEYS)
+        {
+            assert!(Key::parse(name).unwrap().is_modifier(), "{name}");
+        }
+    }
+
+    /// Every key [`NON_CHARACTER_KEYS`] names is in [`KEYS`], not as a modifier, and a key
+    /// labelled with the one character it types (A, 5, /) is never among them.
+    #[test]
+    fn keys_that_type_a_character() {
+        for name in keys::NON_CHARACTER_KEYS {
+            assert!(!Key::parse(name).unwrap().is_modifier(), "{name}");
+            assert!(!types_character(name), "{name}");
+        }
+        for &(name, label, _, kind) in KEYS {
+            if kind == Swallowed && label.chars().count() == 1 {
+                assert!(types_character(name), "{name}");
+            }
+        }
+        for name in ["Space", "Keypad5", "KeypadPlus", "KeypadDecimal", "F"] {
+            assert!(types_character(name), "{name}");
+        }
+        for name in ["F1", "F5", "F12", "F13", "LeftArrow", "Tab"] {
+            assert!(!types_character(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn same_keys_and_contains() {
+        let k = |s| Hotkey::parse(s).unwrap();
+        // The brief's "F13+A" is refused (two keys that aren't modifiers): LeftShift instead.
+        assert!(k("LeftShift+A").same_keys(&k("A+LeftShift")));
+        assert!(k("F13").contains(&k("F13")) && !k("F13").contains(&k("F14")));
+        assert!(!k("LeftShift+A").same_keys(&k("LeftShift")));
+        assert!(k("LeftShift+A").contains(&k("LeftShift")));
+        assert!(!k("LeftShift").contains(&k("LeftShift+A")));
+        assert!(!k("LeftShift+A").contains(&k("RightShift")));
+    }
+
+    /// Every name and code appears once, Esc is absent, names stay one word, and the keys
+    /// today's configs use keep their codes.
+    #[test]
+    fn key_tables_are_consistent() {
+        for (i, &(name, label, code, kind)) in KEYS.iter().enumerate() {
+            assert!(name.chars().all(|c| c.is_ascii_alphanumeric()), "{name:?}");
+            assert!(!label.is_empty(), "{name}");
+            assert_ne!(code, ESC_CODE, "{name}");
+            #[cfg(not(target_os = "macos"))]
+            assert_ne!(code, PAUSE_CODE, "{name}");
+            for &(other, _, other_code, _) in &KEYS[..i] {
+                assert!(!other.eq_ignore_ascii_case(name), "{name} is listed twice");
+                assert_ne!(other_code, code, "{name} and {other} share a code");
+            }
+            let key = Key::from_code(code).unwrap();
+            assert_eq!(
+                (key.name, key.label(), key.code(), key.kind()),
+                (name, label, code, kind)
+            );
+            assert_eq!(key.is_modifier(), kind != Swallowed, "{name}");
+        }
+        #[cfg(target_os = "macos")]
+        let old = [
+            ("Fn", 0x3F),
+            ("RightOption", 0x3D),
+            ("RightCommand", 0x36),
+            ("F13", 0x69),
+            ("F14", 0x6B),
+            ("F15", 0x71),
+            ("F16", 0x6A),
+            ("F17", 0x40),
+            ("F18", 0x4F),
+            ("F19", 0x50),
+            ("F20", 0x5A),
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let old = [
+            ("RightCtrl", 0xA3),
+            ("LeftCtrl", 0xA2),
+            ("RightShift", 0xA1),
+            ("LeftShift", 0xA0),
+            ("LeftWin", 0x5B),
+            ("RightWin", 0x5C),
+            ("F13", 0x7C),
+            ("F18", 0x81),
+            ("F24", 0x87),
+        ];
+        for (name, code) in old {
+            assert_eq!(Key::parse(name).unwrap().code(), code, "{name}");
+        }
+        assert_eq!(Key::parse(" f13 ").unwrap().name, "F13");
+        assert_eq!(
+            Hotkey::parse("leftshift + a").unwrap().to_string(),
+            "LeftShift+A"
         );
+    }
+
+    #[test]
+    fn hotkeys_from_pressed_codes() {
+        let code = |name| Key::parse(name).unwrap().code();
+        // The modifiers first, in press order (not the table's), then the other key.
+        let hk = Hotkey::from_codes(&[code("A"), code("LeftShift")]).unwrap();
+        assert_eq!(hk.to_string(), "LeftShift+A");
+        assert_eq!(hk.label(), "Left Shift + A");
+        let hk = Hotkey::from_codes(&[code("RightShift"), code("Space"), code("LeftShift")]);
+        assert_eq!(hk.unwrap().to_string(), "RightShift+LeftShift+Space");
+        let hk = Hotkey::from_codes(&[code("LeftShift"), code("RightShift")]).unwrap();
+        assert_eq!(hk.to_string(), "LeftShift+RightShift");
+        // The window shows these as they are (no "invalid hotkey" prefix).
+        assert_eq!(
+            Hotkey::from_codes(&[code("A"), code("Space")]).unwrap_err(),
+            "A hotkey can have only one key that isn't a modifier (A, Space)."
+        );
+        let five = ["LeftShift", "RightShift", "F13", "F14", "A"].map(code);
+        assert_eq!(
+            Hotkey::from_codes(&five).unwrap_err(),
+            "A hotkey can have at most 4 keys."
+        );
+        assert_eq!(
+            Hotkey::from_codes(&[ESC_CODE]).unwrap_err(),
+            "Esc cancels a recording, so it can't be a hotkey."
+        );
+        assert_eq!(
+            Hotkey::from_codes(&[code("LeftShift"), 0xFF]).unwrap_err(),
+            "AGT doesn't know that key."
+        );
+        assert!(Hotkey::from_codes(&[]).is_err());
+        // The config file gets the same text, after the spec as written.
+        assert_eq!(
+            Hotkey::parse("LeftShift+RightShift+F13+F14+A").unwrap_err(),
+            "invalid hotkey \"LeftShift+RightShift+F13+F14+A\": A hotkey can have at most 4 keys."
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windows_labels_and_warnings() {
+        let k = |s| Hotkey::parse(s).unwrap();
+        assert_eq!(k("LeftCtrl+LeftWin").label(), "Left Ctrl + Left Win");
+        let start = Some("A tap of this key no longer opens Start while AGT runs.");
+        let menu = Some("A tap of this key no longer opens an app's menu while AGT runs.");
+        for (name, warning) in [
+            ("LeftCtrl", EVERYDAY),
+            ("LeftShift", EVERYDAY),
+            ("RightShift", EVERYDAY),
+            // Everyday modifiers too, but a tap of one opening a menu is more to the point.
+            ("LeftWin", start),
+            ("RightWin", start),
+            ("LeftAlt", menu),
+            ("RightAlt", menu),
+            ("RightCtrl", None),
+            ("F24", None),
+            ("LeftCtrl+LeftWin", None),
+            ("RightAlt+LeftShift", None),
+            ("RightCtrl+F13", None),
+            ("RightCtrl+A", SHORTCUT),
+            ("LeftWin+Space", SHORTCUT),
+            ("LeftAlt+F4", SHORTCUT),
+            ("LeftCtrl+LeftShift+A", SHORTCUT),
+            ("RightAlt+Q", TYPES),
+            ("RightAlt+LeftShift+2", TYPES),
+            ("RightShift+Keypad5", TYPES),
+            ("RightAlt+IsoKey", TYPES),
+            ("LeftShift+KeypadDecimal", TYPES),
+            ("RightAlt+LeftArrow", SHORTCUT),
+            ("LeftShift+Enter", SHORTCUT),
+            ("RightAlt+Insert", SHORTCUT),
+            ("LeftShift+Delete", SHORTCUT),
+            ("CapsLock", TAKEN),
+            ("F12", TAKEN),
+            ("Keypad5", TAKEN),
+            ("Enter", TAKEN),
+            ("Insert", TAKEN),
+            ("ScrollLock", TAKEN),
+            ("Menu", TAKEN),
+            ("KeypadPlus", TAKEN),
+            ("IsoKey", TAKEN),
+        ] {
+            assert_eq!(k(name).warning(), warning, "{name}");
+        }
+        assert!(!k("LeftAlt").keys()[0].swallowed());
     }
 
     #[test]
     fn hold_ignores_repeat_and_reports_release() {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
-        assert_eq!(d.on_key(HOT, true, 1000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 1000, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(HOT, true, 1500, t), None); // first auto-repeat
         assert_eq!(d.on_key(HOT, true, 1533, t), None);
         assert_eq!(d.on_key(OTHER, false, 1600, t), None); // release of some other key
         assert_eq!(d.on_key(HOT, false, 9000, t), Some(HotkeyEvent::Up(t)));
         assert_eq!(d.on_key(HOT, false, 9001, t), None);
-        assert_eq!(d.on_key(HOT, true, 9100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 9100, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -800,72 +1194,30 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
         assert_eq!(d.on_key(OTHER, true, 0, t), None); // typing while idle
-        assert_eq!(d.on_key(HOT, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(OTHER, true, 20, t), Some(HotkeyEvent::Cancel)); // e.g. Esc
         assert_eq!(d.on_key(OTHER, true, 30, t), None);
         assert_eq!(d.on_key(HOT, false, 40, t), None);
         // Next hold works normally.
-        assert_eq!(d.on_key(HOT, true, 50, t), Some(HotkeyEvent::Down(t)));
-    }
-
-    #[test]
-    fn escape_is_reported_only_when_armed_and_without_a_hold() {
-        let t = Instant::now();
-        let mut d = HoldDetector::new(1);
-        let esc =
-            |d: &mut HoldDetector, armed, down, ms| d.on_hook_key(OTHER, true, armed, down, ms, t);
-        // Disarmed (not hands-free, or a modifier held): Esc is the app's.
-        assert_eq!(esc(&mut d, false, true, 0), (None, false));
-        assert_eq!(esc(&mut d, false, false, 5), (None, false));
-        // Armed with the hotkey up: ends a hands-free recording, and the app sees neither the
-        // press, its auto-repeat nor its release (even if disarmed in between).
-        assert_eq!(
-            esc(&mut d, true, true, 10),
-            (Some(HotkeyEvent::Escape), true)
-        );
-        assert_eq!(esc(&mut d, false, true, 12), (None, true));
-        assert_eq!(esc(&mut d, false, false, 15), (None, true));
-        // Esc while the hotkey is held is the hold's cancel, not an Escape too.
-        assert_eq!(d.on_key(HOT, true, 20, t), Some(HotkeyEvent::Down(t)));
-        assert_eq!(
-            esc(&mut d, true, true, 30),
-            (Some(HotkeyEvent::Cancel), false)
-        );
-        assert_eq!(esc(&mut d, true, false, 35), (None, false));
-        assert_eq!(
-            esc(&mut d, true, true, 40),
-            (None, false),
-            "still waiting for the hotkey's release"
-        );
-        assert_eq!(d.on_key(HOT, false, 50, t), None);
-        assert_eq!(
-            esc(&mut d, true, true, 60),
-            (Some(HotkeyEvent::Escape), true)
-        );
-        // Other keys are never kept from the app.
-        assert_eq!(
-            d.on_hook_key(OTHER, false, true, true, 70, t),
-            (None, false)
-        );
-        // Part of a chord down: a shortcut, not an Escape.
-        let mut d = HoldDetector::new(2);
-        d.on_key(HOT, true, 0, t);
-        assert_eq!(esc(&mut d, true, true, 10), (None, false));
+        assert_eq!(d.on_key(HOT, true, 50, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
     fn missed_release_does_not_turn_next_press_into_repeat() {
         let t = Instant::now();
         let mut d = HoldDetector::new(1);
-        assert_eq!(d.on_key(HOT, true, 1_000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 1_000, t), Some(HotkeyEvent::Down(t, 0)));
         // The release happened on the secure desktop; the hook never saw it. Much later:
-        assert_eq!(d.on_key(HOT, true, 60_000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(HOT, true, 60_000, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
         assert_eq!(d.on_key(HOT, false, 61_000, t), Some(HotkeyEvent::Up(t)));
         // Same after a cancelled hold whose release was missed, across tick wrap-around.
         let mut d = HoldDetector::new(1);
         d.on_key(HOT, true, u32::MAX - 10, t);
         d.on_key(OTHER, true, u32::MAX - 5, t);
-        assert_eq!(d.on_key(HOT, true, 5_000, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 5_000, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -875,7 +1227,7 @@ mod tests {
         d.on_key(HOT, true, 0, t);
         d.reset();
         assert_eq!(d.on_key(HOT, false, 100, t), None);
-        assert_eq!(d.on_key(HOT, true, 200, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(HOT, true, 200, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     // Chords: key 0 = Ctrl, key 1 = Win.
@@ -891,7 +1243,10 @@ mod tests {
             assert_eq!(d.on_key(first, true, 0, t0), None);
             assert_eq!(d.on_key(first, true, 500, t0), None); // auto-repeat
             // The hold (and the short-hold threshold) starts when the chord completes.
-            assert_eq!(d.on_key(second, true, 600, t1), Some(HotkeyEvent::Down(t1)));
+            assert_eq!(
+                d.on_key(second, true, 600, t1),
+                Some(HotkeyEvent::Down(t1, 0))
+            );
             assert_eq!(d.on_key(second, true, 1100, t1), None); // auto-repeat
             assert_eq!(d.on_key(first, true, 1150, t1), None); // late repeat of the first
             // Releasing either key ends it.
@@ -899,7 +1254,10 @@ mod tests {
             assert_eq!(d.on_key(second, false, 2010, t1), None);
             // Ready again.
             assert_eq!(d.on_key(second, true, 3000, t0), None);
-            assert_eq!(d.on_key(first, true, 3010, t1), Some(HotkeyEvent::Down(t1)));
+            assert_eq!(
+                d.on_key(first, true, 3010, t1),
+                Some(HotkeyEvent::Down(t1, 0))
+            );
             assert_eq!(d.on_key(second, false, 3500, t1), Some(HotkeyEvent::Up(t1)));
         }
     }
@@ -910,7 +1268,7 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(WIN, false, 40, t), Some(HotkeyEvent::Up(t)));
     }
 
@@ -919,7 +1277,7 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(WIN, false, 1000, t), Some(HotkeyEvent::Up(t)));
         // Ctrl still held; Win again: no new dictation...
         assert_eq!(d.on_key(WIN, true, 1100, t), None);
@@ -927,7 +1285,7 @@ mod tests {
         // ...until everything was released.
         assert_eq!(d.on_key(CTRL, false, 1300, t), None);
         d.on_key(WIN, true, 1400, t);
-        assert_eq!(d.on_key(CTRL, true, 1410, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(CTRL, true, 1410, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -936,7 +1294,7 @@ mod tests {
         let t = Instant::now();
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(OTHER, true, 50, t), Some(HotkeyEvent::Cancel));
         assert_eq!(d.on_key(OTHER, false, 60, t), None);
         assert_eq!(d.on_key(OTHER, true, 70, t), None); // again: Ctrl+Win+Right twice
@@ -945,7 +1303,7 @@ mod tests {
         assert_eq!(d.on_key(WIN, false, 95, t), None);
         assert_eq!(d.on_key(CTRL, false, 100, t), None);
         d.on_key(CTRL, true, 200, t);
-        assert_eq!(d.on_key(WIN, true, 210, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 210, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -963,7 +1321,22 @@ mod tests {
         // Typing with nothing held doesn't disarm anything.
         assert_eq!(d.on_key(OTHER, true, 80, t), None);
         d.on_key(WIN, true, 90, t);
-        assert_eq!(d.on_key(CTRL, true, 100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(CTRL, true, 100, t), Some(HotkeyEvent::Down(t, 0)));
+    }
+
+    #[test]
+    fn would_complete_only_when_armed_with_the_rest_down() {
+        let t = Instant::now();
+        let mut d = HoldDetector::new(2);
+        assert!(!d.would_complete(WIN.unwrap()));
+        d.on_key(CTRL, true, 0, t);
+        assert!(d.would_complete(WIN.unwrap()));
+        assert!(!d.would_complete(CTRL.unwrap()), "Win isn't down");
+        d.on_key(OTHER, true, 10, t); // Ctrl+C disarms the chord
+        assert!(!d.would_complete(WIN.unwrap()));
+        d.on_key(CTRL, false, 20, t);
+        d.on_key(CTRL, true, 30, t);
+        assert!(d.would_complete(WIN.unwrap()));
     }
 
     #[test]
@@ -975,7 +1348,10 @@ mod tests {
         assert_eq!(d.on_key(OTHER, true, 10, t), None); // L
         // Back at the desktop a minute later: Ctrl, then Win.
         assert_eq!(d.on_key(CTRL, true, 60_000, t), None);
-        assert_eq!(d.on_key(WIN, true, 60_100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(WIN, true, 60_100, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
         assert_eq!(d.on_key(CTRL, false, 61_000, t), Some(HotkeyEvent::Up(t)));
         assert_eq!(d.on_key(WIN, false, 61_010, t), None);
 
@@ -983,9 +1359,12 @@ mod tests {
         // stale hold (Cancel), the other key's press then starts a new one.
         let mut d = HoldDetector::new(2);
         d.on_key(CTRL, true, 0, t);
-        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 10, t), Some(HotkeyEvent::Down(t, 0)));
         assert_eq!(d.on_key(CTRL, true, 30_000, t), Some(HotkeyEvent::Cancel));
-        assert_eq!(d.on_key(WIN, true, 30_050, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(WIN, true, 30_050, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
 
         // Only one release missed (Win), Ctrl's was seen: re-pressing completes the chord.
         let mut d = HoldDetector::new(2);
@@ -994,7 +1373,7 @@ mod tests {
         assert_eq!(d.on_key(OTHER, true, 20, t), Some(HotkeyEvent::Cancel));
         assert_eq!(d.on_key(CTRL, false, 5_000, t), None);
         assert_eq!(d.on_key(CTRL, true, 9_000, t), None); // Win still believed down
-        assert_eq!(d.on_key(WIN, true, 9_100, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 9_100, t), Some(HotkeyEvent::Down(t, 0)));
     }
 
     #[test]
@@ -1003,14 +1382,20 @@ mod tests {
         let mut d = HoldDetector::new(3);
         assert_eq!(d.on_key(Some(2), true, 0, t), None);
         assert_eq!(d.on_key(Some(0), true, 10, t), None);
-        assert_eq!(d.on_key(Some(1), true, 20, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(Some(1), true, 20, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
         assert_eq!(d.on_key(Some(0), false, 500, t), Some(HotkeyEvent::Up(t)));
         assert_eq!(d.on_key(Some(0), true, 600, t), None);
         d.reset();
         // After a reset (hook re-installed), keys must be pressed again.
         assert_eq!(d.on_key(Some(0), true, 700, t), None);
         assert_eq!(d.on_key(Some(1), true, 710, t), None);
-        assert_eq!(d.on_key(Some(2), true, 720, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(
+            d.on_key(Some(2), true, 720, t),
+            Some(HotkeyEvent::Down(t, 0))
+        );
     }
 
     #[test]
@@ -1029,7 +1414,7 @@ mod tests {
         // The chord held: Win repeats are in the chord.
         d.on_key(CTRL, true, 1000, t);
         assert!(!d.repeat_in_chord(1)); // the press completing the chord isn't a repeat
-        assert_eq!(d.on_key(WIN, true, 1010, t), Some(HotkeyEvent::Down(t)));
+        assert_eq!(d.on_key(WIN, true, 1010, t), Some(HotkeyEvent::Down(t, 0)));
         assert!(d.repeat_in_chord(1));
         // Being released: Ctrl let go first, Win lingers and repeats.
         assert_eq!(d.on_key(CTRL, false, 2000, t), Some(HotkeyEvent::Up(t)));
@@ -1053,5 +1438,56 @@ mod tests {
         eprintln!("foreground app: {app:?}, {each:?} per call");
         assert!(app.as_deref() != Some(""));
         assert!(each < std::time::Duration::from_millis(5), "{each:?}");
+    }
+
+    #[test]
+    fn meeting_app_names() {
+        // Chrome captures the mic in a helper process, which has its own bundle ID.
+        assert_eq!(
+            meeting_app_name("com.google.Chrome.helper"),
+            Some("Google Chrome")
+        );
+        assert_eq!(meeting_app_name("com.google.Chrome"), Some("Google Chrome"));
+        // The new Teams client is `teams2`.
+        assert_eq!(
+            meeting_app_name("com.microsoft.teams2"),
+            Some("Microsoft Teams")
+        );
+        assert_eq!(meeting_app_name("us.zoom.xos"), Some("Zoom"));
+        assert_eq!(meeting_app_name("com.example"), None);
+        assert_eq!(meeting_app_name(""), None);
+    }
+
+    #[test]
+    fn mic_users_excludes_self() {
+        let me = std::process::id() as i32;
+        let users = mic_users();
+        assert!(users.iter().all(|u| u.pid != me), "{users:?}");
+        assert!(
+            users.iter().all(|u| u.pid > 0 && !u.app.is_empty()),
+            "{users:?}"
+        );
+    }
+
+    #[test]
+    fn system_audio_permission_does_not_panic() {
+        let p = system_audio_permission();
+        if cfg!(not(target_os = "macos")) {
+            assert_eq!(p, Some(true));
+        }
+    }
+
+    /// What this machine reports right now: `cargo test -p agt-platform -- --ignored
+    /// --nocapture print_meeting_state`.
+    #[test]
+    #[ignore = "prints this machine's state"]
+    fn print_meeting_state() {
+        // The first call also connects to the HAL; the second is what a poll costs.
+        for _ in 0..2 {
+            let t = Instant::now();
+            let users = mic_users();
+            println!("mic_users ({:?}): {users:#?}", t.elapsed());
+        }
+        println!("system_audio_permission: {:?}", system_audio_permission());
     }
 }
