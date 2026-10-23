@@ -73,7 +73,7 @@ removes it (there's always at least one).
 
 - Nearly any key can be a hotkey, on its own or in a combo of up to 4 keys held together, at
   most one of them not a modifier (Shift, Ctrl or Control, Alt or Option, Win or Command, and
-  Fn on a Mac). Esc can't be one, and on macOS neither can Caps Lock.
+  Fn on a Mac). Esc can't be one, and neither can Caps Lock on macOS or Pause on Windows.
 - A combo of only modifiers (**Left Ctrl + Left Win**) starts once all its keys are down, in
   any order, even with other modifiers held too. A combo with a regular key (**Left Control +
   Space**) starts only when exactly its modifiers are held, pressed before that key. Space on

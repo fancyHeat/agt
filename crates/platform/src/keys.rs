@@ -18,7 +18,7 @@ use crate::KeyKind::{self, Modifier, Swallowed};
 ///   for any other key it costs typing it (see [`crate::Hotkey::warning`]).
 ///
 /// Punctuation is named and labelled after the US layout's keys (its virtual-key codes).
-/// Deliberately absent: Esc ([`ESC_CODE`]).
+/// Deliberately absent: Esc ([`ESC_CODE`]) and Pause ([`PAUSE_CODE`]).
 #[cfg(not(target_os = "macos"))]
 pub const KEYS: &[(&str, &str, u16, KeyKind)] = &[
     ("RightCtrl", "Right Ctrl", 0xA3, Modifier),
@@ -131,7 +131,6 @@ pub const KEYS: &[(&str, &str, u16, KeyKind)] = &[
     ("KeypadDecimal", "Keypad .", 0x6E, Swallowed),
     ("KeypadDivide", "Keypad /", 0x6F, Swallowed),
     ("Insert", "Insert", 0x2D, Swallowed),
-    ("Pause", "Pause", 0x13, Swallowed),
     ("ScrollLock", "Scroll Lock", 0x91, Swallowed),
     // The context-menu key (`VK_APPS`).
     ("Menu", "Menu", 0x5D, Swallowed),
@@ -147,6 +146,11 @@ pub(crate) const CHORD_EXAMPLE: &str = "LeftCtrl+LeftWin";
 /// AGT already uses it to cancel a dictation and end a hands-free recording.
 #[cfg(not(target_os = "macos"))]
 pub(crate) const ESC_CODE: u16 = 0x1B;
+
+/// Pause's virtual-key code (`VK_PAUSE`). Not in [`KEYS`]: the key says nothing when it's let
+/// go, so Windows sends its press and release together, and a hold of it can't be timed.
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PAUSE_CODE: u16 = 0x13;
 
 /// The modifiers used all the time in shortcuts and typing (goes with [`KEYS`]): as a whole
 /// hotkey, AGT starts listening each time one is held. Right Alt is AltGr on most layouts
@@ -192,7 +196,6 @@ pub(crate) const NON_CHARACTER_KEYS: &[&str] = &[
     "UpArrow",
     "DownArrow",
     "Insert",
-    "Pause",
     "ScrollLock",
     "Menu",
 ];

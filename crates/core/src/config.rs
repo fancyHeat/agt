@@ -41,9 +41,9 @@ launch_at_login = true
 
 [hotkey]
 # Hold a hotkey to dictate, let go to paste. Nearly any key can be one (not Esc, nor Caps
-# Lock on macOS), by its name in one word: F13, A, Space, Slash, LeftShift, RightOption or
-# LeftCommand (macOS), RightCtrl, RightAlt or LeftWin (Windows)... Pressing a key that isn't a
-# modifier while holding a hotkey (e.g. Esc) cancels.
+# Lock on macOS or Pause on Windows), by its name in one word: F13, A, Space, Slash,
+# LeftShift, RightOption or LeftCommand (macOS), RightCtrl, RightAlt or LeftWin (Windows)...
+# Pressing a key that isn't a modifier while holding a hotkey (e.g. Esc) cancels.
 # Or a combo of up to 4 keys held together, at most one of them not a modifier, e.g.
 # "LeftCtrl+LeftWin" (the default on Windows) or "LeftControl+Space" (macOS). A combo of only
 # modifiers starts once all are down, in any order. With a key that isn't a modifier, it

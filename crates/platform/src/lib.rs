@@ -68,6 +68,8 @@ mod keys;
 #[cfg(target_os = "macos")]
 use keys::CAPS_LOCK_CODE;
 pub use keys::KEYS;
+#[cfg(not(target_os = "macos"))]
+use keys::PAUSE_CODE;
 use keys::{
     CHARACTER_MODIFIERS, CHORD_EXAMPLE, ESC_CODE, EVERYDAY_MODIFIERS, MENU_KEYS, START_KEYS,
     is_spare_f_key, key_names, types_character,
@@ -167,6 +169,10 @@ fn unusable_key(code: u16) -> &'static str {
     #[cfg(target_os = "macos")]
     if code == CAPS_LOCK_CODE {
         return "macOS doesn't say when Caps Lock is let go, so it can't be held as a hotkey.";
+    }
+    #[cfg(not(target_os = "macos"))]
+    if code == PAUSE_CODE {
+        return "Windows sends Pause's press and release together, so it can't be held as a hotkey.";
     }
     if code == ESC_CODE {
         "Esc cancels a recording, so it can't be a hotkey."
@@ -794,6 +800,15 @@ mod tests {
         assert_eq!(Key::parse("LeftAlt").unwrap().kind(), Masked);
         assert_eq!(Key::parse("LeftWin").unwrap().kind(), Masked);
         assert_eq!(Key::parse("CapsLock").unwrap().kind(), Swallowed);
+        assert!(Key::parse("Pause").is_err());
+        assert_eq!(
+            Hotkey::from_codes(&[0x13]).unwrap_err(),
+            "Windows sends Pause's press and release together, so it can't be held as a hotkey."
+        );
+        assert_eq!(
+            Hotkey::from_codes(&[0x1B]).unwrap_err(),
+            "Esc cancels a recording, so it can't be a hotkey."
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -949,6 +964,8 @@ mod tests {
             assert!(name.chars().all(|c| c.is_ascii_alphanumeric()), "{name:?}");
             assert!(!label.is_empty(), "{name}");
             assert_ne!(code, ESC_CODE, "{name}");
+            #[cfg(not(target_os = "macos"))]
+            assert_ne!(code, PAUSE_CODE, "{name}");
             for &(other, _, other_code, _) in &KEYS[..i] {
                 assert!(!other.eq_ignore_ascii_case(name), "{name} is listed twice");
                 assert_ne!(other_code, code, "{name} and {other} share a code");
@@ -1072,7 +1089,6 @@ mod tests {
             ("Keypad5", TAKEN),
             ("Enter", TAKEN),
             ("Insert", TAKEN),
-            ("Pause", TAKEN),
             ("ScrollLock", TAKEN),
             ("Menu", TAKEN),
             ("KeypadPlus", TAKEN),
