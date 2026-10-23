@@ -3650,8 +3650,11 @@ mod tests {
         assert_eq!((s.pending, s.failures, s.error.as_deref()), (0, 0, None));
     }
 
-    /// Says `text` and keeps the terms it was asked to favor, and how much.
-    struct Hears(&'static str, Arc<Mutex<Vec<(Vec<String>, f32)>>>);
+    /// The terms each call was asked to favor, and how much.
+    type Heard = Arc<Mutex<Vec<(Vec<String>, f32)>>>;
+
+    /// Says its text and keeps what each call asked of it.
+    struct Hears(&'static str, Heard);
 
     impl SttEngine for Hears {
         fn name(&self) -> String {

@@ -136,8 +136,9 @@ clicks. The settings window's **Updates** page turns the background checks on or
 ## Settings
 
 Tray menu → **Settings...** opens the settings window, in pages (General, Speech, Polish,
-History, Updates). Each page shows the settings most people need; **Show advanced settings**
-at the bottom adds the rest (timeouts, devices, prompts, log level and so on).
+Replacements, History, Updates). Each page shows the settings most people need; **Show
+advanced settings** at the bottom adds the rest (timeouts, devices, prompts, log level and so
+on).
 
 Settings live in a plain text file, `config.toml`, with a comment on every option:
 
@@ -185,7 +186,16 @@ profiles = ["code"]
   matches whole words and phrases, ignoring case; `to` is pasted exactly as you wrote it.
   Only use them for things that are never meant: a replacement of a real word applies
   everywhere (unless you limit it with `profiles`), so `from = "Maine"`, `to = "main"` means
-  you can't dictate the state of Maine any more.
+  you can't dictate the state of Maine any more. Meeting notes get the replacements and terms
+  that apply everywhere, not a profile's.
+
+**Settings... → Replacements** changes the replacements without opening the file: type the
+**Speech** (what you say, e.g. "Reddit True Tide") and the **Inserted text** (what AGT types
+instead, e.g. "retatrutide"), then click **Add replacement**. It's added to `dictionary.toml`
+for everywhere; a speech that's already there (capitals and spacing don't count) gets the new
+text instead. Your replacements are listed under it, each with its inserted text in a field
+(a profile's with the profile's name): change it there, or empty it to remove the
+replacement. Profiles and terms are only in the file.
 
 A new `dictionary.toml` has a commented-out `code` profile with the common editors, terminals
 and IDEs. If you already have the file, paste this in (and remove the apps you don't use):

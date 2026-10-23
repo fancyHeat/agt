@@ -1,17 +1,19 @@
 //! The settings window: `agt settings`, a process of its own, so it costs dictation nothing
-//! and is gone once closed. It changes `config.toml` the way the tray does; the running AGT
-//! notices the change (`watch_config`) and applies it once dictation is idle.
+//! and is gone once closed. It changes `config.toml` the way the tray does, and the
+//! Replacements page `dictionary.toml`; the running AGT notices a change (`watch_config`) and
+//! applies the config once dictation is idle, the dictionary right away.
 
 use super::{Action, metrics, schema};
 use agt_core::{
     Config, Dictionary,
     config::{self, SettingPath, SettingValue},
-    paths,
+    dictionary, paths,
 };
 use agt_platform::{Hotkey, Hotkeys};
 use agt_settings_ui::{Control, Event, Page, Row, Section};
 use std::{
     fs::{self, File, TryLockError},
+    io,
     path::PathBuf,
     time::SystemTime,
 };
@@ -96,6 +98,7 @@ pub fn run() {
 
     let model = Model {
         path: paths::config_file(),
+        dictionary_path: paths::dictionary_file(),
         actions: Vec::new(),
         stamp: None,
         dictionary_stamp: None,
@@ -103,6 +106,7 @@ pub fn run() {
         advanced: false,
         adding_hotkey: false,
         hotkeys: Vec::new(),
+        draft: schema::Draft::default(),
     };
     let icon = crate::tray::color_icon;
     if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page), Some(icon)) {
@@ -124,6 +128,7 @@ enum Act {
     /// Hotkey `index` of the list (`None`: the one being added): recorded keys replace it (or
     /// join the list), its minus button removes it.
     Hotkey(Option<usize>),
+    Replace(schema::ReplaceField),
     Metrics(metrics::Act),
     /// "Show advanced settings" / "Hide advanced settings".
     Advanced,
@@ -132,6 +137,8 @@ enum Act {
 
 struct Model {
     path: PathBuf,
+    /// `dictionary.toml` (the Replacements page writes it; "Edit dictionary..." opens it).
+    dictionary_path: PathBuf,
     /// By row id, for the pages last shown.
     actions: Vec<Act>,
     /// The file's modification time and size when last read or written, and
@@ -146,6 +153,8 @@ struct Model {
     adding_hotkey: bool,
     /// `[hotkey] key` as the pages last shown list it (what [`Act::Hotkey`]'s index means).
     hotkeys: Vec<String>,
+    /// The replacement being typed on the Replacements page, until "Add replacement".
+    draft: schema::Draft,
 }
 
 /// `[hotkey] key`.
@@ -178,7 +187,7 @@ impl Model {
 
     fn row(&mut self, mut item: schema::Item, enabled: bool) -> Row {
         if let schema::Kind::Button(Action::EditDictionary) = item.kind
-            && let Err(e) = Dictionary::load(&paths::dictionary_file())
+            && let Err(e) = Dictionary::load(&self.dictionary_path)
         {
             item.note = format!(
                 "{e}. Until it's fixed, AGT uses the last version that worked since it started (none if the error was there at start-up)."
@@ -234,6 +243,19 @@ impl Model {
                 },
                 Act::Hotkey(index),
             ),
+            schema::Kind::Replacement {
+                field,
+                value,
+                placeholder,
+            } => (
+                item.label,
+                Control::Text {
+                    value,
+                    placeholder,
+                    secret: false,
+                },
+                Act::Replace(field),
+            ),
         };
         self.actions.push(act);
         Row {
@@ -287,12 +309,95 @@ impl Model {
         self.stamp = self.stamp();
         result.map(drop).map_err(|e| e.to_string())
     }
+
+    /// The Replacements page's content, from `dictionary.toml` now.
+    fn replacing(&self) -> schema::Replacing {
+        let draft = self.draft.clone();
+        match Dictionary::load(&self.dictionary_path) {
+            Ok(d) => schema::Replacing {
+                list: d
+                    .replacements()
+                    .iter()
+                    .map(|r| {
+                        let profiles = d.profiles_of(r).into_iter().map(Into::into).collect();
+                        (r.from.clone(), r.to.clone(), profiles)
+                    })
+                    .collect(),
+                broken: false,
+                draft,
+            },
+            Err(_) => schema::Replacing {
+                broken: true,
+                draft,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Writes `dictionary.toml` as `change` makes it from the file now (from the template if
+    /// there's none yet). The running AGT reloads it.
+    fn change_dictionary(
+        &mut self,
+        change: impl FnOnce(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
+        let path = &self.dictionary_path;
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => dictionary::TEMPLATE.to_owned(),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let out = change(&text)?;
+        let saved = dictionary::save(path, &out)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()));
+        self.dictionary_stamp = stamp(path);
+        saved
+    }
+
+    fn add_replacement(&mut self) -> Result<(), String> {
+        let schema::Draft { from, to } = self.draft.clone();
+        if let Some(problem) = replacement_problem(&from, &to) {
+            return Err(problem.into());
+        }
+        self.change_dictionary(|text| {
+            dictionary::with_replacement(text, &from, &to).map_err(|e| e.to_string())
+        })?;
+        self.draft = schema::Draft::default();
+        Ok(())
+    }
+
+    /// The listed replacement of `from` now inserts `to`; empty: it's removed.
+    fn set_replacement(&mut self, from: &str, to: &str) -> Result<(), String> {
+        self.change_dictionary(|text| {
+            let d = Dictionary::parse(text).map_err(|e| e.to_string())?;
+            // Changed in the file since the page was shown: not this entry.
+            if !d.replacements().iter().any(|r| r.from == from) {
+                return Err("dictionary.toml changed; try again.".into());
+            }
+            match to {
+                "" => dictionary::without_replacement(text, from),
+                to => dictionary::with_replacement(text, from, to),
+            }
+            .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Why the speech and inserted text typed on the Replacements page can't be added, if they
+/// can't.
+fn replacement_problem(from: &str, to: &str) -> Option<&'static str> {
+    if !from.chars().any(char::is_alphanumeric) {
+        Some("Type the speech first: the words you say.")
+    } else if to.is_empty() {
+        Some("Type the inserted text: what AGT types when it hears the speech.")
+    } else {
+        None
+    }
 }
 
 impl agt_settings_ui::Model for Model {
     fn pages(&mut self) -> Vec<Page> {
         self.stamp = self.stamp();
-        self.dictionary_stamp = stamp(&paths::dictionary_file());
+        self.dictionary_stamp = stamp(&self.dictionary_path);
         self.actions.clear();
         // Not `load_or_create`: a file deleted while the window is open isn't brought back
         // with defaults (which AGT would then apply).
@@ -329,7 +434,8 @@ impl agt_settings_ui::Model for Model {
             }
         };
         self.hotkeys = config.hotkey.keys.clone();
-        let pages = schema::pages(&config, self.advanced, self.adding_hotkey);
+        let replacing = self.replacing();
+        let pages = schema::pages(&config, self.advanced, self.adding_hotkey, &replacing);
         // The buttons' ids come first, so they're the same either way: the focus (by id)
         // stays on the button that was clicked.
         let buttons: Vec<Section> = pages.iter().map(|_| self.advanced_section()).collect();
@@ -374,6 +480,15 @@ impl agt_settings_ui::Model for Model {
                 let text = if *multiline { &text } else { text.trim() };
                 vec![(*path, text.into())]
             }
+            (Some(Act::Replace(field)), Event::Text(_, text)) => {
+                let text = text.trim().to_owned();
+                match field.clone() {
+                    schema::ReplaceField::NewFrom => self.draft.from = text,
+                    schema::ReplaceField::NewTo => self.draft.to = text,
+                    schema::ReplaceField::To(from) => return self.set_replacement(&from, &text),
+                }
+                return Ok(());
+            }
             (Some(Act::Metrics(metrics::Act::Period)), Event::Choose(_, i)) => {
                 self.metrics.set_period(i);
                 return Ok(());
@@ -386,14 +501,15 @@ impl agt_settings_ui::Model for Model {
                 match action {
                     Action::EditFile => crate::open_in_editor(&self.path),
                     Action::EditDictionary => {
-                        let path = paths::dictionary_file();
-                        Dictionary::create_if_missing(&path)
+                        let path = &self.dictionary_path;
+                        Dictionary::create_if_missing(path)
                             .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-                        crate::open_in_editor(&path);
+                        crate::open_in_editor(path);
                     }
                     Action::OpenHistory => crate::open_history(),
                     // The window asks for the pages again after this.
                     Action::AddHotkey => self.adding_hotkey = true,
+                    Action::AddReplacement => return self.add_replacement(),
                 }
                 return Ok(());
             }
@@ -447,7 +563,7 @@ impl agt_settings_ui::Model for Model {
 
     fn changed_elsewhere(&mut self) -> bool {
         let file =
-            self.stamp() != self.stamp || stamp(&paths::dictionary_file()) != self.dictionary_stamp;
+            self.stamp() != self.stamp || stamp(&self.dictionary_path) != self.dictionary_stamp;
         // Always asked: it keeps the figures current.
         let figures = self.metrics.refresh();
         file || figures
@@ -490,13 +606,11 @@ pub(crate) mod tests {
         (hotkeys, add)
     }
 
-    /// Run by the settings schema's only test that builds pages (see there).
-    pub(crate) fn hotkeys_are_set_by_pressing_them() {
-        let dir = std::env::temp_dir().join(format!("agt-settings-hotkeys-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        let mut model = Model {
-            path: path.clone(),
+    /// A window on `dir`'s config.toml, dictionary.toml and agt.db.
+    fn test_model(dir: &std::path::Path) -> Model {
+        Model {
+            path: dir.join("config.toml"),
+            dictionary_path: dir.join("dictionary.toml"),
             actions: Vec::new(),
             stamp: None,
             dictionary_stamp: None,
@@ -504,7 +618,16 @@ pub(crate) mod tests {
             advanced: false,
             adding_hotkey: false,
             hotkeys: Vec::new(),
-        };
+            draft: schema::Draft::default(),
+        }
+    }
+
+    /// Run by the settings schema's only test that builds pages (see there).
+    pub(crate) fn hotkeys_are_set_by_pressing_them() {
+        let dir = std::env::temp_dir().join(format!("agt-settings-hotkeys-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut model = test_model(&dir);
         let code = |name| agt_platform::Key::parse(name).unwrap().code();
         let file = || fs::read_to_string(&path).unwrap();
         let start = |text: &str| fs::write(&path, format!("[hotkey]\n{text}\n")).unwrap();
@@ -631,6 +754,142 @@ pub(crate) mod tests {
             Err("At least one hotkey is needed.".into())
         );
         assert!(file().contains(&keys("key = \"F14\"")), "{}", file());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The Replacements page's rows: (id, label, value) of each text field, and the "Add
+    /// replacement" button's id.
+    fn replacement_rows(model: &mut Model) -> (Vec<(usize, String, String)>, usize) {
+        let pages = model.pages();
+        let page = pages
+            .iter()
+            .find(|p| p.title == "Replacements")
+            .expect("a Replacements page");
+        let rows: Vec<&Row> = page.sections.iter().flat_map(|s| &s.rows).collect();
+        let fields = rows
+            .iter()
+            .filter_map(|r| match &r.control {
+                Control::Text { value, .. } => Some((r.id, r.label.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        let add = rows
+            .iter()
+            .find(|r| r.control == Control::Button("Add replacement".into()))
+            .expect("an \"Add replacement\" button")
+            .id;
+        (fields, add)
+    }
+
+    /// Run by the settings schema's only test that builds pages (see there).
+    pub(crate) fn replacements_are_set_on_their_page() {
+        let dir = std::env::temp_dir().join(format!("agt-settings-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), "").unwrap();
+        let mut model = test_model(&dir);
+        let dictionary = dir.join("dictionary.toml");
+        let file = || fs::read_to_string(&dictionary).unwrap();
+        let labels = |fields: &[(usize, String, String)]| {
+            fields
+                .iter()
+                .map(|(_, label, value)| (label.clone(), value.clone()))
+                .collect::<Vec<_>>()
+        };
+        let s = String::from;
+
+        // No file yet: the two fields of a new one, nothing listed.
+        let (fields, add) = replacement_rows(&mut model);
+        assert_eq!(
+            labels(&fields),
+            [(s("Speech"), s("")), (s("Inserted text"), s(""))]
+        );
+        // Both are needed; nothing is written without them.
+        assert_eq!(
+            model.handle(Event::Click(add)),
+            Err("Type the speech first: the words you say.".into())
+        );
+        model
+            .handle(Event::Text(fields[0].0, " Reddit True Tide ".into()))
+            .unwrap();
+        assert_eq!(
+            model.handle(Event::Click(add)),
+            Err("Type the inserted text: what AGT types when it hears the speech.".into())
+        );
+        assert!(!dictionary.exists());
+
+        // Added: the file is made from the template, the fields empty again, and it's listed.
+        model
+            .handle(Event::Text(fields[1].0, "retatrutide".into()))
+            .unwrap();
+        assert_eq!(model.handle(Event::Click(add)), Ok(()));
+        assert!(
+            file().starts_with(dictionary::TEMPLATE.trim_end()),
+            "{}",
+            file()
+        );
+        let d = Dictionary::parse(&file()).unwrap();
+        assert_eq!(d.replace("a reddit true tide b").0, "a retatrutide b");
+        let (fields, add) = replacement_rows(&mut model);
+        assert_eq!(
+            labels(&fields),
+            [
+                (s("Speech"), s("")),
+                (s("Inserted text"), s("")),
+                (s("Reddit True Tide"), s("retatrutide")),
+            ]
+        );
+
+        // The same speech again (case and spacing don't count) changes that one.
+        model
+            .handle(Event::Text(fields[0].0, "reddit  true tide".into()))
+            .unwrap();
+        model
+            .handle(Event::Text(fields[1].0, "Retatrutide".into()))
+            .unwrap();
+        assert_eq!(model.handle(Event::Click(add)), Ok(()));
+        let (fields, _) = replacement_rows(&mut model);
+        assert_eq!(
+            labels(&fields)[2..],
+            [(s("Reddit True Tide"), s("Retatrutide"))]
+        );
+
+        // Changed in its field; emptied, it's removed.
+        assert_eq!(
+            model.handle(Event::Text(fields[2].0, "retatrutide ".into())),
+            Ok(())
+        );
+        assert!(file().contains("to = \"retatrutide\"\n"), "{}", file());
+        assert_eq!(model.handle(Event::Text(fields[2].0, "".into())), Ok(()));
+        assert_eq!(Dictionary::parse(&file()).unwrap().replacements(), []);
+        assert_eq!(replacement_rows(&mut model).0.len(), 2);
+
+        // A profile's replacement says so; one removed from the file since the page was
+        // shown isn't brought back.
+        fs::write(
+            &dictionary,
+            "[profiles.code]\napps = [\"Code.exe\"]\n\n\
+             [[replace]]\nfrom = \"dot env\"\nto = \".env\"\nprofiles = [\"code\"]\n",
+        )
+        .unwrap();
+        let (fields, _) = replacement_rows(&mut model);
+        assert_eq!(labels(&fields)[2..], [(s("dot env (in code)"), s(".env"))]);
+        fs::write(&dictionary, "").unwrap();
+        assert_eq!(
+            model.handle(Event::Text(fields[2].0, ".envrc".into())),
+            Err("dictionary.toml changed; try again.".into())
+        );
+        assert_eq!(file(), "");
+
+        // A file with an error: listed as such, and left as it is.
+        fs::write(&dictionary, "terms = [").unwrap();
+        let (fields, add) = replacement_rows(&mut model);
+        assert_eq!(fields.len(), 2);
+        model.handle(Event::Text(fields[0].0, "a".into())).unwrap();
+        model.handle(Event::Text(fields[1].0, "b".into())).unwrap();
+        assert!(model.handle(Event::Click(add)).is_err());
+        assert_eq!(file(), "terms = [");
 
         let _ = fs::remove_dir_all(&dir);
     }

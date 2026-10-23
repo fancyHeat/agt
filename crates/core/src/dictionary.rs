@@ -66,7 +66,7 @@
 //! Rules are compiled at load into lowercased pieces indexed by their first character, so
 //! applying them is one scan of the text, and no allocation at all when nothing matches.
 
-use crate::config::{line_column, located, redact_values};
+use crate::config::{line_column, located, redact_values, write_whole};
 use serde::Deserialize;
 use std::{
     borrow::Cow,
@@ -502,6 +502,17 @@ impl Dictionary {
         &self.replacements
     }
 
+    /// The names of the profiles `replacement` (one of [`Self::replacements`]) is limited to;
+    /// none: it applies everywhere.
+    pub fn profiles_of(&self, replacement: &Replacement) -> Vec<&str> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| replacement.profiles & 1 << i != 0)
+            .map(|(_, p)| p.name.as_str())
+            .collect()
+    }
+
     /// `text` with every replacement that applies everywhere (no `profiles`) applied: what
     /// an app in no profile gets ([`Scope::replace`]).
     pub fn replace<'a>(&self, text: &'a str) -> (Cow<'a, str>, usize) {
@@ -630,6 +641,104 @@ impl Scope {
     pub fn replace<'a>(&self, text: &'a str) -> (Cow<'a, str>, usize) {
         self.dictionary.replace_in(text, self.profiles)
     }
+}
+
+// Changing the file (the settings window's Replacements page). The file stays the user's:
+// comments, order and the other entries are kept as written.
+
+/// `text` (a `dictionary.toml`) replacing `from` with `to`: the `[[replace]]` whose `from` is
+/// the same (case and spacing don't count, as for duplicates) gets `to`, keeping its
+/// `profiles`; otherwise one that applies everywhere is added at the end of the file. Fails,
+/// with nothing changed, if `text` has an error or the result would have one (a blank `from`
+/// or `to`).
+pub fn with_replacement(text: &str, from: &str, to: &str) -> Result<String, DictionaryError> {
+    let (from, to) = (from.trim(), to.trim());
+    edit(text, |doc| {
+        let list = replace_tables(doc)?;
+        if let Some(t) = list.iter_mut().find(|t| same_from(t, from)) {
+            t["to"] = toml_edit::value(to);
+            return Ok(());
+        }
+        let mut table = toml_edit::Table::new();
+        table["from"] = toml_edit::value(from);
+        table["to"] = toml_edit::value(to);
+        list.push(table);
+        // Comments at the end of the file (the template's explain the format) would
+        // otherwise come after the new table.
+        let trailing = doc.trailing().as_str().unwrap_or_default().to_owned();
+        if !trailing.trim().is_empty() {
+            let list = replace_tables(doc)?;
+            let last = list.len() - 1;
+            let table = list.get_mut(last).expect("just pushed");
+            table
+                .decor_mut()
+                .set_prefix(format!("{}\n\n", trailing.trim_end()));
+            doc.set_trailing("");
+        }
+        Ok(())
+    })
+}
+
+/// `text` without the `[[replace]]` whose `from` is the same as `from` (see
+/// [`with_replacement`]); unchanged if there's none.
+pub fn without_replacement(text: &str, from: &str) -> Result<String, DictionaryError> {
+    let from = from.trim();
+    edit(text, |doc| {
+        let list = replace_tables(doc)?;
+        list.retain(|t| !same_from(t, from));
+        if list.is_empty() {
+            doc.remove("replace");
+        }
+        Ok(())
+    })
+}
+
+/// Writes `text` to `path` in one step (a new file, renamed over it): the running AGT reloads
+/// it once, whole.
+pub fn save(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    write_whole(path, text)
+}
+
+/// `text` changed by `change`, if both it and the result are valid dictionaries.
+fn edit(
+    text: &str,
+    change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), DictionaryError>,
+) -> Result<String, DictionaryError> {
+    Dictionary::parse(text)?;
+    let mut doc: toml_edit::DocumentMut =
+        text.parse()
+            .map_err(|e: toml_edit::TomlError| DictionaryError::Parse {
+                message: redact(e.message()),
+                at: line_column(e.span(), text),
+            })?;
+    change(&mut doc)?;
+    let out = doc.to_string();
+    Dictionary::parse(&out)?;
+    Ok(out)
+}
+
+/// The file's `[[replace]]` tables (none yet: an empty list).
+fn replace_tables(
+    doc: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables, DictionaryError> {
+    doc.entry("replace")
+        .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
+        .as_array_of_tables_mut()
+        .ok_or_else(|| DictionaryError::Parse {
+            message: "`replace` isn't written as [[replace]] tables, so it can only be changed in the file".into(),
+            at: None,
+        })
+}
+
+/// `table`'s `from` is `from`, as duplicates are told apart.
+fn same_from(table: &toml_edit::Table, from: &str) -> bool {
+    table
+        .get("from")
+        .and_then(|f| f.as_str())
+        .is_some_and(|f| compile(f.trim()) == compile(from))
 }
 
 #[cfg(test)]
@@ -967,5 +1076,72 @@ to = "AGT"
         fs::write(&path, "terms = 1").unwrap();
         assert!(Dictionary::load(&path).is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacements_are_added_changed_and_removed_in_the_file() {
+        // Added to the template: after its comments, which stay.
+        let text = with_replacement(TEMPLATE, " Reddit True Tide ", "retatrutide").unwrap();
+        assert!(text.starts_with(TEMPLATE.trim_end()), "{text}");
+        assert!(
+            text.contains("# profiles = [\"code\"]\n\n[[replace]]"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n[[replace]]\nfrom = \"Reddit True Tide\"\nto = \"retatrutide\"\n"),
+            "{text}"
+        );
+        let d = dict(&text);
+        assert_eq!(
+            apply(&d, "Take Reddit true tide daily."),
+            ("Take retatrutide daily.".into(), 1)
+        );
+
+        // The same `from` (case and spacing don't count) changes that entry, profiles kept.
+        let text = "[profiles.code]\napps = [\"Code.exe\"]\n\n\
+                    # Mine.\n[[replace]]\nfrom = \"dot env\"\nto = \"env\"\nprofiles = [\"code\"]\n";
+        let changed = with_replacement(text, "Dot  Env", ".env").unwrap();
+        assert_eq!(changed, text.replace("to = \"env\"", "to = \".env\""));
+        let d = dict(&changed);
+        assert_eq!(d.profiles_of(&d.replacements()[0]), ["code"]);
+
+        // A second one comes after it; removing leaves the rest as written.
+        let two = with_replacement(&changed, "my email", "me@example.com").unwrap();
+        assert_eq!(dict(&two).replacements().len(), 2);
+        assert_eq!(
+            dict(&two).profiles_of(&dict(&two).replacements()[1]),
+            [] as [&str; 0]
+        );
+        assert_eq!(without_replacement(&two, "MY EMAIL").unwrap(), changed);
+        // The last one gone: no `replace` left. None to remove: unchanged.
+        let none = without_replacement(&changed, "dot env").unwrap();
+        assert_eq!(none, "[profiles.code]\napps = [\"Code.exe\"]\n");
+        assert_eq!(without_replacement(&none, "dot env").unwrap(), none);
+    }
+
+    #[test]
+    fn replacements_are_not_written_into_a_broken_file() {
+        // The file's error, or the result's: nothing to write either way.
+        assert!(with_replacement("terms = [", "a", "b").is_err());
+        assert!(without_replacement("[[replace]]\nfrom = \"a\"\n", "a").is_err());
+        assert!(with_replacement("", "a", " ").is_err());
+        assert!(with_replacement("", " ", "b").is_err());
+        // Written some other way than [[replace]] tables: left to the file.
+        let inline = "replace = [{ from = \"a\", to = \"b\" }]\n";
+        assert!(dict(inline).replacements().len() == 1);
+        assert!(with_replacement(inline, "c", "d").is_err());
+    }
+
+    #[test]
+    fn saved_files_are_whole() {
+        let dir = std::env::temp_dir().join(format!("agt-dictionary-save-{}", std::process::id()));
+        let path = dir.join("sub").join("dictionary.toml");
+        save(&path, "terms = [\"AGT\"]\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "terms = [\"AGT\"]\n");
+        save(&path, "terms = []\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "terms = []\n");
+        let left: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
+        assert_eq!(left.len(), 1, "no temporary file left");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

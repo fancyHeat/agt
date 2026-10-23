@@ -55,6 +55,43 @@ pub enum Kind {
         removable: bool,
         listening: bool,
     },
+    /// A field of the Replacements page: what's typed goes into `dictionary.toml` by way of
+    /// the window ([`super::window`]), not into `config.toml`.
+    Replacement {
+        field: ReplaceField,
+        value: String,
+        placeholder: String,
+    },
+}
+
+/// Which field of the Replacements page.
+#[derive(Clone)]
+pub enum ReplaceField {
+    /// The new replacement's speech (`from`) or inserted text (`to`): kept by the window until
+    /// "Add replacement".
+    NewFrom,
+    NewTo,
+    /// The inserted text of the listed replacement with this `from` (as written).
+    To(String),
+}
+
+/// The replacement being added, as typed so far (it isn't in the file until it's added).
+#[derive(Clone, Default)]
+pub struct Draft {
+    pub from: String,
+    pub to: String,
+}
+
+/// What the Replacements page shows: `dictionary.toml`'s replacements and the one being
+/// added.
+#[derive(Default)]
+pub struct Replacing {
+    /// Each `[[replace]]`, in file order: its `from`, its `to` and the profiles it's limited
+    /// to (none: everywhere).
+    pub list: Vec<(String, String, Vec<String>)>,
+    /// The file has an error: its replacements can't be listed or changed here.
+    pub broken: bool,
+    pub draft: Draft,
 }
 
 pub struct Text {
@@ -135,14 +172,15 @@ fn section(title: &'static str, items: Vec<Item>) -> Section {
 }
 
 /// The settings, with `c`'s values: the basic ones, or all of them with `advanced`;
-/// `adding_hotkey`: with a hotkey row that listens for a new one ("+ Add hotkey" clicked).
-/// Always the same pages (they're the macOS toolbar's items), sections without an item to
-/// show left out.
-pub fn pages(c: &Config, advanced: bool, adding_hotkey: bool) -> Vec<Page> {
+/// `adding_hotkey`: with a hotkey row that listens for a new one ("+ Add hotkey" clicked);
+/// and the dictionary's replacements. Always the same pages (they're the macOS toolbar's
+/// items), sections without an item to show left out.
+pub fn pages(c: &Config, advanced: bool, adding_hotkey: bool, replacing: &Replacing) -> Vec<Page> {
     let mut pages = vec![
         general(c, adding_hotkey),
         speech(c),
         polish(c),
+        replacements(replacing),
         history(c),
         updates(c),
     ];
@@ -657,6 +695,70 @@ fn polish(c: &Config) -> Page {
     }
 }
 
+/// The dictionary's `[[replace]]` entries, without editing the file: add one (it applies
+/// everywhere), change one's inserted text, or empty it to remove the entry.
+fn replacements(r: &Replacing) -> Page {
+    let field = |label: &str, field: ReplaceField, value: &str, placeholder: &str| {
+        Item::new(
+            label,
+            Kind::Replacement {
+                field,
+                value: value.into(),
+                placeholder: placeholder.into(),
+            },
+        )
+    };
+    let new = vec![
+        field(
+            "Speech",
+            ReplaceField::NewFrom,
+            &r.draft.from,
+            "Reddit True Tide",
+        ),
+        field(
+            "Inserted text",
+            ReplaceField::NewTo,
+            &r.draft.to,
+            "retatrutide",
+        )
+        .note(
+            "When AGT hears the speech, it types the inserted text instead. Capitals don't \
+             matter, and only whole words match.",
+        ),
+        Item::new("Add replacement", Kind::Button(Action::AddReplacement)),
+    ];
+    let mut list: Vec<Item> = r
+        .list
+        .iter()
+        .map(|(from, to, profiles)| {
+            let label = match profiles.as_slice() {
+                [] => from.clone(),
+                names => format!("{from} (in {})", names.join(", ")),
+            };
+            field(&label, ReplaceField::To(from.clone()), to, "")
+        })
+        .collect();
+    if r.broken {
+        list.push(Item::new(
+            "",
+            Kind::Info("dictionary.toml has an error: see Edit dictionary... below.".into()),
+        ));
+    } else if let Some(last) = list.last_mut() {
+        last.note = "Change the inserted text here; empty it to remove the replacement.".into();
+    } else {
+        list.push(Item::new("", Kind::Info("None yet.".into())));
+    }
+    Page {
+        title: "Replacements",
+        symbol: "character.book.closed",
+        sections: vec![
+            section("New replacement", new),
+            section("Your replacements", list),
+            section("", vec![edit_dictionary()]),
+        ],
+    }
+}
+
 fn history(c: &Config) -> Page {
     let items = vec![
         Item::check(
@@ -972,11 +1074,12 @@ mod tests {
         basic_pages_hide_advanced_settings();
         hotkey_rows();
         super::super::window::tests::hotkeys_are_set_by_pressing_them();
+        super::super::window::tests::replacements_are_set_on_their_page();
     }
 
     fn hotkey_rows() {
         let c = Config::parse("[hotkey]\nkey = [\"F13\", \"F14\"]\n").unwrap();
-        let general = &super::pages(&c, false, true)[0];
+        let general = &super::pages(&c, false, true, &Replacing::default())[0];
         let kinds: Vec<_> = general.sections[0].items.iter().map(|i| &i.kind).collect();
         // F13 (removable), F14 (removable), the row being added (listening), then "+ Add hotkey".
         assert!(matches!(
@@ -999,7 +1102,7 @@ mod tests {
         assert!(matches!(kinds[3], Kind::Button(Action::AddHotkey)));
         let one = Config::parse("[hotkey]\nkey = \"F13\"\n").unwrap();
         assert!(matches!(
-            super::pages(&one, false, false)[0].sections[0].items[0].kind,
+            super::pages(&one, false, false, &Replacing::default())[0].sections[0].items[0].kind,
             Kind::Hotkey {
                 removable: false,
                 ..
@@ -1014,7 +1117,7 @@ mod tests {
         let types = "This types a character, so AGT takes it over in every app while AGT runs.";
         let shown = |text: &str, adding: bool| {
             let c = Config::parse(text).unwrap();
-            let general = super::pages(&c, false, adding).swap_remove(0);
+            let general = super::pages(&c, false, adding, &Replacing::default()).swap_remove(0);
             let items = general.sections.into_iter().next().unwrap().items;
             items
                 .into_iter()
@@ -1065,7 +1168,7 @@ mod tests {
             )
             .unwrap();
             let c = Config::parse(&text).unwrap();
-            for page in super::pages(&c, true, false) {
+            for page in super::pages(&c, true, false, &Replacing::default()) {
                 for item in page.sections.iter().flat_map(|s| &s.items) {
                     let changes: Vec<_> = match &item.kind {
                         Kind::Check { path, on, .. } => vec![vec![(*path, (!on).into())]],
@@ -1073,7 +1176,10 @@ mod tests {
                             choices.iter().map(|c| c.changes.clone()).collect()
                         }
                         Kind::Text(t) => vec![vec![(t.path, "x".into())]],
-                        Kind::Info(_) | Kind::Button(_) | Kind::Hotkey { .. } => Vec::new(),
+                        Kind::Info(_)
+                        | Kind::Button(_)
+                        | Kind::Hotkey { .. }
+                        | Kind::Replacement { .. } => Vec::new(),
                     };
                     for change in changes {
                         config::with_settings(&text, &change)
@@ -1088,8 +1194,8 @@ mod tests {
         // The same pages either way (the macOS toolbar's items), each with something basic.
         let c = Config::default();
         let (basic, all) = (
-            super::pages(&c, false, false),
-            super::pages(&c, true, false),
+            super::pages(&c, false, false, &Replacing::default()),
+            super::pages(&c, true, false, &Replacing::default()),
         );
         let titles = |p: &[Page]| p.iter().map(|p| p.title).collect::<Vec<_>>();
         assert_eq!(titles(&basic), titles(&all));

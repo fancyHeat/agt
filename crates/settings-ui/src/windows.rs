@@ -1115,6 +1115,7 @@ fn glyph(symbol: &str) -> Option<char> {
         // Sparkles are only in Fluent Icons; a pen otherwise.
         "wand.and.stars" if FLUENT.get() => '\u{F4A5}',
         "wand.and.stars" => '\u{E70F}',
+        "character.book.closed" => '\u{E82D}',
         "clock.arrow.circlepath" => '\u{E81C}',
         "arrow.down.circle" => '\u{E896}',
         "chart.bar.xaxis" => '\u{E9D2}',

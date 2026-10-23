@@ -1142,10 +1142,17 @@ pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Confi
         Err(e) => return Err(ConfigError::Io(e)),
     };
     let out = with_settings(&text, changes)?;
+    write_whole(path, &out).map_err(ConfigError::Io)?;
+    Config::parse(&out)
+}
+
+/// Writes `text` over `path` (a symlink's target) in one step: a temporary file next to it,
+/// renamed over it, so AGT never reads half a file. Keeps the file's permissions.
+pub(crate) fn write_whole(path: &Path, text: &str) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     // Per process: the tray and the settings window may both be writing.
     let tmp = target.with_extension(format!("toml.{}.tmp", std::process::id()));
-    let written = fs::write(&tmp, &out).and_then(|()| {
+    let written = fs::write(&tmp, text).and_then(|()| {
         // Keep the file's permissions (e.g. 0600 for a file holding an API key).
         if let Ok(m) = fs::metadata(&target) {
             fs::set_permissions(&tmp, m.permissions())?;
@@ -1155,8 +1162,7 @@ pub fn set(path: &Path, changes: &[(SettingPath, SettingValue)]) -> Result<Confi
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    written.map_err(ConfigError::Io)?;
-    Config::parse(&out)
+    written
 }
 
 /// `fs::rename`, retried briefly: on Windows it fails while another process (a virus scanner,
