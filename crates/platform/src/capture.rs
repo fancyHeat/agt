@@ -33,8 +33,10 @@ impl CaptureHandle {
 
 /// Starts recording a key press on a dedicated thread, ahead of every other app's view of the
 /// keyboard: macOS an active event tap at the HID level, which comes before AGT's own (at the
-/// session level); Windows a low-level keyboard hook, which runs before those installed
-/// earlier (AGT's). While the handle lives, a key pressed reaches neither apps nor AGT's
+/// session level), or if it can't have one there, at the head of the session level; Windows a
+/// low-level keyboard hook, which runs before those installed earlier (AGT's). A session-level
+/// tap or a hook is made afresh twice a second, so it's soon ahead again of a restarted AGT's
+/// (saving a hotkey restarts AGT). While the handle lives, a key pressed reaches neither apps nor AGT's
 /// listener, so it neither starts a dictation nor acts in the window behind. A key already
 /// down when recording started (the Enter that clicked "Add hotkey") isn't recorded, and its
 /// auto-repeat and release reach apps as usual.

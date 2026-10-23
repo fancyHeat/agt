@@ -51,9 +51,9 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
-            GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
-            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP,
-            WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+            GetWindowThreadProcessId, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KillTimer, MSG,
+            PostThreadMessageW, SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+            WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WM_TIMER,
         },
     },
 };
@@ -242,10 +242,11 @@ pub fn prepare_focus_check() {}
 
 pub fn key_down(key: Key) -> Option<bool> {
     let down = vk_down(key.code);
-    // A swallowed key (F13-F24) updates the system's key state only when the hook didn't
-    // swallow its press (dropped, or too slow for that event). So "up" says nothing, but
-    // "down" is a press the hook missed. (The hook lets that press's release through, so it
-    // doesn't stay "down".)
+    // A key of the swallowed kind (F13-F24, a letter, Space...) updates the system's key state
+    // only when its press reached the system: the hook didn't swallow it (dropped, or too slow
+    // for that event), or it didn't count (a combo's key pressed without exactly the combo's
+    // modifiers). So "up" says nothing, but "down" is a press that got past the hook. (The hook
+    // lets that press's release through, so it doesn't stay "down".)
     (down || !key.swallowed()).then_some(down)
 }
 
@@ -405,8 +406,24 @@ impl Drop for CaptureHandle {
     }
 }
 
+/// How often the key recorder's hook is installed afresh (see [`capture_keys`]).
+const CAPTURE_RENEW_MS: u32 = 500;
+
+fn install_capture_hook() -> HHOOK {
+    unsafe {
+        SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(capture_proc),
+            GetModuleHandleW(null()),
+            0,
+        )
+    }
+}
+
 /// Windows side of [`crate::capture_keys`]: a low-level keyboard hook of its own. Windows
-/// calls the newest one first, so it runs before AGT's (installed when AGT started).
+/// calls the newest one first, so it runs before AGT's (installed when AGT started). AGT
+/// installs its hook anew when it restarts (as it does after a hotkey is saved), so the
+/// recorder's is installed afresh every [`CAPTURE_RENEW_MS`] to be the newest again.
 pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
     let (tx, rx) = mpsc::sync_channel(1);
     let keys_up = Arc::new(AtomicBool::new(true));
@@ -423,14 +440,7 @@ pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Er
                     keys_up: thread_keys_up,
                 })
             });
-            let hook = unsafe {
-                SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(capture_proc),
-                    GetModuleHandleW(null()),
-                    0,
-                )
-            };
+            let mut hook = install_capture_hook();
             if hook.is_null() {
                 let _ = tx.send(Err(format!(
                     "SetWindowsHookExW failed (error {})",
@@ -438,17 +448,39 @@ pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Er
                 )));
                 return;
             }
+            // A timer of this thread's (no window): its WM_TIMER comes to the loop below.
+            let renew = unsafe { SetTimer(null_mut(), 0, CAPTURE_RENEW_MS, None) };
             let _ = tx.send(Ok(unsafe { GetCurrentThreadId() }));
             // The hook runs on this thread, inside GetMessageW. Until the handle is dropped
             // (WM_QUIT).
+            let mut renew_failed = false;
             let mut msg: MSG = unsafe { std::mem::zeroed() };
             while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
+                if msg.message == WM_TIMER && msg.hwnd.is_null() {
+                    // The new hook first, then the old one goes: no key gets past both. The
+                    // recording (`CAPTURE`) goes on as it was.
+                    let new = install_capture_hook();
+                    if !new.is_null() {
+                        unsafe { UnhookWindowsHookEx(hook) };
+                        hook = new;
+                    } else if !renew_failed {
+                        tracing::warn!(
+                            "cannot install the key recorder's hook afresh (error {}); keeping the old one",
+                            unsafe { GetLastError() }
+                        );
+                        renew_failed = true;
+                    }
+                    continue;
+                }
                 unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
-            unsafe { UnhookWindowsHookEx(hook) };
+            unsafe {
+                KillTimer(null_mut(), renew);
+                UnhookWindowsHookEx(hook);
+            }
             CAPTURE.with(|c| *c.borrow_mut() = None);
         })?;
     let thread_id = rx.recv().map_err(|_| "key recorder thread died")??;

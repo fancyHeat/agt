@@ -13,7 +13,7 @@
 
 use crate::{
     Capture, Error, Hotkey, HotkeyEvent, Hotkeys, Key, LoginItem, Permission, capture::KeyCapture,
-    hotkeys::Detector,
+    hotkeys::Detector, keys::CAPS_LOCK_CODE,
 };
 use block2::RcBlock;
 use objc2::{
@@ -412,6 +412,9 @@ pub fn key_down(key: Key) -> Option<bool> {
 /// How long the key recorder's run loop runs at a time, in seconds: the longest its thread
 /// can miss that the handle was dropped (stopping a run loop that isn't running does nothing).
 const CAPTURE_WAKE: f64 = 0.2;
+/// How often the key recorder's tap is made afresh when it's at the session level (see
+/// [`run_capture_thread`]).
+const CAPTURE_RENEW: Duration = Duration::from_millis(500);
 
 struct CaptureState {
     capture: KeyCapture,
@@ -453,7 +456,8 @@ impl Drop for CaptureHandle {
 }
 
 /// macOS side of [`crate::capture_keys`]: an active tap at the HID level, ahead of AGT's own
-/// tap (at the session level) and of every app.
+/// tap (at the session level) and of every app; or at the head of the session level, made
+/// afresh to stay there (see [`run_capture_thread`]).
 pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
     if !post_access() {
         let name = accessibility_name();
@@ -489,48 +493,106 @@ fn run_capture_thread(shared: Arc<CaptureShared>, ready: mpsc::SyncSender<Result
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
     };
-    let mask = (1u64 << CGEventType::KeyDown.0)
-        | (1u64 << CGEventType::KeyUp.0)
-        | (1u64 << CGEventType::FlagsChanged.0);
-    let tap = unsafe {
-        CGEvent::tap_create(
-            CGEventTapLocation::HIDEventTap,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            mask,
-            Some(capture_callback),
-            Arc::as_ptr(&shared) as *mut c_void,
-        )
-    };
-    let Some(tap) = tap else {
-        let _ = ready.send(Err("cannot create the key recorder's event tap".into()));
-        return;
-    };
-    let (Some(source), Some(run_loop)) = (
-        CFMachPort::new_run_loop_source(None, Some(&tap), 0),
-        CFRunLoop::current(),
-    ) else {
-        CFMachPort::invalidate(&tap);
+    let Some(run_loop) = CFRunLoop::current() else {
         let _ = ready.send(Err("cannot run the key recorder's event tap".into()));
         return;
     };
-    run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
-    CGEvent::tap_enable(&tap, true);
+    // At the HID level the tap comes before every session-level one (AGT's), whenever that was
+    // made. Apple documents HID-level taps as needing more than Accessibility, so failing that:
+    // at the head of the session level, which a tap put there later runs before (AGT's, made
+    // anew when it restarts after a hotkey is saved). Made afresh every [`CAPTURE_RENEW`], it's
+    // soon first again.
+    let (mut tap, hid) = match capture_tap(&shared, &run_loop, CGEventTapLocation::HIDEventTap) {
+        Some(tap) => (tap, true),
+        None => match capture_tap(&shared, &run_loop, CGEventTapLocation::SessionEventTap) {
+            Some(tap) => (tap, false),
+            None => {
+                let _ = ready.send(Err("cannot create the key recorder's event tap".into()));
+                return;
+            }
+        },
+    };
+    tracing::info!(
+        "key recorder: {}",
+        if hid {
+            "event tap at the HID level"
+        } else {
+            "event tap at the session level (none at the HID level), made afresh every 0.5 s"
+        }
+    );
     {
         let mut st = shared.state.lock().unwrap();
         st.tap = Some(Cf(tap.clone()));
-        st.run_loop = Some(Cf(run_loop));
+        st.run_loop = Some(Cf(run_loop.clone()));
     }
     let _ = ready.send(Ok(()));
     // Until the handle is dropped. Its `stop()` ends a wait at once; the timeout catches a stop
     // that came before the run loop was running (stopping an idle loop does nothing).
+    let mut made = Instant::now();
+    let mut renew_failed = false;
     while !shared.stop.load(Ordering::SeqCst) {
-        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, CAPTURE_WAKE, false);
+        let wait = if hid {
+            CAPTURE_WAKE
+        } else {
+            CAPTURE_RENEW
+                .saturating_sub(made.elapsed())
+                .as_secs_f64()
+                .min(CAPTURE_WAKE)
+        };
+        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, wait, false);
+        if hid || made.elapsed() < CAPTURE_RENEW || shared.stop.load(Ordering::SeqCst) {
+            continue;
+        }
+        made = Instant::now();
+        // The new tap first, then the old one goes: no key gets past both.
+        match capture_tap(&shared, &run_loop, CGEventTapLocation::SessionEventTap) {
+            Some(new) => {
+                shared.state.lock().unwrap().tap = Some(Cf(new.clone()));
+                let old = std::mem::replace(&mut tap, new);
+                CFMachPort::invalidate(&old);
+            }
+            None if !renew_failed => {
+                tracing::warn!(
+                    "key recorder: cannot make its event tap afresh; keeping the old one"
+                );
+                renew_failed = true;
+            }
+            None => {}
+        }
     }
     CFMachPort::invalidate(&tap);
     let mut st = shared.state.lock().unwrap();
     st.tap = None;
     st.run_loop = None;
+}
+
+/// A key recorder's active tap at `location`, at the head of the taps there, running on
+/// `run_loop` (this thread's).
+fn capture_tap(
+    shared: &Arc<CaptureShared>,
+    run_loop: &CFRunLoop,
+    location: CGEventTapLocation,
+) -> Option<CFRetained<CFMachPort>> {
+    let mask = (1u64 << CGEventType::KeyDown.0)
+        | (1u64 << CGEventType::KeyUp.0)
+        | (1u64 << CGEventType::FlagsChanged.0);
+    let tap = unsafe {
+        CGEvent::tap_create(
+            location,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            mask,
+            Some(capture_callback),
+            Arc::as_ptr(shared) as *mut c_void,
+        )
+    }?;
+    let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
+        CFMachPort::invalidate(&tap);
+        return None;
+    };
+    run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+    CGEvent::tap_enable(&tap, true);
+    Some(tap)
 }
 
 unsafe extern "C-unwind" fn capture_callback(
@@ -582,10 +644,13 @@ unsafe extern "C-unwind" fn capture_callback(
         }
         // Caps Lock: macOS reports it switching on or off, not being let go. Taken as a press
         // and its release, so the window can say why it can't be a hotkey.
-        CGEventType::FlagsChanged => {
+        CGEventType::FlagsChanged if code == CAPS_LOCK_CODE => {
             key(true, false);
             key(false, false)
         }
+        // Any other key that changes the flags but isn't in KEYS: kept from apps, not recorded
+        // (a hold can't use it either).
+        CGEventType::FlagsChanged => true,
         _ => return pass,
     };
     if keep {
