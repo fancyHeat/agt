@@ -583,6 +583,34 @@ pub(crate) mod tests {
             file()
         );
 
+        // Recording a row with its own keys again changes nothing (it isn't checked against
+        // itself).
+        start("key = [\"F13\", \"F14\"]");
+        let (rows, _) = shown(&mut model);
+        let same = Some(vec![code("F13")]);
+        assert_eq!(model.handle(Event::Hotkey(rows[0].0, same)), Ok(()));
+        assert!(
+            file().contains(&keys("key = [\"F13\", \"F14\"]")),
+            "{}",
+            file()
+        );
+        let (rows, _) = shown(&mut model);
+        let labels: Vec<_> = rows.iter().map(|r| (r.1.as_str(), r.2, r.3)).collect();
+        assert_eq!(labels, [("F13", false, true), ("F14", false, true)]);
+
+        // The modifiers are saved first, whatever order they went down in.
+        let space_then_shift = Some(vec![code("Space"), code("LeftShift")]);
+        assert_eq!(
+            model.handle(Event::Hotkey(rows[1].0, space_then_shift)),
+            Ok(())
+        );
+        assert!(
+            file().contains(&keys("key = [\"F13\", \"LeftShift+Space\"]")),
+            "{}",
+            file()
+        );
+        assert_eq!(shown(&mut model).0[1].1, "Left Shift + Space");
+
         // The minus removes a hotkey; the last one stays.
         start("key = [\"F13\", \"F14\"]");
         let (rows, _) = shown(&mut model);

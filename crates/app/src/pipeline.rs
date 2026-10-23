@@ -496,7 +496,7 @@ pub fn start(
     };
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     let ducker = Ducker::start(paths::ducked_volume_file());
-    let hotkeys = Hotkeys::parse(&config.hotkey.keys)?;
+    let hotkeys = Hotkeys::parse(&config.hotkey.keys).map_err(|e| format!("[hotkey] key: {e}"))?;
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);
 
@@ -803,9 +803,10 @@ fn is_double_tap(last_tap: Option<Instant>, now: Instant, gap: Duration) -> bool
 /// [`AudioThread::missed_press`]), if any: the first in the list whose keys all read down
 /// now (`key_down`; `None`, can't tell, never counts) and none of them at the previous poll
 /// (`was_up`). A hotkey held since before that poll isn't a new press (a shortcut that
-/// cancelled the press ending a hands-free recording leaves it held). One with a key that
+/// cancelled the press ending a hands-free recording leaves it held). A combo with a key that
 /// isn't a modifier also needs no other modifier down, as the hook does: Ctrl+Option+Space
-/// is a shortcut, not Left Control + Space (a modifier that can't be read doesn't count).
+/// is a shortcut, not Left Control + Space (a modifier that can't be read doesn't count). Such
+/// a key alone is a hotkey whatever else is held, as in the hook.
 /// Sets `was_up` for the next poll: no key read down (a key that can't be read counts as
 /// up: Windows can't read one its hook swallows while it's up).
 fn missed_press_of(
@@ -826,7 +827,7 @@ fn missed_press_of(
                 .filter_map(|&(.., code, _)| Key::from_code(code))
                 .any(|k| k.is_modifier() && !keys.contains(&k) && key_down(k) == Some(true))
         };
-        let combo = keys.iter().any(|k| !k.is_modifier());
+        let combo = keys.len() > 1 && keys.iter().any(|k| !k.is_modifier());
         if pressed.is_none()
             && *up
             && down.iter().all(|&d| d == Some(true))
@@ -3146,6 +3147,11 @@ mod tests {
         let mut was_up = [true];
         let with_other = down_keys(&["LeftShift", "RightShift"]);
         assert_eq!(missed_press_of(&hk, &mut was_up, with_other), Some(0));
+        // So does a key that isn't a modifier on its own: the hook takes it with any held.
+        let hk = Hotkeys::parse(&["F14".into()]).unwrap();
+        let mut was_up = [true];
+        let with_shift = down_keys(&["F14", "LeftShift"]);
+        assert_eq!(missed_press_of(&hk, &mut was_up, with_shift), Some(0));
     }
 
     /// A fake key-state source: held for the first `n` polls.
