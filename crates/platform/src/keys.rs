@@ -124,6 +124,19 @@ pub const KEYS: &[(&str, &str, u16, KeyKind)] = &[
     ("Keypad7", "Keypad 7", 0x67, Swallowed),
     ("Keypad8", "Keypad 8", 0x68, Swallowed),
     ("Keypad9", "Keypad 9", 0x69, Swallowed),
+    ("KeypadMultiply", "Keypad *", 0x6A, Swallowed),
+    ("KeypadPlus", "Keypad +", 0x6B, Swallowed),
+    ("KeypadSeparator", "Keypad Separator", 0x6C, Swallowed),
+    ("KeypadMinus", "Keypad -", 0x6D, Swallowed),
+    ("KeypadDecimal", "Keypad .", 0x6E, Swallowed),
+    ("KeypadDivide", "Keypad /", 0x6F, Swallowed),
+    ("Insert", "Insert", 0x2D, Swallowed),
+    ("Pause", "Pause", 0x13, Swallowed),
+    ("ScrollLock", "Scroll Lock", 0x91, Swallowed),
+    // The context-menu key (`VK_APPS`).
+    ("Menu", "Menu", 0x5D, Swallowed),
+    // The key ISO keyboards have between Left Shift and Z (`VK_OEM_102`).
+    ("IsoKey", "ISO key", 0xE2, Swallowed),
 ];
 
 /// An example chord for error messages (goes with [`KEYS`]).
@@ -136,16 +149,30 @@ pub(crate) const CHORD_EXAMPLE: &str = "LeftCtrl+LeftWin";
 pub(crate) const ESC_CODE: u16 = 0x1B;
 
 /// The modifiers used all the time in shortcuts and typing (goes with [`KEYS`]): as a whole
-/// hotkey, AGT starts listening each time one is held.
+/// hotkey, AGT starts listening each time one is held. Right Alt is AltGr on most layouts
+/// outside the US, which types characters.
 #[cfg(not(target_os = "macos"))]
 pub(crate) const EVERYDAY_MODIFIERS: &[&str] = &[
     "LeftCtrl",
     "LeftShift",
     "RightShift",
     "LeftAlt",
+    "RightAlt",
     "LeftWin",
     "RightWin",
 ];
+
+/// The modifiers that change which character a key types (Shift, and AltGr where Right Alt is
+/// that) rather than making it a shortcut (goes with [`KEYS`]).
+#[cfg(not(target_os = "macos"))]
+pub(crate) const CHARACTER_MODIFIERS: &[&str] = &["LeftShift", "RightShift", "RightAlt"];
+
+/// The keys whose tap opens the Start menu, and those whose tap opens the focused app's menu
+/// (goes with [`KEYS`]): as a whole hotkey, AGT stops that (see [`KeyKind::Masked`]).
+#[cfg(not(target_os = "macos"))]
+pub(crate) const START_KEYS: &[&str] = &["LeftWin", "RightWin"];
+#[cfg(not(target_os = "macos"))]
+pub(crate) const MENU_KEYS: &[&str] = &["LeftAlt", "RightAlt"];
 
 /// Every key a hotkey can use on macOS: its name in the config file (case-insensitive, one
 /// word), its label in plain words (what the settings window shows), its macOS virtual key
@@ -266,6 +293,18 @@ pub const KEYS: &[(&str, &str, u16, KeyKind)] = &[
     ("Keypad7", "Keypad 7", 0x59, Swallowed),
     ("Keypad8", "Keypad 8", 0x5B, Swallowed),
     ("Keypad9", "Keypad 9", 0x5C, Swallowed),
+    ("KeypadDecimal", "Keypad .", 0x41, Swallowed),
+    ("KeypadMultiply", "Keypad *", 0x43, Swallowed),
+    ("KeypadPlus", "Keypad +", 0x45, Swallowed),
+    ("KeypadClear", "Keypad Clear", 0x47, Swallowed),
+    ("KeypadDivide", "Keypad /", 0x4B, Swallowed),
+    ("KeypadEnter", "Keypad Enter", 0x4C, Swallowed),
+    ("KeypadMinus", "Keypad -", 0x4E, Swallowed),
+    ("KeypadEquals", "Keypad =", 0x51, Swallowed),
+    // Insert on a PC keyboard.
+    ("Help", "Help", 0x72, Swallowed),
+    // The key ISO keyboards have left of 1 (`kVK_ISO_Section`).
+    ("Section", "§", 0x0A, Swallowed),
 ];
 
 #[cfg(target_os = "macos")]
@@ -292,6 +331,18 @@ pub(crate) const EVERYDAY_MODIFIERS: &[&str] = &[
     "LeftShift",
     "RightShift",
 ];
+
+/// The modifiers that change which character a key types (Shift and Option) rather than making
+/// it a shortcut (goes with [`KEYS`]).
+#[cfg(target_os = "macos")]
+pub(crate) const CHARACTER_MODIFIERS: &[&str] =
+    &["LeftShift", "RightShift", "LeftOption", "RightOption"];
+
+/// No key's tap opens a menu on macOS (Windows: Win and Alt).
+#[cfg(target_os = "macos")]
+pub(crate) const START_KEYS: &[&str] = &[];
+#[cfg(target_os = "macos")]
+pub(crate) const MENU_KEYS: &[&str] = &[];
 
 /// Whether the key named `name` is one of F13-F24: on no keyboard's typing keys (typically
 /// mapped to spare mouse or keyboard buttons), so a hotkey can take it over for free.

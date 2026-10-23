@@ -68,7 +68,10 @@ mod keys;
 #[cfg(target_os = "macos")]
 use keys::CAPS_LOCK_CODE;
 pub use keys::KEYS;
-use keys::{CHORD_EXAMPLE, ESC_CODE, EVERYDAY_MODIFIERS, is_spare_f_key, key_names};
+use keys::{
+    CHARACTER_MODIFIERS, CHORD_EXAMPLE, ESC_CODE, EVERYDAY_MODIFIERS, MENU_KEYS, START_KEYS,
+    is_spare_f_key, key_names,
+};
 
 /// A single key, by name. See [`KEYS`]. Each configured hotkey is a [`Hotkey`]: one key or a
 /// chord of several.
@@ -209,12 +212,17 @@ impl Hotkey {
     /// The hotkey made of the keys with platform key codes `codes` (as the key recorder saw
     /// them go down, in that order). A chord has 1 to [`MAX_CHORD`] distinct keys, at most one
     /// of which isn't a modifier; Esc and keys missing from [`KEYS`] can't be in one. Errors
-    /// are plain sentences for the settings window.
+    /// are plain sentences for the settings window. The modifiers come first, in the order they
+    /// went down, then the key that isn't one: Space then Left Control is "Left Control +
+    /// Space".
     pub fn from_codes(codes: &[u16]) -> Result<Self, String> {
-        let keys = codes
+        let (mut keys, others): (Vec<_>, Vec<_>) = codes
             .iter()
             .map(|&code| Key::from_code(code).ok_or_else(|| unusable_key(code).to_owned()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .partition(Key::is_modifier);
+        keys.extend(others);
         Self::from_keys(keys)
     }
 
@@ -254,21 +262,45 @@ impl Hotkey {
             .join(" + ")
     }
 
-    /// What the settings window says under this hotkey, if it costs something: a lone key that
-    /// isn't a modifier is kept from apps whenever AGT runs (F13-F24 aside: nothing types
-    /// them), and a lone modifier used in everyday shortcuts and typing starts AGT listening
-    /// every time it's held. Chords cost nothing: their modifiers say they're not typing.
+    /// What the settings window says under this hotkey, if it costs something (one text, the
+    /// most specific):
+    ///
+    /// - A key that isn't a modifier is kept from apps (F13-F24 cost nothing: nothing types
+    ///   them): alone, always; in a combo, whenever the combo is held. In a combo that takes
+    ///   over a character when its modifiers only pick which one a key types (Shift, Option,
+    ///   AltGr), and an app's shortcut otherwise.
+    /// - Alone, a Windows Win or Alt key no longer opens its menu when tapped (AGT masks the
+    ///   tap), and a modifier used in everyday shortcuts and typing starts AGT listening every
+    ///   time it's held.
+    /// - A combo of only modifiers costs nothing: they say they're not typing.
     pub fn warning(&self) -> Option<&'static str> {
-        let [key] = self.keys.as_slice() else {
-            return None;
+        let Some(key) = self.keys.iter().find(|k| !k.is_modifier()) else {
+            let [key] = self.keys.as_slice() else {
+                return None;
+            };
+            return if START_KEYS.contains(&key.name) {
+                Some("A tap of this key no longer opens Start while AGT runs.")
+            } else if MENU_KEYS.contains(&key.name) {
+                Some("A tap of this key no longer opens an app's menu while AGT runs.")
+            } else {
+                EVERYDAY_MODIFIERS.contains(&key.name).then_some(
+                    "You use this key in shortcuts and typing. AGT starts listening each time you hold it.",
+                )
+            };
         };
-        if !key.is_modifier() {
-            (!is_spare_f_key(key.name))
-                .then_some("AGT takes this key over: it won't type in other apps while AGT runs.")
+        if is_spare_f_key(key.name) {
+            None
+        } else if self.keys.len() == 1 {
+            Some("AGT takes this key over: it won't type in other apps while AGT runs.")
+        } else if self
+            .keys
+            .iter()
+            .filter(|k| k.is_modifier())
+            .all(|k| CHARACTER_MODIFIERS.contains(&k.name))
+        {
+            Some("This types a character, so AGT takes it over in every app while AGT runs.")
         } else {
-            EVERYDAY_MODIFIERS.contains(&key.name).then_some(
-                "You use this key in shortcuts and typing. AGT starts listening each time you hold it.",
-            )
+            Some("Apps won't see this shortcut while AGT runs.")
         }
     }
 
@@ -791,27 +823,74 @@ mod tests {
         assert!(err("Hyper").contains("LeftShift"), "lists valid names");
     }
 
+    const TAKEN: Option<&str> =
+        Some("AGT takes this key over: it won't type in other apps while AGT runs.");
+    const EVERYDAY: Option<&str> = Some(
+        "You use this key in shortcuts and typing. AGT starts listening each time you hold it.",
+    );
+    const TYPES: Option<&str> =
+        Some("This types a character, so AGT takes it over in every app while AGT runs.");
+    const SHORTCUT: Option<&str> = Some("Apps won't see this shortcut while AGT runs.");
+
     #[test]
     fn labels_and_warnings() {
         let lone = Hotkey::parse("Space").unwrap();
         assert_eq!(lone.label(), "Space");
-        assert_eq!(
-            lone.warning(),
-            Some("AGT takes this key over: it won't type in other apps while AGT runs.")
-        );
+        assert_eq!(lone.warning(), TAKEN);
         assert_eq!(Hotkey::parse("F13").unwrap().warning(), None);
+        // Names both platforms have.
+        let k = |s| Hotkey::parse(s).unwrap();
+        for (name, warning) in [
+            ("LeftShift+A", TYPES),
+            ("A+LeftShift", TYPES),
+            ("LeftShift+RightShift+Space", TYPES),
+            ("LeftShift+F5", TYPES),
+            ("LeftShift+F13", None),
+            ("LeftShift+RightShift", None),
+            ("LeftShift", EVERYDAY),
+            ("RightShift", EVERYDAY),
+        ] {
+            assert_eq!(k(name).warning(), warning, "{name}");
+        }
         #[cfg(target_os = "macos")]
         {
             let combo = Hotkey::parse("LeftControl+Space").unwrap();
             assert_eq!(combo.label(), "Left Control + Space");
-            assert_eq!(combo.warning(), None);
-            assert_eq!(Hotkey::parse("Fn").unwrap().warning(), None);
-            assert_eq!(
-                Hotkey::parse("LeftCommand").unwrap().warning(),
-                Some(
-                    "You use this key in shortcuts and typing. AGT starts listening each time you hold it."
-                )
-            );
+            for (name, warning) in [
+                ("LeftControl+Space", SHORTCUT),
+                ("RightCommand+F5", SHORTCUT),
+                ("Fn+A", SHORTCUT),
+                ("LeftShift+LeftControl+A", SHORTCUT),
+                ("RightOption+E", TYPES),
+                ("LeftOption+LeftShift+2", TYPES),
+                ("RightCommand+F20", None),
+                ("LeftControl+LeftOption", None),
+                ("Fn", None),
+                ("RightOption", None),
+                ("RightCommand", None),
+                ("LeftCommand", EVERYDAY),
+                ("LeftOption", EVERYDAY),
+                ("LeftControl", EVERYDAY),
+                ("RightControl", EVERYDAY),
+                ("Help", TAKEN),
+                ("KeypadEnter", TAKEN),
+                ("Section", TAKEN),
+            ] {
+                assert_eq!(k(name).warning(), warning, "{name}");
+            }
+        }
+    }
+
+    /// Every key the warnings name is in [`KEYS`], as a modifier.
+    #[test]
+    fn warning_lists_name_modifiers() {
+        for name in EVERYDAY_MODIFIERS
+            .iter()
+            .chain(CHARACTER_MODIFIERS)
+            .chain(START_KEYS)
+            .chain(MENU_KEYS)
+        {
+            assert!(Key::parse(name).unwrap().is_modifier(), "{name}");
         }
     }
 
@@ -885,10 +964,14 @@ mod tests {
     #[test]
     fn hotkeys_from_pressed_codes() {
         let code = |name| Key::parse(name).unwrap().code();
-        // Press order is kept (not the table's).
+        // The modifiers first, in press order (not the table's), then the other key.
         let hk = Hotkey::from_codes(&[code("A"), code("LeftShift")]).unwrap();
-        assert_eq!(hk.to_string(), "A+LeftShift");
-        assert_eq!(hk.label(), "A + Left Shift");
+        assert_eq!(hk.to_string(), "LeftShift+A");
+        assert_eq!(hk.label(), "Left Shift + A");
+        let hk = Hotkey::from_codes(&[code("RightShift"), code("Space"), code("LeftShift")]);
+        assert_eq!(hk.unwrap().to_string(), "RightShift+LeftShift+Space");
+        let hk = Hotkey::from_codes(&[code("LeftShift"), code("RightShift")]).unwrap();
+        assert_eq!(hk.to_string(), "LeftShift+RightShift");
         // The window shows these as they are (no "invalid hotkey" prefix).
         assert_eq!(
             Hotkey::from_codes(&[code("A"), code("Space")]).unwrap_err(),
@@ -920,31 +1003,41 @@ mod tests {
     fn windows_labels_and_warnings() {
         let k = |s| Hotkey::parse(s).unwrap();
         assert_eq!(k("LeftCtrl+LeftWin").label(), "Left Ctrl + Left Win");
-        let everyday = Some(
-            "You use this key in shortcuts and typing. AGT starts listening each time you hold it.",
-        );
-        for name in [
-            "LeftCtrl",
-            "LeftShift",
-            "RightShift",
-            "LeftAlt",
-            "LeftWin",
-            "RightWin",
+        let start = Some("A tap of this key no longer opens Start while AGT runs.");
+        let menu = Some("A tap of this key no longer opens an app's menu while AGT runs.");
+        for (name, warning) in [
+            ("LeftCtrl", EVERYDAY),
+            ("LeftShift", EVERYDAY),
+            ("RightShift", EVERYDAY),
+            // Everyday modifiers too, but a tap of one opening a menu is more to the point.
+            ("LeftWin", start),
+            ("RightWin", start),
+            ("LeftAlt", menu),
+            ("RightAlt", menu),
+            ("RightCtrl", None),
+            ("F24", None),
+            ("LeftCtrl+LeftWin", None),
+            ("RightAlt+LeftShift", None),
+            ("RightCtrl+F13", None),
+            ("RightCtrl+A", SHORTCUT),
+            ("LeftWin+Space", SHORTCUT),
+            ("LeftAlt+F4", SHORTCUT),
+            ("LeftCtrl+LeftShift+A", SHORTCUT),
+            ("RightAlt+Q", TYPES),
+            ("RightAlt+LeftShift+2", TYPES),
+            ("RightShift+Keypad5", TYPES),
+            ("CapsLock", TAKEN),
+            ("F12", TAKEN),
+            ("Keypad5", TAKEN),
+            ("Enter", TAKEN),
+            ("Insert", TAKEN),
+            ("Pause", TAKEN),
+            ("ScrollLock", TAKEN),
+            ("Menu", TAKEN),
+            ("KeypadPlus", TAKEN),
+            ("IsoKey", TAKEN),
         ] {
-            assert_eq!(k(name).warning(), everyday, "{name}");
-        }
-        for name in [
-            "RightCtrl",
-            "RightAlt",
-            "F24",
-            "LeftCtrl+LeftWin",
-            "RightCtrl+A",
-        ] {
-            assert_eq!(k(name).warning(), None, "{name}");
-        }
-        let taken = Some("AGT takes this key over: it won't type in other apps while AGT runs.");
-        for name in ["CapsLock", "F12", "Keypad5", "Enter"] {
-            assert_eq!(k(name).warning(), taken, "{name}");
+            assert_eq!(k(name).warning(), warning, "{name}");
         }
         assert!(!k("LeftAlt").keys()[0].swallowed());
     }

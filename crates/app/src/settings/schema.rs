@@ -1011,6 +1011,7 @@ mod tests {
         let note = "Hold any of them to dictate, let go to paste. Click one and press a key \
                     or combo to change it.";
         let taken = "AGT takes this key over: it won't type in other apps while AGT runs.";
+        let types = "This types a character, so AGT takes it over in every app while AGT runs.";
         let shown = |text: &str, adding: bool| {
             let c = Config::parse(text).unwrap();
             let general = super::pages(&c, false, adding).swap_remove(0);
@@ -1038,7 +1039,7 @@ mod tests {
                     s("Some(0) Space true"),
                     format!("{note}\n{taken}")
                 ),
-                (s(""), s("Some(1) Left Shift + A true"), s("")),
+                (s(""), s("Some(1) Left Shift + A true"), s(types)),
                 (s(""), s("None  false"), s("")),
                 (s("+ Add hotkey"), s("add"), s("")),
             ]

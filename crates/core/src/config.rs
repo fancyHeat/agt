@@ -54,10 +54,12 @@ launch_at_login = true
 # contain another (LeftShift and LeftShift+Space). In the Settings window you set them by
 # pressing the keys.
 # Alone, a key that isn't a modifier is taken over: it won't type in other apps while AGT runs
-# (F13-F24 cost nothing: they're usually spare mouse or keyboard buttons). Alone, a modifier
-# you use in shortcuts and typing (either Shift; macOS: either Control, LeftOption,
-# LeftCommand; Windows: LeftCtrl, LeftAlt, either Win) starts AGT listening each time you
-# hold it.
+# (F13-F24 cost nothing: they're usually spare mouse or keyboard buttons). A combo with one is
+# taken over in every app too: with only Shift or Option (Windows: RightAlt, AltGr on many
+# layouts) it types a character, with other modifiers it's a shortcut apps won't see.
+# Alone, a modifier you use in shortcuts and typing (either Shift; macOS: either Control,
+# LeftOption, LeftCommand; Windows: LeftCtrl, either Alt, either Win) starts AGT listening
+# each time you hold it, and a tap of Win or Alt alone no longer opens Start or an app's menu.
 # macOS: Fn is the Globe key (the default; as a hotkey on its own, tapping it no longer also
 # opens the emoji picker).
 # With a key in a hotkey that pasting would let go of (macOS: LeftCommand or V; Windows:

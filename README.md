@@ -81,17 +81,23 @@ removes it (there's always at least one).
 - One hotkey can't contain another (**Left Shift** and **Left Shift + Space**): holding the
   longer one would start the shorter one first. Sharing keys is fine (**Left Shift + A** and
   **Left Shift + B**).
-- Two kinds of hotkey cost you something, and the settings window says so under them:
+- Some hotkeys cost you something, and the settings window says so under them:
   - A regular key on its own (A, Space, F5) is taken over: it won't type in other apps while
     AGT runs. F13 to F24 cost nothing, as nothing types them (they're usually spare mouse or
     keyboard buttons).
+  - A combo with a regular key (F13 to F24 aside) is taken over in every app while AGT runs.
+    With only Shift or Option (Windows: Right Alt, which is AltGr on many keyboard layouts)
+    it types a character, so that character is gone (**Left Shift + A**); with any other
+    modifier it's a shortcut your apps won't see (**Left Control + Space**).
   - A modifier you use in shortcuts and typing, on its own (either Shift; macOS: either
-    Control, Left Option or Left Command; Windows: Left Ctrl, Left Alt or either Win), starts
+    Control, Left Option or Left Command; Windows: Left Ctrl, either Alt or either Win), starts
     AGT listening each time you hold it.
+  - Windows: Win or Alt on its own no longer opens the Start menu or an app's menu when you
+    tap it.
 
-In `config.toml` they're `key` under `[hotkey]`: one (`key = "Fn"`) or a list
-(`key = ["Fn", "LeftControl+Space"]`), each key named in one word, with `+` between the keys
-of a combo.
+In `config.toml` they're `key` under `[hotkey]`: one (`key = "Fn"`) or a list (macOS:
+`key = ["Fn", "LeftControl+Space"]`; Windows: `key = ["LeftCtrl+LeftWin", "RightCtrl"]`), each
+key named in one word, with `+` between the keys of a combo.
 
 ## macOS
 

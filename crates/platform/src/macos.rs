@@ -99,7 +99,8 @@ fn down_flag(code: u16) -> CGEventFlags {
 }
 
 /// Whether macOS sets Fn's flag on every key event of `code`, Fn held or not: it does for the
-/// F-keys and the navigation keys (arrows, Home, End, Page Up, Page Down, Forward Delete).
+/// F-keys and the navigation keys (arrows, Home, End, Page Up, Page Down, Forward Delete,
+/// Help).
 fn fn_flag_always(code: u16) -> bool {
     Key::from_code(code).is_some_and(|k| {
         k.name
@@ -116,6 +117,7 @@ fn fn_flag_always(code: u16) -> bool {
                     | "PageUp"
                     | "PageDown"
                     | "ForwardDelete"
+                    | "Help"
             )
     })
 }
@@ -1464,6 +1466,7 @@ mod tests {
             "PageUp",
             "PageDown",
             "ForwardDelete",
+            "Help",
         ] {
             assert_eq!(modifier_down_in(none, key(n).code, key("Fn")), None, "{n}");
             assert_eq!(
@@ -1472,7 +1475,17 @@ mod tests {
                 "{n}"
             );
         }
-        for n in ["A", "F", "Space", "Return", "Backspace", "Keypad5", "Slash"] {
+        for n in [
+            "A",
+            "F",
+            "Space",
+            "Return",
+            "Backspace",
+            "Keypad5",
+            "KeypadEnter",
+            "Slash",
+            "Section",
+        ] {
             assert!(!fn_flag_always(key(n).code), "{n}");
         }
     }
