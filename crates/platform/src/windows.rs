@@ -442,25 +442,44 @@ pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Er
 }
 
 unsafe extern "system" fn capture_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let mut keep = false;
     if code == HC_ACTION as i32 {
         let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
         if kb.dwExtraInfo != INJECTED_MARK {
-            // AltGr's fake Left Ctrl and the generic Shift, Ctrl and Alt codes aren't keys of
-            // their own (see `classify`): kept from apps like the rest, but not recorded.
-            if let Some(key) = classify(kb.vkCode, kb.scanCode) {
-                let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-                CAPTURE.with(|c| {
-                    if let Ok(mut c) = c.try_borrow_mut()
-                        && let Some(s) = c.as_mut()
-                        && let Some(capture) = s.capture.on_key(key, down)
-                    {
-                        (s.on)(capture);
-                    }
-                });
-            }
-            // Apps and AGT's own hook never see it.
-            return 1;
+            let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            // The hook runs before the key state updates, and a press it keeps leaves the key
+            // up: a key the system has down went down before the capture (or got past the
+            // hook).
+            keep = match classify(kb.vkCode, kb.scanCode) {
+                Some(key) => {
+                    let was_down = vk_down(key);
+                    let keep = CAPTURE.with(|c| {
+                        let Ok(mut c) = c.try_borrow_mut() else {
+                            return true;
+                        };
+                        let Some(s) = c.as_mut() else {
+                            return true;
+                        };
+                        let (capture, keep) = s.capture.on_key(key, down, down && was_down);
+                        if let Some(capture) = capture {
+                            (s.on)(capture);
+                        }
+                        keep
+                    });
+                    // A release whose press got past the hook passes too, or the system would
+                    // take the key as still down.
+                    keep && (down || !was_down)
+                }
+                // AltGr's fake Left Ctrl and the generic Shift, Ctrl and Alt codes aren't keys
+                // of their own (see `classify`): not recorded, and kept unless the system has
+                // the key down already.
+                None => !vk_down(kb.vkCode as u16),
+            };
         }
+    }
+    if keep {
+        // Apps and AGT's own hook never see it.
+        return 1;
     }
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }

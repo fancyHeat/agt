@@ -26,8 +26,10 @@ pub struct CaptureHandle(imp::CaptureHandle);
 /// Starts recording a key press on a dedicated thread, ahead of every other app's view of the
 /// keyboard: macOS an active event tap at the HID level, which comes before AGT's own (at the
 /// session level); Windows a low-level keyboard hook, which runs before those installed
-/// earlier (AGT's). While the handle lives, no key event reaches apps or AGT's listener, so
-/// a press neither starts a dictation nor acts in the window behind.
+/// earlier (AGT's). While the handle lives, a key pressed reaches neither apps nor AGT's
+/// listener, so it neither starts a dictation nor acts in the window behind. A key already
+/// down when recording started (the Enter that clicked "Add hotkey") isn't recorded, and its
+/// auto-repeat and release reach apps as usual.
 ///
 /// `on` runs on that thread for each change ([`Capture`]) and must return quickly (every
 /// keystroke on the system waits for it); it must not drop the handle. Nothing is reported
@@ -40,14 +42,21 @@ pub fn capture_keys(on: impl Fn(Capture) + Send + 'static) -> Result<CaptureHand
     imp::capture_keys(Box::new(on)).map(CaptureHandle)
 }
 
-/// The press being recorded, from the key events the tap or hook sees: auto-repeat (a press
-/// of a key already down) and the release of a key that went down before recording started
-/// are ignored. Platform-independent so it can be unit-tested.
+/// The press being recorded, from the key events the tap or hook sees, and which of them to keep
+/// from apps (and from AGT's own listener). Platform-independent so it can be unit-tested.
+///
+/// - A key pressed during the capture is kept, its auto-repeat and release too. It's recorded
+///   until [`Capture::Done`] or [`Capture::Cancelled`]; after either, keys are still kept but
+///   nothing is reported.
+/// - A key that was already down when the capture started (the Enter or Space that clicked
+///   "Add hotkey", a held Ctrl) is never recorded, and its auto-repeat and release pass: apps
+///   saw it go down, so they must see it come up.
 #[derive(Debug, Default)]
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) struct KeyCapture {
-    /// Down now, in press order.
-    held: Vec<u16>,
+    /// The keys pressed during the capture and not released since, in press order: recorded
+    /// (until it's finished) and kept from apps.
+    down: Vec<u16>,
     /// The most keys down at once so far, in press order.
     peak: Vec<u16>,
     /// `Done` or `Cancelled` was reported.
@@ -56,39 +65,56 @@ pub(crate) struct KeyCapture {
 
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 impl KeyCapture {
-    /// The key with platform code `code` went down (`down`) or up: what to report, if
-    /// anything.
-    pub(crate) fn on_key(&mut self, code: u16, down: bool) -> Option<Capture> {
-        if self.finished {
-            return None;
+    /// The key with platform code `code` went down (`down`) or up; `repeat`: the OS says this
+    /// press is an auto-repeat (or already had the key down). Returns what to report, if
+    /// anything, and whether to keep the event from apps.
+    pub(crate) fn on_key(
+        &mut self,
+        code: u16,
+        down: bool,
+        repeat: bool,
+    ) -> (Option<Capture>, bool) {
+        match self.down.iter().position(|&c| c == code) {
+            // An auto-repeat of a key pressed during the capture.
+            Some(_) if down => (None, true),
+            Some(i) => {
+                self.down.remove(i);
+                if self.finished {
+                    (None, true)
+                } else if self.down.is_empty() {
+                    self.finished = true;
+                    (Some(Capture::Done(std::mem::take(&mut self.peak))), true)
+                } else {
+                    (Some(Capture::Held(self.down.clone())), true)
+                }
+            }
+            // Down before the capture started: its auto-repeat or release.
+            None if !down || repeat => (None, false),
+            None => {
+                self.down.push(code);
+                if self.finished {
+                    (None, true)
+                } else if code == ESC_CODE {
+                    self.finished = true;
+                    (Some(Capture::Cancelled), true)
+                } else {
+                    if self.down.len() > self.peak.len() {
+                        self.peak.clone_from(&self.down);
+                    }
+                    (Some(Capture::Held(self.down.clone())), true)
+                }
+            }
         }
-        if down {
-            if code == ESC_CODE {
-                self.finished = true;
-                return Some(Capture::Cancelled);
-            }
-            if self.held.contains(&code) {
-                return None;
-            }
-            self.held.push(code);
-            if self.held.len() > self.peak.len() {
-                self.peak.clone_from(&self.held);
-            }
-        } else {
-            let i = self.held.iter().position(|&c| c == code)?;
-            self.held.remove(i);
-            if self.held.is_empty() {
-                self.finished = true;
-                return Some(Capture::Done(std::mem::take(&mut self.peak)));
-            }
-        }
-        Some(Capture::Held(self.held.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kept from apps, or passed on.
+    const KEEP: bool = true;
+    const PASS: bool = false;
 
     fn held(codes: &[u16]) -> Option<Capture> {
         Some(Capture::Held(codes.to_vec()))
@@ -98,68 +124,109 @@ mod tests {
         Some(Capture::Done(codes.to_vec()))
     }
 
+    /// A press as the hook sees it (on Windows, an auto-repeat of a key the capture saw go
+    /// down looks the same).
+    fn press(c: &mut KeyCapture, code: u16) -> (Option<Capture>, bool) {
+        c.on_key(code, true, false)
+    }
+
+    /// A press the OS marks as an auto-repeat.
+    fn repeat(c: &mut KeyCapture, code: u16) -> (Option<Capture>, bool) {
+        c.on_key(code, true, true)
+    }
+
+    fn release(c: &mut KeyCapture, code: u16) -> (Option<Capture>, bool) {
+        c.on_key(code, false, false)
+    }
+
     #[test]
     fn records_peak_set_on_release() {
         let mut c = KeyCapture::default();
-        assert_eq!(c.on_key(1, true), held(&[1]));
-        assert_eq!(c.on_key(2, true), held(&[1, 2]));
-        assert_eq!(c.on_key(2, false), held(&[1]));
-        assert_eq!(c.on_key(1, false), done(&[1, 2]));
+        assert_eq!(press(&mut c, 1), (held(&[1]), KEEP));
+        assert_eq!(press(&mut c, 2), (held(&[1, 2]), KEEP));
+        assert_eq!(release(&mut c, 2), (held(&[1]), KEEP));
+        assert_eq!(release(&mut c, 1), (done(&[1, 2]), KEEP));
     }
 
     #[test]
     fn peak_is_the_first_largest_set() {
         let mut c = KeyCapture::default();
-        c.on_key(1, true);
-        c.on_key(2, true);
-        assert_eq!(c.on_key(1, false), held(&[2]));
-        assert_eq!(c.on_key(3, true), held(&[2, 3]));
-        c.on_key(2, false);
-        assert_eq!(c.on_key(3, false), done(&[1, 2]));
+        press(&mut c, 1);
+        press(&mut c, 2);
+        assert_eq!(release(&mut c, 1), (held(&[2]), KEEP));
+        assert_eq!(press(&mut c, 3), (held(&[2, 3]), KEEP));
+        release(&mut c, 2);
+        assert_eq!(release(&mut c, 3), (done(&[1, 2]), KEEP));
     }
 
     #[test]
     fn repeat_is_ignored() {
         let mut c = KeyCapture::default();
-        assert_eq!(c.on_key(1, true), held(&[1]));
-        assert_eq!(c.on_key(1, true), None);
-        assert_eq!(c.on_key(1, false), done(&[1]));
+        assert_eq!(press(&mut c, 1), (held(&[1]), KEEP));
+        assert_eq!(press(&mut c, 1), (None, KEEP));
+        assert_eq!(repeat(&mut c, 1), (None, KEEP));
+        assert_eq!(release(&mut c, 1), (done(&[1]), KEEP));
     }
 
     #[test]
     fn esc_cancels() {
         let mut c = KeyCapture::default();
-        assert_eq!(c.on_key(1, true), held(&[1]));
-        assert_eq!(c.on_key(ESC_CODE, true), Some(Capture::Cancelled));
-        assert_eq!(c.on_key(ESC_CODE, false), None);
-        assert_eq!(c.on_key(1, false), None);
-        assert_eq!(c.on_key(2, true), None);
-        assert_eq!(c.on_key(2, false), None);
+        assert_eq!(press(&mut c, 1), (held(&[1]), KEEP));
+        assert_eq!(press(&mut c, ESC_CODE), (Some(Capture::Cancelled), KEEP));
+        // Still kept, but nothing more is reported.
+        assert_eq!(repeat(&mut c, ESC_CODE), (None, KEEP));
+        assert_eq!(release(&mut c, ESC_CODE), (None, KEEP));
+        assert_eq!(release(&mut c, 1), (None, KEEP));
+        assert_eq!(press(&mut c, 2), (None, KEEP));
+        assert_eq!(release(&mut c, 2), (None, KEEP));
     }
 
     #[test]
     fn single_tap() {
         let mut c = KeyCapture::default();
-        assert_eq!(c.on_key(7, true), held(&[7]));
-        assert_eq!(c.on_key(7, false), done(&[7]));
+        assert_eq!(press(&mut c, 7), (held(&[7]), KEEP));
+        assert_eq!(release(&mut c, 7), (done(&[7]), KEEP));
     }
 
     #[test]
     fn nothing_after_done() {
         let mut c = KeyCapture::default();
-        c.on_key(7, true);
-        assert_eq!(c.on_key(7, false), done(&[7]));
-        assert_eq!(c.on_key(8, true), None);
-        assert_eq!(c.on_key(ESC_CODE, true), None);
+        press(&mut c, 7);
+        assert_eq!(release(&mut c, 7), (done(&[7]), KEEP));
+        assert_eq!(press(&mut c, 8), (None, KEEP));
+        assert_eq!(repeat(&mut c, 8), (None, KEEP));
+        assert_eq!(release(&mut c, 8), (None, KEEP));
+        assert_eq!(press(&mut c, ESC_CODE), (None, KEEP));
     }
 
     #[test]
-    fn release_of_a_key_down_before_recording_is_ignored() {
+    fn key_down_before_capture_passes_and_is_not_recorded() {
         let mut c = KeyCapture::default();
-        assert_eq!(c.on_key(3, false), None);
-        assert_eq!(c.on_key(1, true), held(&[1]));
-        assert_eq!(c.on_key(3, false), None);
-        assert_eq!(c.on_key(1, false), done(&[1]));
+        // Enter clicked "Add hotkey" and is still held: its repeats and release pass.
+        assert_eq!(repeat(&mut c, 3), (None, PASS));
+        assert_eq!(press(&mut c, 1), (held(&[1]), KEEP));
+        assert_eq!(repeat(&mut c, 3), (None, PASS));
+        assert_eq!(release(&mut c, 3), (None, PASS));
+        assert_eq!(release(&mut c, 1), (done(&[1]), KEEP));
+        // A held Esc's repeat doesn't cancel either.
+        let mut c = KeyCapture::default();
+        assert_eq!(repeat(&mut c, ESC_CODE), (None, PASS));
+        assert_eq!(press(&mut c, 1), (held(&[1]), KEEP));
+    }
+
+    #[test]
+    fn key_down_before_capture_passes_after_it_finished() {
+        let mut c = KeyCapture::default();
+        press(&mut c, 1);
+        assert_eq!(release(&mut c, 1), (done(&[1]), KEEP));
+        assert_eq!(repeat(&mut c, 3), (None, PASS));
+        assert_eq!(release(&mut c, 3), (None, PASS));
+        let mut c = KeyCapture::default();
+        press(&mut c, 1);
+        assert_eq!(press(&mut c, ESC_CODE), (Some(Capture::Cancelled), KEEP));
+        assert_eq!(repeat(&mut c, 3), (None, PASS));
+        assert_eq!(release(&mut c, 3), (None, PASS));
+        assert_eq!(release(&mut c, 1), (None, KEEP));
     }
 
     /// Takes over the keyboard for a moment (macOS: needs Accessibility for the process

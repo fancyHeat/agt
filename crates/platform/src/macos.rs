@@ -547,30 +547,40 @@ unsafe extern "C-unwind" fn capture_callback(
     }
     let code = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
     let st = &mut *st;
-    let mut report = |down| {
-        if let Some(c) = st.capture.on_key(code, down) {
+    let mut key = |down, repeat| {
+        let (c, keep) = st.capture.on_key(code, down, repeat);
+        if let Some(c) = c {
             (st.on)(c);
         }
+        keep
     };
-    match ty {
+    let keep = match ty {
         // Not a key: what macOS sends after Fn is released on its own. Apps don't see it
         // either.
-        CGEventType::KeyDown | CGEventType::KeyUp if code == KVK_GLOBE => {}
-        CGEventType::KeyDown => report(true),
-        CGEventType::KeyUp => report(false),
+        CGEventType::KeyDown | CGEventType::KeyUp if code == KVK_GLOBE => true,
+        CGEventType::KeyDown => key(
+            true,
+            CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventAutorepeat) != 0,
+        ),
+        CGEventType::KeyUp => key(false, false),
+        // A modifier: no auto-repeat. The release of one that was down before the tap started
+        // passes, like any other.
         CGEventType::FlagsChanged if !down_flag(code).is_empty() => {
-            report(CGEvent::flags(Some(ev)).intersects(down_flag(code)))
+            key(CGEvent::flags(Some(ev)).intersects(down_flag(code)), false)
         }
         // Caps Lock: macOS reports it switching on or off, not being let go. Taken as a press
         // and its release, so the window can say why it can't be a hotkey.
         CGEventType::FlagsChanged => {
-            report(true);
-            report(false);
+            key(true, false);
+            key(false, false)
         }
         _ => return pass,
+    };
+    if keep {
+        // Apps and AGT's own tap never see it.
+        return null_mut();
     }
-    // Apps and AGT's own tap never see it.
-    null_mut()
+    pass
 }
 
 // ---------------------------------------------------------------------------------------
