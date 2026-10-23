@@ -32,7 +32,8 @@ impl Hotkeys {
 
     /// Whether `new` can join the list, in place of entry `replacing` if given (re-recording
     /// a row): it must not be the same keys as another entry, contain one or be contained in
-    /// one. Errors are plain sentences for the settings window, with the shorter hotkey first.
+    /// one. Errors are plain sentences for the settings window, naming the hotkey already in
+    /// the list first.
     pub fn check_new(&self, new: &Hotkey, replacing: Option<usize>) -> Result<(), String> {
         for (i, old) in self.0.iter().enumerate() {
             if Some(i) == replacing {
@@ -41,18 +42,20 @@ impl Hotkeys {
             if old.same_keys(new) {
                 return Err("That's already a hotkey.".into());
             }
-            let (short, long) = if new.contains(old) {
-                (old, new)
-            } else if old.contains(new) {
-                (new, old)
-            } else {
-                continue;
-            };
-            return Err(format!(
-                "{} is already a hotkey, and {} starts with it.",
-                short.label(),
-                long.label()
-            ));
+            if new.contains(old) {
+                return Err(format!(
+                    "{} is already a hotkey, and {} starts with it.",
+                    old.label(),
+                    new.label()
+                ));
+            }
+            if old.contains(new) {
+                return Err(format!(
+                    "{} is already a hotkey, and it starts with {}.",
+                    old.label(),
+                    new.label()
+                ));
+            }
         }
         Ok(())
     }
@@ -374,11 +377,22 @@ mod tests {
         let one = Hotkeys::parse(&s(&["LeftShift+A"])).unwrap();
         assert_eq!(one.list(), [Hotkey::parse("LeftShift+A").unwrap()]);
         assert_eq!(one.to_string(), "LeftShift+A");
-        // The shorter one comes first whichever is new.
+        // The one already in the list comes first, whichever is shorter.
         assert_eq!(
             one.check_new(&Hotkey::parse("LeftShift").unwrap(), None)
                 .unwrap_err(),
+            "Left Shift + A is already a hotkey, and it starts with Left Shift."
+        );
+        let short = Hotkeys::parse(&s(&["LeftShift"])).unwrap();
+        assert_eq!(
+            short
+                .check_new(&Hotkey::parse("LeftShift+A").unwrap(), None)
+                .unwrap_err(),
             "Left Shift is already a hotkey, and Left Shift + A starts with it."
+        );
+        assert_eq!(
+            Hotkeys::parse(&s(&["LeftShift+A", "LeftShift"])).unwrap_err(),
+            "Left Shift + A is already a hotkey, and it starts with Left Shift."
         );
         assert_eq!(
             one.check_new(&Hotkey::parse("a+leftshift").unwrap(), None)

@@ -46,6 +46,15 @@ pub enum Kind {
     Info(String),
     /// Not a setting: works while the file has an error too.
     Button(Action),
+    /// A hotkey, set by pressing it: entry `index` of `[hotkey] key` (`None`: the row being
+    /// added), its keys in plain words. `removable`: with a minus button (not the only
+    /// hotkey). `listening`: listens for keys as soon as it's shown.
+    Hotkey {
+        index: Option<usize>,
+        label: String,
+        removable: bool,
+        listening: bool,
+    },
 }
 
 pub struct Text {
@@ -125,11 +134,18 @@ fn section(title: &'static str, items: Vec<Item>) -> Section {
     Section { title, items }
 }
 
-/// The settings, with `c`'s values: the basic ones, or all of them with `advanced`.
+/// The settings, with `c`'s values: the basic ones, or all of them with `advanced`;
+/// `adding_hotkey`: with a hotkey row that listens for a new one ("+ Add hotkey" clicked).
 /// Always the same pages (they're the macOS toolbar's items), sections without an item to
 /// show left out.
-pub fn pages(c: &Config, advanced: bool) -> Vec<Page> {
-    let mut pages = vec![general(c), speech(c), polish(c), history(c), updates(c)];
+pub fn pages(c: &Config, advanced: bool, adding_hotkey: bool) -> Vec<Page> {
+    let mut pages = vec![
+        general(c, adding_hotkey),
+        speech(c),
+        polish(c),
+        history(c),
+        updates(c),
+    ];
     for page in &mut pages {
         for section in &mut page.sections {
             section.items.retain(|i| advanced || !i.advanced);
@@ -139,31 +155,22 @@ pub fn pages(c: &Config, advanced: bool) -> Vec<Page> {
     pages
 }
 
-fn general(c: &Config) -> Page {
-    let hotkey = section(
-        "Hotkey",
-        vec![
-            // The first hotkey only, until rows for each replace this menu.
-            Item::choice(
-                "Key",
-                hotkey_choices(c.hotkey.keys.first().map_or("", String::as_str)),
-            )
-            .note(
-                "Hold it to dictate, let go to paste. A chord written in config.toml is \
-                 kept and shown as is.",
+fn general(c: &Config, adding_hotkey: bool) -> Page {
+    let mut hotkeys = hotkey_rows(&c.hotkey.keys, adding_hotkey);
+    hotkeys.push(Item::new("+ Add hotkey", Kind::Button(Action::AddHotkey)));
+    hotkeys.push(
+        Item::choice(
+            "Minimum hold",
+            numbers(
+                &["hotkey", "min_hold_ms"],
+                c.hotkey.min_hold_ms,
+                &[100, 150, 250, 400],
+                ms,
             ),
-            Item::choice(
-                "Minimum hold",
-                numbers(
-                    &["hotkey", "min_hold_ms"],
-                    c.hotkey.min_hold_ms,
-                    &[100, 150, 250, 400],
-                    ms,
-                ),
-            )
-            .advanced(),
-        ],
+        )
+        .advanced(),
     );
+    let hotkey = section("Hotkey", hotkeys);
     let audio = section(
         "",
         vec![
@@ -815,29 +822,49 @@ fn keep_days(current: u64) -> Vec<Choice> {
     )
 }
 
-/// The keys `agt-platform` accepts on their own, the default chord, and the file's value
-/// if it's another one (a chord the user wrote).
-fn hotkey_choices(current: &str) -> Vec<Choice> {
-    let mut names: Vec<&str> = agt_platform::KEYS.iter().map(|&(name, ..)| name).collect();
-    if !names.contains(&config::DEFAULT_HOTKEY) {
-        names.insert(0, config::DEFAULT_HOTKEY);
-    }
-    let is_current = |n: &str| n.eq_ignore_ascii_case(current.trim());
-    let mut choices: Vec<Choice> = names
+/// A row per hotkey in the file (its keys in plain words, or as written if they aren't a
+/// hotkey), then the row being added if `adding`. The first is labelled and has the section's
+/// note; a row's own warning goes under it.
+fn hotkey_rows(keys: &[String], adding: bool) -> Vec<Item> {
+    let removable = keys.len() > 1;
+    let mut rows: Vec<Item> = keys
         .iter()
-        .map(|&n| {
-            let label = if n == config::DEFAULT_HOTKEY {
-                format!("{n} (default)")
-            } else {
-                n.to_owned()
+        .enumerate()
+        .map(|(i, key)| {
+            let hotkey = agt_platform::Hotkey::parse(key).ok();
+            let label = hotkey.as_ref().map_or_else(|| key.clone(), |h| h.label());
+            let kind = Kind::Hotkey {
+                index: Some(i),
+                label,
+                removable,
+                listening: false,
             };
-            Choice::set(&["hotkey", "key"], label, n.into(), is_current(n))
+            Item::new("", kind).note(hotkey.and_then(|h| h.warning()).unwrap_or_default())
         })
         .collect();
-    if !names.iter().any(|n| is_current(n)) {
-        choices.push(Choice::current(current));
+    if adding {
+        // No minus: Esc cancels it.
+        rows.push(Item::new(
+            "",
+            Kind::Hotkey {
+                index: None,
+                label: String::new(),
+                removable: false,
+                listening: true,
+            },
+        ));
     }
-    choices
+    if let Some(first) = rows.first_mut() {
+        let note = "Hold any of them to dictate, let go to paste. Click one and press a key or \
+                    combo to change it.";
+        first.label = "Hotkey".into();
+        first.note = if first.note.is_empty() {
+            note.into()
+        } else {
+            format!("{note}\n{}", first.note)
+        };
+    }
+    rows
 }
 
 /// The system default, the connected input devices, and the file's device if it isn't
@@ -937,11 +964,95 @@ mod tests {
     use super::*;
 
     /// The only test that builds pages: they list the microphones, and doing that from a
-    /// second test thread crashes on Windows CI (AGT itself lists them from one thread).
+    /// second test thread crashes on Windows CI (AGT itself lists them from one thread). The
+    /// settings window's tests run from here too.
     #[test]
     fn pages() {
         every_page_value_is_valid();
         basic_pages_hide_advanced_settings();
+        hotkey_rows();
+        super::super::window::tests::hotkeys_are_set_by_pressing_them();
+    }
+
+    fn hotkey_rows() {
+        let c = Config::parse("[hotkey]\nkey = [\"F13\", \"F14\"]\n").unwrap();
+        let general = &super::pages(&c, false, true)[0];
+        let kinds: Vec<_> = general.sections[0].items.iter().map(|i| &i.kind).collect();
+        // F13 (removable), F14 (removable), the row being added (listening), then "+ Add hotkey".
+        assert!(matches!(
+            kinds[0],
+            Kind::Hotkey {
+                index: Some(0),
+                removable: true,
+                listening: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kinds[2],
+            Kind::Hotkey {
+                index: None,
+                listening: true,
+                ..
+            }
+        ));
+        assert!(matches!(kinds[3], Kind::Button(Action::AddHotkey)));
+        let one = Config::parse("[hotkey]\nkey = \"F13\"\n").unwrap();
+        assert!(matches!(
+            super::pages(&one, false, false)[0].sections[0].items[0].kind,
+            Kind::Hotkey {
+                removable: false,
+                ..
+            }
+        ));
+
+        // Labels, notes and the button's text: the section's note on the first row, then
+        // that row's warning on a line of its own; the row being added can't be removed.
+        let note = "Hold any of them to dictate, let go to paste. Click one and press a key \
+                    or combo to change it.";
+        let taken = "AGT takes this key over: it won't type in other apps while AGT runs.";
+        let shown = |text: &str, adding: bool| {
+            let c = Config::parse(text).unwrap();
+            let general = super::pages(&c, false, adding).swap_remove(0);
+            let items = general.sections.into_iter().next().unwrap().items;
+            items
+                .into_iter()
+                .map(|i| match i.kind {
+                    Kind::Hotkey {
+                        index,
+                        label: keys,
+                        removable,
+                        ..
+                    } => (i.label, format!("{index:?} {keys} {removable}"), i.note),
+                    Kind::Button(Action::AddHotkey) => (i.label, "add".into(), i.note),
+                    _ => (i.label, "other".into(), i.note),
+                })
+                .collect::<Vec<_>>()
+        };
+        let s = String::from;
+        assert_eq!(
+            shown("[hotkey]\nkey = [\"Space\", \"LeftShift+A\"]\n", true),
+            [
+                (
+                    s("Hotkey"),
+                    s("Some(0) Space true"),
+                    format!("{note}\n{taken}")
+                ),
+                (s(""), s("Some(1) Left Shift + A true"), s("")),
+                (s(""), s("None  false"), s("")),
+                (s("+ Add hotkey"), s("add"), s("")),
+            ]
+        );
+        // A name that isn't a hotkey is shown as written.
+        assert_eq!(
+            shown("[hotkey]\nkey = [\"F13\", \"Space\", \"Hyper\"]\n", false),
+            [
+                (s("Hotkey"), s("Some(0) F13 true"), s(note)),
+                (s(""), s("Some(1) Space true"), s(taken)),
+                (s(""), s("Some(2) Hyper true"), s("")),
+                (s("+ Add hotkey"), s("add"), s("")),
+            ]
+        );
     }
 
     fn every_page_value_is_valid() {
@@ -953,7 +1064,7 @@ mod tests {
             )
             .unwrap();
             let c = Config::parse(&text).unwrap();
-            for page in super::pages(&c, true) {
+            for page in super::pages(&c, true, false) {
                 for item in page.sections.iter().flat_map(|s| &s.items) {
                     let changes: Vec<_> = match &item.kind {
                         Kind::Check { path, on, .. } => vec![vec![(*path, (!on).into())]],
@@ -961,7 +1072,7 @@ mod tests {
                             choices.iter().map(|c| c.changes.clone()).collect()
                         }
                         Kind::Text(t) => vec![vec![(t.path, "x".into())]],
-                        Kind::Info(_) | Kind::Button(_) => Vec::new(),
+                        Kind::Info(_) | Kind::Button(_) | Kind::Hotkey { .. } => Vec::new(),
                     };
                     for change in changes {
                         config::with_settings(&text, &change)
@@ -975,7 +1086,10 @@ mod tests {
     fn basic_pages_hide_advanced_settings() {
         // The same pages either way (the macOS toolbar's items), each with something basic.
         let c = Config::default();
-        let (basic, all) = (super::pages(&c, false), super::pages(&c, true));
+        let (basic, all) = (
+            super::pages(&c, false, false),
+            super::pages(&c, true, false),
+        );
         let titles = |p: &[Page]| p.iter().map(|p| p.title).collect::<Vec<_>>();
         assert_eq!(titles(&basic), titles(&all));
         let items = |p: &Page| p.sections.iter().flat_map(|s| &s.items).count();
@@ -1003,7 +1117,6 @@ mod tests {
         // Each preset written into the default file gives a config that parses.
         let c = Config::default();
         let mut all = Vec::new();
-        all.extend(hotkey_choices(&c.hotkey.keys[0]));
         all.extend(enums(
             &["stt", "device"],
             Device::ALL,
@@ -1032,11 +1145,6 @@ mod tests {
         let text = config::with_settings(config::DEFAULT_CONFIG, &[(path, true.into())]).unwrap();
         let on = Config::parse(&text).unwrap();
         assert!(on.polish.s1_mini.fast_drafting && !c.polish.s1_mini.fast_drafting);
-        // The default hotkey is offered and checked; a custom chord is shown as is.
-        let keys = hotkey_choices(config::DEFAULT_HOTKEY);
-        assert_eq!(keys.iter().filter(|c| c.checked).count(), 1);
-        let keys = hotkey_choices("F13+F14+X");
-        assert!(keys.last().unwrap().checked && keys.last().unwrap().changes.is_empty());
         // The default mic is checked by default; a chosen mic that's unplugged stays listed.
         let mics = microphone_choices("", vec!["Headset".into()]);
         assert!(mics[0].checked && mics.iter().filter(|c| c.checked).count() == 1);

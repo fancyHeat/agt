@@ -30,7 +30,8 @@ text **on your own computer**; your voice never leaves it.
    - Windows: **Left Ctrl + Windows key**
    - macOS: **Fn** (the Globe key)
 
-   A small bar at the bottom of the screen shows that AGT is listening.
+   A small bar at the bottom of the screen shows that AGT is listening. To use other keys, or
+   several, see [Hotkeys](#hotkeys).
 4. **Let go.** A moment later the text is pasted where your cursor is.
 
 Good to know:
@@ -45,8 +46,8 @@ Good to know:
   Settings... → Polish → **Fast drafting**
   (`fast_drafting` under `[polish.s1-mini]`) polishes long text about twice as fast on a GPU,
   at the cost of an occasional different word or comma; it's off by default.
-- **Hands-free:** tap the hotkey twice quickly and AGT keeps recording after you let go; press
-  it once more to stop and paste. Esc cancels, and one left running for 30 minutes is
+- **Hands-free:** tap a hotkey twice quickly and AGT keeps recording after you let go; press
+  a hotkey once more to stop and paste. Esc cancels, and one left running for 30 minutes is
   discarded. `double_tap_ms` under `[hotkey]` in `config.toml` sets how quick (0 turns it
   off).
 - While you hold the hotkey, other audio (music, videos) is turned down to 10% of its volume,
@@ -63,6 +64,35 @@ Good to know:
   page, a link or the desktop), the text is still pasted, and a note where the bar was says so,
   with a **Copy** button that puts the text on your clipboard. It needs the overlay on.
 
+## Hotkeys
+
+Settings... → General lists your hotkeys, and holding any of them dictates. Click one and
+press the key or combo you want instead: it's saved once you let go of every key, and **Esc**
+cancels. **+ Add hotkey** adds one the same way, and the minus button next to a hotkey
+removes it (there's always at least one).
+
+- Nearly any key can be a hotkey, on its own or in a combo of up to 4 keys held together, at
+  most one of them not a modifier (Shift, Ctrl or Control, Alt or Option, Win or Command, and
+  Fn on a Mac). Esc can't be one, and on macOS neither can Caps Lock.
+- A combo of only modifiers (**Left Ctrl + Left Win**) starts once all its keys are down, in
+  any order, even with other modifiers held too. A combo with a regular key (**Left Control +
+  Space**) starts only when exactly its modifiers are held, pressed before that key. Space on
+  its own, Space then Control, and Control + Shift + Space reach your apps as usual.
+- One hotkey can't contain another (**Left Shift** and **Left Shift + Space**): holding the
+  longer one would start the shorter one first. Sharing keys is fine (**Left Shift + A** and
+  **Left Shift + B**).
+- Two kinds of hotkey cost you something, and the settings window says so under them:
+  - A regular key on its own (A, Space, F5) is taken over: it won't type in other apps while
+    AGT runs. F13 to F24 cost nothing, as nothing types them (they're usually spare mouse or
+    keyboard buttons).
+  - A modifier you use in shortcuts and typing, on its own (either Shift; macOS: either
+    Control, Left Option or Left Command; Windows: Left Ctrl, Left Alt or either Win), starts
+    AGT listening each time you hold it.
+
+In `config.toml` they're `key` under `[hotkey]`: one (`key = "Fn"`) or a list
+(`key = ["Fn", "LeftControl+Space"]`), each key named in one word, with `+` between the keys
+of a combo.
+
 ## macOS
 
 AGT asks for two permissions on first launch, one after the other:
@@ -74,12 +104,11 @@ AGT asks for two permissions on first launch, one after the other:
 Until everything is granted, the menu-bar item says which permission is missing, and its
 "Privacy & Security settings..." item opens the right page.
 
-The default hotkey is **Fn** (the 🌐 Globe key). While AGT runs, tapping it no longer does
-what System Settings > Keyboard > "Press 🌐 key to" says (by default, opening the emoji
-picker), so a dictation doesn't also open the picker. Fn+key shortcuts still work. If a
-tap still sets off something else, set "Press 🌐 key to" to **Do Nothing**.
-Other choices in `config.toml`: `RightOption`, `RightCommand`, `F13`-`F20`, or a chord such as
-`"Fn+RightOption"`.
+The default hotkey is **Fn** (the 🌐 Globe key). While AGT runs with Fn on its own as a
+hotkey, tapping it no longer does what System Settings > Keyboard > "Press 🌐 key to" says
+(by default, opening the emoji picker), so a dictation doesn't also open the picker. Fn+key
+shortcuts still work. If a tap still sets off something else, set "Press 🌐 key to" to **Do
+Nothing**. To use other keys, see [Hotkeys](#hotkeys).
 
 AGT transcribes on the CPU by default: with the usual pauses between dictations it's faster
 than the GPU for anything under ~20 s, and more accurate (see
@@ -110,7 +139,7 @@ Settings live in a plain text file, `config.toml`, with a comment on every optio
 
 Tray menu → **Open config folder** takes you there. AGT restarts on its own to apply a change
 a few seconds after the last change, once dictation is idle; tray menu → **Restart now to
-apply settings** does it right away. You can change the hotkey, turn the
+apply settings** does it right away. You can change or add hotkeys, turn the
 overlay off, or turn off AI clean-up of your text (removes "um"s, fixes punctuation; on by
 default, and it runs locally unless you point it at a cloud service).
 

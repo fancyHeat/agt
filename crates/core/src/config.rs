@@ -40,10 +40,10 @@ log_level = "info"
 launch_at_login = true
 
 [hotkey]
-# Hold the hotkey to dictate, let go to paste. Nearly any key can be one (not Esc, nor Caps
+# Hold a hotkey to dictate, let go to paste. Nearly any key can be one (not Esc, nor Caps
 # Lock on macOS), by its name in one word: F13, A, Space, Slash, LeftShift, RightOption or
 # LeftCommand (macOS), RightCtrl, RightAlt or LeftWin (Windows)... Pressing a key that isn't a
-# modifier while holding the hotkey (e.g. Esc) cancels.
+# modifier while holding a hotkey (e.g. Esc) cancels.
 # Or a combo of up to 4 keys held together, at most one of them not a modifier, e.g.
 # "LeftCtrl+LeftWin" (the default on Windows) or "LeftControl+Space" (macOS). A combo of only
 # modifiers starts once all are down, in any order. With a key that isn't a modifier, it
@@ -51,7 +51,8 @@ launch_at_login = true
 # that key kept from the app. A combo ends when any of its keys is released.
 # Several hotkeys can be listed, and any of them dictates: key = ["Fn", "LeftControl+Space"]
 # on macOS, or ["LeftCtrl+LeftWin", "F13"] on Windows. They can share keys, but one can't
-# contain another (LeftShift and LeftShift+Space).
+# contain another (LeftShift and LeftShift+Space). In the Settings window you set them by
+# pressing the keys.
 # Alone, a key that isn't a modifier is taken over: it won't type in other apps while AGT runs
 # (F13-F24 cost nothing: they're usually spare mouse or keyboard buttons). Alone, a modifier
 # you use in shortcuts and typing (either Shift; macOS: either Control, LeftOption,
@@ -59,18 +60,18 @@ launch_at_login = true
 # hold it.
 # macOS: Fn is the Globe key (the default; as a hotkey on its own, tapping it no longer also
 # opens the emoji picker).
-# With a key in the hotkey that pasting would let go of (macOS: LeftCommand or V; Windows:
+# With a key in a hotkey that pasting would let go of (macOS: LeftCommand or V; Windows:
 # LeftCtrl, either Shift, either Alt or either Win), text is only pasted once those keys are
-# up: if you already hold the hotkey for the next dictation, the previous text lands when you
+# up: if you already hold a hotkey for the next dictation, the previous text lands when you
 # release it (after 10 s it's pasted anyway).
 key = ""#,
     default_hotkey!(),
     r#""
 # Holds shorter than this many milliseconds are ignored, so a tap never pastes anything.
 min_hold_ms = 150
-# Hands-free: tap the hotkey twice (the second press within this many milliseconds of letting
-# go of the first) and AGT keeps recording after you let go, until you press the hotkey
-# again; that press pastes. Esc cancels, and so does running for 30 minutes. 0: off.
+# Hands-free: tap a hotkey twice (the second press within this many milliseconds of letting
+# go of the first) and AGT keeps recording after you let go, until you press a hotkey again;
+# that press pastes. Esc cancels, and so does running for 30 minutes. 0: off.
 double_tap_ms = 400
 
 [audio]

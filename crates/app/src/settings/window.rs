@@ -8,6 +8,7 @@ use agt_core::{
     config::{self, SettingPath, SettingValue},
     paths,
 };
+use agt_platform::{Hotkey, Hotkeys};
 use agt_settings_ui::{Control, Event, Page, Row, Section};
 use std::{
     fs::{self, File, TryLockError},
@@ -94,6 +95,8 @@ pub fn run() {
         dictionary_stamp: None,
         metrics: metrics::Metrics::new(paths::db_file()),
         advanced: false,
+        adding_hotkey: false,
+        hotkeys: Vec::new(),
     };
     let icon = crate::tray::color_icon;
     if let Err(e) = agt_settings_ui::run("AGT Settings", Box::new(model), Some(page), Some(icon)) {
@@ -109,6 +112,9 @@ enum Act {
     /// `multiline`: kept as typed; one line is trimmed.
     Text(SettingPath, bool),
     Button(Action),
+    /// Hotkey `index` of the list (`None`: the one being added): recorded keys replace it (or
+    /// join the list), its minus button removes it.
+    Hotkey(Option<usize>),
     Metrics(metrics::Act),
     /// "Show advanced settings" / "Hide advanced settings".
     Advanced,
@@ -126,6 +132,28 @@ struct Model {
     metrics: metrics::Metrics,
     /// Showing every setting, not just the basic ones (until the window closes).
     advanced: bool,
+    /// Showing a row that listens for a new hotkey, until it reports its keys or is
+    /// cancelled.
+    adding_hotkey: bool,
+    /// `[hotkey] key` as the pages last shown list it (what [`Act::Hotkey`]'s index means).
+    hotkeys: Vec<String>,
+}
+
+/// `[hotkey] key`.
+const HOTKEY_KEY: SettingPath = &["hotkey", "key"];
+
+/// Whether `new` can be hotkey `replacing` of `hotkeys` (`None`: added to them), by
+/// [`Hotkeys::check_new`]'s rules and words. Each is checked on its own, so a list AGT can't
+/// use (a name that isn't a hotkey, two that clash) can still be fixed here.
+fn check_hotkey(hotkeys: &[String], new: &Hotkey, replacing: Option<usize>) -> Result<(), String> {
+    for (i, spec) in hotkeys.iter().enumerate() {
+        if Some(i) != replacing
+            && let Ok(old) = Hotkeys::parse(std::slice::from_ref(spec))
+        {
+            old.check_new(new, None)?;
+        }
+    }
+    Ok(())
 }
 
 fn stamp(path: &std::path::Path) -> Option<(Option<SystemTime>, u64)> {
@@ -182,6 +210,20 @@ impl Model {
                 String::new(),
                 Control::Button(item.label),
                 Act::Button(action),
+            ),
+            schema::Kind::Hotkey {
+                index,
+                label,
+                removable,
+                listening,
+            } => (
+                item.label,
+                Control::Hotkey {
+                    label,
+                    listening,
+                    removable,
+                },
+                Act::Hotkey(index),
             ),
         };
         self.actions.push(act);
@@ -248,6 +290,8 @@ impl agt_settings_ui::Model for Model {
         let config = match Config::load(&self.path) {
             Ok(c) => c,
             Err(e) => {
+                // The row being added is gone with the page.
+                self.adding_hotkey = false;
                 let rows = vec![
                     self.row(
                         schema::Item {
@@ -275,7 +319,8 @@ impl agt_settings_ui::Model for Model {
                 ];
             }
         };
-        let pages = schema::pages(&config, self.advanced);
+        self.hotkeys = config.hotkey.keys.clone();
+        let pages = schema::pages(&config, self.advanced, self.adding_hotkey);
         // The buttons' ids come first, so they're the same either way: the focus (by id)
         // stays on the button that was clicked.
         let buttons: Vec<Section> = pages.iter().map(|_| self.advanced_section()).collect();
@@ -338,8 +383,45 @@ impl agt_settings_ui::Model for Model {
                         crate::open_in_editor(&path);
                     }
                     Action::OpenHistory => crate::open_history(),
+                    // The window asks for the pages again after this.
+                    Action::AddHotkey => self.adding_hotkey = true,
                 }
                 return Ok(());
+            }
+            (Some(Act::Hotkey(index)), Event::Hotkey(_, keys)) => {
+                let index = *index;
+                if index.is_none() {
+                    // The row being added goes, whatever came of it (also when it couldn't
+                    // listen: shown again, it would try again).
+                    self.adding_hotkey = false;
+                }
+                let Some(codes) = keys else {
+                    return Ok(());
+                };
+                let new = Hotkey::from_codes(&codes)?;
+                check_hotkey(&self.hotkeys, &new, index)?;
+                let mut hotkeys = self.hotkeys.clone();
+                // The rows' indexes come from the same list.
+                match index {
+                    Some(i) => hotkeys[i] = new.to_string(),
+                    None => hotkeys.push(new.to_string()),
+                }
+                vec![(HOTKEY_KEY, config::hotkey_value(&hotkeys))]
+            }
+            // Its minus button.
+            (Some(Act::Hotkey(Some(i))), Event::Click(_)) => {
+                let hotkeys: Vec<String> = self
+                    .hotkeys
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != *i)
+                    .map(|(_, spec)| spec.clone())
+                    .collect();
+                // Never none (the window shows no minus for the only one).
+                if hotkeys.is_empty() {
+                    return Err("At least one hotkey is needed.".into());
+                }
+                vec![(HOTKEY_KEY, config::hotkey_value(&hotkeys))]
             }
             // The window asks for the pages again after this.
             (Some(Act::Advanced), Event::Click(_)) => {
@@ -360,5 +442,159 @@ impl agt_settings_ui::Model for Model {
         // Always asked: it keeps the figures current.
         let figures = self.metrics.refresh();
         file || figures
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use agt_settings_ui::Model as _;
+
+    /// A hotkey row as the window shows it: its id, keys, whether it listens and whether it
+    /// has a minus button.
+    type HotkeyRow = (usize, String, bool, bool);
+
+    /// The hotkey rows of `model`'s pages, and the "+ Add hotkey" button's id.
+    fn shown(model: &mut Model) -> (Vec<HotkeyRow>, usize) {
+        let pages = model.pages();
+        let rows: Vec<&Row> = pages
+            .iter()
+            .flat_map(|p| &p.sections)
+            .flat_map(|s| &s.rows)
+            .collect();
+        let hotkeys = rows
+            .iter()
+            .filter_map(|r| match &r.control {
+                Control::Hotkey {
+                    label,
+                    listening,
+                    removable,
+                } => Some((r.id, label.clone(), *listening, *removable)),
+                _ => None,
+            })
+            .collect();
+        let add = rows
+            .iter()
+            .find(|r| r.control == Control::Button("+ Add hotkey".into()))
+            .expect("an \"+ Add hotkey\" button")
+            .id;
+        (hotkeys, add)
+    }
+
+    /// Run by the settings schema's only test that builds pages (see there).
+    pub(crate) fn hotkeys_are_set_by_pressing_them() {
+        let dir = std::env::temp_dir().join(format!("agt-settings-hotkeys-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut model = Model {
+            path: path.clone(),
+            actions: Vec::new(),
+            stamp: None,
+            dictionary_stamp: None,
+            metrics: metrics::Metrics::new(dir.join("agt.db")),
+            advanced: false,
+            adding_hotkey: false,
+            hotkeys: Vec::new(),
+        };
+        let code = |name| agt_platform::Key::parse(name).unwrap().code();
+        let file = || fs::read_to_string(&path).unwrap();
+        let start = |text: &str| fs::write(&path, format!("[hotkey]\n{text}\n")).unwrap();
+        let keys = |line: &str| format!("\n{line}\n");
+
+        // "+ Add hotkey" adds a row that listens; the keys pressed there join the list.
+        start("key = \"F13\"");
+        let (rows, add) = shown(&mut model);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].1.as_str(), rows[0].2, rows[0].3),
+            ("F13", false, false)
+        );
+        assert_eq!(model.handle(Event::Click(add)), Ok(()));
+        let (rows, _) = shown(&mut model);
+        let added = rows[1].clone();
+        assert_eq!((added.1.as_str(), added.2, added.3), ("", true, false));
+        let f14 = Some(vec![code("F14")]);
+        assert_eq!(model.handle(Event::Hotkey(added.0, f14.clone())), Ok(()));
+        assert!(
+            file().contains(&keys("key = [\"F13\", \"F14\"]")),
+            "{}",
+            file()
+        );
+        let (rows, _) = shown(&mut model);
+        let labels: Vec<_> = rows.iter().map(|r| (r.1.as_str(), r.2, r.3)).collect();
+        assert_eq!(labels, [("F13", false, true), ("F14", false, true)]);
+
+        // Cancelled (or the recorder couldn't start): nothing written, the row goes.
+        start("key = \"F13\"");
+        let (_, add) = shown(&mut model);
+        model.handle(Event::Click(add)).unwrap();
+        let (rows, _) = shown(&mut model);
+        assert_eq!(model.handle(Event::Hotkey(rows[1].0, None)), Ok(()));
+        assert_eq!(file(), "[hotkey]\nkey = \"F13\"\n");
+        assert_eq!(shown(&mut model).0.len(), 1);
+
+        // Recording a row again replaces it; one hotkey is written as a string.
+        let (rows, _) = shown(&mut model);
+        let f15 = Some(vec![code("F15")]);
+        assert_eq!(model.handle(Event::Hotkey(rows[0].0, f15)), Ok(()));
+        assert!(file().contains(&keys("key = \"F15\"")), "{}", file());
+
+        // A refusal says why and writes nothing; the row being added goes too.
+        start("key = \"F13\"");
+        let (_, add) = shown(&mut model);
+        model.handle(Event::Click(add)).unwrap();
+        let (rows, _) = shown(&mut model);
+        let f13 = Some(vec![code("F13")]);
+        assert_eq!(
+            model.handle(Event::Hotkey(rows[1].0, f13)),
+            Err("That's already a hotkey.".into())
+        );
+        assert_eq!(file(), "[hotkey]\nkey = \"F13\"\n");
+        assert_eq!(shown(&mut model).0.len(), 1);
+        // The one already there is named first, whichever is shorter.
+        start("key = \"LeftShift+A\"");
+        let (_, add) = shown(&mut model);
+        model.handle(Event::Click(add)).unwrap();
+        let (rows, _) = shown(&mut model);
+        let shift = Some(vec![code("LeftShift")]);
+        assert_eq!(
+            model.handle(Event::Hotkey(rows[1].0, shift)),
+            Err("Left Shift + A is already a hotkey, and it starts with Left Shift.".into())
+        );
+        // So are the recorder's own refusals.
+        let (_, add) = shown(&mut model);
+        model.handle(Event::Click(add)).unwrap();
+        let (rows, _) = shown(&mut model);
+        let two = Some(vec![code("F13"), code("F14")]);
+        assert_eq!(
+            model.handle(Event::Hotkey(rows[1].0, two)),
+            Err("A hotkey can have only one key that isn't a modifier (F13, F14).".into())
+        );
+        assert_eq!(file(), "[hotkey]\nkey = \"LeftShift+A\"\n");
+
+        // A name the file gets wrong can be recorded over (it isn't checked against).
+        start("key = [\"Hyper\", \"F13\"]");
+        let (rows, _) = shown(&mut model);
+        assert_eq!(rows[0].1, "Hyper");
+        assert_eq!(model.handle(Event::Hotkey(rows[0].0, f14)), Ok(()));
+        assert!(
+            file().contains(&keys("key = [\"F14\", \"F13\"]")),
+            "{}",
+            file()
+        );
+
+        // The minus removes a hotkey; the last one stays.
+        start("key = [\"F13\", \"F14\"]");
+        let (rows, _) = shown(&mut model);
+        assert_eq!(model.handle(Event::Click(rows[0].0)), Ok(()));
+        assert!(file().contains(&keys("key = \"F14\"")), "{}", file());
+        let (rows, _) = shown(&mut model);
+        assert_eq!(
+            model.handle(Event::Click(rows[0].0)),
+            Err("At least one hotkey is needed.".into())
+        );
+        assert!(file().contains(&keys("key = \"F14\"")), "{}", file());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
