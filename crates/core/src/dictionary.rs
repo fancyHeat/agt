@@ -23,7 +23,8 @@
 //!   program's file name (`Code.exe`) or the macOS app's bundle identifier
 //!   (`com.microsoft.VSCode`), compared ignoring case. An app in several profiles gets all of
 //!   them. At most [`MAX_PROFILES`].
-//! - `[[replace]]`: rewrites applied to every transcript before polish, or with `profiles`
+//! - `[[replace]]`: rewrites of the text about to be pasted, made after polish (or on the
+//!   transcript when polish is off or fails), so polish never rewrites them; with `profiles`
 //!   only in those profiles' apps ([`Scope::replace`]). A `profiles` entry no
 //!   `[profiles.<name>]` defines is an error, and so is an empty list.
 //!
@@ -41,16 +42,24 @@
 //! - `from` matches whole words and phrases, ignoring case. Word characters are Unicode
 //!   letters and digits and the apostrophes `'` and `’`; anything else is a boundary, so
 //!   `maine` matches in `Maine.` and `(MAINE)` but not in `Maines` or `Maine's`.
-//! - Whitespace inside `from` matches any run of whitespace; other characters match
-//!   themselves (`from = "node js"` doesn't match `node.js`).
+//! - Between two words of `from`, a run of whitespace, hyphens, dashes and commas matches
+//!   any such run or none at all, since the speech model and polish don't always write a
+//!   phrase the same way: `true tide` (or `true-tide`) matches `True Tide`, `true-tide`,
+//!   `true, tide` and `truetide`. Whitespace elsewhere (next to punctuation) matches any run
+//!   of whitespace; other characters match themselves (`from = "node js"` doesn't match
+//!   `node.js`).
 //! - The leftmost match wins, and of those starting at the same place the longest. It's one
 //!   pass: replaced text is never matched again (no chains like a → b → c).
-//! - `to` is inserted exactly as written, with no case carried over from what it replaced:
-//!   `Maine`, `maine` and `MAINE` all become `to`. That is also why a rewrite of a real word
-//!   applies everywhere, including where the word was meant.
+//! - `to` is inserted as written, with no case carried over from what it replaced (`Maine`,
+//!   `maine` and `MAINE` all become `to`), except that `\n` in it (a backslash and an `n`)
+//!   is a new line, and a `to` whose first word is all lowercase letters gets a capital
+//!   where what it replaces starts a sentence with one (at the start, on a new line, or after
+//!   `.`, `!` or `?`): `Maine is` there becomes `Main is`. That a rewrite applies whatever the
+//!   case is also why a rewrite of a real word applies everywhere, including where the word
+//!   was meant.
 //! - A blank `from` or `to` is an error, and so is a `from` given twice (ignoring case and
-//!   spacing), even for different profiles: in an app in both, which one applied would
-//!   depend on their order.
+//!   what's between its words), even for different profiles: in an app in both, which one
+//!   applied would depend on their order.
 //!
 //! Edge cases, by design (speech engines write NFC text, where they hardly come up):
 //!
@@ -113,10 +122,13 @@ terms = []
 # ]
 # terms = ["main", "rebase", "kubectl", "PR"]
 
-# Fixed rewrites applied to every transcript before polish. Only for things that are never
-# ambiguous: a rewrite of a real word (e.g. "Maine") applies everywhere, unless you limit it
-# to profiles. `from` matches whole words, ignoring case; `to` is pasted exactly as written.
-# Copy these lines for each (`profiles` is optional):
+# Fixed rewrites of what AGT pastes, made after the AI clean-up. Only for things that are
+# never ambiguous: a rewrite of a real word (e.g. "Maine") applies everywhere, unless you
+# limit it to profiles. `from` matches whole words, ignoring case and what's between them (a
+# space, a hyphen, a comma or nothing: "dot env" also matches "dot-env" and "dotenv"). `to`
+# is pasted as written, except that \n in it starts a new line, and a lowercase word starts
+# with a capital where it starts a sentence. Settings... > Replacements adds and changes
+# them too. Copy these lines for each (`profiles` is optional):
 #
 # [[replace]]
 # from = "dot env"
@@ -127,7 +139,7 @@ terms = []
 /// Profiles a dictionary may have (they're a bit mask).
 pub const MAX_PROFILES: usize = 64;
 
-/// One `[[replace]]` entry, as written (trimmed).
+/// One `[[replace]]` entry, as written (trimmed, though `to` keeps its new lines).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Replacement {
     pub from: String,
@@ -136,6 +148,18 @@ pub struct Replacement {
     /// everywhere.
     profiles: u64,
     pieces: Vec<Piece>,
+    /// What's inserted: `to` with each `\n` a new line.
+    insert: String,
+    /// `to` starts with an all-lowercase word: capitalized where it starts a sentence.
+    capitalize: bool,
+}
+
+impl Replacement {
+    /// What it types: `to` with each `\n` a new line (and maybe a capital, see the module
+    /// docs).
+    pub fn inserted(&self) -> &str {
+        &self.insert
+    }
 }
 
 /// A `[profiles.<name>]` table.
@@ -154,8 +178,10 @@ pub struct Profile {
 /// A compiled `from`: what the text must have, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Piece {
-    /// A whole word (lowercased).
+    /// A whole word (lowercased); just its letters if a [`Piece::Gap`] follows.
     Word(String),
+    /// Between two words: any run of [`separates_words`] characters, or none.
+    Gap,
     /// Any run of whitespace.
     Space,
     /// One character that isn't a word character (lowercased).
@@ -287,12 +313,24 @@ fn lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
+/// What may sit between two words of a phrase (besides nothing): see [`Piece::Gap`].
+fn separates_words(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '-' | '‐' | '–' | '—' | ',')
+}
+
 /// `from` (trimmed, not blank) as pieces.
 fn compile(from: &str) -> Vec<Piece> {
     let mut pieces = Vec::new();
     let mut rest = from;
     while let Some(c) = rest.chars().next() {
-        let len = if c.is_whitespace() {
+        let gap = rest.find(|c| !separates_words(c)).unwrap_or(rest.len());
+        let len = if gap > 0
+            && matches!(pieces.last(), Some(Piece::Word(_)))
+            && rest[gap..].starts_with(is_word_char)
+        {
+            pieces.push(Piece::Gap);
+            gap
+        } else if c.is_whitespace() {
             pieces.push(Piece::Space);
             rest.find(|c: char| !c.is_whitespace())
                 .unwrap_or(rest.len())
@@ -314,9 +352,11 @@ fn compile(from: &str) -> Vec<Piece> {
 /// end of the match.
 fn match_at(pieces: &[Piece], text: &str, at: usize) -> Option<usize> {
     let mut pos = at;
-    for piece in pieces {
+    for (k, piece) in pieces.iter().enumerate() {
         let rest = &text[pos..];
         pos += match piece {
+            // The next word may follow right away ("truetide"): only this one's letters.
+            Piece::Word(w) if pieces.get(k + 1) == Some(&Piece::Gap) => word_prefix(rest, w)?,
             // A whole word: what follows a word or a non-word character starts a new one.
             Piece::Word(w) => {
                 let len = rest.find(|c| !is_word_char(c)).unwrap_or(rest.len());
@@ -329,6 +369,7 @@ fn match_at(pieces: &[Piece], text: &str, at: usize) -> Option<usize> {
                 }
                 len
             }
+            Piece::Gap => rest.find(|c| !separates_words(c)).unwrap_or(rest.len()),
             Piece::Space => match rest
                 .find(|c: char| !c.is_whitespace())
                 .unwrap_or(rest.len())
@@ -343,6 +384,53 @@ fn match_at(pieces: &[Piece], text: &str, at: usize) -> Option<usize> {
         };
     }
     Some(pos)
+}
+
+/// The length of `w` (a lowercased word) at the start of `text`, made of word characters
+/// whatever comes after them.
+fn word_prefix(text: &str, w: &str) -> Option<usize> {
+    let mut want = w.chars().peekable();
+    let mut len = 0;
+    for c in text.chars() {
+        if want.peek().is_none() {
+            break;
+        }
+        if !is_word_char(c) {
+            return None;
+        }
+        for l in c.to_lowercase() {
+            if want.next() != Some(l) {
+                return None;
+            }
+        }
+        len += c.len_utf8();
+    }
+    want.peek().is_none().then_some(len)
+}
+
+/// Whether `at` in `text` starts a sentence: the text's start, a new line, or after `.`, `!`
+/// or `?` (an opening quote or bracket in between).
+fn sentence_starts(text: &str, at: usize) -> bool {
+    let before = text[..at].trim_end_matches(|c: char| {
+        (c.is_whitespace() && c != '\n') || matches!(c, '"' | '“' | '\'' | '‘' | '(' | '[')
+    });
+    before.is_empty() || before.ends_with(['.', '!', '?', '\n'])
+}
+
+/// Puts `r`'s text in `out` in place of what it matched at `at` in `text` (see the module
+/// docs for the capital).
+fn push_insert(out: &mut String, r: &Replacement, text: &str, at: usize) {
+    match r.insert.chars().next() {
+        Some(first)
+            if r.capitalize
+                && text[at..].starts_with(char::is_uppercase)
+                && sentence_starts(text, at) =>
+        {
+            out.extend(first.to_uppercase());
+            out.push_str(&r.insert[first.len_utf8()..]);
+        }
+        _ => out.push_str(&r.insert),
+    }
 }
 
 impl Dictionary {
@@ -411,7 +499,11 @@ impl Dictionary {
                 }
             }
             let from = entry.from.get_ref().trim();
-            let to = entry.to.get_ref().trim();
+            // New lines are what it types (`to = "\n"`): kept.
+            let to = entry
+                .to
+                .get_ref()
+                .trim_matches(|c: char| c.is_whitespace() && c != '\n');
             if from.is_empty() {
                 return Err(error("`from` is empty", Some(entry.from.span())));
             }
@@ -424,7 +516,7 @@ impl Dictionary {
             let pieces = compile(from);
             if seen.insert(pieces.clone(), ()).is_some() {
                 return Err(error(
-                    "this `from` is already replaced above (case and spacing don't count)",
+                    "this `from` is already replaced above (case and what's between its words don't count)",
                     Some(entry.from.span()),
                 ));
             }
@@ -432,14 +524,22 @@ impl Dictionary {
                 Piece::Word(w) => w.chars().next().expect("a word is not empty"),
                 Piece::Char(c) => *c,
                 Piece::Space => unreachable!("`from` is trimmed"),
+                Piece::Gap => unreachable!("a gap follows a word"),
             };
             let i = dictionary.replacements.len();
             dictionary.index.entry(first).or_default().push(i);
+            let insert = to.replace("\\n", "\n");
+            let capitalize = insert
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.chars().all(|c| c.is_alphabetic() && c.is_lowercase()));
             dictionary.replacements.push(Replacement {
                 from: from.to_owned(),
                 to: to.to_owned(),
                 profiles: mask,
                 pieces,
+                insert,
+                capitalize,
             });
         }
         dictionary.profiles = profiles;
@@ -553,7 +653,7 @@ impl Dictionary {
                         out.reserve(text.len() + 16);
                     }
                     out.push_str(&text[copied..i]);
-                    out.push_str(&self.replacements[r].to);
+                    push_insert(&mut out, &self.replacements[r], text, i);
                     count += 1;
                     (copied, i) = (end, end);
                 }
@@ -782,26 +882,117 @@ mod tests {
 
     #[test]
     fn whole_words_ignoring_case() {
+        // Mid-sentence: no capital (see `a_lowercase_to_starts_a_sentence_with_a_capital`).
         let d = rules(&[("maine", "main")]);
         for (text, want, n) in [
             ("merge it into Maine.", "merge it into main.", 1),
-            ("(MAINE) and maine", "(main) and main", 2),
+            ("so (MAINE) and maine", "so (main) and main", 2),
             ("Maines and Maine's", "Maines and Maine's", 0),
             ("remaine", "remaine", 0),
-            ("Maine,Maine", "main,main", 2),
-            ("Maine", "main", 1),
+            ("so Maine,Maine", "so main,main", 2),
+            ("into Maine", "into main", 1),
         ] {
             assert_eq!(apply(&d, text), (want.into(), n), "{text}");
         }
     }
 
     #[test]
-    fn whitespace_in_from_matches_any_run() {
+    fn what_is_between_words_does_not_count() {
         let d = rules(&[("dot  env", ".env")]);
         assert_eq!(apply(&d, "copy dot env now"), ("copy .env now".into(), 1));
         assert_eq!(apply(&d, "copy Dot\n\t env"), ("copy .env".into(), 1));
-        assert_eq!(apply(&d, "dotenv dot-env"), ("dotenv dot-env".into(), 0));
+        assert_eq!(apply(&d, "dotenv dot-env"), (".env .env".into(), 2));
         assert_eq!(apply(&d, "dot. env"), ("dot. env".into(), 0));
+
+        // However the speech model or polish wrote it, and however `from` is written.
+        for from in [
+            "Reddit True Tide",
+            "reddit true-tide",
+            "Reddit, True – Tide",
+        ] {
+            let d = rules(&[(from, "retatrutide")]);
+            for said in [
+                "Reddit True Tide",
+                "reddit true tide",
+                "Reddit true-tide",
+                "Reddit truetide",
+                "redditTrueTide",
+                "reddit, true tide",
+                "Reddit True — Tide",
+                "Reddit  True\nTide",
+            ] {
+                let text = format!("take {said} daily");
+                assert_eq!(
+                    apply(&d, &text),
+                    ("take retatrutide daily".into(), 1),
+                    "{from}: {said}"
+                );
+            }
+            // Still whole words, and other punctuation still counts.
+            for said in [
+                "Reddit true tides",
+                "Reddit untrue tide",
+                "Reddits true tide",
+                "Reddit true tide's",
+                "Reddit true.tide",
+                "Reddit true; tide",
+            ] {
+                let text = format!("take {said} daily");
+                assert_eq!(apply(&d, &text), (text.clone(), 0), "{from}: {said}");
+            }
+        }
+        // So these are the same `from`.
+        let e = Dictionary::parse(
+            "[[replace]]\nfrom = \"true tide\"\nto = \"a\"\n[[replace]]\nfrom = \"True-Tide\"\nto = \"b\"\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("already replaced"), "{e}");
+    }
+
+    #[test]
+    fn a_lowercase_to_starts_a_sentence_with_a_capital() {
+        let d = rules(&[
+            ("reddit true tide", "retatrutide"),
+            ("dot env", ".env"),
+            ("agt", "AGT"),
+        ]);
+        for (text, want) in [
+            ("Reddit true tide works.", "Retatrutide works."),
+            ("So Reddit true tide works.", "So retatrutide works."),
+            (
+                "Done. Reddit true tide! Reddit truetide? (Reddit true tide)",
+                "Done. Retatrutide! Retatrutide? (Retatrutide)",
+            ),
+            ("Done.\n\"Reddit true tide\"", "Done.\n\"Retatrutide\""),
+            ("line one\nReddit true tide", "line one\nRetatrutide"),
+            // What it replaces was lowercase: so is `to`.
+            ("Done. reddit true tide", "Done. retatrutide"),
+            // `to` doesn't start with a lowercase word: as written.
+            ("Dot env first. Agt next.", ".env first. AGT next."),
+        ] {
+            assert_eq!(apply(&d, text).0, want, "{text}");
+        }
+        let d = rules(&[
+            ("my email", "me@example.com"),
+            ("my site", "example.com/me"),
+        ]);
+        assert_eq!(
+            apply(&d, "My email. My site.").0,
+            "me@example.com. example.com/me."
+        );
+    }
+
+    #[test]
+    fn backslash_n_in_to_is_a_new_line() {
+        // Written `\n` (a TOML literal string, or typed in the settings window), or a TOML
+        // escape: a new line either way. `to` keeps what was written.
+        let d = dict(
+            "[[replace]]\nfrom = \"sign off\"\nto = 'Best,\\nGrant'\n\n\
+             [[replace]]\nfrom = \"new para\"\nto = \"\\n\\n\"\n",
+        );
+        assert_eq!(d.replacements()[0].to, "Best,\\nGrant");
+        assert_eq!(apply(&d, "thanks sign off").0, "thanks Best,\nGrant");
+        assert_eq!(apply(&d, "one. new para two").0, "one. \n\n two");
     }
 
     #[test]

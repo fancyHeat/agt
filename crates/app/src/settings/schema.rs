@@ -722,8 +722,9 @@ fn replacements(r: &Replacing) -> Page {
             "retatrutide",
         )
         .note(
-            "When AGT hears the speech, it types the inserted text instead. Capitals don't \
-             matter, and only whole words match.",
+            "When AGT hears the speech, it types the inserted text instead, after the AI \
+             clean-up. Capitals and what's between the words (a space, a hyphen, a comma or \
+             nothing) don't matter, but only whole words match. \\n starts a new line.",
         ),
         Item::new("Add replacement", Kind::Button(Action::AddReplacement)),
     ];

@@ -182,18 +182,22 @@ profiles = ["code"]
   model hears it in your email. `apps` are, on Windows, the program's file name
   (`Code.exe`); on macOS, the app's bundle identifier (`com.microsoft.VSCode`); case doesn't
   matter, and an app can be in several profiles. Terms outside a profile apply everywhere.
-- **Replacements** (`[[replace]]`) rewrite every transcript before the AI clean-up: `from`
-  matches whole words and phrases, ignoring case; `to` is pasted exactly as you wrote it.
-  Only use them for things that are never meant: a replacement of a real word applies
-  everywhere (unless you limit it with `profiles`), so `from = "Maine"`, `to = "main"` means
-  you can't dictate the state of Maine any more. Meeting notes get the replacements and terms
-  that apply everywhere, not a profile's.
+- **Replacements** (`[[replace]]`) rewrite what AGT pastes, after the AI clean-up, so the
+  clean-up never rewrites them. `from` matches whole words and phrases, ignoring case and
+  what's between its words: a space, a hyphen, a comma or nothing, so "Reddit True Tide"
+  also matches "reddit true-tide" and "Reddit truetide". `to` is pasted as you wrote it,
+  except that `\n` in it starts a new line, and a `to` that starts with a lowercase word
+  ("retatrutide") gets a capital where it starts a sentence. Only use them for things that
+  are never meant: a replacement of a real word applies everywhere (unless you limit it with
+  `profiles`), so `from = "Maine"`, `to = "main"` means you can't dictate the state of Maine
+  any more. Meeting notes get the replacements and terms that apply everywhere, not a
+  profile's.
 
 **Settings... → Replacements** changes the replacements without opening the file: type the
 **Speech** (what you say, e.g. "Reddit True Tide") and the **Inserted text** (what AGT types
 instead, e.g. "retatrutide"), then click **Add replacement**. It's added to `dictionary.toml`
-for everywhere; a speech that's already there (capitals and spacing don't count) gets the new
-text instead. Your replacements are listed under it, each with its inserted text in a field
+for everywhere; a speech that's already there (capitals and what's between the words don't
+count) gets the new text instead. Your replacements are listed under it, each with its inserted text in a field
 (a profile's with the profile's name): change it there, or empty it to remove the
 replacement. Profiles and terms are only in the file.
 

@@ -28,17 +28,14 @@
 //!   reload) goes first, in the order sent ([`SttQueue`]). So a meeting delays a dictation by
 //!   at most the one meeting segment already being transcribed when the dictation's work came
 //!   in. Meeting segments never reach polish, the paste, history or the status line.
-//! - `polish`: first applies the dictionary's replacements (`dictionary.toml`, see
-//!   [`agt_core::dictionary`]) to each transcript, polish on or off. Then, with
-//!   `polish.enabled`, cleans it up with an LLM (`agt-polish`), bounded by
-//!   `polish.timeout_ms`; on any failure the transcript (replaced) is pasted. Then hands it to
-//!   `paste`. A long dictation transcribed while recording is also polished while
-//!   recording, in pieces that end at a sentence end (`agt_polish::ahead`, local servers
-//!   only), so at release only the rest is left to polish (see [`Partial::feed_ahead`]); the
-//!   replacements are then applied to each piece. A phrase is never split across segments
-//!   (their texts are joined with a space before any replacement), only across pieces, which
-//!   end at a sentence end (or, in a run-on of over `agt_polish::ahead::MAX_HELD_WORDS`
-//!   words, at a segment boundary): a `from` spanning one of those isn't matched.
+//! - `polish`: with `polish.enabled`, cleans each transcript up with an LLM (`agt-polish`),
+//!   bounded by `polish.timeout_ms`; on any failure the transcript is kept. Then applies the
+//!   dictionary's replacements (`dictionary.toml`, see [`agt_core::dictionary`]) to that
+//!   text, polish on or off, so polish never rewrites them, and hands it to `paste`. A long
+//!   dictation transcribed while recording is also polished while recording, in pieces that
+//!   end at a sentence end (`agt_polish::ahead`, local servers only), so at release only the
+//!   rest is left to polish (see [`Partial::feed_ahead`]). The replacements are made once the
+//!   pieces are joined, so a phrase is never split across segments or pieces.
 //! - `permissions` (macOS, only while something is missing): asks for the Microphone and
 //!   Accessibility permissions at start-up, then re-checks every [`PERMISSION_POLL`] until
 //!   both are granted, so no restart is needed.
@@ -504,7 +501,7 @@ struct Shared {
     dropped: AtomicBool,
     /// Segments sent and not started yet.
     queued: AtomicUsize,
-    /// The dictionary in the app focused at key-down, for its segments and pieces (see
+    /// The dictionary in the app focused at key-down, for its segments' terms (see
     /// [`Words`]).
     scope: Arc<Scope>,
 }
@@ -1960,10 +1957,8 @@ struct Pieces {
     shared: Arc<Shared>,
     texts: Vec<String>,
     outcomes: Vec<Outcome>,
-    /// Words of the pieces as transcribed (before the dictionary's replacements).
+    /// Words of the pieces as transcribed.
     raw_words: usize,
-    /// The dictionary's replacements made in the pieces.
-    replacements: usize,
     /// Time spent on the pieces polished in the background, before the transcript was ready.
     ahead_ms: f64,
     /// A request ran out of time: the rest of the pieces stay raw.
@@ -1977,22 +1972,19 @@ impl Pieces {
             texts: Vec::new(),
             outcomes: Vec::new(),
             raw_words: 0,
-            replacements: 0,
             ahead_ms: 0.0,
             timed_out: false,
         }
     }
 
-    /// Applies the dictionary's replacements to the next piece (`raw`, as transcribed) and
-    /// polishes it, or keeps it unpolished once a request for this dictation failed by
-    /// running out of time: a hung server would make every piece wait out its own deadline,
-    /// one after the other. A quick failure (a server restarting) doesn't stop the rest.
-    fn polish(&mut self, p: &dyn Polisher, raw: &str, cfg: &PolishConfig, scope: &Scope) {
-        self.raw_words += raw.split_whitespace().count();
-        let (piece, replaced) = scope.replace(raw);
-        self.replacements += replaced;
-        let piece = piece.as_ref();
+    /// Polishes the next piece (`piece`, as transcribed), or keeps it unpolished once a
+    /// request for this dictation failed by running out of time: a hung server would make
+    /// every piece wait out its own deadline, one after the other. A quick failure (a server
+    /// restarting) doesn't stop the rest. The dictionary's replacements are made once the
+    /// pieces are joined.
+    fn polish(&mut self, p: &dyn Polisher, piece: &str, cfg: &PolishConfig) {
         let words = piece.split_whitespace().count();
+        self.raw_words += words;
         let (text, outcome) = if self.timed_out {
             let why = "an earlier piece timed out".to_owned();
             (piece.to_owned(), Outcome::Failed(why))
@@ -2076,7 +2068,7 @@ fn polish_thread(
                 // Dropped (cancelled): its pieces still queued are skipped.
                 if !shared.dropped.load(Relaxed) {
                     let t = Instant::now();
-                    p.polish(polisher, &text, &piece_cfg, &shared.scope);
+                    p.polish(polisher, &text, &piece_cfg);
                     p.ahead_ms += ms(t.elapsed());
                 }
                 continue;
@@ -2095,8 +2087,6 @@ fn polish_thread(
         } = *job;
         // Pieces sent before it are its own (or a failed dictation's).
         let earlier = pieces.take();
-        // Polished in pieces, the replacements are made in each (see `Pieces::polish`).
-        let mut replacements = None;
         if let Some(polisher) = polisher.as_deref() {
             let start = Instant::now();
             d.polish_wait_ms = Some(ms(start.saturating_duration_since(ready)));
@@ -2118,9 +2108,8 @@ fn polish_thread(
                 Some((mut p, rest, words)) => {
                     let ahead = p.texts.len();
                     for piece in &rest {
-                        p.polish(polisher, piece, &piece_cfg, &scope);
+                        p.polish(polisher, piece, &piece_cfg);
                     }
-                    replacements = Some(p.replacements);
                     tracing::debug!(
                         "polished in {} pieces, {ahead} in the background ({:.0} ms); {words} words left at release",
                         ahead + rest.len(),
@@ -2135,7 +2124,6 @@ fn polish_thread(
                     outcome
                 }
                 None => {
-                    replacements = Some(replace_in(&scope, &mut text));
                     let (polished, outcome) =
                         agt_polish::polish_or_raw(polisher, &text, &config.polish);
                     log_outcome(&outcome, &text, "transcript");
@@ -2146,13 +2134,13 @@ fn polish_thread(
             d.polish_ms = Some(ms(start.elapsed()));
             d.polish_outcome = Some(outcome);
         }
-        let replacements = replacements.unwrap_or_else(|| replace_in(&scope, &mut text));
-        d.replacements = Some(replacements as i64);
         if let Some(t) = saved.as_mut().and_then(|e| e.text.as_mut()) {
             t.polish_outcome = d.polish_outcome;
             t.polished =
                 matches!(d.polish_outcome, Some("polished" | "partial")).then(|| text.clone());
         }
+        // After polish, which so never rewrites them; the history's "pasted" has them.
+        d.replacements = Some(replace_in(&scope, &mut text) as i64);
         if config.paste.trailing_space && !text.is_empty() {
             text.push(' ');
         }
@@ -2892,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn replacements_apply_before_polish_and_the_history_keeps_the_raw_text() {
+    fn replacements_apply_after_polish_and_the_history_keeps_the_text_before() {
         let text = "merge it into Maine and copy the dot env file";
         let out = polish_with(
             vec![with_history(whole_with(text, test_dictionary()))],
@@ -2905,7 +2893,47 @@ mod tests {
         assert_eq!(d.replacements, Some(2));
         let t = saved.as_ref().unwrap().text.as_ref().unwrap();
         assert_eq!(t.raw, text, "the engine's output, for the eval");
-        assert_eq!(t.polished.as_deref(), Some(pasted.as_str()));
+        assert_eq!(t.polished, Some(format!("{text} ok.")), "what polish wrote");
+    }
+
+    /// Polish that writes a phrase its own way, as an LLM may.
+    struct Hyphenates;
+    impl Polisher for Hyphenates {
+        fn name(&self) -> String {
+            "hyphenates".into()
+        }
+        fn polish(
+            &self,
+            text: &str,
+            _: &agt_core::polish::PolishCtx,
+        ) -> agt_core::polish::Result<String> {
+            Ok(text.replace("true tide", "True-Tide"))
+        }
+    }
+
+    #[test]
+    fn polish_never_rewrites_a_replacement() {
+        // However polish writes the phrase, it's replaced after, with a capital where it
+        // starts the sentence.
+        let scope = in_app(
+            "[[replace]]\nfrom = \"Reddit true tide\"\nto = \"retatrutide\"\n",
+            None,
+        );
+        let text = "Reddit true tide daily, then reddit true tide weekly";
+        let out = polish_with(
+            vec![with_history(whole_with(text, scope))],
+            Some(Arc::new(Hyphenates)),
+        );
+        let [(pasted, d, saved)] = &out[..] else {
+            panic!()
+        };
+        assert_eq!(pasted, "Retatrutide daily, then retatrutide weekly");
+        assert_eq!(d.replacements, Some(2));
+        let t = saved.as_ref().unwrap().text.as_ref().unwrap();
+        assert_eq!(
+            t.polished.as_deref(),
+            Some("Reddit True-Tide daily, then reddit True-Tide weekly")
+        );
     }
 
     #[test]
@@ -2913,8 +2941,8 @@ mod tests {
         let cases = [
             // Polish off.
             (None, "into Maine please", "into main please"),
-            // Too short to polish.
-            (Some(Arc::new(Marks) as Arc<dyn Polisher>), "Maine", "main"),
+            // Too short to polish (and it starts the sentence: a capital).
+            (Some(Arc::new(Marks) as Arc<dyn Polisher>), "Maine", "Main"),
             // Polish failed: the transcript pasted as is, replaced.
             (
                 Some(Arc::new(Marks) as Arc<dyn Polisher>),
@@ -2935,7 +2963,7 @@ mod tests {
     }
 
     #[test]
-    fn replacements_apply_to_every_piece_of_a_long_dictation() {
+    fn replacements_apply_to_the_joined_pieces_of_a_long_dictation() {
         let a = shared_with(test_dictionary());
         // Each piece and the rest have a phrase to replace; "dot env" -> ".env" drops a word,
         // which must not make the pieces look like they don't add up to the transcript.
@@ -2953,7 +2981,8 @@ mod tests {
         assert_eq!(
             text,
             &format!(
-                "{} main .env. ok. {} then .env. ok. into main ok.",
+                // "Maine" starts a sentence there: "Main".
+                "{} Main .env. ok. {} then .env. ok. into main ok.",
                 sentences(25, "one"),
                 sentences(25, "two")
             )
@@ -3018,7 +3047,7 @@ mod tests {
         let [(text, d)] = &out[..] else { panic!() };
         assert_eq!(
             text,
-            &format!("{} main. ok. into main ok.", sentences(25, "one"))
+            &format!("{} Main. ok. into main ok.", sentences(25, "one"))
         );
         assert_eq!(d.replacements, Some(2));
         // The next dictation gets the new one.

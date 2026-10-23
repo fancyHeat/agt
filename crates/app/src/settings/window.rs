@@ -320,7 +320,8 @@ impl Model {
                     .iter()
                     .map(|r| {
                         let profiles = d.profiles_of(r).into_iter().map(Into::into).collect();
-                        (r.from.clone(), r.to.clone(), profiles)
+                        // A new line written in the file shows as typed here.
+                        (r.from.clone(), r.to.replace('\n', "\\n"), profiles)
                     })
                     .collect(),
                 broken: false,
