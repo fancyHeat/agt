@@ -3,7 +3,7 @@
 //!
 //! | What | Needs |
 //! |---|---|
-//! | Seeing the hotkeys (event tap), swallowing their keys that aren't modifiers and the Globe key, sending Cmd+V | Accessibility |
+//! | Seeing the hotkeys (event tap), swallowing their keys that aren't modifiers and the Globe key, sending Cmd+V, recording a hotkey (settings window) | Accessibility |
 //! | Recording (otherwise CoreAudio delivers silence) | Microphone |
 //!
 //! Accessibility also lets an event tap see keystrokes, so AGT doesn't ask for Input
@@ -11,7 +11,10 @@
 //! restart once granted: the hotkey thread retries creating its tap every second until it
 //! works, and the others are checked when used.
 
-use crate::{Error, Hotkey, HotkeyEvent, Hotkeys, Key, LoginItem, Permission, hotkeys::Detector};
+use crate::{
+    Capture, Error, Hotkey, HotkeyEvent, Hotkeys, Key, LoginItem, Permission, capture::KeyCapture,
+    hotkeys::Detector,
+};
 use block2::RcBlock;
 use objc2::{
     msg_send,
@@ -41,6 +44,7 @@ use std::{
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -398,6 +402,175 @@ pub fn key_down(key: Key) -> Option<bool> {
         CGEventSourceStateID::HIDSystemState,
         key.code,
     ))
+}
+
+// ---------------------------------------------------------------------------------------
+// Key recorder
+
+/// How long the key recorder's run loop runs at a time, in seconds: the longest its thread
+/// can miss that the handle was dropped (stopping a run loop that isn't running does nothing).
+const CAPTURE_WAKE: f64 = 0.2;
+
+struct CaptureState {
+    capture: KeyCapture,
+    on: Box<dyn Fn(Capture) + Send>,
+    tap: Option<Cf<CFRetained<CFMachPort>>>,
+    run_loop: Option<Cf<CFRetained<CFRunLoop>>>,
+}
+
+struct CaptureShared {
+    stop: AtomicBool,
+    state: Mutex<CaptureState>,
+}
+
+pub struct CaptureHandle {
+    shared: Arc<CaptureShared>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        if let Ok(st) = self.shared.state.lock()
+            && let Some(rl) = &st.run_loop
+        {
+            rl.0.stop();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// macOS side of [`crate::capture_keys`]: an active tap at the HID level, ahead of AGT's own
+/// tap (at the session level) and of every app.
+pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
+    if !post_access() {
+        let name = accessibility_name();
+        return Err(format!(
+            "Recording a key needs the {name} permission (System Settings > Privacy & Security > {name})"
+        )
+        .into());
+    }
+    let shared = Arc::new(CaptureShared {
+        stop: AtomicBool::new(false),
+        state: Mutex::new(CaptureState {
+            capture: KeyCapture::default(),
+            on,
+            tap: None,
+            run_loop: None,
+        }),
+    });
+    let (tx, rx) = mpsc::sync_channel(1);
+    let s = shared.clone();
+    let thread = thread::Builder::new()
+        .name("key-capture".into())
+        .spawn(move || run_capture_thread(s, tx))?;
+    rx.recv().map_err(|_| "key recorder thread died")??;
+    Ok(CaptureHandle {
+        shared,
+        thread: Some(thread),
+    })
+}
+
+fn run_capture_thread(shared: Arc<CaptureShared>, ready: mpsc::SyncSender<Result<(), String>>) {
+    // Every key event on the system waits for this tap: keep the thread ahead of the others.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    let mask = (1u64 << CGEventType::KeyDown.0)
+        | (1u64 << CGEventType::KeyUp.0)
+        | (1u64 << CGEventType::FlagsChanged.0);
+    let tap = unsafe {
+        CGEvent::tap_create(
+            CGEventTapLocation::HIDEventTap,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            mask,
+            Some(capture_callback),
+            Arc::as_ptr(&shared) as *mut c_void,
+        )
+    };
+    let Some(tap) = tap else {
+        let _ = ready.send(Err("cannot create the key recorder's event tap".into()));
+        return;
+    };
+    let (Some(source), Some(run_loop)) = (
+        CFMachPort::new_run_loop_source(None, Some(&tap), 0),
+        CFRunLoop::current(),
+    ) else {
+        CFMachPort::invalidate(&tap);
+        let _ = ready.send(Err("cannot run the key recorder's event tap".into()));
+        return;
+    };
+    run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+    CGEvent::tap_enable(&tap, true);
+    {
+        let mut st = shared.state.lock().unwrap();
+        st.tap = Some(Cf(tap.clone()));
+        st.run_loop = Some(Cf(run_loop));
+    }
+    let _ = ready.send(Ok(()));
+    // Until the handle is dropped. Its `stop()` ends a wait at once; the timeout catches a stop
+    // that came before the run loop was running (stopping an idle loop does nothing).
+    while !shared.stop.load(Ordering::SeqCst) {
+        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, CAPTURE_WAKE, false);
+    }
+    CFMachPort::invalidate(&tap);
+    let mut st = shared.state.lock().unwrap();
+    st.tap = None;
+    st.run_loop = None;
+}
+
+unsafe extern "C-unwind" fn capture_callback(
+    _proxy: CGEventTapProxy,
+    ty: CGEventType,
+    event: NonNull<CGEvent>,
+    info: *mut c_void,
+) -> *mut CGEvent {
+    // SAFETY: `info` is the `CaptureShared` the thread running this tap holds an `Arc` of.
+    let shared = unsafe { &*(info as *const CaptureShared) };
+    let pass = event.as_ptr();
+    let ev = unsafe { event.as_ref() };
+    let Ok(mut st) = shared.state.lock() else {
+        return pass;
+    };
+    if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
+        if let Some(tap) = &st.tap {
+            CGEvent::tap_enable(&tap.0, true);
+        }
+        tracing::warn!("key recorder's event tap was disabled; re-enabled it");
+        return pass;
+    }
+    if CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceUserData) == INJECTED_MARK {
+        return pass;
+    }
+    let code = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
+    let st = &mut *st;
+    let mut report = |down| {
+        if let Some(c) = st.capture.on_key(code, down) {
+            (st.on)(c);
+        }
+    };
+    match ty {
+        // Not a key: what macOS sends after Fn is released on its own. Apps don't see it
+        // either.
+        CGEventType::KeyDown | CGEventType::KeyUp if code == KVK_GLOBE => {}
+        CGEventType::KeyDown => report(true),
+        CGEventType::KeyUp => report(false),
+        CGEventType::FlagsChanged if !down_flag(code).is_empty() => {
+            report(CGEvent::flags(Some(ev)).intersects(down_flag(code)))
+        }
+        // Caps Lock: macOS reports it switching on or off, not being let go. Taken as a press
+        // and its release, so the window can say why it can't be a hotkey.
+        CGEventType::FlagsChanged => {
+            report(true);
+            report(false);
+        }
+        _ => return pass,
+    }
+    // Apps and AGT's own tap never see it.
+    null_mut()
 }
 
 // ---------------------------------------------------------------------------------------

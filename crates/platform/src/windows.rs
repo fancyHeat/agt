@@ -1,8 +1,9 @@
-//! Windows: WH_KEYBOARD_LL hook on its own thread, Win32 clipboard, SendInput.
+//! Windows: WH_KEYBOARD_LL hooks on their own threads (the hotkey's, the key recorder's),
+//! Win32 clipboard, SendInput.
 
 use crate::{
-    Error, HotkeyEvent, Hotkeys, Key, KeyKind, LoginItem, Permission, hotkeys::Detector,
-    needs_masker,
+    Capture, Error, HotkeyEvent, Hotkeys, Key, KeyKind, LoginItem, Permission, capture::KeyCapture,
+    hotkeys::Detector, needs_masker,
 };
 use std::{
     cell::RefCell,
@@ -353,6 +354,114 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         return 1;
     }
     // Modifiers (hotkey keys or not) and every other key pass through.
+    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+// ---------------------------------------------------------------------------------------
+// Key recorder
+
+struct CaptureState {
+    capture: KeyCapture,
+    on: Box<dyn Fn(Capture) + Send>,
+}
+
+thread_local! {
+    static CAPTURE: RefCell<Option<CaptureState>> = const { RefCell::new(None) };
+}
+
+pub struct CaptureHandle {
+    thread_id: u32,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        // WM_QUIT ends its message loop. If that can't be posted, the thread has ended already,
+        // or has no message queue (installing the hook makes one) and would never end: don't
+        // wait for it.
+        if unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } == 0 {
+            tracing::warn!("cannot stop the key recorder (error {})", unsafe {
+                GetLastError()
+            });
+            return;
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Windows side of [`crate::capture_keys`]: a low-level keyboard hook of its own. Windows
+/// calls the newest one first, so it runs before AGT's (installed when AGT started).
+pub fn capture_keys(on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let thread = thread::Builder::new()
+        .name("key-capture".into())
+        .spawn(move || {
+            // Windows silently removes a low-level hook that misses LowLevelHooksTimeout.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+            CAPTURE.with(|c| {
+                *c.borrow_mut() = Some(CaptureState {
+                    capture: KeyCapture::default(),
+                    on,
+                })
+            });
+            let hook = unsafe {
+                SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(capture_proc),
+                    GetModuleHandleW(null()),
+                    0,
+                )
+            };
+            if hook.is_null() {
+                let _ = tx.send(Err(format!(
+                    "SetWindowsHookExW failed (error {})",
+                    unsafe { GetLastError() }
+                )));
+                return;
+            }
+            let _ = tx.send(Ok(unsafe { GetCurrentThreadId() }));
+            // The hook runs on this thread, inside GetMessageW. Until the handle is dropped
+            // (WM_QUIT).
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            unsafe { UnhookWindowsHookEx(hook) };
+            CAPTURE.with(|c| *c.borrow_mut() = None);
+        })?;
+    let thread_id = rx.recv().map_err(|_| "key recorder thread died")??;
+    Ok(CaptureHandle {
+        thread_id,
+        thread: Some(thread),
+    })
+}
+
+unsafe extern "system" fn capture_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        if kb.dwExtraInfo != INJECTED_MARK {
+            // AltGr's fake Left Ctrl and the generic Shift, Ctrl and Alt codes aren't keys of
+            // their own (see `classify`): kept from apps like the rest, but not recorded.
+            if let Some(key) = classify(kb.vkCode, kb.scanCode) {
+                let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+                CAPTURE.with(|c| {
+                    if let Ok(mut c) = c.try_borrow_mut()
+                        && let Some(s) = c.as_mut()
+                        && let Some(capture) = s.capture.on_key(key, down)
+                    {
+                        (s.on)(capture);
+                    }
+                });
+            }
+            // Apps and AGT's own hook never see it.
+            return 1;
+        }
+    }
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
 }
 

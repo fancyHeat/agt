@@ -1,7 +1,7 @@
 //! Placeholder for platforms without an implementation (anything but Windows and macOS).
 //! Everything compiles and fails with a clear error instead of crashing.
 
-use crate::{Error, HotkeyEvent, Hotkeys, Key, LoginItem, Permission};
+use crate::{Capture, Error, HotkeyEvent, Hotkeys, Key, LoginItem, Permission};
 
 const MSG: &str = "not supported on this platform";
 
@@ -10,6 +10,7 @@ pub struct HotkeyHandle;
 pub struct HotkeyReset;
 pub struct ClipboardSnapshot;
 pub struct PasteToken;
+pub struct CaptureHandle;
 
 impl HotkeyHandle {
     pub fn resetter(&self) -> HotkeyReset {
@@ -26,6 +27,10 @@ pub fn start_hotkey(
     _on_event: Box<dyn Fn(HotkeyEvent) + Send>,
 ) -> Result<HotkeyHandle, Error> {
     Err(format!("global hotkey {MSG}").into())
+}
+
+pub fn capture_keys(_on: Box<dyn Fn(Capture) + Send>) -> Result<CaptureHandle, Error> {
+    Err(format!("recording a key {MSG}").into())
 }
 
 pub fn paste_may_release(_key: Key) -> bool {

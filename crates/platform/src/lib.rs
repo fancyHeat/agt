@@ -4,6 +4,8 @@
 //! - Windows: low-level keyboard hook, Win32 clipboard, `SendInput`.
 //! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone and Accessibility
 //!   permissions (see [`missing_permissions`]).
+//! - Recording a hotkey for the settings window ([`capture_keys`]): the keys pressed, kept from
+//!   every other app and from AGT's own hotkey listener.
 //! - Ducking other audio while dictating ([`Ducker`]): the default output device's volume
 //!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL).
 //! - Starting AGT at login ([`set_launch_at_login`]; Windows: the `Run` key; macOS:
@@ -36,6 +38,9 @@ pub use duck::{Ducked, Ducker};
 
 mod hotkeys;
 pub use hotkeys::Hotkeys;
+
+mod capture;
+pub use capture::{Capture, CaptureHandle, capture_keys};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
