@@ -62,8 +62,6 @@ const KVK_FUNCTION: u16 = 0x3F;
 const KVK_GLOBE: u16 = 0xB3;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
-/// IOKit's device-dependent flag for Left Control being down (alongside `MaskControl`).
-const NX_DEVICELCTLKEYMASK: CGEventFlags = CGEventFlags::from_bits_retain(0x01);
 
 /// Event times for [`HoldDetector`], in ms since this module was first used (wraps after 49
 /// days, which the detector handles). Our own clock: `CGEventGetTimestamp`'s unit differs
@@ -813,27 +811,31 @@ pub fn send_paste(keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(
     // forwards each key to the session and follows Control the way a keyboard sends it: a
     // flagsChanged event carrying the left key's device bit. Sent like Command below (a key
     // event, no device bit), Control never reached the session, which got a bare V.
-    let (modifier, flag) = if keys.control {
+    let (modifier, flag, modifier_type) = if keys.control {
         (
             KVK_CONTROL,
-            CGEventFlags::MaskControl | NX_DEVICELCTLKEYMASK,
+            // NX_DEVICELCTLKEYMASK
+            CGEventFlags::MaskControl | CGEventFlags::from_bits_retain(0x01),
+            Some(CGEventType::FlagsChanged),
         )
     } else {
-        (KVK_COMMAND, CGEventFlags::MaskCommand)
+        (KVK_COMMAND, CGEventFlags::MaskCommand, None)
     };
     // A private source: the events carry exactly the flags we set, not the modifiers the user
     // is holding (e.g. Option for the next dictation, which would make it Cmd+Option+V).
     let source = CGEventSource::new(CGEventSourceStateID::Private);
-    for (code, down, flags) in [
-        (modifier, true, flag),
-        (KVK_ANSI_V, true, flag),
-        (KVK_ANSI_V, false, flag),
-        (modifier, false, CGEventFlags::empty()),
-    ] {
+    // All built before any is posted: a modifier left down would hold for every key after.
+    let events = [
+        (modifier, true, flag, modifier_type),
+        (KVK_ANSI_V, true, flag, None),
+        (KVK_ANSI_V, false, flag, None),
+        (modifier, false, CGEventFlags::empty(), modifier_type),
+    ]
+    .map(|(code, down, flags, event_type)| {
         let event = CGEvent::new_keyboard_event(source.as_deref(), code, down)
             .ok_or("cannot create a keyboard event")?;
-        if code == KVK_CONTROL {
-            CGEvent::set_type(Some(&event), CGEventType::FlagsChanged);
+        if let Some(t) = event_type {
+            CGEvent::set_type(Some(&event), t);
         }
         CGEvent::set_flags(Some(&event), flags);
         CGEvent::set_integer_value_field(
@@ -841,7 +843,12 @@ pub fn send_paste(keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(
             CGEventField::EventSourceUserData,
             INJECTED_MARK,
         );
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        Ok::<_, Error>(event)
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    for event in &events {
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
     }
     Ok(())
 }
