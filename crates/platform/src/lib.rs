@@ -454,8 +454,9 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
 
 /// Sends Ctrl+V to the focused window (Windows: releasing held Shift/Alt/Win first, so e.g. a
 /// Win key still held from a `LeftCtrl+LeftWin` chord doesn't turn it into Win+Ctrl+V; macOS:
-/// Cmd+V with no other modifier, whatever is held). Returns once the keystrokes are queued;
-/// the target app reads the clipboard asynchronously, so wait a bit before restoring it.
+/// Cmd+V with no other modifier, whatever is held, or Ctrl+V into a remote Windows session in
+/// the Windows App). Returns once the keystrokes are queued; the target app reads the
+/// clipboard asynchronously, so wait a bit before restoring it.
 /// Fails e.g. when the focused app runs elevated (Windows) or without the Accessibility
 /// permission (macOS).
 ///
@@ -494,8 +495,8 @@ pub fn paste_count() -> u64 {
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
 /// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
-/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, Cmd+V only posts Left
-/// Command and V).
+/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, a paste only posts Left
+/// Command or Left Control and V).
 pub fn paste_may_release(key: Key) -> bool {
     imp::paste_may_release(key)
 }

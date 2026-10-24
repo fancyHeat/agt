@@ -54,6 +54,7 @@ const TAP_RETRY: Duration = Duration::from_secs(1);
 
 // Virtual key codes (Carbon `kVK_*`).
 const KVK_COMMAND: u16 = 0x37;
+const KVK_CONTROL: u16 = 0x3B;
 const KVK_ESCAPE: u16 = 0x35;
 const KVK_FUNCTION: u16 = 0x3F;
 /// The key event macOS sends right after Fn is released on its own, which apps act on with
@@ -331,7 +332,8 @@ unsafe extern "C-unwind" fn tap_callback(
 }
 
 /// macOS side of [`crate::paste_may_release`]: never. [`send_paste`] only posts Left Command
-/// and V, neither of which can be a hotkey key, and nothing for the keys the user holds.
+/// or Left Control and V, none of which can be a hotkey key, and nothing for the keys the user
+/// holds.
 pub fn paste_may_release(_key: Key) -> bool {
     false
 }
@@ -473,6 +475,11 @@ const NOT_TEXT_ROLES: &[&str] = &[
 /// files, not text.
 const FINDER: &str = "com.apple.finder";
 
+/// Remote desktop apps showing a Windows session, where Ctrl+V pastes (Cmd+V doesn't): the
+/// Windows App (formerly Microsoft Remote Desktop). It shares the Mac's clipboard with the
+/// session.
+const REMOTE_DESKTOPS: &[&str] = &["com.microsoft.rdc.macos"];
+
 fn ax_element(raw: Option<NonNull<CFType>>) -> Option<CFRetained<CFType>> {
     // SAFETY: `AXUIElementCreate*` return a +1 reference.
     raw.map(|p| unsafe { CFRetained::from_raw(p) })
@@ -613,6 +620,31 @@ fn takes_text(role: Option<&str>, editable: bool, finder: bool) -> Option<bool> 
     }
 }
 
+/// Whether a paste should be Ctrl+V: focus is in a remote Windows session. Asks the focused
+/// app only when it is a remote desktop app.
+fn paste_with_control() -> bool {
+    let Some(app) = foreground_app() else {
+        return false;
+    };
+    if !REMOTE_DESKTOPS.contains(&app.as_str()) {
+        return false;
+    }
+    let role = focused_app()
+        .and_then(|(app, _)| ax_element_attribute(&app, "AXFocusedUIElement").ok())
+        .and_then(|f| ax_attribute(&f, "AXRole").ok())
+        .and_then(|r| r.downcast_ref::<CFString>().map(ToString::to_string));
+    let control = remote_session_focused(&app, role.as_deref());
+    tracing::debug!("paste: {app}, focused {role:?} → Ctrl+V: {control}");
+    control
+}
+
+/// Whether focus is in a remote desktop session: `app` (a bundle identifier) is a remote
+/// desktop app and its focused element (`role`) isn't one of its own text fields (the Windows
+/// App's search box, say), which are the Mac's and paste with Cmd+V.
+fn remote_session_focused(app: &str, role: Option<&str>) -> bool {
+    REMOTE_DESKTOPS.contains(&app) && !role.is_some_and(|r| TEXT_ROLES.contains(&r))
+}
+
 // ---------------------------------------------------------------------------------------
 // Clipboard
 
@@ -746,15 +778,20 @@ pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
         )
         .into());
     }
+    // A remote Windows session pastes with Ctrl+V, which the remote desktop app passes on.
+    let (modifier, flag) = if paste_with_control() {
+        (KVK_CONTROL, CGEventFlags::MaskControl)
+    } else {
+        (KVK_COMMAND, CGEventFlags::MaskCommand)
+    };
     // A private source: the events carry exactly the flags we set, not the modifiers the user
     // is holding (e.g. Option for the next dictation, which would make it Cmd+Option+V).
     let source = CGEventSource::new(CGEventSourceStateID::Private);
-    let command = CGEventFlags::MaskCommand;
     for (code, down, flags) in [
-        (KVK_COMMAND, true, command),
-        (KVK_ANSI_V, true, command),
-        (KVK_ANSI_V, false, command),
-        (KVK_COMMAND, false, CGEventFlags::empty()),
+        (modifier, true, flag),
+        (KVK_ANSI_V, true, flag),
+        (KVK_ANSI_V, false, flag),
+        (modifier, false, CGEventFlags::empty()),
     ] {
         let event = CGEvent::new_keyboard_event(source.as_deref(), code, down)
             .ok_or("cannot create a keyboard event")?;
@@ -1199,5 +1236,23 @@ mod tests {
         // Renaming a file.
         assert_eq!(takes_text(Some("AXTextField"), false, true), Some(true));
         assert_eq!(takes_text(Some("AXWindow"), false, true), None);
+    }
+
+    #[test]
+    fn remote_sessions_paste_with_control() {
+        let rdp = "com.microsoft.rdc.macos";
+        // The session window, whatever it reports, or nothing focused.
+        for role in [
+            Some("AXGroup"),
+            Some("AXWindow"),
+            Some("AXScrollArea"),
+            None,
+        ] {
+            assert!(remote_session_focused(rdp, role), "{role:?}");
+        }
+        // The Windows App's own search box is a Mac text field.
+        assert!(!remote_session_focused(rdp, Some("AXSearchField")));
+        assert!(!remote_session_focused(rdp, Some("AXTextField")));
+        assert!(!remote_session_focused("com.microsoft.VSCode", None));
     }
 }
