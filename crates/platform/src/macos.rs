@@ -807,30 +807,48 @@ pub fn send_paste(keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(
         )
         .into());
     }
-    // A remote Windows session pastes with Ctrl+V, which the remote desktop app passes on.
-    let (modifier, flag) = if keys.control {
-        (KVK_CONTROL, CGEventFlags::MaskControl)
+    // A remote Windows session pastes with Ctrl+V, which the remote desktop app passes on. It
+    // forwards each key to the session and follows Control the way a keyboard sends it: a
+    // flagsChanged event carrying the left key's device bit. Sent like Command below (a key
+    // event, no device bit), Control never reached the session, which got a bare V.
+    let (modifier, flag, modifier_type) = if keys.control {
+        (
+            KVK_CONTROL,
+            // NX_DEVICELCTLKEYMASK
+            CGEventFlags::MaskControl | CGEventFlags::from_bits_retain(0x01),
+            Some(CGEventType::FlagsChanged),
+        )
     } else {
-        (KVK_COMMAND, CGEventFlags::MaskCommand)
+        (KVK_COMMAND, CGEventFlags::MaskCommand, None)
     };
     // A private source: the events carry exactly the flags we set, not the modifiers the user
     // is holding (e.g. Option for the next dictation, which would make it Cmd+Option+V).
     let source = CGEventSource::new(CGEventSourceStateID::Private);
-    for (code, down, flags) in [
-        (modifier, true, flag),
-        (KVK_ANSI_V, true, flag),
-        (KVK_ANSI_V, false, flag),
-        (modifier, false, CGEventFlags::empty()),
-    ] {
+    // All built before any is posted: a modifier left down would hold for every key after.
+    let events = [
+        (modifier, true, flag, modifier_type),
+        (KVK_ANSI_V, true, flag, None),
+        (KVK_ANSI_V, false, flag, None),
+        (modifier, false, CGEventFlags::empty(), modifier_type),
+    ]
+    .map(|(code, down, flags, event_type)| {
         let event = CGEvent::new_keyboard_event(source.as_deref(), code, down)
             .ok_or("cannot create a keyboard event")?;
+        if let Some(t) = event_type {
+            CGEvent::set_type(Some(&event), t);
+        }
         CGEvent::set_flags(Some(&event), flags);
         CGEvent::set_integer_value_field(
             Some(&event),
             CGEventField::EventSourceUserData,
             INJECTED_MARK,
         );
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        Ok::<_, Error>(event)
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    for event in &events {
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
     }
     Ok(())
 }
