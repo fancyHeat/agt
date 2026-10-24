@@ -10,6 +10,7 @@ pub struct HotkeyHandle;
 pub struct HotkeyReset;
 pub struct ClipboardSnapshot;
 pub struct PasteToken;
+pub struct PasteKeys;
 
 impl HotkeyHandle {
     pub fn resetter(&self) -> HotkeyReset {
@@ -70,7 +71,11 @@ pub fn wait_for_clipboard_listeners() -> Option<std::time::Duration> {
     None
 }
 
-pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
+pub fn paste_keys() -> PasteKeys {
+    PasteKeys
+}
+
+pub fn send_paste(_keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(), Error> {
     Err(format!("pasting {MSG}").into())
 }
 

@@ -561,7 +561,14 @@ fn process_name(hwnd: HWND) -> Option<String> {
     path.rsplit('\\').next().map(str::to_owned)
 }
 
-pub fn send_paste(before_releasing: impl FnOnce()) -> Result<(), Error> {
+/// Always Ctrl+V.
+pub struct PasteKeys;
+
+pub fn paste_keys() -> PasteKeys {
+    PasteKeys
+}
+
+pub fn send_paste(_keys: PasteKeys, before_releasing: impl FnOnce()) -> Result<(), Error> {
     let mut inputs = Vec::with_capacity(12);
     // Modifiers that are down would change the shortcut (Ctrl+Shift+V pastes without
     // formatting in many apps, Ctrl+Alt+V is something else, Win+Ctrl+V opens the sound

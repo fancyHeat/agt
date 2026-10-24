@@ -452,19 +452,31 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
     imp::wait_for_clipboard_listeners()
 }
 
+/// Which keystroke pastes into the focused window, for [`send_paste`]. macOS: Ctrl+V into a
+/// remote Windows session in the Windows App (asking the app which of its controls has focus,
+/// a quarter second at most per request), else Cmd+V. Ask it before the last check that focus
+/// hasn't moved.
+pub fn paste_keys() -> PasteKeys {
+    PasteKeys(imp::paste_keys())
+}
+
+/// See [`paste_keys`].
+pub struct PasteKeys(imp::PasteKeys);
+
 /// Sends Ctrl+V to the focused window (Windows: releasing held Shift/Alt/Win first, so e.g. a
 /// Win key still held from a `LeftCtrl+LeftWin` chord doesn't turn it into Win+Ctrl+V; macOS:
-/// Cmd+V with no other modifier, whatever is held). Returns once the keystrokes are queued;
-/// the target app reads the clipboard asynchronously, so wait a bit before restoring it.
+/// Cmd+V with no other modifier, whatever is held, or Ctrl+V into a remote Windows session in
+/// the Windows App). Returns once the keystrokes are queued; the target app reads the
+/// clipboard asynchronously, so wait a bit before restoring it.
 /// Fails e.g. when the focused app runs elevated (Windows) or without the Accessibility
 /// permission (macOS).
 ///
 /// To avoid that release altogether, wait until the hotkey's keys are up first (see
 /// [`paste_may_release`]).
-pub fn send_paste() -> Result<(), Error> {
+pub fn send_paste(keys: PasteKeys) -> Result<(), Error> {
     // Counted before the keystrokes go out, so a poll can never see a fake release that
     // isn't counted yet.
-    imp::send_paste(|| {
+    imp::send_paste(keys.0, || {
         PASTES.fetch_add(1, Ordering::SeqCst);
     })
 }
@@ -494,8 +506,8 @@ pub fn paste_count() -> u64 {
 
 /// Whether [`send_paste`] can make `key` *look* released to [`key_down`] while it is still
 /// physically held (Windows: it injects key-ups for held Shift and Win keys, and a Ctrl-up
-/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, Cmd+V only posts Left
-/// Command and V).
+/// that maps to Left Ctrl; Right Ctrl is never touched. macOS: never, a paste only posts Left
+/// Command or Left Control and V).
 pub fn paste_may_release(key: Key) -> bool {
     imp::paste_may_release(key)
 }
