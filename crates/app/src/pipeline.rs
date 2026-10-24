@@ -2180,6 +2180,8 @@ fn paste_thread(
                     // reads it, and some targets then paste nothing (#75).
                     d.clipboard_settle_ms = agt_platform::wait_for_clipboard_listeners().map(ms);
                 }
+                // Before the check below: it may ask the focused app, which takes time.
+                let keys = agt_platform::paste_keys();
                 let result = match set {
                     None => Err(PasteError::WindowChanged),
                     Some(Err(e)) => Err(PasteError::ClipboardBusy(e)),
@@ -2189,7 +2191,7 @@ fn paste_thread(
                         undo_clipboard(&mut saver, &token, &mut pending_restore);
                         Err(PasteError::WindowChanged)
                     }
-                    Some(Ok(token)) => match agt_platform::send_paste() {
+                    Some(Ok(token)) => match agt_platform::send_paste(keys) {
                         Ok(()) => Ok(token),
                         Err(e) => {
                             undo_clipboard(&mut saver, &token, &mut pending_restore);

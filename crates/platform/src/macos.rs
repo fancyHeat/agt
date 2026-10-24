@@ -557,13 +557,7 @@ pub fn prepare_focus_check() {
 pub fn focus_takes_text() -> Option<bool> {
     let (app, pid) = focused_app()?;
     let pid = pid.unwrap_or(0);
-    let is_finder = || {
-        autoreleasepool(|_| {
-            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-                .and_then(|a| a.bundleIdentifier())
-                .is_some_and(|b| b.to_string() == FINDER)
-        })
-    };
+    let is_finder = || bundle_of(pid).as_deref() == Some(FINDER);
     let focused = match ax_element_attribute(&app, "AXFocusedUIElement") {
         Ok(f) => f,
         // The app has nothing focused (no window, or a window with no focusable control).
@@ -577,10 +571,7 @@ pub fn focus_takes_text() -> Option<bool> {
             return None;
         }
     };
-    let role = ax_attribute(&focused, "AXRole")
-        .ok()
-        .and_then(|r| r.downcast_ref::<CFString>().map(ToString::to_string));
-    let Some(role) = role else {
+    let Some(role) = ax_role(&focused) else {
         tracing::debug!("focus: pid {pid}: can't tell (no role)");
         return None;
     };
@@ -620,29 +611,67 @@ fn takes_text(role: Option<&str>, editable: bool, finder: bool) -> Option<bool> 
     }
 }
 
-/// Whether a paste should be Ctrl+V: focus is in a remote Windows session. Asks the focused
-/// app only when it is a remote desktop app.
-fn paste_with_control() -> bool {
-    let Some(app) = foreground_app() else {
-        return false;
-    };
-    if !REMOTE_DESKTOPS.contains(&app.as_str()) {
+fn ax_role(element: &CFType) -> Option<String> {
+    ax_attribute(element, "AXRole")
+        .ok()
+        .and_then(|r| r.downcast_ref::<CFString>().map(ToString::to_string))
+}
+
+/// The bundle identifier of the app running as `pid`.
+fn bundle_of(pid: i32) -> Option<String> {
+    autoreleasepool(|_| {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .and_then(|a| a.bundleIdentifier())
+            .map(|b| b.to_string())
+    })
+}
+
+/// Which keystroke pastes: Ctrl+V into a remote Windows session, else Cmd+V.
+pub struct PasteKeys {
+    control: bool,
+}
+
+pub fn paste_keys() -> PasteKeys {
+    PasteKeys {
+        control: remote_session_focused(),
+    }
+}
+
+/// Whether focus is in a remote Windows session: the focused app is a remote desktop app, and
+/// focus isn't in one of its own text fields.
+fn remote_session_focused() -> bool {
+    // No request to any app: others pay nothing.
+    if !foreground_app().is_some_and(|b| REMOTE_DESKTOPS.contains(&b.as_str())) {
         return false;
     }
-    let role = focused_app()
-        .and_then(|(app, _)| ax_element_attribute(&app, "AXFocusedUIElement").ok())
-        .and_then(|f| ax_attribute(&f, "AXRole").ok())
-        .and_then(|r| r.downcast_ref::<CFString>().map(ToString::to_string));
-    let control = remote_session_focused(&app, role.as_deref());
-    tracing::debug!("paste: {app}, focused {role:?} → Ctrl+V: {control}");
+    // `NSWorkspace` may still name the app focus just left: ask the accessibility API too.
+    let Some((app, pid)) = focused_app() else {
+        tracing::debug!("paste: remote desktop, can't tell what's focused → Ctrl+V");
+        return true;
+    };
+    if let Some(bundle) = pid.and_then(bundle_of)
+        && !REMOTE_DESKTOPS.contains(&bundle.as_str())
+    {
+        return false;
+    }
+    let role = match ax_element_attribute(&app, "AXFocusedUIElement") {
+        Ok(f) => ax_role(&f),
+        Err(AX_NO_VALUE) => None,
+        Err(e) => {
+            tracing::debug!("paste: remote desktop, can't tell (accessibility error {e})");
+            None
+        }
+    };
+    let control = pastes_with_control(role.as_deref());
+    tracing::debug!("paste: remote desktop, focused {role:?} → Ctrl+V: {control}");
     control
 }
 
-/// Whether focus is in a remote desktop session: `app` (a bundle identifier) is a remote
-/// desktop app and its focused element (`role`) isn't one of its own text fields (the Windows
-/// App's search box, say), which are the Mac's and paste with Cmd+V.
-fn remote_session_focused(app: &str, role: Option<&str>) -> bool {
-    REMOTE_DESKTOPS.contains(&app) && !role.is_some_and(|r| TEXT_ROLES.contains(&r))
+/// Whether a remote desktop app whose focused element has `role` (`None`: nothing focused, or
+/// can't tell) pastes with Ctrl+V: everywhere but its own text fields (the Windows App's search
+/// box, say), which are the Mac's and paste with Cmd+V.
+fn pastes_with_control(role: Option<&str>) -> bool {
+    !role.is_some_and(|r| TEXT_ROLES.contains(&r))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -770,7 +799,7 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
 
 /// Never releases a held modifier (see [`paste_may_release`]), so `_before_releasing` is never
 /// called.
-pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
+pub fn send_paste(keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(), Error> {
     if !post_access() {
         let name = accessibility_name();
         return Err(format!(
@@ -779,7 +808,7 @@ pub fn send_paste(_before_releasing: impl FnOnce()) -> Result<(), Error> {
         .into());
     }
     // A remote Windows session pastes with Ctrl+V, which the remote desktop app passes on.
-    let (modifier, flag) = if paste_with_control() {
+    let (modifier, flag) = if keys.control {
         (KVK_CONTROL, CGEventFlags::MaskControl)
     } else {
         (KVK_COMMAND, CGEventFlags::MaskCommand)
@@ -1240,7 +1269,6 @@ mod tests {
 
     #[test]
     fn remote_sessions_paste_with_control() {
-        let rdp = "com.microsoft.rdc.macos";
         // The session window, whatever it reports, or nothing focused.
         for role in [
             Some("AXGroup"),
@@ -1248,11 +1276,10 @@ mod tests {
             Some("AXScrollArea"),
             None,
         ] {
-            assert!(remote_session_focused(rdp, role), "{role:?}");
+            assert!(pastes_with_control(role), "{role:?}");
         }
         // The Windows App's own search box is a Mac text field.
-        assert!(!remote_session_focused(rdp, Some("AXSearchField")));
-        assert!(!remote_session_focused(rdp, Some("AXTextField")));
-        assert!(!remote_session_focused("com.microsoft.VSCode", None));
+        assert!(!pastes_with_control(Some("AXSearchField")));
+        assert!(!pastes_with_control(Some("AXTextField")));
     }
 }

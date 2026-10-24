@@ -452,6 +452,17 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
     imp::wait_for_clipboard_listeners()
 }
 
+/// Which keystroke pastes into the focused window, for [`send_paste`]. macOS: Ctrl+V into a
+/// remote Windows session in the Windows App (asking the app which of its controls has focus,
+/// a quarter second at most per request), else Cmd+V. Ask it before the last check that focus
+/// hasn't moved.
+pub fn paste_keys() -> PasteKeys {
+    PasteKeys(imp::paste_keys())
+}
+
+/// See [`paste_keys`].
+pub struct PasteKeys(imp::PasteKeys);
+
 /// Sends Ctrl+V to the focused window (Windows: releasing held Shift/Alt/Win first, so e.g. a
 /// Win key still held from a `LeftCtrl+LeftWin` chord doesn't turn it into Win+Ctrl+V; macOS:
 /// Cmd+V with no other modifier, whatever is held, or Ctrl+V into a remote Windows session in
@@ -462,10 +473,10 @@ pub fn wait_for_clipboard_listeners() -> Option<Duration> {
 ///
 /// To avoid that release altogether, wait until the hotkey's keys are up first (see
 /// [`paste_may_release`]).
-pub fn send_paste() -> Result<(), Error> {
+pub fn send_paste(keys: PasteKeys) -> Result<(), Error> {
     // Counted before the keystrokes go out, so a poll can never see a fake release that
     // isn't counted yet.
-    imp::send_paste(|| {
+    imp::send_paste(keys.0, || {
         PASTES.fetch_add(1, Ordering::SeqCst);
     })
 }
