@@ -62,6 +62,8 @@ const KVK_FUNCTION: u16 = 0x3F;
 const KVK_GLOBE: u16 = 0xB3;
 /// The key that types "v" on ANSI/ISO QWERTY, QWERTZ and AZERTY layouts.
 const KVK_ANSI_V: u16 = 0x09;
+/// IOKit's device-dependent flag for Left Control being down (alongside `MaskControl`).
+const NX_DEVICELCTLKEYMASK: CGEventFlags = CGEventFlags::from_bits_retain(0x01);
 
 /// Event times for [`HoldDetector`], in ms since this module was first used (wraps after 49
 /// days, which the detector handles). Our own clock: `CGEventGetTimestamp`'s unit differs
@@ -807,9 +809,15 @@ pub fn send_paste(keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(
         )
         .into());
     }
-    // A remote Windows session pastes with Ctrl+V, which the remote desktop app passes on.
+    // A remote Windows session pastes with Ctrl+V, which the remote desktop app passes on. It
+    // forwards each key to the session and follows Control the way a keyboard sends it: a
+    // flagsChanged event carrying the left key's device bit. Sent like Command below (a key
+    // event, no device bit), Control never reached the session, which got a bare V.
     let (modifier, flag) = if keys.control {
-        (KVK_CONTROL, CGEventFlags::MaskControl)
+        (
+            KVK_CONTROL,
+            CGEventFlags::MaskControl | NX_DEVICELCTLKEYMASK,
+        )
     } else {
         (KVK_COMMAND, CGEventFlags::MaskCommand)
     };
@@ -824,6 +832,9 @@ pub fn send_paste(keys: PasteKeys, _before_releasing: impl FnOnce()) -> Result<(
     ] {
         let event = CGEvent::new_keyboard_event(source.as_deref(), code, down)
             .ok_or("cannot create a keyboard event")?;
+        if code == KVK_CONTROL {
+            CGEvent::set_type(Some(&event), CGEventType::FlagsChanged);
+        }
         CGEvent::set_flags(Some(&event), flags);
         CGEvent::set_integer_value_field(
             Some(&event),
