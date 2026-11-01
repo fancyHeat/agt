@@ -96,6 +96,11 @@ pub const TEST_WAV_ENV: &str = "AGT_TEST_WAV";
 /// It's also how often the new audio is taken and cut ([`Feed`]).
 const RELEASE_POLL: Duration = Duration::from_millis(250);
 
+/// A kept-open microphone that was lost is reopened this often until it's back.
+const MIC_RETRY: Duration = Duration::from_secs(5);
+/// The status line when the microphone can't be started.
+const MIC_UNAVAILABLE: &str = "microphone unavailable (see log)";
+
 /// A hands-free recording (double tap) that nobody ends is discarded after this, the longest
 /// recording: it was most likely forgotten, and pasting it would put whatever was said since
 /// into whatever window has focus by then.
@@ -978,6 +983,25 @@ impl AudioThread {
                     }
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
+            } else if self.config.audio.keep_mic_open {
+                // Kept open: woken up regularly to reopen it if it was lost (device unplugged).
+                match events.recv_timeout(MIC_RETRY) {
+                    Ok(ev) => (ev, false),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if recorder.wants_reopen() && !self.hub.missing(Permission::Microphone) {
+                            match recorder.prepare() {
+                                Ok(()) => self.hub.update(|s| {
+                                    if s.error.as_deref() == Some(MIC_UNAVAILABLE) {
+                                        s.error = None;
+                                    }
+                                }),
+                                Err(e) => tracing::debug!("microphone still unavailable: {e}"),
+                            }
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             } else {
                 match events.recv() {
                     Ok(ev) => (ev, false),
@@ -1235,8 +1259,7 @@ impl AudioThread {
             }
             Err(e) => {
                 tracing::error!("cannot start microphone: {e}");
-                self.hub
-                    .update(|s| s.fail("microphone unavailable (see log)"));
+                self.hub.update(|s| s.fail(MIC_UNAVAILABLE));
                 self.hub.reject();
                 telemetry::global().dictation(d, Ended::MicFailed);
                 None

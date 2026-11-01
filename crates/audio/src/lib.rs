@@ -19,6 +19,13 @@
 //! the fallback, each recording checks whether the chosen device is back (an enumeration, a
 //! few ms) and switches to it. A chosen device that is connected but fails to open also
 //! falls back, and is tried again a minute later or once it has been reconnected.
+//!
+//! When no device is found, the old stream is dropped rather than kept for when one returns:
+//! that press fails and the next one builds a fresh stream. A stream that failed to play, or
+//! delivered no audio for [`NO_AUDIO_DEAD`] of a recording, is rebuilt on the next press too.
+//! In keep-open mode the owner also retries in the background ([`Recorder::wants_reopen`]).
+//! (On Windows, `play()` doesn't report a missing device itself: the stream's error callback
+//! does, once it runs.)
 
 pub mod resample;
 pub mod wav;
@@ -46,6 +53,9 @@ pub const PREROLL_MS: usize = 300;
 pub const MAX_SECONDS: usize = 30 * 60;
 /// A chosen microphone that failed to open is tried again after this long.
 const CHOSEN_RETRY: Duration = Duration::from_secs(60);
+/// A recording this long that got no audio at all means the stream is dead; long enough for
+/// a slow-starting (Bluetooth) headset to deliver its first audio.
+const NO_AUDIO_DEAD: Duration = Duration::from_secs(2);
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -97,6 +107,8 @@ pub struct Recorder {
     /// as soon as it was unplugged and is back.
     chosen_failed: Option<Instant>,
     live: Option<Live>,
+    /// The stream was lost (errored, or no device): its rebuild is logged as a reopen.
+    lost: bool,
     capture: Arc<Mutex<Capture>>,
     failed: Arc<AtomicBool>,
     level: Level,
@@ -112,6 +124,7 @@ impl Recorder {
             missing_logged: false,
             chosen_failed: None,
             live: None,
+            lost: false,
             capture: Arc::new(Mutex::new(Capture {
                 recording: false,
                 resampler: Resampler::new(SAMPLE_RATE, SAMPLE_RATE),
@@ -146,18 +159,50 @@ impl Recorder {
         if unplug_reported && healthy && self.live.as_ref().is_some_and(|l| l.chosen) {
             return Ok(());
         }
+        if self.live.is_some() && !healthy {
+            self.lost = true;
+        }
         let host = cpal::default_host();
-        let (device, chosen) = self.pick_device(&host)?;
+        let (device, chosen) = match self.pick_device(&host) {
+            Ok(picked) => picked,
+            Err(e) => {
+                // Nothing to record from: drop the stale stream so a reconnected device
+                // gets a fresh one.
+                self.live = None;
+                self.lost = true;
+                return Err(e);
+            }
+        };
         let device_id = device.id().ok().map(|id| id.to_string());
-        if healthy
-            && let Some(live) = &mut self.live
-            && live.device_id == device_id
-        {
-            live.chosen = chosen;
+        let current = self.live.as_ref().map(|l| l.device_id.as_ref());
+        if !needs_rebuild(healthy, current, device_id.as_ref()) {
+            if let Some(live) = &mut self.live {
+                live.chosen = chosen;
+            }
             return Ok(());
         }
         self.live = None; // drops (closes) any previous stream first
-        match self.open(&device, device_id, chosen) {
+        let r = self.open_or_default(&host, &device, device_id, chosen);
+        if r.is_ok() && std::mem::take(&mut self.lost) {
+            tracing::info!("microphone reopened after the device was lost");
+        }
+        r
+    }
+
+    /// Whether the owner should call [`Recorder::prepare`] again between recordings: in
+    /// keep-open mode, the stream is gone or errored (device unplugged).
+    pub fn wants_reopen(&self) -> bool {
+        self.keep_open && (self.live.is_none() || self.failed.load(Ordering::Relaxed))
+    }
+
+    fn open_or_default(
+        &mut self,
+        host: &cpal::Host,
+        device: &cpal::Device,
+        device_id: Option<String>,
+        chosen: bool,
+    ) -> Result<(), Error> {
+        match self.open(device, device_id, chosen) {
             Err(e) if chosen => {
                 // Connected but unusable (held exclusively, broken driver): the default until
                 // a retry, rather than failing every press.
@@ -342,7 +387,8 @@ impl Recorder {
             let live = self.live.as_ref().ok_or("microphone stream not built")?;
             if let Err(e) = live.stream.play() {
                 self.capture.lock().unwrap().recording = false;
-                self.failed.store(true, Ordering::Relaxed);
+                self.live = None; // rebuilt on the next press
+                self.lost = true;
                 return Err(e.into());
             }
         }
@@ -375,6 +421,13 @@ impl Recorder {
         if !c.keep_preroll {
             c.resampler.finish(&mut samples);
         }
+        if c.first_audio.is_none()
+            && c.started.is_some_and(|t| t.elapsed() >= NO_AUDIO_DEAD)
+            && self.live.is_some()
+        {
+            tracing::warn!("microphone delivered no audio; reopening it on the next press");
+            self.failed.store(true, Ordering::Relaxed);
+        }
         if c.truncated {
             tracing::warn!("recording cut off at {MAX_SECONDS} s");
         }
@@ -384,6 +437,11 @@ impl Recorder {
             first_audio: c.first_audio,
         }
     }
+}
+
+/// Whether the stream must be rebuilt: none, it failed, or `picked` isn't the device it's on.
+fn needs_rebuild(healthy: bool, current: Option<Option<&String>>, picked: Option<&String>) -> bool {
+    !healthy || current != Some(picked)
 }
 
 /// The names of the connected input devices, as `audio.device` takes them (duplicates once).
@@ -476,6 +534,29 @@ mod tests {
         let mut r = Recorder::new(false, "no such mic".into(), Level::default());
         r.prepare().expect("prepare");
         assert!(!r.live.as_ref().unwrap().chosen);
+    }
+
+    #[test]
+    fn rebuilds_lost_or_changed_streams() {
+        let (a, b) = ("a".to_string(), "b".to_string());
+        assert!(!needs_rebuild(true, Some(Some(&a)), Some(&a)));
+        assert!(needs_rebuild(false, Some(Some(&a)), Some(&a)), "errored");
+        assert!(needs_rebuild(false, None, Some(&a)), "no stream");
+        assert!(
+            needs_rebuild(true, Some(Some(&a)), Some(&b)),
+            "other device"
+        );
+        assert!(needs_rebuild(true, Some(None), Some(&a)));
+    }
+
+    #[test]
+    fn keep_open_wants_reopen_when_lost() {
+        let r = Recorder::new(true, String::new(), Level::default());
+        assert!(r.wants_reopen(), "never opened");
+        r.failed.store(true, Ordering::Relaxed);
+        assert!(r.wants_reopen());
+        // Opened only per press: nothing to retry in the background.
+        assert!(!Recorder::new(false, String::new(), Level::default()).wants_reopen());
     }
 
     #[test]
