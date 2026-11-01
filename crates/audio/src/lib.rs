@@ -20,10 +20,12 @@
 //! few ms) and switches to it. A chosen device that is connected but fails to open also
 //! falls back, and is tried again a minute later or once it has been reconnected.
 //!
-//! A stream that errored (WASAPI `AUDCLNT_E_DEVICE_INVALIDATED`: device unplugged), failed to
-//! play, or delivered no audio during a recording is dropped and rebuilt on the next press;
-//! if no device is connected then, that press fails and the next one tries again. In
-//! keep-open mode the owner also retries in the background ([`Recorder::wants_reopen`]).
+//! When no device is found, the old stream is dropped rather than kept for when one returns:
+//! that press fails and the next one builds a fresh stream. A stream that failed to play, or
+//! delivered no audio for [`NO_AUDIO_DEAD`] of a recording, is rebuilt on the next press too.
+//! In keep-open mode the owner also retries in the background ([`Recorder::wants_reopen`]).
+//! (On Windows, `play()` doesn't report a missing device itself: the stream's error callback
+//! does, once it runs.)
 
 pub mod resample;
 pub mod wav;
@@ -51,9 +53,9 @@ pub const PREROLL_MS: usize = 300;
 pub const MAX_SECONDS: usize = 30 * 60;
 /// A chosen microphone that failed to open is tried again after this long.
 const CHOSEN_RETRY: Duration = Duration::from_secs(60);
-/// A recording this long that got no audio at all means the stream is dead (a removed
-/// device's paused WASAPI stream can play without an error, and without data).
-const NO_AUDIO_DEAD: Duration = Duration::from_millis(500);
+/// A recording this long that got no audio at all means the stream is dead; long enough for
+/// a slow-starting (Bluetooth) headset to deliver its first audio.
+const NO_AUDIO_DEAD: Duration = Duration::from_secs(2);
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -164,8 +166,8 @@ impl Recorder {
         let (device, chosen) = match self.pick_device(&host) {
             Ok(picked) => picked,
             Err(e) => {
-                // Nothing to record from: drop the stream so a reconnected device gets a
-                // fresh one (the old one may have been invalidated without an error).
+                // Nothing to record from: drop the stale stream so a reconnected device
+                // gets a fresh one.
                 self.live = None;
                 self.lost = true;
                 return Err(e);
