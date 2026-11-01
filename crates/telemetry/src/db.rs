@@ -59,7 +59,8 @@ CREATE TABLE app_sessions (
     id INTEGER PRIMARY KEY,
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
-    -- quit | update_restart | settings_restart | error | crash (panicked) | unknown (killed, power loss, ...)
+    -- quit | update_restart | settings_restart | error | os_shutdown | logoff (Windows) | crash (panicked)
+    -- | unknown (killed, power loss, macOS shutdown, ...)
     exit_reason TEXT,
     app_version TEXT NOT NULL,
     os TEXT NOT NULL,
@@ -315,7 +316,7 @@ fn move_aside(path: &Path) -> PathBuf {
 
 /// Closes sessions left open by a previous run that didn't exit cleanly: `crash` if its
 /// last event was a panic (`panic at ...`, see the app's panic hook), else `unknown`
-/// (killed, logged off, power loss; also a worker-thread panic the app outlived). `ended_at`
+/// (killed, power loss, macOS shutdown; also a worker-thread panic the app outlived). `ended_at`
 /// is its last event.
 pub(crate) fn close_stale_sessions(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(

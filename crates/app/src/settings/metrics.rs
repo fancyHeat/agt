@@ -545,6 +545,8 @@ fn exit_name(reason: &str) -> &str {
         "settings_restart" => "Restarted for settings",
         "error" => "Error",
         "crash" => "Crashed",
+        "os_shutdown" => "Windows shut down",
+        "logoff" => "Logged off",
         "unknown" => "Killed or shut down",
         other => other,
     }
