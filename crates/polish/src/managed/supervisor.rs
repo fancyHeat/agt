@@ -33,6 +33,8 @@ pub(crate) trait Server: Send {
     fn try_wait(&mut self) -> Option<String>;
     /// Blocks until it exits.
     fn wait(&mut self) -> String;
+    /// Its last lines of output, once it has exited (or been killed); "" if none.
+    fn last_output(&self) -> String;
     /// Stops it (and reaps it).
     fn kill(&mut self);
 }
@@ -238,49 +240,58 @@ pub(crate) fn run(
             Status::Restarting
         });
         let launched = Instant::now();
-        let failure = match launcher.launch() {
-            Err(e) => e,
-            Ok(mut server) => match wait_healthy(server.as_mut(), t) {
-                Err(e) => {
-                    server.kill();
-                    e
-                }
-                Ok(()) => {
-                    generation += 1;
-                    let ep = Endpoint {
-                        generation,
-                        ..server.endpoint()
-                    };
-                    tracing::info!(
-                        "S1-mini ready at {} (server start {:.1} s; {:.1} s since AGT asked for it)",
-                        ep.base_url,
-                        launched.elapsed().as_secs_f64(),
-                        started.elapsed().as_secs_f64(),
-                    );
-                    // Suspended whenever it has been idle a while (see `gate`).
-                    ep.gate.start();
-                    shared.set(State::Ready(ep));
-                    report(&Status::Ready);
-                    let exit = server.wait();
-                    shared.set(State::Down);
-                    format!("llama-server exited unexpectedly ({exit})")
-                }
-            },
+        let (failure, output) = match launcher.launch() {
+            Err(e) => (e, String::new()),
+            Ok(mut server) => {
+                let failure = match wait_healthy(server.as_mut(), t) {
+                    Err(e) => {
+                        server.kill();
+                        e
+                    }
+                    Ok(()) => {
+                        generation += 1;
+                        let ep = Endpoint {
+                            generation,
+                            ..server.endpoint()
+                        };
+                        tracing::info!(
+                            "S1-mini ready at {} (server start {:.1} s; {:.1} s since AGT asked for it)",
+                            ep.base_url,
+                            launched.elapsed().as_secs_f64(),
+                            started.elapsed().as_secs_f64(),
+                        );
+                        // Suspended whenever it has been idle a while (see `gate`).
+                        ep.gate.start();
+                        shared.set(State::Ready(ep));
+                        report(&Status::Ready);
+                        let exit = server.wait();
+                        shared.set(State::Down);
+                        format!("llama-server exited unexpectedly ({exit})")
+                    }
+                };
+                (failure, server.last_output())
+            }
+        };
+        // Last in the one ERROR event, on lines of its own; not in the state's message,
+        // which every dictation's polish failure repeats.
+        let output = match output {
+            o if o.is_empty() => o,
+            o => format!("\nits last output:\n{o}"),
         };
         match policy.on_failure(Instant::now()) {
             Decision::Backoff(d) => {
                 // Off meanwhile, so dictations are pasted raw at once instead of waiting.
                 let why = format!(
-                    "{failure}; it failed again soon after a restart, retrying in {} min",
+                    "{failure}; backing off after repeated crashes, retrying in {} min",
                     d.as_secs().div_ceil(60)
                 );
-                tracing::error!("S1-mini: {why}");
+                tracing::error!("S1-mini: {why}{output}");
                 shared.set(State::Failed(why.clone()));
                 report(&Status::Failed(why));
                 thread::sleep(d);
             }
             Decision::Restart => {
-                tracing::error!("S1-mini: {failure}; restarting it");
+                tracing::error!("S1-mini: {failure}; restarting it{output}");
                 shared.set(State::Down);
                 thread::sleep(t.restart_delay);
             }
@@ -430,6 +441,9 @@ mod tests {
             let _ = self.exit.recv();
             "exit code 3".into()
         }
+        fn last_output(&self) -> String {
+            "ggml_abort: out of memory".into()
+        }
         fn kill(&mut self) {
             *self.killed.lock().unwrap() += 1;
         }
@@ -540,6 +554,10 @@ mod tests {
             panic!("{statuses:?}")
         };
         assert!(why.contains("retrying in"), "{why}");
+        assert!(
+            !why.contains("out of memory"),
+            "output only goes to the log: {why}"
+        );
         assert_eq!(statuses[6..8], [Status::Restarting, Status::Ready]);
     }
 

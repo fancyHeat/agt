@@ -71,7 +71,8 @@ pub enum Status {
     Starting,
     Ready,
     Restarting,
-    /// Gave up; the reason is in the log (and here).
+    /// Off: backing off after repeated crashes (tried again later), or the download gave
+    /// up; the reason is in the log (and here, in short).
     Failed(String),
 }
 
