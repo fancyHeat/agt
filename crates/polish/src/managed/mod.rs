@@ -9,10 +9,10 @@
 //!    tied to AGT's lifetime: on Windows it's in a job object that kills it when AGT exits
 //!    or crashes; on Unix a small `sh` watchdog kills it when AGT's end of a pipe closes;
 //! 3. polls `/health` until the model is loaded, then serves polish requests through the
-//!    OpenAI-compatible client, and restarts the server once if it dies; a second failure
-//!    within [`supervisor::FAILURE_WINDOW`] gives up (see [`supervisor`]).
+//!    OpenAI-compatible client, and restarts the server if it dies; a failure soon after a
+//!    restart backs off for a few minutes, doubling, but never gives up (see [`supervisor`]).
 //!
-//! Until the server is ready, and after giving up, [`Polisher::polish`] fails at once, so
+//! Until the server is ready, and while backing off, [`Polisher::polish`] fails at once, so
 //! dictations are pasted raw. Nothing here ever runs on the hotkey or STT path. Between
 //! dictations an idle server is suspended, since it would otherwise poll ([`gate`]).
 

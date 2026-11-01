@@ -9,8 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Two failures (crash, or no healthy start) within this window: give up. So a crash is
-/// followed by one restart; a crash days later gets its restart again.
+/// A failure (crash, or no healthy start) within this window of the last restart: back
+/// off. So a crash is followed by one quick restart; a crash days later gets its quick
+/// restart again.
 pub(crate) const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// Starts and stops servers. Called from the supervisor thread only.
@@ -42,6 +43,11 @@ pub(crate) struct Timing {
     pub poll: Duration,
     pub restart_delay: Duration,
     pub failure_window: Duration,
+    /// After a failure soon after a restart: wait this long before the next try, doubling
+    /// with each such failure in a row, up to `backoff_max`. Never gives up for good (the
+    /// server is sometimes killed on sleep or logoff).
+    pub backoff: Duration,
+    pub backoff_max: Duration,
     /// Download attempts before giving up, and the pause between them.
     pub prepare_attempts: u32,
     pub prepare_retry: Duration,
@@ -54,6 +60,8 @@ impl Default for Timing {
             poll: Duration::from_millis(100),
             restart_delay: Duration::from_secs(1),
             failure_window: FAILURE_WINDOW,
+            backoff: Duration::from_secs(5 * 60),
+            backoff_max: Duration::from_secs(60 * 60),
             prepare_attempts: 3,
             prepare_retry: Duration::from_secs(5 * 60),
         }
@@ -78,6 +86,7 @@ pub(crate) enum State {
     Ready(Endpoint),
     /// Crashed; restarting.
     Down,
+    /// The download gave up, or backing off after repeated crashes (fails fast).
     Failed(String),
 }
 
@@ -143,33 +152,55 @@ fn not_ready(s: &State) -> String {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Decision {
     Restart,
-    GiveUp,
+    /// Wait this long, then restart.
+    Backoff(Duration),
 }
 
-/// Restart after a failure, unless another failure happened within `window` before it.
+/// Restart at once after a failure, unless it came within `window` of the last restart:
+/// then back off, `backoff` doubling with every such failure in a row, up to `max`.
 pub(crate) struct RestartPolicy {
     window: Duration,
-    last_failure: Option<Instant>,
+    backoff: Duration,
+    max: Duration,
+    /// When the last restart happened (failure time plus its backoff).
+    last_restart: Option<Instant>,
+    /// Failures in a row that came soon after a restart.
+    streak: u32,
 }
 
 impl RestartPolicy {
-    pub fn new(window: Duration) -> Self {
+    pub fn new(window: Duration, backoff: Duration, max: Duration) -> Self {
         Self {
             window,
-            last_failure: None,
+            backoff,
+            max,
+            last_restart: None,
+            streak: 0,
         }
     }
 
     pub fn on_failure(&mut self, now: Instant) -> Decision {
-        let previous = self.last_failure.replace(now);
-        match previous {
-            Some(t) if now.saturating_duration_since(t) < self.window => Decision::GiveUp,
-            _ => Decision::Restart,
+        let soon = self
+            .last_restart
+            .is_some_and(|t| now.saturating_duration_since(t) < self.window);
+        self.streak = if soon { self.streak + 1 } else { 0 };
+        let delay = match self.streak {
+            0 => Duration::ZERO,
+            n => self
+                .backoff
+                .saturating_mul(1 << (n - 1).min(16))
+                .min(self.max),
+        };
+        self.last_restart = Some(now + delay);
+        if delay.is_zero() {
+            Decision::Restart
+        } else {
+            Decision::Backoff(delay)
         }
     }
 }
 
-/// The supervisor thread's body. Returns only when it gives up.
+/// The supervisor thread's body. Returns only when the download gives up.
 pub(crate) fn run(
     mut launcher: impl Launcher,
     shared: &Shared,
@@ -198,7 +229,7 @@ pub(crate) fn run(
         }
     }
 
-    let mut policy = RestartPolicy::new(t.failure_window);
+    let mut policy = RestartPolicy::new(t.failure_window, t.backoff, t.backoff_max);
     let mut generation = 0;
     loop {
         report(&if generation == 0 {
@@ -237,11 +268,16 @@ pub(crate) fn run(
             },
         };
         match policy.on_failure(Instant::now()) {
-            Decision::GiveUp => {
-                return give_up(format!(
-                    "{failure}; it failed twice within {} min",
-                    t.failure_window.as_secs() / 60
-                ));
+            Decision::Backoff(d) => {
+                // Off meanwhile, so dictations are pasted raw at once instead of waiting.
+                let why = format!(
+                    "{failure}; it failed again soon after a restart, retrying in {} min",
+                    d.as_secs().div_ceil(60)
+                );
+                tracing::error!("S1-mini: {why}");
+                shared.set(State::Failed(why.clone()));
+                report(&Status::Failed(why));
+                thread::sleep(d);
             }
             Decision::Restart => {
                 tracing::error!("S1-mini: {failure}; restarting it");
@@ -277,18 +313,41 @@ mod tests {
     use std::sync::{Arc, mpsc};
 
     #[test]
-    fn policy_restarts_once_per_window() {
+    fn policy_restarts_once_per_window_then_backs_off() {
         let w = Duration::from_secs(600);
+        let min = Duration::from_secs(60);
         let t0 = Instant::now();
-        let mut p = RestartPolicy::new(w);
+        let mut p = RestartPolicy::new(w, 5 * min, 60 * min);
         assert_eq!(p.on_failure(t0), Decision::Restart);
-        // A crash long after the last one gets a restart again...
-        assert_eq!(p.on_failure(t0 + w * 3), Decision::Restart);
-        // ...a second one soon after doesn't.
+        // A crash long after the last one gets a quick restart again...
+        let t1 = t0 + w * 3;
+        assert_eq!(p.on_failure(t1), Decision::Restart);
+        // ...one soon after backs off, doubling with each failure soon after the
+        // (delayed) restart, up to the cap.
+        let mut now = t1 + Duration::from_secs(5);
+        for want in [5, 10, 20, 40, 60, 60] {
+            assert_eq!(p.on_failure(now), Decision::Backoff(want * min));
+            now += want * min + Duration::from_secs(30);
+        }
+        // It ran for a while after the last restart: quick restart, and the backoff
+        // starts over.
+        now += w;
+        assert_eq!(p.on_failure(now), Decision::Restart);
         assert_eq!(
-            p.on_failure(t0 + w * 3 + Duration::from_secs(5)),
-            Decision::GiveUp
+            p.on_failure(now + Duration::from_secs(5)),
+            Decision::Backoff(5 * min)
         );
+    }
+
+    #[test]
+    fn policy_backoff_never_overflows() {
+        let mut p = RestartPolicy::new(Duration::MAX, Duration::from_secs(1), Duration::MAX);
+        let mut now = Instant::now();
+        for _ in 0..100 {
+            if let Decision::Backoff(d) = p.on_failure(now) {
+                now += d.min(Duration::from_secs(1 << 20));
+            }
+        }
     }
 
     /// What a fake server does after launch.
@@ -382,6 +441,8 @@ mod tests {
             poll: Duration::from_millis(1),
             restart_delay: Duration::from_millis(1),
             failure_window: Duration::from_secs(600),
+            backoff: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(20),
             prepare_attempts: 2,
             prepare_retry: Duration::from_millis(1),
         }
@@ -429,8 +490,11 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(10);
 
     #[test]
-    fn becomes_ready_restarts_once_then_gives_up() {
-        let r = start(vec![Script::Healthy(3), Script::Healthy(0)], vec![]);
+    fn becomes_ready_restarts_once_then_backs_off() {
+        let r = start(
+            vec![Script::Healthy(3), Script::Healthy(0), Script::Healthy(0)],
+            vec![],
+        );
         let ep = r.shared.wait_ready(WAIT).unwrap();
         assert_eq!(ep.base_url, "http://127.0.0.1:1001/v1");
         assert_eq!(ep.generation, 1);
@@ -447,16 +511,19 @@ mod tests {
         };
         assert_eq!(ep2.base_url, "http://127.0.0.1:1002/v1");
 
-        // It crashes again right away: give up, and say so.
+        // It crashes again right away: off for a while (and says so), then tried again.
         drop(exit2);
-        r.done.recv_timeout(WAIT).unwrap();
-        assert!(matches!(r.shared.state(), State::Failed(_)));
-        assert!(r.shared.endpoint().unwrap_err().contains("unavailable"));
-        assert!(
-            r.shared.wait_ready(WAIT).is_err(),
-            "must not wait after giving up"
-        );
-        assert_eq!(*r.launches.lock().unwrap(), 2);
+        let exit3 = r.exits.recv_timeout(WAIT).unwrap();
+        let ep3 = loop {
+            match r.shared.wait_ready(WAIT) {
+                Ok(ep) if ep.generation == 3 => break ep,
+                _ => thread::sleep(Duration::from_millis(1)),
+            }
+        };
+        assert_eq!(ep3.base_url, "http://127.0.0.1:1003/v1");
+        assert_eq!(*r.launches.lock().unwrap(), 3);
+        assert!(r.done.try_recv().is_err(), "must never give up");
+        drop(exit3);
         let statuses = r.statuses.lock().unwrap().clone();
         assert_eq!(
             statuses[0],
@@ -469,28 +536,32 @@ mod tests {
             statuses[1..4],
             [Status::Starting, Status::Ready, Status::Restarting]
         );
-        assert_eq!(statuses[4], Status::Ready);
-        assert!(matches!(statuses.last(), Some(Status::Failed(_))));
+        let Status::Failed(why) = &statuses[5] else {
+            panic!("{statuses:?}")
+        };
+        assert!(why.contains("retrying in"), "{why}");
+        assert_eq!(statuses[6..8], [Status::Restarting, Status::Ready]);
     }
 
     #[test]
     fn start_failures_count_and_hung_servers_are_killed() {
         let r = start(vec![Script::Hangs, Script::ExitsAtStart], vec![]);
-        r.done.recv_timeout(WAIT).unwrap();
-        assert_eq!(*r.launches.lock().unwrap(), 2);
+        // Keeps trying (every later launch exits at start).
+        let deadline = Instant::now() + WAIT;
+        while *r.launches.lock().unwrap() < 4 {
+            assert!(Instant::now() < deadline, "stopped trying");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(r.done.try_recv().is_err(), "must never give up");
         // Every failed start is cleaned up, in particular the hung one.
-        assert_eq!(*r.killed.lock().unwrap(), 2);
+        assert!(*r.killed.lock().unwrap() >= 3);
+        let statuses = r.statuses.lock().unwrap().clone();
+        assert!(statuses.iter().all(|s| *s != Status::Ready));
         assert!(
-            r.statuses
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|s| *s != Status::Ready)
+            statuses.iter().any(|s| matches!(s, Status::Failed(why)
+                if why.contains("exited during start-up") && why.contains("retrying"))),
+            "{statuses:?}"
         );
-        let State::Failed(why) = r.shared.state() else {
-            panic!("not failed")
-        };
-        assert!(why.contains("exited during start-up"), "{why}");
     }
 
     #[test]
