@@ -74,9 +74,9 @@ enum UpdateEvent {
 }
 
 /// How long exiting waits for the telemetry writer to commit the last records.
-const TELEMETRY_FLUSH: Duration = Duration::from_secs(2);
+pub(crate) const TELEMETRY_FLUSH: Duration = Duration::from_secs(2);
 /// The same for the dictation history writer.
-const HISTORY_FLUSH: Duration = Duration::from_secs(2);
+pub(crate) const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
 fn main() {
     // `agt stats`: a report from the telemetry database; doesn't start the app.
@@ -561,7 +561,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
-            session_end::listen(TELEMETRY_FLUSH, HISTORY_FLUSH);
+            session_end::listen();
             let installed = self.updater.is_some();
             // On macOS (and with AGT_HOME) the history is in the config folder: one item will do.
             let data_folder = paths::history_dir() != paths::config_dir();

@@ -5,7 +5,6 @@
 //! on the main thread gets these: winit's event loop already dispatches its messages.
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use agt_telemetry::ExitReason;
 
@@ -17,45 +16,48 @@ pub fn os_reason() -> Option<ExitReason> {
     OS_REASON.get().copied()
 }
 
-/// `WM_ENDSESSION`'s `lParam`: log off, else shutdown or restart.
+/// `ENDSESSION_LOGOFF` and `ENDSESSION_CLOSEAPP` (WinUser.h), kept here so tests run anywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn reason_for(lparam: isize, logoff_flag: u32) -> ExitReason {
-    if lparam as u32 & logoff_flag != 0 {
-        ExitReason::Logoff
+const LOGOFF: u32 = 0x8000_0000;
+#[cfg_attr(not(windows), allow(dead_code))]
+const CLOSEAPP: u32 = 0x1;
+
+/// `WM_ENDSESSION`'s `lParam`: log off, shutdown or restart; `None` for Restart Manager (an
+/// installer closing apps), which isn't the session ending.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reason_for(lparam: isize) -> Option<ExitReason> {
+    let flags = lparam as u32;
+    if flags & LOGOFF != 0 {
+        Some(ExitReason::Logoff)
+    } else if flags & CLOSEAPP != 0 {
+        None
     } else {
-        ExitReason::OsShutdown
+        Some(ExitReason::OsShutdown)
     }
 }
 
 /// Starts listening. Call on the event loop's thread, once it's running.
 #[cfg(windows)]
-pub fn listen(flush: Duration, history_flush: Duration) {
-    use std::cell::Cell;
+pub fn listen() {
     use std::ptr::null_mut;
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, ENDSESSION_LOGOFF, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
-        RegisterClassW, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSW, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, RegisterClassW,
+        WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WNDCLASSW, WS_POPUP,
     };
-
-    thread_local! {
-        static FLUSH: Cell<(Duration, Duration)> = const { Cell::new((Duration::ZERO, Duration::ZERO)) };
-    }
 
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
             WM_QUERYENDSESSION => 1,
             WM_ENDSESSION => {
-                if wp != 0 {
-                    let reason = reason_for(lp, ENDSESSION_LOGOFF);
-                    if OS_REASON.set(reason).is_ok() {
-                        tracing::info!("Windows is ending the session: {reason:?}");
-                        let (flush, history) = FLUSH.get();
-                        agt_telemetry::global().end_session(reason, flush);
-                        agt_history::flush(history);
-                    }
+                if let Some(reason) = reason_for(lp).filter(|_| wp != 0)
+                    && OS_REASON.set(reason).is_ok()
+                {
+                    tracing::info!("Windows is ending the session: {reason:?}");
+                    agt_telemetry::global().end_session(reason, crate::TELEMETRY_FLUSH);
+                    agt_history::flush(crate::HISTORY_FLUSH);
                 }
                 0
             }
@@ -71,7 +73,6 @@ pub fn listen(flush: Duration, history_flush: Duration) {
         }
     }
 
-    FLUSH.set((flush, history_flush));
     let class: Vec<u16> = "AGT.SessionEnd".encode_utf16().chain([0]).collect();
     unsafe {
         let instance = GetModuleHandleW(null_mut());
@@ -104,31 +105,31 @@ pub fn listen(flush: Duration, history_flush: Duration) {
 }
 
 #[cfg(not(windows))]
-pub fn listen(_flush: Duration, _history_flush: Duration) {}
+pub fn listen() {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const LOGOFF: u32 = 0x8000_0000;
-
     #[test]
     fn logoff_flag_means_logoff() {
-        assert_eq!(
-            reason_for(LOGOFF as i32 as isize, LOGOFF),
-            ExitReason::Logoff
-        );
-        assert_eq!(
-            reason_for((LOGOFF | 1) as i32 as isize, LOGOFF),
-            ExitReason::Logoff
-        );
+        assert_eq!(reason_for(LOGOFF as i32 as isize), Some(ExitReason::Logoff));
+        // Log off wins even when apps are also asked to close.
+        let both = (LOGOFF | CLOSEAPP) as i32 as isize;
+        assert_eq!(reason_for(both), Some(ExitReason::Logoff));
+    }
+
+    #[test]
+    fn restart_manager_is_ignored() {
+        assert_eq!(reason_for(CLOSEAPP as isize), None);
+        // ENDSESSION_CRITICAL with CLOSEAPP is still Restart Manager.
+        assert_eq!(reason_for((0x4000_0000 | CLOSEAPP) as isize), None);
     }
 
     #[test]
     fn otherwise_shutdown() {
-        assert_eq!(reason_for(0, LOGOFF), ExitReason::OsShutdown);
-        // ENDSESSION_CRITICAL / ENDSESSION_CLOSEAPP without log off.
-        assert_eq!(reason_for(0x4000_0000, LOGOFF), ExitReason::OsShutdown);
-        assert_eq!(reason_for(1, LOGOFF), ExitReason::OsShutdown);
+        assert_eq!(reason_for(0), Some(ExitReason::OsShutdown));
+        // ENDSESSION_CRITICAL: a forced shutdown.
+        assert_eq!(reason_for(0x4000_0000), Some(ExitReason::OsShutdown));
     }
 }
