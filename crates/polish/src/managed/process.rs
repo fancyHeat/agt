@@ -11,7 +11,8 @@
 //!   SIGTERM. The watchdog exits with the server's status, so AGT still sees crashes.
 //! - Its start-up output goes to `Env::log_file` (the previous run's kept as `.1`); later
 //!   output is dropped (see `StartupLog`): at its default verbosity llama-server logs
-//!   per-request timings, not prompts, but an error path could quote a request.
+//!   per-request timings, not prompts, but an error path could quote a request. Its last
+//!   lines (start-up, then only crash reports) are logged with an unexpected exit.
 
 use super::{
     Status,
@@ -170,32 +171,24 @@ impl Launcher for LlamaLauncher {
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }
-        let log = match &self.log_file {
-            Some(path) => match rotate_and_create(path) {
-                Ok(f) => Some(Arc::new(StartupLog::new(f))),
+        let file = self
+            .log_file
+            .as_ref()
+            .and_then(|path| match rotate_and_create(path) {
+                Ok(f) => Some(f),
                 Err(e) => {
                     tracing::warn!("cannot write {}: {e}", path.display());
                     None
                 }
-            },
-            None => None,
-        };
-        let piped = || {
-            if log.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            }
-        };
-        cmd.stdout(piped()).stderr(piped());
+            });
+        let log = Arc::new(StartupLog::new(file));
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = spawn(cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
-        if let Some(log) = &log {
-            if let Some(out) = child.stdout.take() {
-                log.clone().tap(out);
-            }
-            if let Some(err) = child.stderr.take() {
-                log.clone().tap(err);
-            }
+        if let Some(out) = child.stdout.take() {
+            log.clone().tap(out);
+        }
+        if let Some(err) = child.stderr.take() {
+            log.clone().tap(err);
         }
         let root = format!("http://127.0.0.1:{port}");
         let idle_check = {
@@ -239,9 +232,34 @@ fn slots_idle(agent: &ureq::Agent, url: &str, key: &str) -> bool {
 /// errors. After that it logs per-request lines, and even
 /// at its default verbosity an error path could quote part of a request, i.e. dictated
 /// text, so later output is read (the server must never block on a full pipe) and dropped.
+///
+/// It also keeps the last [`TAIL_LINES`] lines in memory, to say why the server exited
+/// ([`StartupLog::tail`]): before start-up all but request lines, after it only lines
+/// that look like a crash report ([`CRASH_MARKERS`]) and quote nothing, never the rest of
+/// an overlong line.
 struct StartupLog {
     file: std::sync::Mutex<Option<fs::File>>,
+    tail: std::sync::Mutex<std::collections::VecDeque<String>>,
+    started: std::sync::atomic::AtomicBool,
+    /// Reader threads still running, to wait for the last output after an exit.
+    readers: std::sync::Mutex<u32>,
+    drained: std::sync::Condvar,
 }
+
+/// Lines of output kept for the exit message, and the most kept of each.
+const TAIL_LINES: usize = 20;
+const TAIL_LINE_MAX: usize = 200;
+
+/// After start-up only lines containing one of these (ignoring case) are kept in the tail.
+const CRASH_MARKERS: &[&str] = &[
+    "ggml_",
+    "llama_",
+    "error",
+    "terminate called",
+    "vulkan",
+    "metal",
+    "cuda",
+];
 
 /// Lines that mean llama-server finished starting (wording differs between its versions).
 const STARTED: &[&str] = &[
@@ -258,24 +276,74 @@ const REQUEST_LINE: &[&str] = &["| task ", "launch_slot", "request:"];
 const STARTUP_LOG_MAX: u64 = 256 * 1024;
 
 impl StartupLog {
-    fn new(f: fs::File) -> Self {
+    fn new(file: Option<fs::File>) -> Self {
         Self {
-            file: std::sync::Mutex::new(Some(f)),
+            file: std::sync::Mutex::new(file),
+            tail: Default::default(),
+            started: Default::default(),
+            readers: Default::default(),
+            drained: Default::default(),
         }
+    }
+
+    /// The last lines kept (see the type docs), oldest first, or "" if none. Waits up to
+    /// `drain` for the readers to reach the end of the output (call it after an exit).
+    fn tail(&self, drain: Duration) -> String {
+        let readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.drained.wait_timeout_while(readers, drain, |n| *n > 0));
+        let tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        Vec::from_iter(tail.iter().map(String::as_str)).join("\n")
+    }
+
+    /// `continued`: the rest of a line too long to be read in one piece.
+    fn keep(&self, text: &str, request: bool, continued: bool) {
+        let started = self.started.load(std::sync::atomic::Ordering::Relaxed);
+        let text = text.trim_end();
+        let crash = || {
+            let lower = text.to_lowercase();
+            CRASH_MARKERS.iter().any(|m| lower.contains(m))
+        };
+        // A quoted request has quotes or braces.
+        let quotes = text.contains(['"', '{']);
+        if request || continued || text.is_empty() || (started && (quotes || !crash())) {
+            return;
+        }
+        let mut end = text.len().min(TAIL_LINE_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        if tail.len() == TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(text[..end].to_owned());
     }
 
     /// Copies `stream` line by line on a helper thread (see the type docs).
     fn tap(self: Arc<Self>, stream: impl std::io::Read + Send + 'static) {
+        *self.readers.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        let log = self.clone();
         let spawned = std::thread::Builder::new()
             .name("llama-server-log".into())
-            .spawn(move || self.copy(stream));
+            .spawn(move || {
+                log.copy(stream);
+                log.reader_done();
+            });
         if let Err(e) = spawned {
             tracing::warn!("cannot read llama-server's output: {e}");
+            self.reader_done();
         }
+    }
+
+    fn reader_done(&self) {
+        *self.readers.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.drained.notify_all();
     }
 
     /// Stops writing: the server passed its health check (or a line said it started).
     fn close(&self) {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = file.as_mut() {
             use std::io::Write;
@@ -292,6 +360,7 @@ impl StartupLog {
         let (mut buf, mut line) = (vec![0u8; 16 * 1024], Vec::new());
         let mut written = 0u64;
         let mut errors = 0u64;
+        let mut continued = false;
         loop {
             let n = match stream.read(&mut buf) {
                 Ok(0) => return,
@@ -306,9 +375,6 @@ impl StartupLog {
                 }
             };
             let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
-            if file.is_none() {
-                continue; // drained to nowhere
-            }
             for &b in &buf[..n] {
                 if b != b'\n' {
                     line.push(b);
@@ -316,15 +382,24 @@ impl StartupLog {
                         continue;
                     }
                 }
-                let Some(f) = file.as_mut() else { break };
                 let text = String::from_utf8_lossy(&line);
                 let request = REQUEST_LINE.iter().any(|m| text.contains(m));
+                let started = STARTED.iter().any(|m| text.contains(m));
+                self.keep(&text, request, continued);
+                continued = b != b'\n';
+                if request || started {
+                    self.started
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let Some(f) = file.as_mut() else {
+                    line.clear();
+                    continue;
+                };
                 if !request {
                     written += line.len() as u64 + 1;
                     let _ = f.write_all(&line);
                     let _ = f.write_all(b"\n");
                 }
-                let started = STARTED.iter().any(|m| text.contains(m));
                 line.clear();
                 if request || started || written > STARTUP_LOG_MAX {
                     let _ =
@@ -360,7 +435,7 @@ struct LlamaServer {
     health: ureq::Agent,
     gate: Arc<Gate>,
     /// Closed when the first health check passes: no request can come before that.
-    log: Option<Arc<StartupLog>>,
+    log: Arc<StartupLog>,
 }
 
 impl Server for LlamaServer {
@@ -380,8 +455,8 @@ impl Server for LlamaServer {
             .get(format!("{}/health", self.root))
             .call()
             .is_ok_and(|r| r.status() == 200);
-        if healthy && let Some(log) = self.log.take() {
-            log.close();
+        if healthy {
+            self.log.close();
         }
         healthy
     }
@@ -402,6 +477,11 @@ impl Server for LlamaServer {
         // Its process (group) is gone: nothing may be suspended under its name any more.
         self.gate.retire();
         status
+    }
+
+    fn last_output(&self) -> String {
+        // The readers may still be reading what it wrote last.
+        self.log.tail(Duration::from_millis(500))
     }
 
     fn kill(&mut self) {
@@ -571,7 +651,7 @@ mod tests {
     #[test]
     fn server_log_keeps_only_start_up() {
         let path = std::env::temp_dir().join(format!("agt-startup-log-{}", std::process::id()));
-        let log = StartupLog::new(fs::File::create(&path).unwrap());
+        let log = StartupLog::new(Some(fs::File::create(&path).unwrap()));
         let out = "load_tensors: offloaded 29/29 layers to GPU\n\
                    main: server is listening on http://127.0.0.1:4242 - starting the main loop\n\
                    srv  log_server_r: request: {\"messages\":[\"dictated words\"]}\n";
@@ -598,7 +678,7 @@ mod tests {
                 }
             }
         }
-        let log = StartupLog::new(fs::File::create(&path).unwrap());
+        let log = StartupLog::new(Some(fs::File::create(&path).unwrap()));
         let mut chunks = vec![
             Ok(&b"load_model: loading\n"[..]),
             Err(std::io::Error::other("glitch")),
@@ -634,7 +714,7 @@ mod tests {
                 "loading model",
             ),
         ] {
-            let log = StartupLog::new(fs::File::create(&path).unwrap());
+            let log = StartupLog::new(Some(fs::File::create(&path).unwrap()));
             log.copy(out.as_bytes());
             drop(log);
             let text = fs::read_to_string(&path).unwrap();
@@ -643,6 +723,65 @@ mod tests {
             assert!(!text.contains("task 0"), "{text}");
             assert!(!text.contains("dictated words"), "{text}");
         }
+    }
+
+    #[test]
+    fn tail_keeps_start_up_then_only_crash_lines() {
+        let log = StartupLog::new(None);
+        let mut out = String::new();
+        for i in 0..30 {
+            out += &format!("load: line {i}\n");
+        }
+        out += "main: server is listening on http://127.0.0.1:4242\n\
+                srv  log_server_r: request: {\"messages\":[\"dictated words\"]}\n\
+                srv  update_slots: dictated words\n\
+                srv  error: failed with \"dictated words\"\n\
+                ggml.c:1234: GGML_ASSERT(n > 0) failed\n\
+                ggml_vulkan: Device lost\n";
+        // An overlong line: only its first piece carries the request marker.
+        out += &format!("request: {}error dictated words\n", "x".repeat(64 * 1024));
+        out += "Error: out of memory\n";
+        log.copy(out.as_bytes());
+        let tail = log.tail(Duration::ZERO);
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), TAIL_LINES, "{tail}");
+        assert_eq!(lines[0], "load: line 14");
+        assert!(lines[16].contains("listening on"), "{tail}");
+        assert_eq!(
+            lines[17..],
+            [
+                "ggml.c:1234: GGML_ASSERT(n > 0) failed",
+                "ggml_vulkan: Device lost",
+                "Error: out of memory"
+            ]
+        );
+        assert!(!tail.contains("dictated words"), "{tail}");
+        // Long lines are cut, at a character boundary.
+        let log = StartupLog::new(None);
+        log.copy(("é".repeat(TAIL_LINE_MAX) + "\n").as_bytes());
+        assert_eq!(log.tail(Duration::ZERO), "é".repeat(TAIL_LINE_MAX / 2));
+    }
+
+    #[test]
+    fn tail_waits_for_the_readers() {
+        struct Slow(&'static [u8]);
+        impl std::io::Read for Slow {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(50));
+                let n = self.0.len();
+                buf[..n].copy_from_slice(self.0);
+                self.0 = b"";
+                Ok(n)
+            }
+        }
+        let log = Arc::new(StartupLog::new(None));
+        log.clone()
+            .tap(Slow(b"llama_model_load: error loading model\n"));
+        log.clone().tap(Slow(b""));
+        assert_eq!(
+            log.tail(Duration::from_secs(10)),
+            "llama_model_load: error loading model"
+        );
     }
 
     #[test]
