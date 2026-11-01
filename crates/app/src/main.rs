@@ -3,6 +3,7 @@
 
 mod logging;
 mod pipeline;
+mod session_end;
 mod settings;
 mod tray;
 mod update;
@@ -263,7 +264,10 @@ fn main() {
     if let Some(p) = &app.pipeline {
         p.shutdown(); // quit or restart mid-dictation: put a ducked volume back
     }
-    agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
+    // Already recorded if Windows ended the session (it may not let this run at all).
+    if session_end::os_reason().is_none() {
+        agt_telemetry::global().end_session(app.exit_reason, TELEMETRY_FLUSH);
+    }
     // The last dictation's history record (and WAV) may still be being written.
     agt_history::flush(HISTORY_FLUSH);
 }
@@ -557,6 +561,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         // The tray must be created once the event loop is running (required on macOS).
         if cause == StartCause::Init {
+            session_end::listen(TELEMETRY_FLUSH, HISTORY_FLUSH);
             let installed = self.updater.is_some();
             // On macOS (and with AGT_HOME) the history is in the config folder: one item will do.
             let data_folder = paths::history_dir() != paths::config_dir();

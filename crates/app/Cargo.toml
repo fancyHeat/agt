@@ -37,7 +37,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 # `agt stats` attaches to the console it was started from (release builds have none); the
 # settings window may take the foreground.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 # Optional STT engines/backends; see agt-stt's Cargo.toml and docs/benchmarks.md.

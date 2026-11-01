@@ -315,6 +315,10 @@ pub enum ExitReason {
     SettingsRestart,
     /// The event loop failed or the tray couldn't be created.
     Error,
+    /// Windows shut down or restarted.
+    OsShutdown,
+    /// The user logged off.
+    Logoff,
 }
 
 impl ExitReason {
@@ -324,6 +328,8 @@ impl ExitReason {
             ExitReason::UpdateRestart => "update_restart",
             ExitReason::SettingsRestart => "settings_restart",
             ExitReason::Error => "error",
+            ExitReason::OsShutdown => "os_shutdown",
+            ExitReason::Logoff => "logoff",
         }
     }
 }
