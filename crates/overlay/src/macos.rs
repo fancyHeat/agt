@@ -23,7 +23,7 @@
 //! the text is a real `NSTextField` and `NSButton`, so VoiceOver can read and press them.
 
 use crate::{
-    Error, NoticeSurface, Surface,
+    Error, NoticeSurface, Surface, Tone,
     canvas::{Canvas, Rgba},
     scene,
 };
@@ -392,7 +392,7 @@ impl Notice {
 }
 
 impl NoticeSurface for Notice {
-    fn show(&mut self, text: &'static str, copy: bool, margin: f32, top: bool) -> bool {
+    fn show(&mut self, text: &str, tone: Tone, copy: bool, margin: f32, top: bool) -> bool {
         let Some((s, _)) = main_screen(self.mtm) else {
             return false;
         };
@@ -408,6 +408,14 @@ impl NoticeSurface for Notice {
             },
         );
         self.label.setStringValue(&NSString::from_str(text));
+        let c = tone.color();
+        self.label
+            .setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+                c.0 as CGFloat,
+                c.1 as CGFloat,
+                c.2 as CGFloat,
+                c.3 as CGFloat,
+            )));
         self.button.setHidden(!copy);
         // Only the Copy button needs the mouse: without it, clicks go through to what's below.
         self.panel.setIgnoresMouseEvents(!copy);
