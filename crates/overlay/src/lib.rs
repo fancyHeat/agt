@@ -16,7 +16,8 @@
 //!   the speech model is still loading shows "Getting ready..." the same way, without the
 //!   button (on Windows too, where it's the only notice).
 //! - After a paste, a filler-word count ("3 filler words") shows the same way,
-//!   but just above where the pill sits, for [`STATS_FOR`].
+//!   but just above where the pill sits, for [`STATS_FILLERS_FOR`] ([`STATS_CLEAN_FOR`] with
+//!   no fillers).
 //!
 //! All methods must be called on the UI (main) thread.
 
@@ -66,8 +67,10 @@ pub const NOTICE_FOR: Duration = Duration::from_secs(12);
 pub const COPIED_FOR: Duration = Duration::from_millis(1200);
 /// How long "Getting ready..." stays up.
 pub const GETTING_READY_FOR: Duration = Duration::from_millis(1800);
-/// How long the after-dictation word count stays up.
-pub const STATS_FOR: Duration = Duration::from_secs(6);
+/// How long the after-dictation filler count stays up when there were fillers.
+pub const STATS_FILLERS_FOR: Duration = Duration::from_secs(1);
+/// How long "0 filler words" stays up.
+pub const STATS_CLEAN_FOR: Duration = Duration::from_millis(500);
 /// Space between the pill's spot and the word count above it, in logical pixels.
 const STATS_GAP: f32 = 10.0;
 
@@ -224,15 +227,20 @@ impl Overlay {
         }
     }
 
-    /// Shows the after-dictation word count (see `agt_core::filler`) just above where the
-    /// pill sits, for [`STATS_FOR`]. Only while the pill is hidden: a new recording that
-    /// already started wins. Like the other notices, the pill coming back hides it.
+    /// Shows the after-dictation filler count (see `agt_core::filler`) just above where the
+    /// pill sits, for [`STATS_FILLERS_FOR`] or [`STATS_CLEAN_FOR`]. Only while the pill is
+    /// hidden: a new recording that already started wins. Like the other notices, the pill
+    /// coming back hides it.
     /// `clean`: no fillers, shown in green (else red).
     pub fn show_stats(&mut self, text: &str, clean: bool, now: Instant) {
         if self.mode == Mode::Hidden {
             let lifted = scene::MARGIN + scene::HEIGHT + STATS_GAP;
-            let tone = if clean { Tone::Good } else { Tone::Bad };
-            self.show_text_at(text, tone, false, STATS_FOR, lifted, now);
+            let (tone, time) = if clean {
+                (Tone::Good, STATS_CLEAN_FOR)
+            } else {
+                (Tone::Bad, STATS_FILLERS_FOR)
+            };
+            self.show_text_at(text, tone, false, time, lifted, now);
         }
     }
 
@@ -691,31 +699,36 @@ mod tests {
             log.borrow().notice_margin > scene::MARGIN + scene::HEIGHT,
             "above the pill's spot"
         );
-        assert_eq!(o.next_frame(), Some(t + STATS_FOR));
-        o.tick(0.0, t + STATS_FOR);
+        assert_eq!(o.next_frame(), Some(t + STATS_FILLERS_FOR));
+        o.tick(0.0, t + STATS_FILLERS_FOR);
         assert_eq!(log.borrow().notice, None);
 
         // Not over a recording that already started; the next one hides it.
-        o.set_mode(Mode::Recording, 0.1, t + STATS_FOR);
-        o.show_stats("x", true, t + STATS_FOR);
+        o.set_mode(Mode::Recording, 0.1, t + STATS_FILLERS_FOR);
+        o.show_stats("x", true, t + STATS_FILLERS_FOR);
         assert_eq!(log.borrow().notice, None);
-        o.set_mode(Mode::Hidden, 0.0, t + STATS_FOR);
-        o.show_stats("x", true, t + STATS_FOR);
-        o.set_mode(Mode::Recording, 0.1, t + STATS_FOR + FRAME);
+        o.set_mode(Mode::Hidden, 0.0, t + STATS_FILLERS_FOR);
+        o.show_stats("x", true, t + STATS_FILLERS_FOR);
+        o.set_mode(Mode::Recording, 0.1, t + STATS_FILLERS_FOR + FRAME);
         assert!(!o.notice_visible());
 
         // The "not in a text box" notice after the same paste takes its place.
-        o.set_mode(Mode::Hidden, 0.0, t + STATS_FOR * 2);
-        o.show_stats("x", true, t + STATS_FOR * 2);
-        o.show_notice(t + STATS_FOR * 2);
+        o.set_mode(Mode::Hidden, 0.0, t + STATS_FILLERS_FOR * 2);
+        o.show_stats("x", true, t + STATS_FILLERS_FOR * 2);
+        o.show_notice(t + STATS_FILLERS_FOR * 2);
         assert_eq!(log.borrow().notice.as_deref(), Some(NOT_IN_TEXT_BOX));
         assert_eq!(log.borrow().notice_margin, scene::MARGIN);
         assert_eq!(log.borrow().tone, Tone::Plain);
 
         // None: green.
-        o.set_mode(Mode::Recording, 0.1, t + STATS_FOR * 3);
-        o.set_mode(Mode::Hidden, 0.0, t + STATS_FOR * 3);
-        o.show_stats("0 filler words", true, t + STATS_FOR * 3);
+        o.set_mode(Mode::Recording, 0.1, t + STATS_FILLERS_FOR * 3);
+        o.set_mode(Mode::Hidden, 0.0, t + STATS_FILLERS_FOR * 3);
+        o.show_stats("0 filler words", true, t + STATS_FILLERS_FOR * 3);
         assert_eq!(log.borrow().tone, Tone::Good);
+        assert_eq!(
+            o.next_frame(),
+            Some(t + STATS_FILLERS_FOR * 3 + STATS_CLEAN_FOR),
+            "shorter with no fillers"
+        );
     }
 }

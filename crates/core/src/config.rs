@@ -184,7 +184,8 @@ enabled = true
 # "bottom" or "top" of the screen with the focused window (horizontally centered).
 position = "bottom"
 # After each dictation, show how many filler words you said ("um", "uh", "like", "you
-# know", ...), just above the bar for a few seconds. Counted before polish.
+# know", ...), just above the bar for a second (half a second when there were none).
+# Counted before polish.
 filler_stats = true
 
 [history]
