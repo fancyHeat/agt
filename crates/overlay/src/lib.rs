@@ -15,6 +15,8 @@
 //!   click, and it still never activates AGT or moves keyboard focus). A key press while
 //!   the speech model is still loading shows "Getting ready..." the same way, without the
 //!   button (on Windows too, where it's the only notice).
+//! - After a paste, a filler-word count ("3 filler words") shows the same way,
+//!   but just above where the pill sits, for [`STATS_FOR`].
 //!
 //! All methods must be called on the UI (main) thread.
 
@@ -64,9 +66,35 @@ pub const NOTICE_FOR: Duration = Duration::from_secs(12);
 pub const COPIED_FOR: Duration = Duration::from_millis(1200);
 /// How long "Getting ready..." stays up.
 pub const GETTING_READY_FOR: Duration = Duration::from_millis(1800);
+/// How long the after-dictation word count stays up.
+pub const STATS_FOR: Duration = Duration::from_secs(6);
+/// Space between the pill's spot and the word count above it, in logical pixels.
+const STATS_GAP: f32 = 10.0;
 
 pub const NOT_IN_TEXT_BOX: &str = "You weren't in a text box";
 pub const GETTING_READY: &str = "Getting ready...";
+
+/// The notice's text color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tone {
+    /// White.
+    #[default]
+    Plain,
+    /// Green: "0 filler words".
+    Good,
+    /// Red: there were filler words.
+    Bad,
+}
+
+impl Tone {
+    pub(crate) fn color(self) -> canvas::Rgba {
+        match self {
+            Tone::Plain => scene::TEXT_PLAIN,
+            Tone::Good => scene::TEXT_GOOD,
+            Tone::Bad => scene::TEXT_BAD,
+        }
+    }
+}
 
 /// The OS window the pill is shown in.
 trait Surface {
@@ -83,7 +111,7 @@ trait NoticeSurface {
     /// Shows `text`, and the Copy button if `copy`, centered where the pill goes (`margin`
     /// from the bottom or top edge of the screen with the keyboard focus). `false` if it
     /// couldn't be shown (no screen).
-    fn show(&mut self, text: &'static str, copy: bool, margin: f32, top: bool) -> bool;
+    fn show(&mut self, text: &str, tone: Tone, copy: bool, margin: f32, top: bool) -> bool;
     /// Swaps the message and button for "Copied", in place.
     fn copied(&mut self);
     fn hide(&mut self);
@@ -196,12 +224,37 @@ impl Overlay {
         }
     }
 
+    /// Shows the after-dictation word count (see `agt_core::filler`) just above where the
+    /// pill sits, for [`STATS_FOR`]. Only while the pill is hidden: a new recording that
+    /// already started wins. Like the other notices, the pill coming back hides it.
+    /// `clean`: no fillers, shown in green (else red).
+    pub fn show_stats(&mut self, text: &str, clean: bool, now: Instant) {
+        if self.mode == Mode::Hidden {
+            let lifted = scene::MARGIN + scene::HEIGHT + STATS_GAP;
+            let tone = if clean { Tone::Good } else { Tone::Bad };
+            self.show_text_at(text, tone, false, STATS_FOR, lifted, now);
+        }
+    }
+
     /// Shows the notice for `time`; `false` if it couldn't be.
-    fn show_text(&mut self, text: &'static str, copy: bool, time: Duration, now: Instant) -> bool {
+    fn show_text(&mut self, text: &str, copy: bool, time: Duration, now: Instant) -> bool {
+        self.show_text_at(text, Tone::Plain, copy, time, scene::MARGIN, now)
+    }
+
+    /// [`Overlay::show_text`], centered `margin` from the screen edge.
+    fn show_text_at(
+        &mut self,
+        text: &str,
+        tone: Tone,
+        copy: bool,
+        time: Duration,
+        margin: f32,
+        now: Instant,
+    ) -> bool {
         let Some(notice) = &mut self.notice else {
             return false;
         };
-        if !notice.show(text, copy, scene::MARGIN, self.position == Position::Top) {
+        if !notice.show(text, tone, copy, margin, self.position == Position::Top) {
             return false;
         }
         self.notice_until = Some(now + time);
@@ -339,7 +392,9 @@ mod tests {
         places: usize,
         presents: usize,
         visible: bool,
-        notice: Option<&'static str>,
+        notice: Option<String>,
+        notice_margin: f32,
+        tone: Tone,
         button: bool,
         /// The notice's `show` fails.
         no_screen: bool,
@@ -364,18 +419,20 @@ mod tests {
     }
 
     impl NoticeSurface for Fake {
-        fn show(&mut self, text: &'static str, copy: bool, _: f32, _: bool) -> bool {
+        fn show(&mut self, text: &str, tone: Tone, copy: bool, margin: f32, _: bool) -> bool {
             let mut log = self.0.borrow_mut();
             if log.no_screen {
                 return false;
             }
-            log.notice = Some(text);
+            log.notice = Some(text.into());
+            log.notice_margin = margin;
+            log.tone = tone;
             log.button = copy;
             true
         }
         fn copied(&mut self) {
             let mut log = self.0.borrow_mut();
-            log.notice = Some("copied");
+            log.notice = Some("copied".into());
             log.button = false;
         }
         fn hide(&mut self) {
@@ -487,7 +544,7 @@ mod tests {
         let (mut o, log) = overlay();
         let t = Instant::now();
         o.show_notice(t);
-        assert_eq!(log.borrow().notice, Some(NOT_IN_TEXT_BOX));
+        assert_eq!(log.borrow().notice.as_deref(), Some(NOT_IN_TEXT_BOX));
         assert!(log.borrow().button);
         assert_eq!(
             o.next_frame(),
@@ -509,7 +566,7 @@ mod tests {
         assert_eq!(log.borrow().notice, None, "nothing to confirm while hidden");
         o.show_notice(t);
         o.notice_copied(t + Duration::from_secs(2));
-        assert_eq!(log.borrow().notice, Some("copied"));
+        assert_eq!(log.borrow().notice.as_deref(), Some("copied"));
         let until = t + Duration::from_secs(2) + COPIED_FOR;
         assert_eq!(o.next_frame(), Some(until));
         o.tick(0.0, until);
@@ -540,7 +597,7 @@ mod tests {
         let later = t + Duration::from_secs(5);
         o.show_notice(later);
         assert_eq!(
-            log.borrow().notice,
+            log.borrow().notice.as_deref(),
             Some(NOT_IN_TEXT_BOX),
             "the button is back"
         );
@@ -582,13 +639,13 @@ mod tests {
         let (mut o, log) = overlay();
         let t = Instant::now();
         o.show_getting_ready(0.0, t);
-        assert_eq!(log.borrow().notice, Some(GETTING_READY));
+        assert_eq!(log.borrow().notice.as_deref(), Some(GETTING_READY));
         assert!(!log.borrow().button);
         assert_eq!(o.mode(), Mode::Hidden, "not the red flash");
         assert!(!log.borrow().visible);
         o.notice_copied(t + FRAME);
         assert_eq!(
-            log.borrow().notice,
+            log.borrow().notice.as_deref(),
             Some(GETTING_READY),
             "nothing was copied from it"
         );
@@ -606,7 +663,7 @@ mod tests {
         o.show_getting_ready(0.0, t + FRAME);
         assert_eq!(o.mode(), Mode::Hidden);
         assert!(!log.borrow().visible);
-        assert_eq!(log.borrow().notice, Some(GETTING_READY));
+        assert_eq!(log.borrow().notice.as_deref(), Some(GETTING_READY));
     }
 
     #[test]
@@ -620,5 +677,45 @@ mod tests {
         // The next download-progress status doesn't cut it short.
         o.set_mode(Mode::Hidden, 0.0, t + FRAME);
         assert_eq!(o.mode(), Mode::Error);
+    }
+
+    #[test]
+    fn stats_show_above_the_pill_then_time_out() {
+        let (mut o, log) = overlay();
+        let t = Instant::now();
+        o.show_stats("3 filler words", false, t);
+        assert_eq!(log.borrow().notice.as_deref(), Some("3 filler words"));
+        assert_eq!(log.borrow().tone, Tone::Bad, "red");
+        assert!(!log.borrow().button);
+        assert!(
+            log.borrow().notice_margin > scene::MARGIN + scene::HEIGHT,
+            "above the pill's spot"
+        );
+        assert_eq!(o.next_frame(), Some(t + STATS_FOR));
+        o.tick(0.0, t + STATS_FOR);
+        assert_eq!(log.borrow().notice, None);
+
+        // Not over a recording that already started; the next one hides it.
+        o.set_mode(Mode::Recording, 0.1, t + STATS_FOR);
+        o.show_stats("x", true, t + STATS_FOR);
+        assert_eq!(log.borrow().notice, None);
+        o.set_mode(Mode::Hidden, 0.0, t + STATS_FOR);
+        o.show_stats("x", true, t + STATS_FOR);
+        o.set_mode(Mode::Recording, 0.1, t + STATS_FOR + FRAME);
+        assert!(!o.notice_visible());
+
+        // The "not in a text box" notice after the same paste takes its place.
+        o.set_mode(Mode::Hidden, 0.0, t + STATS_FOR * 2);
+        o.show_stats("x", true, t + STATS_FOR * 2);
+        o.show_notice(t + STATS_FOR * 2);
+        assert_eq!(log.borrow().notice.as_deref(), Some(NOT_IN_TEXT_BOX));
+        assert_eq!(log.borrow().notice_margin, scene::MARGIN);
+        assert_eq!(log.borrow().tone, Tone::Plain);
+
+        // None: green.
+        o.set_mode(Mode::Recording, 0.1, t + STATS_FOR * 3);
+        o.set_mode(Mode::Hidden, 0.0, t + STATS_FOR * 3);
+        o.show_stats("0 filler words", true, t + STATS_FOR * 3);
+        assert_eq!(log.borrow().tone, Tone::Good);
     }
 }

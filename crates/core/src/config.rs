@@ -183,6 +183,9 @@ fast_drafting = false
 enabled = true
 # "bottom" or "top" of the screen with the focused window (horizontally centered).
 position = "bottom"
+# After each dictation, show how many filler words you said ("um", "uh", "like", "you
+# know", ...), just above the bar for a few seconds. Counted before polish.
+filler_stats = true
 
 [history]
 # Keep a copy of each dictation, e.g. to look back at what you said or to build a custom
@@ -589,6 +592,8 @@ impl std::fmt::Debug for PolishConfig {
 pub struct OverlayConfig {
     pub enabled: bool,
     pub position: OverlayPosition,
+    /// Filler-word count above the bar after each dictation.
+    pub filler_stats: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -603,6 +608,7 @@ impl Default for OverlayConfig {
         Self {
             enabled: true,
             position: OverlayPosition::Bottom,
+            filler_stats: true,
         }
     }
 }

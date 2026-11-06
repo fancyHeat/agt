@@ -182,6 +182,9 @@ pub enum Event {
     NotInTextBox,
     /// The last transcript was put on the clipboard (see [`Pipeline::copy_last_transcript`]).
     Copied,
+    /// A dictation was pasted: its filler-word count, as the line to show, and whether it
+    /// had none (with `[overlay] filler_stats` on).
+    WordStats { line: String, clean: bool },
     /// New tray line about LLM polish (the managed S1-mini downloading, starting, failed).
     PolishInfo(String),
 }
@@ -266,6 +269,10 @@ impl Hub {
 
     fn copied(&self) {
         (self.notify)(Event::Copied);
+    }
+
+    fn word_stats(&self, line: String, clean: bool) {
+        (self.notify)(Event::WordStats { line, clean });
     }
 
     fn engine_ready(&self) -> bool {
@@ -469,6 +476,9 @@ enum ToPaste {
         dictation: Box<Dictation>,
         /// Only with `[history]` on.
         saved: Option<Box<history::Entry>>,
+        /// Counted on the raw transcript (polish removes fillers); only with
+        /// `[overlay] filler_stats` on.
+        fillers: Option<agt_core::filler::FillerStats>,
     },
     /// The user asked for the last transcript on the clipboard (tray menu).
     CopyLast,
@@ -1828,6 +1838,9 @@ fn polish_thread(
             mut saved,
             scope,
         } = *job;
+        // Before polish, which takes the fillers out.
+        let fillers = (config.overlay.enabled && config.overlay.filler_stats)
+            .then(|| agt_core::filler::count(&text));
         // Pieces sent before it are its own (or a failed dictation's).
         let earlier = pieces.take();
         // Polished in pieces, the replacements are made in each (see `Pieces::polish`).
@@ -1897,6 +1910,7 @@ fn polish_thread(
             target,
             dictation: d,
             saved,
+            fillers,
         });
     }
 }
@@ -2137,6 +2151,7 @@ fn paste_thread(
                 target,
                 dictation: mut d,
                 saved,
+                fillers,
             }) => {
                 // Later messages (the next dictation's paste included) queue up behind this
                 // wait, so pastes stay in order.
@@ -2257,6 +2272,10 @@ fn paste_thread(
                             pending_restore = Some((token, pasted + restore_after));
                         }
                         telemetry::global().dictation(d, Ended::Pasted);
+                        if let Some(f) = &fillers {
+                            tracing::info!("dictation: {} words, {} fillers", f.words, f.fillers);
+                            hub.word_stats(f.summary(), f.fillers == 0);
+                        }
                         // Last, once the restore is scheduled: it asks the focused app, which
                         // may take up to a second while it handles the paste. Pasted anyway
                         // (the check can be wrong, and an app may take a paste outside a text

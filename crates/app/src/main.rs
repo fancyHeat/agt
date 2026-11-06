@@ -633,6 +633,11 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+                pipeline::Event::WordStats { line, clean } => {
+                    if let Some(o) = &mut self.overlay {
+                        o.show_stats(line, *clean, Instant::now());
+                    }
+                }
                 pipeline::Event::Copied => {
                     if let Some(o) = &mut self.overlay {
                         o.notice_copied(Instant::now());

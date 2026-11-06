@@ -8,11 +8,7 @@
 //! The window is owned by the thread that creates it (the UI thread), whose message loop
 //! (winit's) dispatches its few messages to `DefWindowProcW`.
 
-use crate::{
-    Error, NoticeSurface, Surface,
-    canvas::{Canvas, Rgba},
-    scene,
-};
+use crate::{Error, NoticeSurface, Surface, Tone, canvas::Canvas, scene};
 use std::{ffi::c_void, mem::zeroed, ptr::null_mut};
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, POINT, RECT, SIZE},
@@ -259,7 +255,6 @@ impl Drop for Window {
 const NOTICE_HEIGHT: f32 = 40.0;
 const NOTICE_PAD: f32 = 16.0;
 const FONT_SIZE: f32 = 13.0;
-const TEXT: Rgba = Rgba(1.0, 1.0, 1.0, 1.0);
 
 pub struct Notice {
     window: Window,
@@ -276,7 +271,7 @@ impl Notice {
 }
 
 impl NoticeSurface for Notice {
-    fn show(&mut self, text: &'static str, copy: bool, margin: f32, top: bool) -> bool {
+    fn show(&mut self, text: &str, tone: Tone, copy: bool, margin: f32, top: bool) -> bool {
         if copy {
             return false;
         }
@@ -294,7 +289,13 @@ impl NoticeSurface for Notice {
         let (wf, hf) = (w as f32, h as f32);
         c.fill_round_rect(0.0, 0.0, wf, hf, f32::MAX, scene::BG);
         c.stroke_round_rect(0.0, 0.0, wf, hf, f32::MAX, scale.max(1.0), scene::BORDER);
-        c.fill_mask(pad, h.saturating_sub(text_h) / 2, text_w, &coverage, TEXT);
+        c.fill_mask(
+            pad,
+            h.saturating_sub(text_h) / 2,
+            text_w,
+            &coverage,
+            tone.color(),
+        );
         self.window.present(&self.canvas);
         self.window.visible
     }
