@@ -15,7 +15,8 @@
 //! Each mute and unmute is an `info` event with how long the MIDI call took: AGT has died
 //! without a trace while muting was on (no panic, no Windows error report), and these
 //! breadcrumbs tell whether the last thing it did was a MIDI call into the driver. A death
-//! inside the mute call leaves the marker, which the next start reports.
+//! inside the mute call leaves the marker, which the next start reports; one inside the unmute
+//! call leaves "unmuting the interface's mix" as the run's last event.
 
 use std::{fs, path::PathBuf, time::Instant};
 
@@ -106,6 +107,8 @@ impl Mixer {
     /// Unmutes what we muted, if anything. A failed send is kept, to retry next time.
     pub(crate) fn unmute(&mut self) {
         let Some(muted) = &self.muted else { return };
+        // Before sending: without it, a death inside the call looks like one while muted.
+        tracing::info!("unmuting the interface's mix");
         let t = Instant::now();
         match (self.send)(&muted.port, &[message(false)]) {
             Ok(()) => {
