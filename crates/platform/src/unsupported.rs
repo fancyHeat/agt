@@ -130,7 +130,7 @@ impl OutputVolume {
     }
 }
 
-/// Not here yet: inputs mixed by a Focusrite interface aren't muted.
+/// Not here: a Focusrite interface's mix isn't muted (the pipeline never asks on macOS).
 pub fn midi_send(_port: &str, _msgs: &[[u8; 3]]) -> Result<(), Error> {
     Err(format!("MIDI {MSG}").into())
 }

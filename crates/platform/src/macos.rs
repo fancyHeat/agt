@@ -1243,6 +1243,11 @@ impl OutputVolume {
     }
 }
 
+/// Not here: a Focusrite interface's mix isn't muted (the pipeline never asks on macOS).
+pub fn midi_send(_port: &str, _msgs: &[[u8; 3]]) -> Result<(), Error> {
+    Err("MIDI output is not supported on macOS yet".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,9 +1305,4 @@ mod tests {
         assert!(!pastes_with_control(Some("AXSearchField")));
         assert!(!pastes_with_control(Some("AXTextField")));
     }
-}
-
-/// Not here yet: inputs mixed by a Focusrite interface aren't muted.
-pub fn midi_send(_port: &str, _msgs: &[[u8; 3]]) -> Result<(), Error> {
-    Err("MIDI output is not supported on macOS yet".into())
 }
