@@ -82,8 +82,10 @@ duck_level = 0.1
 # speakers, play by default) while dictating. That reaches a game console or another device
 # plugged into the interface, which the volume above doesn't; everything on the speakers is
 # silent until you let go. AGT sends MIDI to Focusrite Control 2, which must be running with
-# Preferences -> MIDI Control set to a virtual MIDI port (loopMIDI, say) and MIDI Channel set
-# to All channels or Channel 1. The name of that port, as Focusrite Control 2 lists it. "": off.
+# Preferences -> MIDI Control set to a virtual MIDI port and MIDI Channel set to All channels or
+# Channel 1. The name of the port AGT sends to: with a Windows MIDI Services loopback, the side
+# Focusrite Control 2 doesn't listen on ("AGT Loop A" when it listens on "AGT Loop B"); with
+# loopMIDI, the port's one name. See the README. "": off.
 # Ignored on macOS.
 focusrite_midi_port = ""
 
