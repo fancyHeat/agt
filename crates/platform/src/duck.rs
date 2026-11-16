@@ -17,8 +17,14 @@
 //!   dictation). Only if its volume still looks like ours: after a crash, anything between the
 //!   ducked value and the original (a fade may have been cut short); after a device loss,
 //!   exactly the volume we left it at.
+//!
+//! The same thread also mutes a Focusrite interface's mix, if configured (see `mixer`): it's
+//! muted with each duck and unmuted with each restore.
 
-use crate::imp;
+use crate::{
+    imp,
+    mixer::{Mixer, MixerMute},
+};
 use std::{
     fs,
     path::PathBuf,
@@ -276,6 +282,8 @@ struct Duck<D: Devices> {
     marker: Marker,
     fade_down: Duration,
     fade_up: Duration,
+    /// Interface inputs to mute alongside (`None`: none).
+    mixer: Option<Mixer>,
 }
 
 impl<D: Devices> Duck<D> {
@@ -291,6 +299,7 @@ impl<D: Devices> Duck<D> {
             marker,
             fade_down,
             fade_up,
+            mixer: None,
         };
         duck.retry_lost();
         duck.save();
@@ -330,6 +339,9 @@ impl<D: Devices> Duck<D> {
 
     /// Lowers the volume to `level` × the original.
     fn duck(&mut self, level: f32, now: Instant) {
+        if let Some(m) = &mut self.mixer {
+            m.mute();
+        }
         let level = clamp_level(level);
         // Still ducked, or fading back up: keep the original from before the first duck.
         match self.session.as_mut().map(Session::seen) {
@@ -384,6 +396,9 @@ impl<D: Devices> Duck<D> {
 
     /// Fades back to the original volume, unless the user changed it meanwhile.
     fn restore(&mut self, now: Instant) {
+        if let Some(m) = &mut self.mixer {
+            m.unmute();
+        }
         let Some(s) = &mut self.session else { return };
         match s.seen() {
             Seen::Untouched => {}
@@ -447,6 +462,9 @@ impl<D: Devices> Duck<D> {
 
     /// Restores the original volume at once (no fade), e.g. when AGT exits.
     fn finish(&mut self) {
+        if let Some(m) = &mut self.mixer {
+            m.unmute();
+        }
         let Some(s) = &mut self.session else { return };
         match s.seen() {
             Seen::Untouched => {
@@ -518,11 +536,19 @@ impl Drop for Ducked {
 
 impl Ducker {
     /// Starts the `duck` thread. `marker`: where to keep the original volume while ducked; a
-    /// marker left by a previous run is acted on first.
-    pub fn start(marker: PathBuf) -> Self {
+    /// marker left by a previous run is acted on first. `mute`: a Focusrite mix to mute
+    /// while ducked, and `mute_marker` where to note it while it is (a mix a previous run left
+    /// muted is unmuted first, even with `mute` off).
+    pub fn start(marker: PathBuf, mute: Option<MixerMute>, mute_marker: PathBuf) -> Self {
         Self::spawn(move || {
             imp::init_volume_thread();
-            Duck::new(Real::default(), Marker(Some(marker)), FADE_DOWN, FADE_UP)
+            let mut duck = Duck::new(Real::default(), Marker(Some(marker)), FADE_DOWN, FADE_UP);
+            duck.mixer = Some(Mixer::new(
+                mute,
+                Some(mute_marker),
+                Box::new(imp::midi_send),
+            ));
+            duck
         })
     }
 
@@ -538,8 +564,8 @@ impl Ducker {
         Self { tx }
     }
 
-    /// Lowers the output volume to `level` (0..=1) times what it is now, until the returned
-    /// guard is dropped. Never blocks.
+    /// Lowers the output volume to `level` (0..=1) times what it is now (and mutes the
+    /// configured Focusrite mix), until the returned guard is dropped. Never blocks.
     pub fn duck(&self, level: f32) -> Ducked {
         let _ = self.tx.send(Cmd::Duck(level));
         Ducked {
@@ -1194,7 +1220,7 @@ mod tests {
             .expect("found by ID");
         assert_eq!(again.id(), out.id());
         let path = temp_marker("real");
-        let ducker = Ducker::start(path.clone());
+        let ducker = Ducker::start(path.clone(), None, path.with_extension("mute"));
         let guard = ducker.duck(0.1);
         thread::sleep(Duration::from_millis(300));
         let during = out.volume().unwrap();

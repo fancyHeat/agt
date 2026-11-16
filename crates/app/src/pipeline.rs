@@ -13,7 +13,8 @@
 //!   [`HANDS_FREE_MAX`]). After a tap the status stays "recording" for `double_tap_ms`, so
 //!   the bar doesn't flicker between the two taps.
 //! - `duck` (agt-platform, with `audio.duck`): once the microphone has started, turns the
-//!   system output volume down until the recording ends, however it ends.
+//!   system output volume down until the recording ends, however it ends (and, on Windows,
+//!   mutes a Focusrite interface's Mix A, with `audio.focusrite_midi_port` set).
 //! - `stt`: downloads/loads the model at start-up, then transcribes jobs in order. A new
 //!   recording may start while the previous one is still being transcribed: jobs queue up
 //!   and are pasted in order (nothing is dropped). A recording's segments are transcribed
@@ -67,7 +68,7 @@ use agt_core::{
 use agt_history::{self as history, History};
 use agt_platform::{
     ClipboardSnapshot, Ducked, Ducker, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyReset, Key,
-    MAX_CHORD, PasteToken, Permission,
+    MAX_CHORD, MixerMute, PasteToken, Permission,
 };
 use agt_polish::{Outcome, ahead::Ahead};
 use agt_stt::chunk::{Cut, CutConfig, Live, LiveStats, Piece, Texts};
@@ -496,7 +497,11 @@ pub fn start(
         notify: Arc::new(notify),
     };
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
-    let ducker = Ducker::start(paths::ducked_volume_file());
+    // Windows only: the setup it's for (Focusrite Control 2 on a virtual MIDI port) is.
+    let port = &config.audio.focusrite_midi_port;
+    let mute = (cfg!(windows) && config.audio.duck && !port.is_empty())
+        .then(|| MixerMute { port: port.clone() });
+    let ducker = Ducker::start(paths::ducked_volume_file(), mute, paths::muted_mix_file());
     let key = Hotkey::parse(&config.hotkey.key)?;
     // Before the audio thread starts: it doesn't open the microphone without the permission.
     watch_permissions(&hub);

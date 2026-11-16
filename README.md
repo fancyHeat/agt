@@ -53,6 +53,16 @@ Good to know:
   and comes back when you let go. Settings... → **Lower other audio while dictating** turns
   this off, and **Lower other audio to** picks how quiet (`duck` and `duck_level` under `[audio]`
   in `config.toml`).
+- Windows, Focusrite interfaces: a game console or other device plugged into the interface
+  and mixed straight to its outputs doesn't go through the system volume, so it isn't turned
+  down. AGT can mute the interface's Mix A (what outputs 1-2, the speakers, play by default:
+  the console and the computer alike) while you dictate, through Focusrite Control 2's MIDI
+  control. Headphones on another mix keep playing.
+  1. Create a virtual MIDI port, for example with [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
+     (a port named `AGT`).
+  2. In Focusrite Control 2: More options → Preferences → Application → **MIDI Control**: that
+     port; **MIDI Channel**: All channels. Keep Focusrite Control 2 running.
+  3. In `config.toml` under `[audio]`: `focusrite_midi_port = "AGT"`.
 - AGT starts when you log in. Settings... → **Start AGT when you log in** turns that off
   (`launch_at_login` in `config.toml`). Turning AGT off or removing it in Task Manager's
   Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks too. If

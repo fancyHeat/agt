@@ -5,7 +5,8 @@
 //! - macOS: `CGEventTap`, `NSPasteboard`, `CGEventPost`; Microphone and Accessibility
 //!   permissions (see [`missing_permissions`]).
 //! - Ducking other audio while dictating ([`Ducker`]): the default output device's volume
-//!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL).
+//!   (Windows: `IAudioEndpointVolume`; macOS: the CoreAudio HAL), and optionally a Focusrite
+//!   interface's mix ([`MixerMute`]; Windows: MIDI to Focusrite Control 2).
 //! - Starting AGT at login ([`set_launch_at_login`]; Windows: the `Run` key; macOS:
 //!   `SMAppService`).
 //! - Anything else returns [`Error`]s saying it's unsupported.
@@ -32,7 +33,9 @@ mod unsupported;
 use unsupported as imp;
 
 mod duck;
+mod mixer;
 pub use duck::{Ducked, Ducker};
+pub use mixer::MixerMute;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
