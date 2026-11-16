@@ -78,6 +78,14 @@ duck = true
 # How much of the volume to keep while dictating, from 0 (silence) to 1 (unchanged): 0.1 turns
 # the volume slider down to a tenth of where it was.
 duck_level = 0.1
+# Windows, Focusrite interfaces: also mute the interface's Mix A (what its outputs 1-2, the
+# speakers, play by default) while dictating. That reaches a game console or another device
+# plugged into the interface, which the volume above doesn't; everything on the speakers is
+# silent until you let go. AGT sends MIDI to Focusrite Control 2, which must be running with
+# Preferences -> MIDI Control set to a virtual MIDI port (loopMIDI, say) and MIDI Channel set
+# to All channels or Channel 1. The name of that port, as Focusrite Control 2 lists it. "": off.
+# Ignored on macOS.
+focusrite_midi_port = ""
 
 [stt]
 # Speech-to-text engine: "parakeet" (NVIDIA Parakeet TDT via ONNX Runtime), or "whisper"
@@ -290,6 +298,8 @@ pub struct AudioConfig {
     pub duck: bool,
     /// As written; the method clamps it.
     pub duck_level: f32,
+    /// MIDI output port Focusrite Control 2 listens on; "" = don't mute its mix (Windows).
+    pub focusrite_midi_port: String,
 }
 
 /// Default `audio.duck_level`.
@@ -302,6 +312,7 @@ impl Default for AudioConfig {
             keep_mic_open: false,
             duck: true,
             duck_level: DEFAULT_DUCK_LEVEL,
+            focusrite_midi_port: String::new(),
         }
     }
 }
@@ -1044,6 +1055,14 @@ mod tests {
         let c = Config::parse("[audio]\nduck = false\n").unwrap();
         assert!(!c.audio.duck);
         assert_eq!(c.audio.duck_level(), DEFAULT_DUCK_LEVEL);
+    }
+
+    #[test]
+    fn focusrite_muting_is_off_unless_a_port_is_named() {
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.audio.focusrite_midi_port, "");
+        let c = Config::parse("[audio]\nfocusrite_midi_port = \"AGT\"\n").unwrap();
+        assert_eq!(c.audio.focusrite_midi_port, "AGT");
     }
 
     #[test]

@@ -29,7 +29,7 @@ env:
 
 jobs:
   preflight:
-    runs-on: macos-14
+    runs-on: macos-15
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -72,7 +72,7 @@ jobs:
           - os: windows-latest
             channel: win-x64
             exe: agt.exe
-          - os: macos-14
+          - os: macos-15
             channel: osx-arm64
             exe: agt
     runs-on: ${{ matrix.os }}
@@ -219,7 +219,7 @@ jobs:
   # see them. The Developer ID identity lives in a throwaway keychain that's deleted at the end.
   package-macos:
     needs: [preflight, build]
-    runs-on: macos-14
+    runs-on: macos-15
     environment: ${{ github.event_name != 'pull_request' && 'release' || '' }}
     permissions:
       contents: read

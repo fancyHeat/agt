@@ -1,6 +1,6 @@
 //! Platform directories. Nothing here creates directories.
 //!
-//! | | config (`config_dir`) | data: instance lock, ducked-volume and login-item markers, the llama.cpp builds in `llama.cpp/` (`data_dir`) | usage history: `agt.db`, `llama-server.log`, saved dictations in `dictations/` (`history_dir`) | models (`models_dir`) |
+//! | | config (`config_dir`) | data: instance lock, ducked-volume, muted-mix and login-item markers, the llama.cpp builds in `llama.cpp/` (`data_dir`) | usage history: `agt.db`, `llama-server.log`, saved dictations in `dictations/` (`history_dir`) | models (`models_dir`) |
 //! |---|---|---|---|---|
 //! | Windows | `%APPDATA%\AGT` (roaming) | `%LOCALAPPDATA%\AGT` (also the Velopack install root) | `%LOCALAPPDATA%\AGT-data` | `%LOCALAPPDATA%\AGT-models` |
 //! | macOS | `~/Library/Application Support/AGT` | same | same | `<data>/models` |
@@ -22,7 +22,7 @@ pub fn config_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::config_dir)
 }
 
-/// Holds the instance lock, the ducked-volume and login-item markers and the llama.cpp builds.
+/// Holds the instance lock, the ducked-volume, muted-mix and login-item markers and the llama.cpp builds.
 /// Machine-local, never roams.
 pub fn data_dir() -> PathBuf {
     home_override().unwrap_or_else(platform::data_dir)
@@ -76,6 +76,12 @@ pub fn eval_dir() -> PathBuf {
 /// While other audio is ducked, the volume to restore if AGT dies before it does.
 pub fn ducked_volume_file() -> PathBuf {
     data_dir().join("ducked-volume")
+}
+
+/// While a Focusrite mix is muted for a dictation, the MIDI port to unmute it through if AGT
+/// dies before it does.
+pub fn muted_mix_file() -> PathBuf {
+    data_dir().join("muted-mix")
 }
 
 /// `launch_at_login` as AGT last applied it to the OS ("on" or "off"). On Windows it's in

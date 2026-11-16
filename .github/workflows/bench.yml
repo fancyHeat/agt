@@ -1,4 +1,4 @@
-# STT benchmark on a GitHub-hosted Apple Silicon runner (macos-14, M1, virtualized), started
+# STT benchmark on a GitHub-hosted Apple Silicon runner (macos-15, Apple Silicon, virtualized), started
 # by hand. Results are in the job summary and the `bench-macos` artifact. These runners are
 # VMs without GPU/Neural Engine access: CPU numbers are indicative of an M1 at best. Core ML is
 # measured on real hardware instead (Phase 4, issue #9; full run: issue #11).
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   bench:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
