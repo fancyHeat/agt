@@ -8,8 +8,9 @@
 //! `duck` thread, next to the volume.
 //!
 //! Only a mute AGT made is undone: muting again while muted sends nothing new, and a failed
-//! send (the port is gone) leaves nothing to undo. While the mix is muted, a small marker file
-//! names the port: if AGT dies before unmuting, the next start does.
+//! send (the port is gone) leaves nothing to undo. A failed unmute is retried with the next
+//! restore. While the mix is muted, a small marker file names the port: if AGT dies before
+//! unmuting, the next start does (trying once: the port may have been renamed since).
 
 use std::{fs, path::PathBuf};
 
@@ -37,7 +38,7 @@ pub(crate) struct Mixer {
     muted: Option<MixerMute>,
     marker: Option<PathBuf>,
     send: Send,
-    /// A failed send was logged at `warn` once; the rest at `debug`.
+    /// A failed mute was logged at `warn` once; the rest at `debug`.
     warned: bool,
 }
 
@@ -61,6 +62,11 @@ impl Mixer {
         if mixer.muted.is_some() {
             tracing::info!("unmuting the interface's mix a previous run left muted");
             mixer.unmute();
+            // Not retried: the port may be gone for good (renamed), which would otherwise
+            // keep muting off forever.
+            if mixer.muted.take().is_some() {
+                mixer.save(None);
+            }
         }
         mixer
     }
@@ -79,7 +85,12 @@ impl Mixer {
                 self.muted = Some(config);
             }
             Err(e) => {
-                self.failed(&e);
+                if self.warned {
+                    tracing::debug!("cannot mute the interface's mix: {e}");
+                } else {
+                    self.warned = true;
+                    tracing::warn!("cannot mute the interface's mix: {e}");
+                }
                 self.save(None);
             }
         }
@@ -94,16 +105,8 @@ impl Mixer {
                 self.muted = None;
                 self.save(None);
             }
-            Err(e) => self.failed(&e),
-        }
-    }
-
-    fn failed(&mut self, e: &crate::Error) {
-        if self.warned {
-            tracing::debug!("cannot mute the interface's mix: {e}");
-        } else {
-            self.warned = true;
-            tracing::warn!("cannot mute the interface's mix: {e}");
+            // Always loud: the speakers stay muted until a retry (the next release) works.
+            Err(e) => tracing::warn!("cannot unmute the interface's mix: {e}"),
         }
     }
 
@@ -209,6 +212,21 @@ mod tests {
         drop(Mixer::new(None, Some(path.clone()), send));
         assert_eq!(*log.lock().unwrap(), [("AGT".into(), vec![UNMUTE])]);
         assert!(!path.exists());
+
+        // Left muted on a port that's gone for good: tried once, then forgotten, so muting
+        // on the configured port still works.
+        let (send, _) = recorder(Arc::default());
+        let mut m = Mixer::new(agt(), Some(path.clone()), send);
+        m.mute();
+        std::mem::forget(m);
+        let down = Arc::new(Mutex::new(true));
+        let (send, log) = recorder(down.clone());
+        let mut m = Mixer::new(agt(), Some(path.clone()), send);
+        assert!(!path.exists());
+        *down.lock().unwrap() = false;
+        m.mute();
+        assert_eq!(*log.lock().unwrap(), [("AGT".into(), vec![MUTE])]);
+        m.unmute();
 
         // A normal unmute removes the file too.
         let (send, _) = recorder(Arc::default());

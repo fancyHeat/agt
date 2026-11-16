@@ -1015,9 +1015,11 @@ impl OutputVolume {
 // MIDI out (muting inputs mixed by a Focusrite interface while dictating; see `mixer`).
 
 /// Sends short MIDI messages (status, data 1, data 2) to the output port named `port` (case
-/// ignored). Opens the port only for this, so it's free the rest of the time.
+/// ignored; Windows keeps only the first 31 characters of a port's name, so a longer `port`
+/// matches on those). Opens the port only for this, so it's free the rest of the time.
 pub fn midi_send(port: &str, msgs: &[[u8; 3]]) -> Result<(), Error> {
     use windows_sys::Win32::Media::{Audio::*, MMSYSERR_NOERROR};
+    let wanted = String::from_utf16_lossy(&port.encode_utf16().take(31).collect::<Vec<_>>());
     let count = unsafe { midiOutGetNumDevs() };
     let id = (0..count)
         .find(|&i| {
@@ -1028,7 +1030,7 @@ pub fn midi_send(port: &str, msgs: &[[u8; 3]]) -> Result<(), Error> {
             }
             let name = caps.szPname; // packed: copy before borrowing
             let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-            String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case(port)
+            String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case(&wanted)
         })
         .ok_or_else(|| format!("no MIDI output port named {port:?}"))?;
     let mut out: HMIDIOUT = null_mut();

@@ -498,9 +498,10 @@ pub fn start(
     };
     // First: it also puts back a volume a previous run left ducked, even if the rest fails.
     // Windows only: the setup it's for (Focusrite Control 2 on a virtual MIDI port) is.
-    let port = &config.audio.focusrite_midi_port;
-    let mute = (cfg!(windows) && config.audio.duck && !port.is_empty())
-        .then(|| MixerMute { port: port.clone() });
+    let port = config.audio.focusrite_midi_port.trim();
+    let mute = (cfg!(windows) && config.audio.duck && !port.is_empty()).then(|| MixerMute {
+        port: port.to_owned(),
+    });
     let ducker = Ducker::start(paths::ducked_volume_file(), mute, paths::muted_mix_file());
     let key = Hotkey::parse(&config.hotkey.key)?;
     // Before the audio thread starts: it doesn't open the microphone without the permission.

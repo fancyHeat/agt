@@ -460,11 +460,16 @@ impl<D: Devices> Duck<D> {
         }
     }
 
-    /// Restores the original volume at once (no fade), e.g. when AGT exits.
+    /// Restores the original volume at once (no fade), e.g. when AGT exits; then unmutes the
+    /// interface's mix (the slower of the two, so it can't eat the volume's time on exit).
     fn finish(&mut self) {
+        self.finish_volume();
         if let Some(m) = &mut self.mixer {
             m.unmute();
         }
+    }
+
+    fn finish_volume(&mut self) {
         let Some(s) = &mut self.session else { return };
         match s.seen() {
             Seen::Untouched => {
