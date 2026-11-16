@@ -11,8 +11,13 @@
 //! send (the port is gone) leaves nothing to undo. A failed unmute is retried with the next
 //! restore. While the mix is muted, a small marker file names the port: if AGT dies before
 //! unmuting, the next start does (trying once: the port may have been renamed since).
+//!
+//! Each mute and unmute is an `info` event with how long the MIDI call took: AGT has died
+//! without a trace while muting was on (no panic, no Windows error report), and these
+//! breadcrumbs tell whether the last thing it did was a MIDI call into the driver. A death
+//! inside the mute call leaves the marker, which the next start reports.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Instant};
 
 /// Where to send the mute.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +65,7 @@ impl Mixer {
             warned: false,
         };
         if mixer.muted.is_some() {
+            // Also the sign that the previous run died while muting or muted.
             tracing::info!("unmuting the interface's mix a previous run left muted");
             mixer.unmute();
             // Not retried: the port may be gone for good (renamed), which would otherwise
@@ -79,9 +85,10 @@ impl Mixer {
         let config = config.clone();
         // Before sending: a crash right after must still unmute.
         self.save(Some(&config));
+        let t = Instant::now();
         match (self.send)(&config.port, &[message(true)]) {
             Ok(()) => {
-                tracing::debug!("muted the interface's mix");
+                tracing::info!("muted the interface's mix ({})", ms(t));
                 self.muted = Some(config);
             }
             Err(e) => {
@@ -99,9 +106,10 @@ impl Mixer {
     /// Unmutes what we muted, if anything. A failed send is kept, to retry next time.
     pub(crate) fn unmute(&mut self) {
         let Some(muted) = &self.muted else { return };
+        let t = Instant::now();
         match (self.send)(&muted.port, &[message(false)]) {
             Ok(()) => {
-                tracing::debug!("unmuted the interface's mix");
+                tracing::info!("unmuted the interface's mix ({})", ms(t));
                 self.muted = None;
                 self.save(None);
             }
@@ -123,6 +131,11 @@ impl Mixer {
             tracing::debug!("cannot update {}: {e}", p.display());
         }
     }
+}
+
+/// "12.3 ms": how long a MIDI call took.
+fn ms(since: Instant) -> String {
+    format!("{:.1} ms", since.elapsed().as_secs_f64() * 1000.0)
 }
 
 #[cfg(test)]
