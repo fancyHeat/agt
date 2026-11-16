@@ -58,11 +58,30 @@ Good to know:
   down. AGT can mute the interface's Mix A (what outputs 1-2, the speakers, play by default:
   the console and the computer alike) while you dictate, through Focusrite Control 2's MIDI
   control. Headphones on another mix keep playing.
-  1. Create a virtual MIDI port, for example with [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
-     (a port named `AGT`).
-  2. In Focusrite Control 2: More options → Preferences → Application → **MIDI Control**: that
-     port; **MIDI Channel**: All channels. Keep Focusrite Control 2 running.
-  3. In `config.toml` under `[audio]`: `focusrite_midi_port = "AGT"`.
+  1. Create a virtual MIDI port. On Windows 11 25H2 and later, Windows MIDI Services can keep
+     one itself, with no app that has to stay running:
+     - Install the Tools package from the [Windows MIDI Services releases](https://aka.ms/midireleases)
+       (a preview for now).
+     - In Windows MIDI Settings → **Configurations**: **New configuration** → **Empty**, then
+       **Use this one**. Without a configuration, Windows forgets the port when the MIDI
+       service restarts.
+     - In a terminal: `midi loopback create --name-a "AGT Loop A" --name-b "AGT Loop B" --save-to-config`.
+       It should say `Saved to Config: Yes`. What's sent to `AGT Loop A` comes out of
+       `AGT Loop B`.
+
+     Or use [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) (a port named
+     `AGT`, used on both sides below). It has to be running: if it's quit, muting stops.
+  2. In Focusrite Control 2: More options → Preferences → Application → **MIDI Control**: the
+     port's receiving side (`AGT Loop B`, or loopMIDI's `AGT`); **MIDI Channel**: All channels.
+     Close Preferences to save them. Keep Focusrite Control 2 running.
+  3. In `config.toml` under `[audio]`: the sending side, `focusrite_midi_port = "AGT Loop A"`
+     (or `"AGT"` with loopMIDI).
+
+  If muting stops, the `events` table in `agt.db` says why, for example `no MIDI output port
+  named "AGT Loop A"`. After the Windows MIDI service restarts (**Use this one** in MIDI
+  Settings does that, as can a MIDI update), apps that were already running can't open any
+  MIDI port, loopMIDI's included (`cannot open MIDI port "..." (error 1)`): restart Focusrite
+  Control 2 and AGT. A reboot is fine.
 - AGT starts when you log in. Settings... → **Start AGT when you log in** turns that off
   (`launch_at_login` in `config.toml`). Turning AGT off or removing it in Task Manager's
   Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks too. If

@@ -1,11 +1,11 @@
 //! Muting a Focusrite interface's main mix while dictating: a game console plugged into a
 //! Scarlett and mixed straight to its outputs never passes through the OS output volume, so
 //! ducking (see `duck`) can't reach it. Focusrite Control 2 takes MIDI control changes from a
-//! MIDI port the user picks (a virtual one, such as loopMIDI's): CC 62 mutes (127) or unmutes
-//! (0) the Mix A bus, which feeds outputs 1-2 (the monitors) by default. That silences
-//! everything on the speakers at once: the inputs and the computer's playback. (CC 78, "Mute,
-//! Monitors", does nothing on a Scarlett 4i4, whose monitor knob is analogue.) Runs on the
-//! `duck` thread, next to the volume.
+//! MIDI port the user picks (a virtual one: a Windows MIDI Services loopback, or loopMIDI's):
+//! CC 62 mutes (127) or unmutes (0) the Mix A bus, which feeds outputs 1-2 (the monitors) by
+//! default. That silences everything on the speakers at once: the inputs and the computer's
+//! playback. (CC 78, "Mute, Monitors", does nothing on a Scarlett 4i4, whose monitor knob is
+//! analogue.) Runs on the `duck` thread, next to the volume.
 //!
 //! Only a mute AGT made is undone: muting again while muted sends nothing new, and a failed
 //! send (the port is gone) leaves nothing to undo. A failed unmute is retried with the next
