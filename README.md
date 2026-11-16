@@ -78,7 +78,10 @@ Good to know:
      (or `"AGT"` with loopMIDI).
 
   If muting stops, the `events` table in `agt.db` says why, for example `no MIDI output port
-  named "AGT Loop A"`.
+  named "AGT Loop A"`. After the Windows MIDI service restarts (**Use this one** in MIDI
+  Settings does that, as can a MIDI update), apps that were already running can't open any
+  MIDI port, loopMIDI's included (`cannot open MIDI port "..." (error 1)`): restart Focusrite
+  Control 2 and AGT. A reboot is fine.
 - AGT starts when you log in. Settings... → **Start AGT when you log in** turns that off
   (`launch_at_login` in `config.toml`). Turning AGT off or removing it in Task Manager's
   Startup apps (Windows) or System Settings > General > Login Items (macOS) sticks too. If
