@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod dictionary;
+pub mod filler;
 pub mod paths;
 pub mod polish;
 pub mod stt;

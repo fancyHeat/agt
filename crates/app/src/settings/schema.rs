@@ -218,6 +218,13 @@ fn general(c: &Config) -> Page {
                     },
                 ),
             ),
+            Item::check(
+                "Show filler-word count",
+                &["overlay", "filler_stats"],
+                |c| c.overlay.filler_stats,
+                c,
+            )
+            .note("After each dictation: how many filler words you said (um, uh, like, you know)."),
         ],
     );
     let startup = section(

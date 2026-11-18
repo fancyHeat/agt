@@ -25,6 +25,10 @@ const BG_ERROR: Rgba = Rgba(0.50, 0.08, 0.08, 0.90);
 pub(crate) const BORDER: Rgba = Rgba(1.0, 1.0, 1.0, 0.14);
 const BAR: Rgba = Rgba(1.0, 1.0, 1.0, 0.95);
 const DOT: Rgba = Rgba(1.0, 0.27, 0.27, 1.0);
+/// Notice text colors on the dark pill (see `Tone`).
+pub(crate) const TEXT_PLAIN: Rgba = Rgba(1.0, 1.0, 1.0, 1.0);
+pub(crate) const TEXT_GOOD: Rgba = Rgba(0.29, 0.87, 0.50, 1.0);
+pub(crate) const TEXT_BAD: Rgba = Rgba(1.0, 0.36, 0.36, 1.0);
 
 /// Canvas size in pixels for a given scale factor (pixels per logical pixel).
 pub fn pixel_size(scale: f32) -> (usize, usize) {
