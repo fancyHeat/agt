@@ -293,6 +293,7 @@ fn session_start(config: &Config, config_error: bool) -> agt_telemetry::SessionS
         stt_device: lower(&config.stt.device),
         stt_threads: config.stt.threads as i64,
         stt_boost: config.stt.boost().into(),
+        stt_heartbeat: config.stt.heartbeat,
         polish_enabled: on,
         polish_provider: on.then(|| lower(&polish.provider)),
         polish_model: on.then(|| polish.model().to_owned()),

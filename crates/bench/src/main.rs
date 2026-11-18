@@ -13,6 +13,13 @@
 //!   --runs <n>          transcribe each file n times (default 3); latency = median
 //!   --gap-ms <n>        sleep n ms before every transcription (default 0: back to back), to see
 //!                       what an idle GPU/CPU costs the next call (clock-down, wake-up)
+//!   --gap-jitter-ms <n> add 0..n ms (pseudo-random, the same every time) to each gap, so a
+//!                       call lands anywhere between two heartbeats
+//!   --heartbeat-ms <n>  during each gap, run the engine's heartbeat whenever it has been idle
+//!                       for n ms, as the app does while recording (a GPU engine only); the
+//!                       call's clock starts at the gap's end, so a beat still running then
+//!                       counts. Prints the beats' times and how often a call waited for one
+//!   --heartbeat-transcribe  beat with a full transcription of 0.5 s of silence instead
 //!   --no-warmup         skip warmup, so the first run shows the cold-start cost
 //!   --quiet             no per-file lines, only the summary
 //!   --dictionary <file> use this dictionary.toml (default: AGT's, if there is one)
@@ -73,7 +80,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--no-warmup] [--quiet] [--dictionary f] [--no-dictionary] [--boost w,...] [--app id] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--gap-jitter-ms n] [--heartbeat-ms n] [--heartbeat-transcribe] [--no-warmup] [--quiet] [--dictionary f] [--no-dictionary] [--boost w,...] [--app id] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
 
 fn main() -> ExitCode {
     match run() {
@@ -137,7 +144,7 @@ fn run() -> Result<(), String> {
     // `None`: AGT's own, if there is one.
     let (mut dictionary_file, mut apply_dictionary) = (None, true);
     let (mut weights, mut app): (Option<Vec<f32>>, Option<String>) = (None, None);
-    let mut gap = std::time::Duration::ZERO;
+    let mut hold = Hold::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if stt_flag(&mut cfg, &a, &mut args)? {
@@ -147,8 +154,18 @@ fn run() -> Result<(), String> {
         match a.as_str() {
             "--runs" => runs = val()?.parse::<usize>().map_err(|_| "bad --runs")?.max(1),
             "--gap-ms" => {
-                gap = std::time::Duration::from_millis(val()?.parse().map_err(|_| "bad --gap-ms")?)
+                hold.gap =
+                    std::time::Duration::from_millis(val()?.parse().map_err(|_| "bad --gap-ms")?)
             }
+            "--gap-jitter-ms" => {
+                hold.jitter_ms = val()?.parse().map_err(|_| "bad --gap-jitter-ms")?
+            }
+            "--heartbeat-ms" => {
+                hold.heartbeat = Some(std::time::Duration::from_millis(
+                    val()?.parse().map_err(|_| "bad --heartbeat-ms")?,
+                ))
+            }
+            "--heartbeat-transcribe" => hold.transcribe_beat = true,
             "--no-warmup" => warmup = false,
             "--quiet" => quiet = true,
             "--dictionary" => dictionary_file = Some(PathBuf::from(val()?)),
@@ -263,7 +280,15 @@ fn run() -> Result<(), String> {
             println!();
             println!("== boost {weight} ==");
         }
-        let pass = transcribe_all(engine.as_mut(), &inputs, weight, runs, gap, quiet, &counted)?;
+        let pass = transcribe_all(
+            engine.as_mut(),
+            &inputs,
+            weight,
+            runs,
+            &hold,
+            quiet,
+            &counted,
+        )?;
         report(&pass, &categories, dictionary.replacements().is_empty());
         passes.push(pass);
     }
@@ -361,7 +386,7 @@ fn transcribe_all(
     inputs: &[Input],
     weight: f32,
     runs: usize,
-    gap: std::time::Duration,
+    hold: &Hold,
     quiet: bool,
     counted: &Dictionary,
 ) -> Result<Pass, String> {
@@ -378,6 +403,7 @@ fn transcribe_all(
             "file", "audio s", "first ms", "median ms", "RTF", "WER"
         );
     }
+    let mut beats = Beats::default();
     for input in inputs {
         // As the app passes them (see the pipeline's `stt_thread`).
         let opts = TranscribeOpts {
@@ -389,8 +415,7 @@ fn transcribe_all(
         let mut times = Vec::with_capacity(runs);
         let mut text = String::new();
         for _ in 0..runs {
-            std::thread::sleep(gap);
-            let t = Instant::now();
+            let t = hold.wait(engine, &mut beats)?;
             text = engine
                 .transcribe(&input.audio, &opts)
                 .map_err(|e| e.to_string())?
@@ -425,7 +450,101 @@ fn transcribe_all(
             text,
         });
     }
+    beats.report();
     Ok(pass)
+}
+
+/// What happens before each timed transcription: `--gap-ms` (plus up to `--gap-jitter-ms`)
+/// and, with `--heartbeat-ms`, the beats the app runs while the user records.
+#[derive(Default)]
+struct Hold {
+    gap: std::time::Duration,
+    jitter_ms: u64,
+    heartbeat: Option<std::time::Duration>,
+    /// Beat with a full transcription of 0.5 s of silence instead of `SttEngine::heartbeat`.
+    transcribe_beat: bool,
+    /// For the jitter (xorshift: the same gaps on every run of the bench).
+    seed: std::cell::Cell<u32>,
+}
+
+/// The heartbeats run during the gaps, and what the timed calls waited for them.
+#[derive(Default)]
+struct Beats {
+    ms: Vec<f64>,
+    /// How long each timed call that started mid-beat waited for the beat.
+    waits: Vec<f64>,
+    calls: usize,
+}
+
+impl Beats {
+    fn report(&self) {
+        if self.ms.is_empty() {
+            return;
+        }
+        let (mut beats, mut waits) = (self.ms.clone(), self.waits.clone());
+        beats.sort_by(f64::total_cmp);
+        waits.sort_by(f64::total_cmp);
+        println!();
+        println!(
+            "heartbeat: {} beats (p50 {:.0} ms, p90 {:.0} ms); {} of {} calls started mid-beat{}",
+            beats.len(),
+            percentile(&beats, 0.5),
+            percentile(&beats, 0.9),
+            waits.len(),
+            self.calls,
+            match waits.last() {
+                Some(max) => format!(
+                    ", waiting p50 {:.0} ms, max {max:.0} ms",
+                    percentile(&waits, 0.5)
+                ),
+                None => String::new(),
+            }
+        );
+    }
+}
+
+impl Hold {
+    /// Waits out the gap like a hold: with a heartbeat, one beat whenever the engine has
+    /// been idle for `heartbeat` (as the app's `stt` thread does; the previous call has just
+    /// ended). Returns when the timed call's clock starts: at the gap's end, so a beat still
+    /// running then (a release landing mid-beat) counts.
+    fn wait(&self, engine: &mut dyn SttEngine, beats: &mut Beats) -> Result<Instant, String> {
+        let mut gap = self.gap;
+        if self.jitter_ms > 0 {
+            let mut x = self.seed.get().max(1);
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.seed.set(x);
+            gap += std::time::Duration::from_millis(x as u64 % (self.jitter_ms + 1));
+        }
+        let deadline = Instant::now() + gap;
+        beats.calls += 1;
+        if let Some(every) = self.heartbeat.filter(|_| engine.wants_heartbeat()) {
+            let silence = vec![0f32; SAMPLE_RATE as usize / 2];
+            let mut idle_since = Instant::now();
+            while idle_since + every < deadline {
+                std::thread::sleep((idle_since + every).saturating_duration_since(Instant::now()));
+                let t = Instant::now();
+                match self.transcribe_beat {
+                    true => engine
+                        .transcribe(&silence, &TranscribeOpts::default())
+                        .map(drop),
+                    false => engine.heartbeat(),
+                }
+                .map_err(|e| e.to_string())?;
+                idle_since = Instant::now();
+                beats.ms.push(ms(t));
+                if idle_since > deadline {
+                    beats
+                        .waits
+                        .push((idle_since - deadline).as_secs_f64() * 1e3);
+                }
+            }
+        }
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        Ok(deadline.min(Instant::now()))
+    }
 }
 
 /// WER totals: (clips, errors, reference words) by set, by category and overall.

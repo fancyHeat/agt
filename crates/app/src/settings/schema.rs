@@ -332,6 +332,18 @@ fn speech(c: &Config) -> Page {
         )
         .advanced(),
     );
+    if c.stt.engine == Engine::Parakeet {
+        items.push(
+            Item::check(
+                "Keep the GPU awake while recording",
+                &["stt", "heartbeat"],
+                |c| c.stt.heartbeat,
+                c,
+            )
+            .note("Text comes a little sooner after you let go. Only on a GPU.")
+            .advanced(),
+        );
+    }
     items.push(
         Item::choice(
             "CPU threads",

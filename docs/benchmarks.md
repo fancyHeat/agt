@@ -163,6 +163,63 @@ using ~30% of the GPU, DirectML was 187 back to back and 260-298 ms at 2-5 s.
   1.25 limit, for a GPU that is far ahead on everything longer. The probe now times DirectML
   after a pause and weighs a medium clip too (see the Decision).
 
+### Keeping the GPU warm while recording (`stt.heartbeat`)
+
+Real use pays the pause above on almost every dictation: in 2,877 dictations in agt.db
+(DirectML, fp32 and int8) STT had a flat ~235 ms floor whatever the clip length or the time
+since the last dictation, because the hold itself is idle GPU time. So while a recording is
+in progress the `stt` thread runs a heartbeat whenever the engine has been idle for 1 s (no
+segment, no job, no beat): Parakeet's encoder alone, on 0.5 s of zero features. A fixed-window
+DirectML encoder computes its whole window anyway, so a beat costs what a short dictation's
+encoder does (~95 ms warm). Only for a GPU encoder (DirectML, CUDA, Core ML); never on the
+CPU, which doesn't slow down after idle.
+
+`agt-bench --heartbeat-ms N` runs the beats in each gap the same way (the call's clock starts
+at the gap's end, so a beat still running then counts). 78 eval clips, `--runs 1 --quiet
+--no-dictionary`, short (avg 3.4 s) / medium (10.7 s) p50/p90 ms:
+
+| Run (RTX 2080 Ti) | gap | short | medium | WER all |
+|---|---|---|---|---|
+| DirectML int8 | 3 s | 211/253 | 222/247 | 3.99 |
+| DirectML int8, heartbeat 1000 (0.5 s transcribe beat) | 3 s | 150/220 | 180/228 | 3.99 |
+| DirectML fp32 | 3 s | 169/191 | 190/230 | 3.78 |
+| DirectML fp32, heartbeat 1000 (0.5 s transcribe beat) | 3 s | 121/153 | 158/184 | 3.78 |
+| CPU int8 | 3 s | 157/225 | 413/534 | 4.09 |
+| DirectML fp32 (second session) | 3 s | 161/222 | 181/199 | 3.78 |
+| DirectML fp32, heartbeat 1000, encoder-only beat (what ships) | 3 s | **105/143** | **126/155** | 3.78 |
+| DirectML fp32, heartbeat 1000, 0.5 s transcribe beat | 3 s | 105/136 | 125/168 | 3.78 |
+| DirectML fp32 | 2.5-4 s | 159/171 | 176/193 | 3.78 |
+| DirectML fp32, heartbeat 1000 | 2.5-4 s | 107/128 | 127/139 | 3.78 |
+| DirectML fp32, heartbeat 1300 | 2.5-4 s | 112/157 | 138/176 | 3.78 |
+
+The first five rows were one session, the rest another (`--gap-ms 2500 --gap-jitter-ms 1500`
+for the 2.5-4 s rows: the release lands anywhere between two beats).
+
+- **About 55 ms off every short and medium dictation** (fp32: 161 → 105, 181 → 126 p50), the
+  whole idle penalty; transcripts are identical with and without beats.
+- **The encoder alone is enough.** A full transcription of 0.5 s of silence (preprocess +
+  encoder + decode) gives the same latency; the beat is 95 vs 99 ms p50 (p90 ~150 ms).
+- **A release mid-beat costs little at 1000 ms:** with random release times, 4 of 78 calls
+  started while a beat was still running and waited 27 ms p50, 30 ms max; p90 was unchanged.
+  At 1300 ms, 9 of 78 waited (47 ms p50, 140 ms max), and 1.3 s of idle is already too close
+  to where the GPU clocks down: worse on both counts. 1000 ms it is.
+- Each dictation's beats and any wait for one are in agt.db (`stt_heartbeats`,
+  `heartbeat_wait_ms`); `stt.heartbeat = false` turns them off.
+
+**In the app**, end to end: a release build with a scratch `AGT_HOME`, fp32 on DirectML,
+S1-mini polish on (fast drafting, Vulkan, same GPU), `AGT_TEST_WAV` = `ted-short-02` (4.9 s),
+30 holds of 5 s each way with 4 s between them (on, off, on, off; 15 per session), the
+user's own AGT idle on the same GPU. p50/p90 ms:
+
+| `stt.heartbeat` | release → paste | stt | polish | beats per hold | waited for a beat |
+|---|---|---|---|---|---|
+| false | 195/205 | 156/166 | 33/34 | - | - |
+| true | **142/151** | **110/114** | 26/28 | 5 | 0 of 30 |
+
+- The app sees the bench's gain: **53 ms off release → paste**, nearly all of it STT.
+- **Polish barely changes** (7 ms on a short transcript): it starts right after STT, which
+  has just woken the GPU either way, so S1-mini doesn't need beats of its own.
+
 ### DirectML: why fixed-length padding gave wrong transcripts
 
 Phase 1 found that padding the features to a fixed length made DirectML fast but returned
@@ -1233,6 +1290,7 @@ uv run scripts/prepare_eval.py                      # eval-data/clips, ~5 min
 cargo build --release -p agt-bench                  # Parakeet: auto, cpu, directml (Windows)
 target/release/agt-bench --device directml eval-data/clips
 target/release/agt-bench --device directml --gap-ms 3000 --runs 1 eval-data/clips   # pauses between calls
+target/release/agt-bench --device directml --precision fp32 --gap-ms 2500 --gap-jitter-ms 1500 --heartbeat-ms 1000 --runs 1 eval-data/clips   # GPU heartbeat
 AGT_LOG=info target/release/agt-bench --device auto eval-data/clips   # logs the start-up probe
 target/release/agt-bench --device directml --no-dictionary eval-data/clips   # without your dictionary.toml
 target/release/agt-bench export-history --days 30   # personal eval set (see above)

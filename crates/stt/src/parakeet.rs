@@ -277,6 +277,11 @@ fn boost_scale(model: &str) -> f32 {
     }
 }
 
+/// Log-mel bins per feature frame (`nemo128.onnx`).
+const MEL_BINS: usize = 128;
+/// Feature frames a heartbeat ([`SttEngine::heartbeat`]) runs the encoder on: 0.5 s.
+const BEAT_FRAMES: usize = window_frames(0.5);
+
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
 const ENCODER_FP32: &str = "encoder-model.onnx";
 
@@ -756,6 +761,28 @@ impl SttEngine for Parakeet {
 
     fn notice(&self) -> Option<String> {
         self.notice.clone()
+    }
+
+    /// Any GPU encoder (not after a fallback to the CPU, where a beat would only burn cores).
+    fn wants_heartbeat(&self) -> bool {
+        self.encoder.device != Device::Cpu
+    }
+
+    /// The encoder alone (the only part on the GPU) on [`BEAT_FRAMES`] frames of zeros. A
+    /// fixed-window encoder computes its whole window anyway, so a beat costs about what a
+    /// short dictation's encoder does. A failure isn't handled here: the next `transcribe`
+    /// falls back to the CPU if the GPU is really gone.
+    fn heartbeat(&mut self) -> Result<()> {
+        let frames = self.encoder.fixed_frames.unwrap_or(BEAT_FRAMES);
+        let feats = vec![0f32; MEL_BINS * frames];
+        self.encoder
+            .session
+            .run(ort::inputs![
+                "audio_signal" => TensorRef::from_array_view(([1usize, MEL_BINS, frames], &feats[..]))?,
+                "length" => TensorRef::from_array_view(([1usize], &[BEAT_FRAMES as i64][..]))?,
+            ])
+            .map_err(|e| EncoderFailed(e.to_string()))?;
+        Ok(())
     }
 
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOpts) -> Result<Transcript> {

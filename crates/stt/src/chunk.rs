@@ -625,6 +625,14 @@ impl SttEngine for Chunked {
         Some(self.limits().0 as f32 / SAMPLE_RATE as f32)
     }
 
+    fn wants_heartbeat(&self) -> bool {
+        self.inner.wants_heartbeat()
+    }
+
+    fn heartbeat(&mut self) -> Result<()> {
+        self.inner.heartbeat()
+    }
+
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOpts) -> Result<Transcript> {
         let (max_len, search_len) = self.limits();
         if audio.len() <= max_len {
