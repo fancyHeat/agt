@@ -340,7 +340,7 @@ fn speech(c: &Config) -> Page {
                 |c| c.stt.heartbeat,
                 c,
             )
-            .note("Text comes a little sooner after you let go. Only on a GPU.")
+            .note("Text comes a little sooner after you let go. Only with DirectML (Windows GPU).")
             .advanced(),
         );
     }

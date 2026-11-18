@@ -171,8 +171,9 @@ since the last dictation, because the hold itself is idle GPU time. So while a r
 in progress the `stt` thread runs a heartbeat whenever the engine has been idle for 1 s (no
 segment, no job, no beat): Parakeet's encoder alone, on 0.5 s of zero features. A fixed-window
 DirectML encoder computes its whole window anyway, so a beat costs what a short dictation's
-encoder does (~95 ms warm). Only for a GPU encoder (DirectML, CUDA, Core ML); never on the
-CPU, which doesn't slow down after idle.
+encoder does (~95 ms warm). DirectML only: it's the one device measured here. Core ML (which
+pays ~90 ms after idle, see the macOS section) and CUDA are GPUs too but get no beats until
+they have numbers of their own. Never on the CPU, which doesn't slow down after idle.
 
 `agt-bench --heartbeat-ms N` runs the beats in each gap the same way (the call's clock starts
 at the gap's end, so a beat still running then counts). 78 eval clips, `--runs 1 --quiet
@@ -193,7 +194,8 @@ at the gap's end, so a beat still running then counts). 78 eval clips, `--runs 1
 | DirectML fp32, heartbeat 1300 | 2.5-4 s | 112/157 | 138/176 | 3.78 |
 
 The first five rows were one session, the rest another (`--gap-ms 2500 --gap-jitter-ms 1500`
-for the 2.5-4 s rows: the release lands anywhere between two beats).
+for the 2.5-4 s rows: the release lands anywhere between two beats). The transcribe-beat rows
+came from a bench option since removed (the question is settled).
 
 - **About 55 ms off every short and medium dictation** (fp32: 161 → 105, 181 → 126 p50), the
   whole idle penalty; transcripts are identical with and without beats.
@@ -204,7 +206,11 @@ for the 2.5-4 s rows: the release lands anywhere between two beats).
   At 1300 ms, 9 of 78 waited (47 ms p50, 140 ms max), and 1.3 s of idle is already too close
   to where the GPU clocks down: worse on both counts. 1000 ms it is.
 - Each dictation's beats and any wait for one are in agt.db (`stt_heartbeats`,
-  `heartbeat_wait_ms`); `stt.heartbeat = false` turns them off.
+  `heartbeat_wait_ms`); `stt.heartbeat = false` turns them off. Beats don't count in
+  `live_busy_at_release` or `live_idle_ms`, which stay real work only.
+- Not measured: a slow DirectML GPU chosen by hand (an iGPU; `auto` would pick the CPU there).
+  A beat runs the whole ~25 s window, so it may take several hundred ms there, about every
+  second while recording, and a release mid-beat waits that long: turn it off on such a GPU.
 
 **In the app**, end to end: a release build with a scratch `AGT_HOME`, fp32 on DirectML,
 S1-mini polish on (fast drafting, Vulkan, same GPU), `AGT_TEST_WAV` = `ted-short-02` (4.9 s),

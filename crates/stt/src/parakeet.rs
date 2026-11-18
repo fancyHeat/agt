@@ -182,6 +182,8 @@ pub struct Parakeet {
     /// The device the encoder fell back to the CPU from, if it did.
     fell_back_from: Option<Device>,
     notice: Option<String>,
+    /// A heartbeat's encoder input (zeros), kept for the next beat.
+    beat_feats: Vec<f32>,
 }
 
 /// The encoder session and how to feed it.
@@ -481,6 +483,7 @@ impl Parakeet {
             explicit,
             fell_back_from,
             notice,
+            beat_feats: Vec::new(),
         };
         p.update_name();
         if p.encoder.device != Device::Cpu {
@@ -763,9 +766,11 @@ impl SttEngine for Parakeet {
         self.notice.clone()
     }
 
-    /// Any GPU encoder (not after a fallback to the CPU, where a beat would only burn cores).
+    /// DirectML only: the one device measured (docs/benchmarks.md). Core ML and CUDA are GPUs
+    /// too but unmeasured, so they get no beats until numbers say they help. Not after a
+    /// fallback to the CPU either, where a beat would only burn cores.
     fn wants_heartbeat(&self) -> bool {
-        self.encoder.device != Device::Cpu
+        self.encoder.device == Device::DirectMl
     }
 
     /// The encoder alone (the only part on the GPU) on [`BEAT_FRAMES`] frames of zeros. A
@@ -774,11 +779,12 @@ impl SttEngine for Parakeet {
     /// falls back to the CPU if the GPU is really gone.
     fn heartbeat(&mut self) -> Result<()> {
         let frames = self.encoder.fixed_frames.unwrap_or(BEAT_FRAMES);
-        let feats = vec![0f32; MEL_BINS * frames];
+        // Only zeros are ever written to it: resizing keeps it all zeros.
+        self.beat_feats.resize(MEL_BINS * frames, 0.0);
         self.encoder
             .session
             .run(ort::inputs![
-                "audio_signal" => TensorRef::from_array_view(([1usize, MEL_BINS, frames], &feats[..]))?,
+                "audio_signal" => TensorRef::from_array_view(([1usize, MEL_BINS, frames], &self.beat_feats[..]))?,
                 "length" => TensorRef::from_array_view(([1usize], &[BEAT_FRAMES as i64][..]))?,
             ])
             .map_err(|e| EncoderFailed(e.to_string()))?;

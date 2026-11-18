@@ -225,7 +225,8 @@ pub struct Dictation {
     pub boosted_terms: Option<i64>,
     /// GPU heartbeats (`stt.heartbeat`) run while it was recorded, and how long its
     /// transcription at release waited for one still running then (0: none was). `None`
-    /// when heartbeats were off or the engine doesn't use them (the CPU).
+    /// when heartbeats were off or the engine doesn't use them (anything but DirectML).
+    /// Beats don't count in `live_busy_at_release` or `live_idle_ms` (real work only).
     pub stt_heartbeats: Option<i64>,
     pub heartbeat_wait_ms: Option<f64>,
 }

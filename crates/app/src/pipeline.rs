@@ -21,7 +21,7 @@
 //!   while it's still being recorded, and their texts joined at release; a dropped
 //!   (cancelled) recording's are skipped, or discarded if already being transcribed. While
 //!   a recording is in progress (`ToStt::Recording` until the hub's `recording` goes false),
-//!   a GPU engine gets a heartbeat whenever it has been idle for [`HEARTBEAT_IDLE`]
+//!   a DirectML engine gets a heartbeat whenever it has been idle for [`HEARTBEAT_IDLE`]
 //!   (`stt.heartbeat`, see [`Heartbeat`]): a GPU clocks down while the user talks, and the
 //!   transcription at release would pay to wake it up.
 //! - `polish`: first applies the dictionary's replacements (`dictionary.toml`, see
@@ -1509,8 +1509,8 @@ fn set_chunk_secs(engine: &dyn SttEngine, chunk_secs: &AtomicU32) {
     chunk_secs.store(secs.to_bits(), Relaxed);
 }
 
-/// While recording, a GPU engine gets a heartbeat ([`SttEngine::heartbeat`]) once it has been
-/// idle this long. DirectML on an RTX 2080 Ti is as fast as back to back after 1.5 s of idle
+/// While recording, a DirectML engine gets a heartbeat ([`SttEngine::heartbeat`]) once it has
+/// been idle this long. DirectML on an RTX 2080 Ti is as fast as back to back after 1.5 s of idle
 /// and 55-80 ms slower from 2 s on; segments transcribed while recording count as activity.
 /// See docs/benchmarks.md.
 const HEARTBEAT_IDLE: Duration = Duration::from_millis(1000);
@@ -1579,11 +1579,11 @@ impl Heartbeat {
         end
     }
 
-    /// Notes this recording's beats in `d`, for an engine that wants them, and how long a
-    /// job released at `released` waited for a beat still running then (or started just
-    /// after the release, before the job arrived).
+    /// Notes this recording's beats in `d`, for an engine that wants them (or that ran some
+    /// before falling back to the CPU), and how long a job released at `released` waited for
+    /// a beat still running then (or started just after the release, before the job arrived).
     fn record(&self, d: &mut Dictation, engine: &dyn SttEngine, released: Instant) {
-        if !(self.enabled && engine.wants_heartbeat()) {
+        if !(self.enabled && (engine.wants_heartbeat() || self.beats > 0)) {
             return;
         }
         d.stt_heartbeats = Some(self.beats);
@@ -1615,16 +1615,23 @@ fn stt_thread(
         set_chunk_secs(e.as_ref(), &chunk_secs);
     }
     let mut partial: Option<Partial> = None;
-    // When the engine's last call (or heartbeat) ended (it's been idle since: a GPU wakes up
-    // slowly).
+    // When the engine's last call ended (it's been idle since: a GPU wakes up slowly). Real
+    // work only, for the live stats; `gpu_done` also counts heartbeats, for scheduling them.
     let mut engine_done: Option<Instant> = None;
+    let mut gpu_done: Option<Instant> = None;
     let mut heartbeat = Heartbeat::new(config.stt.heartbeat);
+    // Free of real work from here on, until the next message: heartbeats and timeouts don't
+    // move it (`heartbeat_wait_ms` has the overlap with a beat).
+    let mut free_at = Instant::now();
+    let mut timed_out = false;
     loop {
-        // Free from here on, until the next message.
-        let free_at = Instant::now();
+        if !timed_out {
+            free_at = Instant::now();
+        }
+        timed_out = false;
         let due = engine
             .as_deref()
-            .and_then(|e| heartbeat.due_in(e, hub.recording(), engine_done, free_at));
+            .and_then(|e| heartbeat.due_in(e, hub.recording(), gpu_done, Instant::now()));
         let msg = match due {
             None => jobs.recv().map_err(|_| RecvTimeoutError::Disconnected),
             Some(wait) => jobs.recv_timeout(wait),
@@ -1635,8 +1642,9 @@ fn stt_thread(
             // Idle while recording: keep the GPU warm, unless the recording just ended.
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(e) = engine.as_mut().filter(|_| hub.recording()) {
-                    engine_done = Some(heartbeat.beat(e.as_mut()));
+                    gpu_done = Some(heartbeat.beat(e.as_mut()));
                 }
+                timed_out = true;
                 continue;
             }
         };
@@ -1671,6 +1679,7 @@ fn stt_thread(
                 let opts = &opts(&shared.scope, boost);
                 let result = transcribe(engine.as_mut(), &piece.audio, opts, &hub, &chunk_secs);
                 engine_done = Some(Instant::now());
+                gpu_done = engine_done;
                 let took = ms(t.elapsed());
                 if shared.dropped.load(Relaxed) {
                     tracing::debug!("recording dropped while a segment was transcribed");
@@ -1744,6 +1753,7 @@ fn stt_thread(
         };
         let stt_end = Instant::now();
         engine_done = Some(stt_end);
+        gpu_done = engine_done;
         d.queue_wait_ms = Some(ms(stt_start.saturating_duration_since(job.released)));
         d.stt_ms = Some(ms(stt_end - stt_start));
         d.release_to_text_ms = Some(ms(stt_end.saturating_duration_since(job.released)));
@@ -2629,6 +2639,10 @@ mod tests {
         Heartbeat::new(false).record(&mut d, &gpu, t);
         hb.record(&mut d, &Idle { gpu: false }, t);
         assert_eq!((d.stt_heartbeats, d.heartbeat_wait_ms), (None, None));
+        // Fell back to the CPU after beats ran: they're still recorded.
+        hb.beats = 2;
+        hb.record(&mut d, &Idle { gpu: false }, t + ms(200));
+        assert_eq!(d.stt_heartbeats, Some(2));
     }
 
     #[test]

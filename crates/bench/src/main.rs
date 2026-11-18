@@ -16,10 +16,9 @@
 //!   --gap-jitter-ms <n> add 0..n ms (pseudo-random, the same every time) to each gap, so a
 //!                       call lands anywhere between two heartbeats
 //!   --heartbeat-ms <n>  during each gap, run the engine's heartbeat whenever it has been idle
-//!                       for n ms, as the app does while recording (a GPU engine only); the
+//!                       for n ms, as the app does while recording (DirectML only); the
 //!                       call's clock starts at the gap's end, so a beat still running then
 //!                       counts. Prints the beats' times and how often a call waited for one
-//!   --heartbeat-transcribe  beat with a full transcription of 0.5 s of silence instead
 //!   --no-warmup         skip warmup, so the first run shows the cold-start cost
 //!   --quiet             no per-file lines, only the summary
 //!   --dictionary <file> use this dictionary.toml (default: AGT's, if there is one)
@@ -80,7 +79,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--gap-jitter-ms n] [--heartbeat-ms n] [--heartbeat-transcribe] [--no-warmup] [--quiet] [--dictionary f] [--no-dictionary] [--boost w,...] [--app id] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
+const USAGE: &str = "usage: agt-bench [--config f] [--engine e] [--model m] [--precision p] [--device d] [--threads n] [--models-dir d] [--runs n] [--gap-ms n] [--gap-jitter-ms n] [--heartbeat-ms n] [--no-warmup] [--quiet] [--dictionary f] [--no-dictionary] [--boost w,...] [--app id] <dir>\n       agt-bench export-history [--days n] [--out dir]\n       agt-bench live [options] <dir>\n       agt-bench polish [options] <transcripts.txt>";
 
 fn main() -> ExitCode {
     match run() {
@@ -165,7 +164,6 @@ fn run() -> Result<(), String> {
                     val()?.parse().map_err(|_| "bad --heartbeat-ms")?,
                 ))
             }
-            "--heartbeat-transcribe" => hold.transcribe_beat = true,
             "--no-warmup" => warmup = false,
             "--quiet" => quiet = true,
             "--dictionary" => dictionary_file = Some(PathBuf::from(val()?)),
@@ -461,8 +459,6 @@ struct Hold {
     gap: std::time::Duration,
     jitter_ms: u64,
     heartbeat: Option<std::time::Duration>,
-    /// Beat with a full transcription of 0.5 s of silence instead of `SttEngine::heartbeat`.
-    transcribe_beat: bool,
     /// For the jitter (xorshift: the same gaps on every run of the bench).
     seed: std::cell::Cell<u32>,
 }
@@ -521,18 +517,11 @@ impl Hold {
         let deadline = Instant::now() + gap;
         beats.calls += 1;
         if let Some(every) = self.heartbeat.filter(|_| engine.wants_heartbeat()) {
-            let silence = vec![0f32; SAMPLE_RATE as usize / 2];
             let mut idle_since = Instant::now();
             while idle_since + every < deadline {
                 std::thread::sleep((idle_since + every).saturating_duration_since(Instant::now()));
                 let t = Instant::now();
-                match self.transcribe_beat {
-                    true => engine
-                        .transcribe(&silence, &TranscribeOpts::default())
-                        .map(drop),
-                    false => engine.heartbeat(),
-                }
-                .map_err(|e| e.to_string())?;
+                engine.heartbeat().map_err(|e| e.to_string())?;
                 idle_since = Instant::now();
                 beats.ms.push(ms(t));
                 if idle_since > deadline {

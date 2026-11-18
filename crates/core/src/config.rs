@@ -109,9 +109,10 @@ precision = "int8"
 device = "auto"
 # CPU threads for inference; 0 = automatic.
 threads = 0
-# Parakeet on a GPU: while you record, run a tiny dummy inference whenever the GPU has been idle
-# for a second, so it doesn't slow down while you talk and the text comes ~50 ms sooner after
-# you let go. Never on the CPU. See docs/benchmarks.md.
+# Parakeet on DirectML (Windows GPU): while you record, run a tiny dummy inference whenever the
+# GPU has been idle for a second, so it doesn't slow down while you talk and the text comes
+# ~50 ms sooner after you let go. Not on the CPU (nor, for now, Core ML or CUDA). See
+# docs/benchmarks.md.
 heartbeat = true
 # Parakeet: how strongly to favor the words in dictionary.toml (its terms, and those of the
 # focused app's profiles) where they sound like what was said. 0 = off; 1 to 4 is the useful
