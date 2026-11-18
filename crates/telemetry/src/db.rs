@@ -231,6 +231,13 @@ ALTER TABLE dictations ADD COLUMN app_id TEXT;
 ALTER TABLE dictations ADD COLUMN profiles TEXT;
 ALTER TABLE dictations ADD COLUMN boosted_terms INTEGER;
 "#,
+    // 10: GPU heartbeats while recording (`stt.heartbeat`): the setting; per dictation the
+    // beats run while it was recorded and how long its transcription waited for one.
+    r#"
+ALTER TABLE app_sessions ADD COLUMN stt_heartbeat INTEGER;
+ALTER TABLE dictations ADD COLUMN stt_heartbeats INTEGER;
+ALTER TABLE dictations ADD COLUMN heartbeat_wait_ms REAL;
+"#,
 ];
 
 /// Opens (creating if needed) and migrates the database. A file that isn't a database or is
@@ -346,10 +353,10 @@ pub(crate) fn insert_session(
             polish_timeout_ms,
             polish_timeout_per_word_ms, polish_min_words, polish_custom_prompt,
             polish_custom_user_message, history_save_text, history_save_audio, history_keep_days,
-            duck, duck_level, s1_fast_drafting, stt_boost)
+            duck, duck_level, s1_fast_drafting, stt_boost, stt_heartbeat)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
-            ?37, ?38, ?39, ?40)",
+            ?37, ?38, ?39, ?40, ?41)",
         params![
             at,
             s.app_version,
@@ -391,6 +398,7 @@ pub(crate) fn insert_session(
             s.duck_level,
             s.s1_fast_drafting,
             s.stt_boost,
+            s.stt_heartbeat,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -451,10 +459,11 @@ pub(crate) fn insert_dictation(
             live_skipped, live_tail_joined, live_trimmed_secs, live_tail_secs, live_stt_ms,
             live_busy_at_release, live_idle_ms, live_max_queue, live_discarded_ms,
             polish_ahead_pieces, polish_ahead_ms, polish_release_words, polish_fallbacks,
-            polish_wait_ms, clipboard_settle_ms, replacements, app_id, profiles, boosted_terms)
+            polish_wait_ms, clipboard_settle_ms, replacements, app_id, profiles, boosted_terms,
+            stt_heartbeats, heartbeat_wait_ms)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-            ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)",
+            ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49)",
         params![
             session,
             d.started_at,
@@ -503,6 +512,8 @@ pub(crate) fn insert_dictation(
             d.app_id,
             d.profiles,
             d.boosted_terms,
+            d.stt_heartbeats,
+            d.heartbeat_wait_ms,
         ],
     )?;
     Ok(())

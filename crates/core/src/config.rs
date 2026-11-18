@@ -109,6 +109,11 @@ precision = "int8"
 device = "auto"
 # CPU threads for inference; 0 = automatic.
 threads = 0
+# Parakeet on DirectML (Windows GPU): while you record, run a tiny dummy inference whenever the
+# GPU has been idle for a second, so it doesn't slow down while you talk and the text comes
+# ~50 ms sooner after you let go. Not on the CPU (nor, for now, Core ML or CUDA). See
+# docs/benchmarks.md.
+heartbeat = true
 # Parakeet: how strongly to favor the words in dictionary.toml (its terms, and those of the
 # focused app's profiles) where they sound like what was said. 0 = off; 1 to 4 is the useful
 # range: more fixes more homophones ("Maine" for "main") and also changes more words that
@@ -338,6 +343,8 @@ pub struct SttConfig {
     pub precision: Precision,
     pub device: Device,
     pub threads: usize,
+    /// Keep a GPU encoder warm while recording (`SttEngine::heartbeat`).
+    pub heartbeat: bool,
     /// As written; use [`SttConfig::boost`], which clamps it.
     pub boost: f32,
     /// As written in the config ("" = default); use [`SttConfig::models_path`] to resolve it.
@@ -692,6 +699,7 @@ impl Default for SttConfig {
             precision: Precision::Int8,
             device: Device::Auto,
             threads: 0,
+            heartbeat: true,
             boost: DEFAULT_BOOST,
             models_dir: String::new(),
         }

@@ -182,6 +182,8 @@ pub struct Parakeet {
     /// The device the encoder fell back to the CPU from, if it did.
     fell_back_from: Option<Device>,
     notice: Option<String>,
+    /// A heartbeat's encoder input (zeros), kept for the next beat.
+    beat_feats: Vec<f32>,
 }
 
 /// The encoder session and how to feed it.
@@ -276,6 +278,11 @@ fn boost_scale(model: &str) -> f32 {
         _ => 1.0,
     }
 }
+
+/// Log-mel bins per feature frame (`nemo128.onnx`).
+const MEL_BINS: usize = 128;
+/// Feature frames a heartbeat ([`SttEngine::heartbeat`]) runs the encoder on: 0.5 s.
+const BEAT_FRAMES: usize = window_frames(0.5);
 
 const ENCODER_INT8: &str = "encoder-model.int8.onnx";
 const ENCODER_FP32: &str = "encoder-model.onnx";
@@ -476,6 +483,7 @@ impl Parakeet {
             explicit,
             fell_back_from,
             notice,
+            beat_feats: Vec::new(),
         };
         p.update_name();
         if p.encoder.device != Device::Cpu {
@@ -756,6 +764,31 @@ impl SttEngine for Parakeet {
 
     fn notice(&self) -> Option<String> {
         self.notice.clone()
+    }
+
+    /// DirectML only: the one device measured (docs/benchmarks.md). Core ML and CUDA are GPUs
+    /// too but unmeasured, so they get no beats until numbers say they help. Not after a
+    /// fallback to the CPU either, where a beat would only burn cores.
+    fn wants_heartbeat(&self) -> bool {
+        self.encoder.device == Device::DirectMl
+    }
+
+    /// The encoder alone (the only part on the GPU) on [`BEAT_FRAMES`] frames of zeros. A
+    /// fixed-window encoder computes its whole window anyway, so a beat costs about what a
+    /// short dictation's encoder does. A failure isn't handled here: the next `transcribe`
+    /// falls back to the CPU if the GPU is really gone.
+    fn heartbeat(&mut self) -> Result<()> {
+        let frames = self.encoder.fixed_frames.unwrap_or(BEAT_FRAMES);
+        // Only zeros are ever written to it: resizing keeps it all zeros.
+        self.beat_feats.resize(MEL_BINS * frames, 0.0);
+        self.encoder
+            .session
+            .run(ort::inputs![
+                "audio_signal" => TensorRef::from_array_view(([1usize, MEL_BINS, frames], &self.beat_feats[..]))?,
+                "length" => TensorRef::from_array_view(([1usize], &[BEAT_FRAMES as i64][..]))?,
+            ])
+            .map_err(|e| EncoderFailed(e.to_string()))?;
+        Ok(())
     }
 
     fn transcribe(&mut self, audio: &[f32], opts: &TranscribeOpts) -> Result<Transcript> {

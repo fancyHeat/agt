@@ -68,4 +68,17 @@ pub trait SttEngine: Send {
     fn notice(&self) -> Option<String> {
         None
     }
+
+    /// Whether [`Self::heartbeat`] is worth running while the user records: the engine runs
+    /// on a GPU that clocks down when idle for a second or so, and the next call pays for
+    /// waking it. May change after a `transcribe` (a fallback to the CPU).
+    fn wants_heartbeat(&self) -> bool {
+        false
+    }
+
+    /// The cheapest call that keeps the device clocked up, its result thrown away. Only
+    /// called while [`Self::wants_heartbeat`].
+    fn heartbeat(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
